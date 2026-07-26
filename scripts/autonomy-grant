@@ -1,0 +1,283 @@
+#!/bin/bash
+# V11 Script: autonomy-grant
+# Persist explicit autonomy level grants (A4/A5) to .autonomy-state.
+# Auto-escalation via track-autonomy hook covers A0→A3 only.
+# A4/A5 require explicit grant through this script (or verbal grant handled by orchestrator).
+#
+# Usage:
+#   autonomy-grant PROJECT LEVEL [--reason "..."]   # Grant autonomy level
+#   autonomy-grant --test                            # Self-test
+#   autonomy-grant --help                            # Show usage
+#
+# Exit codes:
+#   0  success
+#   1  usage error
+#   2  validation failure
+#   3  file I/O failure
+
+set -euo pipefail
+
+V11_WORKSPACE_ROOT="${V11_WORKSPACE_ROOT:-$HOME/.v11}"
+SESSIONS_ROOT="${SESSIONS_ROOT:-$V11_WORKSPACE_ROOT/sessions}"
+
+LEVEL_NAMES=("Manual" "Guided" "Supervised" "Trusted" "Autonomous" "Self-Organizing")
+
+# --- Usage ---
+usage() {
+    cat <<'EOF'
+Usage: autonomy-grant PROJECT LEVEL [--reason "..."]
+
+Arguments:
+  PROJECT  V11 project name (alphanumeric, dots, hyphens, underscores; max 64 chars)
+  LEVEL    Autonomy level integer 0-5 (A0 through A5)
+
+Options:
+  --reason "TEXT"   Optional reason string stored in grants[] history
+  --help            Show this help
+  --test            Self-test (creates a temp project, verifies read/write, cleans up)
+
+Exit codes:
+  0  success
+  1  usage error
+  2  validation failure
+  3  file I/O failure
+
+Examples:
+  autonomy-grant ice-aware 5 --reason "operator-granted for sprint 16"
+  autonomy-grant flow-chi 4
+  autonomy-grant my-project 0 --reason "reset after test"
+
+Notes:
+  - A0-A3 auto-escalate via track-autonomy hook based on successful action count
+  - A4 and A5 require explicit grant through this script
+  - Grants are appended to .grants[] history; action counters are preserved
+  - Atomic write: tmp file -> jq validate -> mv (no partial writes)
+EOF
+}
+
+# --- Self-test ---
+run_self_test() {
+    echo "autonomy-grant self-test starting..."
+
+    # Bug fix (2026-04-20): TEST_DIR was local, but trap EXIT fires AFTER the function
+    # returns and locals are unwound — with set -u, the expansion in the trap failed
+    # with "TEST_DIR: unbound variable" and the script exited 1 despite PASS output.
+    # Promote to plain (unscoped) assignment so the trap sees a defined value.
+    TEST_PROJECT="__autonomy-grant-selftest-$$"
+    TEST_DIR="$SESSIONS_ROOT/$TEST_PROJECT"
+
+    # Cleanup on exit — guard against unset (belt-and-suspenders for set -u)
+    trap 'rm -rf "${TEST_DIR:-}"' EXIT
+
+    mkdir -p "$TEST_DIR"
+
+    # Test 1: grant on missing .autonomy-state (init skeleton)
+    "$0" "$TEST_PROJECT" 3 --reason "self-test init" 2>&1 | grep -q "persisted" || {
+        echo "FAIL: grant on missing state file did not emit persisted message"
+        exit 3
+    }
+
+    local LEVEL
+    LEVEL=$(jq -r '.level' "$TEST_DIR/.autonomy-state")
+    [ "$LEVEL" = "3" ] || { echo "FAIL: expected level 3, got $LEVEL"; exit 3; }
+
+    local GRANT_COUNT
+    GRANT_COUNT=$(jq '.grants | length' "$TEST_DIR/.autonomy-state")
+    [ "$GRANT_COUNT" = "1" ] || { echo "FAIL: expected 1 grant, got $GRANT_COUNT"; exit 3; }
+
+    local GRANT_SOURCE
+    GRANT_SOURCE=$(jq -r '.grants[0].source' "$TEST_DIR/.autonomy-state")
+    [ "$GRANT_SOURCE" = "manual" ] || { echo "FAIL: expected source=manual, got $GRANT_SOURCE"; exit 3; }
+
+    # Test 2: escalate to A5
+    "$0" "$TEST_PROJECT" 5 --reason "self-test escalate" 2>&1 | grep -q "persisted" || {
+        echo "FAIL: escalate to A5 did not emit persisted message"
+        exit 3
+    }
+    LEVEL=$(jq -r '.level' "$TEST_DIR/.autonomy-state")
+    [ "$LEVEL" = "5" ] || { echo "FAIL: expected level 5, got $LEVEL"; exit 3; }
+
+    # Test 3: grants array accumulated (now 2 grants)
+    GRANT_COUNT=$(jq '.grants | length' "$TEST_DIR/.autonomy-state")
+    [ "$GRANT_COUNT" = "2" ] || { echo "FAIL: expected 2 grants, got $GRANT_COUNT"; exit 3; }
+
+    # Test 4: action counters preserved (not reset)
+    local SUCCESSFUL
+    SUCCESSFUL=$(jq -r '.successful' "$TEST_DIR/.autonomy-state")
+    [ "$SUCCESSFUL" = "0" ] || { echo "FAIL: expected successful=0 (initial skeleton), got $SUCCESSFUL"; exit 3; }
+
+    # Test 5: grant without --reason
+    "$0" "$TEST_PROJECT" 2 2>&1 | grep -q "persisted" || {
+        echo "FAIL: grant without --reason failed"
+        exit 3
+    }
+
+    # Test 6: invalid level
+    "$0" "$TEST_PROJECT" 6 2>/dev/null && { echo "FAIL: level 6 should have been rejected"; exit 3; } || true
+
+    # Test 7: invalid project name
+    "$0" "bad project!" 3 2>/dev/null && { echo "FAIL: invalid project name should have been rejected"; exit 3; } || true
+
+    echo "autonomy-grant self-test PASS (7/7)"
+}
+
+# --- Flags ---
+if [ "${1:-}" = "--help" ]; then
+    usage
+    exit 0
+fi
+
+if [ "${1:-}" = "--test" ]; then
+    run_self_test
+    exit 0
+fi
+
+# --- Argument parsing ---
+if [ $# -lt 2 ]; then
+    echo "ERROR: Missing required arguments." >&2
+    echo "" >&2
+    usage >&2
+    exit 1
+fi
+
+PROJECT="$1"
+LEVEL_RAW="$2"
+shift 2
+
+REASON=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --reason)
+            if [ $# -lt 2 ]; then
+                echo "ERROR: --reason requires a value." >&2
+                exit 1
+            fi
+            REASON="$2"
+            shift 2
+            ;;
+        --help)
+            usage
+            exit 0
+            ;;
+        *)
+            echo "ERROR: Unknown option: $1" >&2
+            exit 1
+            ;;
+    esac
+done
+
+# --- Validate PROJECT ---
+if ! echo "$PROJECT" | grep -qE '^[a-zA-Z0-9._-]{1,64}$'; then
+    echo "ERROR: Invalid project name '$PROJECT'." >&2
+    echo "       Must match [a-zA-Z0-9._-]{1,64}" >&2
+    exit 2
+fi
+
+# --- Validate LEVEL ---
+if ! echo "$LEVEL_RAW" | grep -qE '^[0-9]+$'; then
+    echo "ERROR: LEVEL must be an integer, got: '$LEVEL_RAW'" >&2
+    exit 2
+fi
+
+LEVEL="$LEVEL_RAW"
+if [ "$LEVEL" -lt 0 ] || [ "$LEVEL" -gt 5 ]; then
+    echo "ERROR: LEVEL must be 0-5, got: $LEVEL" >&2
+    exit 2
+fi
+
+LEVEL_NAME="${LEVEL_NAMES[$LEVEL]}"
+
+# --- Resolve paths ---
+SESSION_DIR="$SESSIONS_ROOT/$PROJECT"
+AUTONOMY_FILE="$SESSION_DIR/.autonomy-state"
+
+# Create session dir if it doesn't exist (grant is allowed to create the dir)
+if [ ! -d "$SESSION_DIR" ]; then
+    mkdir -p "$SESSION_DIR" || {
+        echo "ERROR: Cannot create session directory: $SESSION_DIR" >&2
+        exit 3
+    }
+fi
+
+# --- Read-modify-write the autonomy state under the SAME flock track-autonomy uses ---
+# Track-autonomy hook holds flock fd 200 on $AUTONOMY_FILE.lock during its read-modify-write.
+# Without this lock here, a hook firing between our read and our mv would silently revert
+# the grant (S-C-01 / X-C-02 — caught by swarm audit 2026-04-20).
+NOW=$(date -Iseconds)
+LOCK_FILE="${AUTONOMY_FILE}.lock"
+
+(
+    flock -w 5 200 || {
+        echo "ERROR: Could not acquire lock on $AUTONOMY_FILE within 5s (track-autonomy busy?)" >&2
+        exit 3
+    }
+
+    if [ -f "$AUTONOMY_FILE" ] && [ -s "$AUTONOMY_FILE" ]; then
+        # Validate existing file is parseable JSON
+        if ! jq empty "$AUTONOMY_FILE" 2>/dev/null; then
+            echo "ERROR: Existing .autonomy-state is not valid JSON: $AUTONOMY_FILE" >&2
+            exit 3
+        fi
+        CURRENT_STATE=$(cat "$AUTONOMY_FILE")
+    else
+        # Initialize skeleton — matches schema written by track-autonomy hook
+        CURRENT_STATE=$(jq -n \
+            --arg now "$NOW" \
+            '{
+                level: 0,
+                successful: 0,
+                errors: 0,
+                rollbacks: 0,
+                approved_categories: [],
+                grants: [],
+                high_risk_history: [],
+                recent_errors: [],
+                last_updated: $now
+            }')
+    fi
+
+    # --- Build new grant entry ---
+    GRANT_ENTRY=$(jq -n \
+        --arg ts "$NOW" \
+        --argjson level "$LEVEL" \
+        --arg reason "$REASON" \
+        '{
+            timestamp: $ts,
+            level: $level,
+            reason: $reason,
+            source: "manual"
+        }')
+
+    # --- Merge: update level, last_updated, append grant, preserve everything else ---
+    UPDATED_STATE=$(echo "$CURRENT_STATE" | jq \
+        --argjson level "$LEVEL" \
+        --arg now "$NOW" \
+        --argjson grant "$GRANT_ENTRY" \
+        '.level = $level
+        | .last_updated = $now
+        | .grants = ((.grants // []) + [$grant])')
+
+    # --- Atomic write: tmp -> validate -> mv (still within the lock) ---
+    TMP_FILE="${AUTONOMY_FILE}.tmp.$$"
+
+    echo "$UPDATED_STATE" > "$TMP_FILE" || {
+        echo "ERROR: Cannot write tmp file: $TMP_FILE" >&2
+        exit 3
+    }
+
+    if ! jq empty "$TMP_FILE" 2>/dev/null; then
+        rm -f "$TMP_FILE"
+        echo "ERROR: Generated state failed JSON validation — aborting atomic write." >&2
+        exit 3
+    fi
+
+    mv "$TMP_FILE" "$AUTONOMY_FILE" || {
+        rm -f "$TMP_FILE"
+        echo "ERROR: Cannot replace $AUTONOMY_FILE" >&2
+        exit 3
+    }
+) 200>"$LOCK_FILE" || exit $?
+
+echo "Autonomy grant persisted: $PROJECT -> A${LEVEL} (${LEVEL_NAME})"
+[ -n "$REASON" ] && echo "  Reason: $REASON"
+echo "  File:   $AUTONOMY_FILE"

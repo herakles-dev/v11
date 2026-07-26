@@ -1,0 +1,150 @@
+#!/usr/bin/env python3
+"""V11 Script: maintain-memory-index
+
+Maintenance operations for project memory indices.
+Removes stale entries, optimizes FTS, reports stats.
+
+Usage:
+    ./scripts/maintain-memory-index PROJECT [--stats|--prune|--optimize|--rebuild]
+
+Options:
+    --stats     Show index statistics (default)
+    --prune     Remove entries for deleted files
+    --optimize  Optimize FTS5 index
+    --rebuild   Full rebuild (reindex all files)
+"""
+
+import os
+import sqlite3
+import sys
+from pathlib import Path
+
+SESSIONS_ROOT = os.environ.get("SESSIONS_ROOT", os.path.expanduser("~/sessions"))
+V11_WORKSPACE_ROOT = os.environ.get("V11_WORKSPACE_ROOT", os.path.expanduser("~"))
+
+
+def get_index_db(project: str) -> Path:
+    """Find memory index database."""
+    candidates = [
+        Path(SESSIONS_ROOT) / project / ".memory-index" / "memory.sqlite",
+        Path(V11_WORKSPACE_ROOT) / project / ".memory-index" / "memory.sqlite",
+    ]
+    for p in candidates:
+        if p.exists():
+            return p
+    return candidates[0]
+
+
+def show_stats(conn: sqlite3.Connection, db_path: Path):
+    """Show index statistics."""
+    total = conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
+    by_type = conn.execute(
+        "SELECT source_type, COUNT(*) FROM chunks GROUP BY source_type ORDER BY COUNT(*) DESC"
+    ).fetchall()
+    by_file = conn.execute(
+        "SELECT file_path, COUNT(*) FROM chunks GROUP BY file_path ORDER BY COUNT(*) DESC LIMIT 10"
+    ).fetchall()
+
+    last_indexed = conn.execute(
+        "SELECT value FROM index_meta WHERE key = 'last_indexed'"
+    ).fetchone()
+
+    db_size = db_path.stat().st_size / 1024
+
+    print(f"  Total chunks: {total}")
+    print(f"  DB size: {db_size:.1f} KB")
+    print(f"  Last indexed: {last_indexed[0] if last_indexed else 'never'}")
+    print()
+
+    print("  By source type:")
+    for stype, count in by_type:
+        print(f"    {stype}: {count}")
+    print()
+
+    print("  Top files (by chunks):")
+    for fpath, count in by_file:
+        basename = os.path.basename(fpath)
+        print(f"    {basename}: {count}")
+
+    # Check embedding stats
+    with_emb = conn.execute("SELECT COUNT(*) FROM chunks WHERE embedding IS NOT NULL").fetchone()[0]
+    print(f"\n  With embeddings: {with_emb}/{total}")
+
+    # Cache stats
+    cache_path = db_path.parent / "embeddings.cache"
+    if cache_path.exists():
+        cache_conn = sqlite3.connect(str(cache_path))
+        cached = cache_conn.execute("SELECT COUNT(*) FROM embedding_cache").fetchone()[0]
+        cache_size = cache_path.stat().st_size / 1024
+        print(f"  Embedding cache: {cached} entries ({cache_size:.1f} KB)")
+        cache_conn.close()
+
+
+def prune_stale(conn: sqlite3.Connection):
+    """Remove entries for files that no longer exist."""
+    files = conn.execute("SELECT DISTINCT file_path FROM chunks").fetchall()
+    pruned = 0
+
+    for (fpath,) in files:
+        if not os.path.isfile(fpath):
+            conn.execute("DELETE FROM chunks WHERE file_path = ?", (fpath,))
+            pruned += 1
+            print(f"  Pruned: {os.path.basename(fpath)} (file deleted)")
+
+    conn.commit()
+    print(f"\n  Pruned {pruned} stale file(s)")
+
+
+def optimize_fts(conn: sqlite3.Connection):
+    """Optimize FTS5 index for faster queries."""
+    print("  Optimizing FTS5 index...")
+    conn.execute("INSERT INTO chunks_fts(chunks_fts) VALUES('optimize')")
+    conn.execute("VACUUM")
+    conn.commit()
+    print("  Done")
+
+
+def main():
+    if len(sys.argv) < 2:
+        print("Usage: maintain-memory-index PROJECT [--stats|--prune|--optimize|--rebuild]")
+        sys.exit(1)
+
+    project = sys.argv[1]
+    action = sys.argv[2] if len(sys.argv) > 2 else "--stats"
+
+    db_path = get_index_db(project)
+    print(f"Memory Index Maintenance: {project}")
+    print(f"  DB: {db_path}")
+    print()
+
+    if not db_path.exists():
+        print(f"  No index found. Run: ./scripts/index-project-memory {project}")
+        sys.exit(1)
+
+    conn = sqlite3.connect(str(db_path))
+
+    if action == "--stats":
+        show_stats(conn, db_path)
+    elif action == "--prune":
+        prune_stale(conn)
+    elif action == "--optimize":
+        optimize_fts(conn)
+    elif action == "--rebuild":
+        print("  Dropping existing index...")
+        conn.execute("DELETE FROM chunks")
+        conn.commit()
+        conn.close()
+        print("  Rebuilding...")
+        os.execvp(
+            sys.executable,
+            [sys.executable, str(Path(__file__).parent / "index-project-memory"), project, "--full"],
+        )
+    else:
+        print(f"  Unknown action: {action}")
+        sys.exit(1)
+
+    conn.close()
+
+
+if __name__ == "__main__":
+    main()

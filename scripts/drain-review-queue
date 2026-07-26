@@ -1,0 +1,210 @@
+#!/bin/bash
+# V11.19 Script: drain-review-queue
+# Orchestrator-friendly dispatch helper for the review queue.
+#
+# For each pending entry in the project's queue, this script emits a
+# structured XML block containing the spawn prompt produced by
+# scripts/task-review. The orchestrator iterates this block, spawns
+# adversarial-lite-reviewer for each task, and folds the verdict into
+# TaskUpdate(metadata.artifacts.review=...).
+#
+# This is the consumer side of T2 (review-queue) — T2 shows you what's
+# pending; this script gives you the prompt you need to ACT on it.
+#
+# USAGE:
+#   drain-review-queue [PROJECT] [--limit N] [--json] [--task-id TID]
+#   drain-review-queue [PROJECT] --safe               # skip items owned by a DIFFERENT live session
+#   drain-review-queue [PROJECT] --force               # drain regardless of concurrent ownership
+#   drain-review-queue [PROJECT] --safe --force-stale   # --safe, but first release stale claims (gc)
+#   drain-review-queue [PROJECT] --session SESSION_UUID # override claimant identity (default: current session)
+#   drain-review-queue --test
+#
+# --safe and --force-stale implement improvement 03 §B/C: items are classified
+# via v11_review_queue_classify (hooks/lib/common.sh) and claimed via
+# v11_review_queue_claim before being included in the drain set, so two
+# concurrent orchestrator sessions never dispatch the same review twice.
+# Default (no flag) preserves pre-improvement-03 behavior: full unfiltered list.
+#
+# Default PROJECT: active-project file.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+V11_HOME="${V11_HOME:-$(dirname "$SCRIPT_DIR")}"
+# shellcheck source=../hooks/lib/common.sh
+source "$V11_HOME/hooks/lib/common.sh"
+
+if [ "${1:-}" = "--test" ]; then
+    echo "drain-review-queue v1.0 (V11.19)"
+    exit 0
+fi
+
+if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
+    sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//'
+    exit 0
+fi
+
+PROJECT=""
+LIMIT=0
+JSON_OUT=false
+TASK_FILTER=""
+SAFE=false
+FORCE=false
+FORCE_STALE=false
+SESSION_OVERRIDE=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --limit) LIMIT="${2:-0}"; shift ;;
+        --json) JSON_OUT=true ;;
+        --task-id) TASK_FILTER="${2:-}"; shift ;;
+        --safe) SAFE=true ;;
+        --force) FORCE=true ;;
+        --force-stale) FORCE_STALE=true; SAFE=true ;;
+        --session) SESSION_OVERRIDE="${2:-}"; shift ;;
+        -*) echo "drain-review-queue: unknown flag '$1'" >&2; exit 2 ;;
+        *) [ -z "$PROJECT" ] && PROJECT="$1" ;;
+    esac
+    shift
+done
+
+if [ -z "$PROJECT" ]; then
+    PROJECT="$(v11_read_active_project 2>/dev/null || true)"
+fi
+if [ -z "$PROJECT" ]; then
+    echo "drain-review-queue: no PROJECT and no active-project — pass project explicitly" >&2
+    exit 1
+fi
+
+MY_SESSION="${SESSION_OVERRIDE:-$(v11_session_uuid 2>/dev/null || echo "legacy-cli")}"
+
+# --force-stale releases stale claims (claimed_by set, unresolved >30 min, no
+# live owner) BEFORE classification, so previously-abandoned claims free up
+# for this session's --safe pass in the same invocation.
+if [ "$FORCE_STALE" = "true" ]; then
+    v11_review_queue_gc "$PROJECT" >/dev/null 2>&1 || true
+fi
+
+# Build the pending list (uses the same logic as scripts/review-queue pending --json)
+PENDING_JSON=$("$V11_HOME/scripts/review-queue" pending "$PROJECT" --json 2>/dev/null || echo '[]')
+
+if [ "$PENDING_JSON" = "[]" ] || [ -z "$PENDING_JSON" ]; then
+    if [ "$JSON_OUT" = "true" ]; then
+        echo "[]"
+    else
+        echo "No pending reviews for project '$PROJECT'."
+    fi
+    exit 0
+fi
+
+# Filter by task ID if requested
+if [ -n "$TASK_FILTER" ]; then
+    PENDING_JSON=$(printf '%s' "$PENDING_JSON" | jq --arg tid "$TASK_FILTER" '[.[] | select(.task_id == $tid)]')
+fi
+
+# --safe (and --force-stale, which implies it): classify pending entries and
+# drop any that are owned by a DIFFERENT still-live session (claimed_by, or
+# files_changed overlapping another live session's entry). --force bypasses
+# this filter entirely -- "drain regardless" per improvement 03 §C.
+SKIPPED_COUNT=0
+SKIPPED_OWNERS=""
+if [ "$SAFE" = "true" ] && [ "$FORCE" != "true" ]; then
+    CLASS_JSON=$(v11_review_queue_classify "$PROJECT" "$MY_SESSION")
+    FILTERED_JSON=$(printf '%s' "$PENDING_JSON" | jq -c --argjson class "$CLASS_JSON" '
+        ($class | map({(.task_id): .}) | add // {}) as $by_id
+        | [.[] | . as $e | ($by_id[$e.task_id] // {drainable:true}) as $c
+           | select($c.drainable != false)]
+    ')
+    SKIPPED_JSON=$(printf '%s' "$PENDING_JSON" | jq -c --argjson class "$CLASS_JSON" '
+        ($class | map({(.task_id): .}) | add // {}) as $by_id
+        | [.[] | . as $e | ($by_id[$e.task_id] // {drainable:true}) as $c
+           | select($c.drainable == false) | {task_id: $e.task_id, conflict_owner: $c.conflict_owner}]
+    ')
+    SKIPPED_COUNT=$(printf '%s' "$SKIPPED_JSON" | jq 'length')
+    SKIPPED_OWNERS=$(printf '%s' "$SKIPPED_JSON" | jq -r '[.[].conflict_owner] | unique | join(", ")')
+
+    # Claim each surviving entry so a concurrent session sees it as owned by
+    # this one for the duration of the drain. Best-effort: a claim race lost
+    # here just drops the entry back to skipped (logged, never silently dispatched twice).
+    CLAIMED_IDS=""
+    for tid in $(printf '%s' "$FILTERED_JSON" | jq -r '.[].task_id'); do
+        RESULT=$(v11_review_queue_claim "$PROJECT" "$tid" "$MY_SESSION")
+        case "$RESULT" in
+            claimed|already_mine) CLAIMED_IDS="$CLAIMED_IDS $tid" ;;
+            *) SKIPPED_COUNT=$((SKIPPED_COUNT + 1)) ;;
+        esac
+    done
+    PENDING_JSON=$(printf '%s' "$FILTERED_JSON" | jq -c --arg ids " $CLAIMED_IDS " \
+        '[.[] | . as $e | select(($ids | index(" " + $e.task_id + " ")) != null)]')
+
+    if [ "$SKIPPED_COUNT" -gt 0 ]; then
+        echo "[drain-review-queue] --safe: skipped $SKIPPED_COUNT review(s) owned by concurrent session(s): ${SKIPPED_OWNERS:-unknown}" >&2
+    fi
+fi
+
+# Apply limit
+if [ "$LIMIT" -gt 0 ]; then
+    PENDING_JSON=$(printf '%s' "$PENDING_JSON" | jq --argjson n "$LIMIT" '.[:$n]')
+fi
+
+COUNT=$(printf '%s' "$PENDING_JSON" | jq 'length')
+if [ "$COUNT" = "0" ]; then
+    if [ "$JSON_OUT" = "true" ]; then
+        echo "[]"
+    else
+        echo "No matching pending reviews."
+    fi
+    exit 0
+fi
+
+if [ "$JSON_OUT" = "true" ]; then
+    # JSON output: array of {task_id, subject, agent_id, files_changed, pending_since, prompt}
+    printf '%s' "$PENDING_JSON" | jq -c '.[]' | while IFS= read -r entry; do
+        TID=$(printf '%s' "$entry" | jq -r '.task_id')
+        SUBJ=$(printf '%s' "$entry" | jq -r '.subject')
+        AGENT=$(printf '%s' "$entry" | jq -r '.agent_id')
+        FILES=$(printf '%s' "$entry" | jq -r '(.files_changed // []) | join(",")')
+        # Build task-review prompt
+        if [ -n "$FILES" ]; then
+            PROMPT=$("$V11_HOME/scripts/task-review" "$PROJECT" "$TID" --files "$FILES" --agent "$AGENT" --subject "$SUBJ" 2>/dev/null || echo "")
+        else
+            PROMPT=$("$V11_HOME/scripts/task-review" "$PROJECT" "$TID" --agent "$AGENT" --subject "$SUBJ" 2>/dev/null || echo "")
+        fi
+        printf '%s' "$entry" | jq --arg prompt "$PROMPT" '. + {prompt: $prompt}'
+    done | jq -s '.'
+else
+    # Human-readable XML-ish block — designed for orchestrator to read inline
+    echo "<v11-review-queue project=\"$PROJECT\" count=\"$COUNT\">"
+    # XML escape helper: replace &, <, >, ", ' with entity references.
+    # The orchestrator parses this block; values like task subjects may contain
+    # ampersands or angle brackets that would otherwise corrupt the XML.
+    _xml_escape() {
+        printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' -e 's/"/\&quot;/g' -e "s/'/\&apos;/g"
+    }
+    printf '%s' "$PENDING_JSON" | jq -c '.[]' | while IFS= read -r entry; do
+        TID=$(printf '%s' "$entry" | jq -r '.task_id')
+        SUBJ=$(printf '%s' "$entry" | jq -r '.subject')
+        AGENT=$(printf '%s' "$entry" | jq -r '.agent_id')
+        FILES=$(printf '%s' "$entry" | jq -r '(.files_changed // []) | join(",")')
+        PSINCE=$(printf '%s' "$entry" | jq -r '.pending_since')
+        # Escape values used in XML attributes / content
+        TID_X=$(_xml_escape "$TID")
+        SUBJ_X=$(_xml_escape "$SUBJ")
+        AGENT_X=$(_xml_escape "$AGENT")
+        FILES_X=$(_xml_escape "$FILES")
+        PSINCE_X=$(_xml_escape "$PSINCE")
+        echo ""
+        echo "  <pending-review task-id=\"$TID_X\" agent=\"$AGENT_X\" since=\"$PSINCE_X\">"
+        echo "    <subject>$SUBJ_X</subject>"
+        echo "    <files-changed>$FILES_X</files-changed>"
+        echo "    <spawn-prompt>"
+        if [ -n "$FILES" ]; then
+            "$V11_HOME/scripts/task-review" "$PROJECT" "$TID" --files "$FILES" --agent "$AGENT" --subject "$SUBJ" 2>/dev/null | sed 's/^/      /'
+        else
+            "$V11_HOME/scripts/task-review" "$PROJECT" "$TID" --agent "$AGENT" --subject "$SUBJ" 2>/dev/null | sed 's/^/      /'
+        fi
+        echo "    </spawn-prompt>"
+        echo "  </pending-review>"
+    done
+    echo ""
+    echo "</v11-review-queue>"
+fi

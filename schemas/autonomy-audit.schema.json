@@ -1,0 +1,37 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "autonomy-audit.schema.json",
+  "title": "V11 Autonomy Audit Trail Line",
+  "description": "Schema for ONE line of ~/.agent-metrics/autonomy-audit.jsonl. Appended by track-autonomy hook on every PostToolUse Write/Edit/Bash event. V11.4 enriched with task_id/agent_id/diff_summary/diff_hash. V11.20 adds caller_kind to distinguish orchestrator runtime actions from subagent runtime actions in agent-scorecard. Legacy entries (pre-V11.4) lack the enrichment fields; pre-V11.20 entries lack caller_kind. All additions are ADDITIVE — consumers tolerate absence and default caller_kind to 'unknown'.",
+  "type": "object",
+  "properties": {
+    "timestamp":       { "type": "string", "format": "date-time" },
+    "session_id":      { "type": "string" },
+    "project":         { "type": ["string", "null"] },
+    "action":          { "type": "string", "description": "Write | Edit | Bash | TaskCreate | TaskUpdate (PostToolUse tool_name)" },
+    "file":            { "type": "string", "description": "Absolute file path for Write/Edit; command string for Bash" },
+    "risk_level":      { "enum": ["low", "medium", "high"] },
+    "autonomy_level":  { "type": "integer", "minimum": 0, "maximum": 5 },
+    "approval_method": {
+      "type": "string",
+      "description": "How the action was authorized: explicit, trusted_low, trusted_medium, autonomy_a4, autonomy_a5, autonomy_grant"
+    },
+    "grant_matched":   { "type": ["string", "null"], "description": "Name of the autonomy grant that matched, if any" },
+    "outcome":         { "enum": ["success", "error", "blocked"] },
+    "error":           { "type": ["string", "null"] },
+    "task_id":         { "type": ["string", "null"], "description": "V11.4: active task_id from task-state (active_task_ids[0])" },
+    "agent_id":        { "type": ["string", "null"], "description": "V11.4: active_agent_id from task-state (set by sync-tasks from TaskUpdate owner)" },
+    "diff_summary":    { "type": ["string", "null"], "description": "V11.4: git diff --stat one-liner for Write/Edit" },
+    "diff_hash":       { "type": ["string", "null"], "description": "V11.4: 8-char hash of the diff content for cross-event correlation" },
+    "caller_kind": {
+      "enum": ["orchestrator", "subagent", "unknown"],
+      "description": "V11.20: was this event triggered by the main orchestrator session or a spawned subagent? Resolved by v11_caller_kind. Rollback: V11_CALLER_KIND=off keeps field unset (legacy)."
+    },
+    "executor_kind": {
+      "enum": ["self", "adversarial", "headless"],
+      "description": "V11.21: For TaskUpdate events on review tasks, identifies the agent's review role. self = implementing agent self-reviewing its own work (Layer A). adversarial = adversarial-lite-reviewer reviewing a sibling parent (Layer B). Orthogonal to caller_kind: both layers can be run from orchestrator OR subagent sessions. Optional — absent on non-review events and pre-V11.21 entries. Rollback: V11_EXECUTOR_KIND=off keeps field unset."
+    }
+  },
+  "required": ["timestamp", "session_id", "action", "risk_level", "autonomy_level", "approval_method", "outcome"],
+  "additionalProperties": false
+}

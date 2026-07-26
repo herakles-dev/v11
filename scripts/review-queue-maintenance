@@ -1,0 +1,232 @@
+#!/usr/bin/env python3
+"""review-queue-maintenance — normalize + GC the V11 review queue (loop-audit 2026-07-01).
+
+The 2026-07-01 rating-loop audit found review_severity was a ~20-value dumping ground
+(case-split LOW/low, MED/MEDIUM, outcome-codes jammed into severity, and a `--severity`
+flag-leak x18) so agent-scorecard couldn't aggregate a clean scale. The write chokepoint
+(v11_review_queue_mark_done) now normalizes forward; this script cleans the historical
+backlog and (optionally) GCs old resolved events so the queue stops growing unbounded.
+
+Canonical severity enum: NONE, LOW, MEDIUM, HIGH, CRITICAL. Anything else on a `done`
+event is neutralized to NONE and preserved in an `outcome` field.
+
+Usage:
+  review-queue-maintenance --normalize [--apply] [--dry-run]   # default: dry-run
+  review-queue-maintenance --gc --days 90 [--apply]            # prune done events older than N days
+  review-queue-maintenance --stats                             # depth report per project
+
+Safe by default: --dry-run unless --apply. --apply writes a .bak-<ts> sidecar first.
+
+H4a (W2-1): the read -> backup -> rewrite critical section per project file is now
+guarded by an exclusive flock on "<project>.jsonl.lock" -- the same lock-file
+convention hooks/lib/common.sh's v11_review_queue_path uses for the FD-208 critical
+section shared by v11_review_queue_add/claim/mark_done. Without this, a concurrent
+flock-guarded append landing inside the snapshot window was silently swapped into the
+.bak sidecar and dropped from the live file.
+"""
+import argparse, fcntl, json, os, re, sys, glob, time
+from datetime import datetime, timezone
+
+QUEUE_DIR = os.path.expanduser("~/.agent-metrics/review-queue")
+
+# Lock wait budget before skipping a file rather than hanging. Overridable for tests.
+LOCK_TIMEOUT_S = float(os.environ.get("V11_RQ_MAINT_LOCK_TIMEOUT", "10"))
+LOCK_POLL_S = 0.1
+
+CANON = {"NONE": "NONE", "": "NONE", "LOW": "LOW", "MED": "MEDIUM",
+         "MEDIUM": "MEDIUM", "HIGH": "HIGH", "CRIT": "CRITICAL", "CRITICAL": "CRITICAL"}
+
+
+class QueueLockTimeout(Exception):
+    """Raised when the per-project queue lock can't be acquired within LOCK_TIMEOUT_S."""
+
+
+class _QueueLock:
+    """Exclusive flock on '<path>.lock', held for the whole read->backup->rewrite
+    critical section for that project file. Matches hooks/lib/common.sh's
+    v11_review_queue_path convention: LOCK FILE = queue path + ".lock".
+
+    Polls (non-blocking flock + sleep) up to `timeout` seconds, then raises
+    QueueLockTimeout so the caller can skip that file cleanly instead of hanging
+    indefinitely behind a concurrent writer.
+    """
+
+    def __init__(self, path, timeout=LOCK_TIMEOUT_S):
+        self.lock_path = f"{path}.lock"
+        self.timeout = timeout
+        self._fh = None
+
+    def __enter__(self):
+        self._fh = open(self.lock_path, "a+")
+        deadline = time.monotonic() + self.timeout
+        while True:
+            try:
+                fcntl.flock(self._fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return self
+            except OSError:
+                if time.monotonic() >= deadline:
+                    self._fh.close()
+                    self._fh = None
+                    raise QueueLockTimeout(self.lock_path)
+                time.sleep(LOCK_POLL_S)
+
+    def __exit__(self, exc_type, exc, tb):
+        if self._fh is not None:
+            # Closing the fd releases the flock (it's tied to the open file
+            # description, not the path).
+            self._fh.close()
+            self._fh = None
+        return False
+
+
+def normalize_sev(raw):
+    """Return (canonical_severity, outcome_or_None) — mirrors common.sh chokepoint."""
+    up = (raw or "").upper()
+    if up in CANON:
+        return CANON[up], None
+    outcome = re.sub(r"[^a-z0-9_-]", "_", (raw or "").lower())
+    outcome = outcome.strip("_-")
+    return "NONE", (outcome or "unparsed")
+
+
+def load(path):
+    rows = []
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rows.append(json.loads(line))
+            except json.JSONDecodeError:
+                rows.append({"_raw": line})  # preserve unparseable lines verbatim
+    return rows
+
+
+def backup_and_write(path, rows):
+    ts = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    os.replace(path, f"{path}.bak-{ts}")
+    with open(path, "w", encoding="utf-8") as f:
+        for r in rows:
+            if "_raw" in r and len(r) == 1:
+                f.write(r["_raw"] + "\n")
+            else:
+                f.write(json.dumps(r, separators=(",", ":")) + "\n")
+
+
+def do_normalize(apply):
+    changed_files = changed_rows = skipped_files = 0
+    for path in sorted(glob.glob(os.path.join(QUEUE_DIR, "*.jsonl"))):
+        try:
+            with _QueueLock(path):
+                rows = load(path)
+                dirty = False
+                for r in rows:
+                    if r.get("ev") != "done" or "_raw" in r:
+                        continue
+                    raw = r.get("review_severity", "NONE")
+                    sev, outcome = normalize_sev(raw)
+                    if sev != raw or (outcome and r.get("outcome") != outcome):
+                        if apply:
+                            r["review_severity"] = sev
+                            if outcome:
+                                r["outcome"] = outcome
+                        dirty = True
+                        changed_rows += 1
+                if dirty:
+                    changed_files += 1
+                    if apply:
+                        backup_and_write(path, rows)
+        except QueueLockTimeout as e:
+            skipped_files += 1
+            print(f"review-queue-maintenance: skip {path} — lock held by a concurrent "
+                  f"writer after {LOCK_TIMEOUT_S}s ({e})", file=sys.stderr)
+    verb = "normalized" if apply else "would normalize"
+    skip_note = f", {skipped_files} skipped (locked)" if skipped_files else ""
+    print(f"{verb}: {changed_rows} done-events across {changed_files} queue files"
+          f"{skip_note}{'' if apply else ' (dry-run — pass --apply)'}")
+
+
+def do_gc(days, apply):
+    cutoff = time.time() - days * 86400
+    pruned_rows = pruned_files = skipped_files = 0
+    for path in sorted(glob.glob(os.path.join(QUEUE_DIR, "*.jsonl"))):
+        try:
+            with _QueueLock(path):
+                rows = load(path)
+                keep = []
+                for r in rows:
+                    ts = r.get("ts", "")
+                    old = False
+                    if r.get("ev") == "done" and ts:
+                        try:
+                            old = datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp() < cutoff
+                        except ValueError:
+                            old = False
+                    if old:
+                        pruned_rows += 1
+                    else:
+                        keep.append(r)
+                if len(keep) != len(rows):
+                    pruned_files += 1
+                    if apply:
+                        backup_and_write(path, keep)
+        except QueueLockTimeout as e:
+            skipped_files += 1
+            print(f"review-queue-maintenance: skip {path} — lock held by a concurrent "
+                  f"writer after {LOCK_TIMEOUT_S}s ({e})", file=sys.stderr)
+    verb = "pruned" if apply else "would prune"
+    skip_note = f", {skipped_files} skipped (locked)" if skipped_files else ""
+    print(f"{verb}: {pruned_rows} resolved done-events older than {days}d across "
+          f"{pruned_files} files{skip_note}{'' if apply else ' (dry-run — pass --apply)'}")
+
+
+def do_stats():
+    total_pending = total_done = 0
+    rows_out = []
+    for path in sorted(glob.glob(os.path.join(QUEUE_DIR, "*.jsonl"))):
+        rows = load(path)
+        pend = {}
+        for r in rows:
+            tid = r.get("task_id")
+            if not tid:
+                continue
+            if r.get("ev") == "pending":
+                pend.setdefault(tid, True)
+            elif r.get("ev") == "done":
+                pend[tid] = False
+        open_n = sum(1 for v in pend.values() if v)
+        done_n = sum(1 for v in pend.values() if not v)
+        total_pending += open_n
+        total_done += done_n
+        if open_n:
+            rows_out.append((open_n, done_n, os.path.basename(path)[:-6]))
+    rows_out.sort(reverse=True)
+    print(f"Review queue: {total_pending} open across {len(rows_out)} projects "
+          f"({total_done} resolved).")
+    for open_n, done_n, proj in rows_out[:12]:
+        print(f"  {open_n:4d} open  {done_n:4d} done  {proj}")
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--normalize", action="store_true")
+    ap.add_argument("--gc", action="store_true")
+    ap.add_argument("--stats", action="store_true")
+    ap.add_argument("--days", type=int, default=90)
+    ap.add_argument("--apply", action="store_true")
+    ap.add_argument("--dry-run", action="store_true")
+    a = ap.parse_args()
+    if not os.path.isdir(QUEUE_DIR):
+        print("no review-queue dir"); return 0
+    if a.stats or not (a.normalize or a.gc):
+        do_stats()
+    if a.normalize:
+        do_normalize(a.apply and not a.dry_run)
+    if a.gc:
+        do_gc(a.days, a.apply and not a.dry_run)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

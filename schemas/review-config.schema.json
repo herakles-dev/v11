@@ -1,0 +1,45 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "review-config.schema.json",
+  "title": "V11 Per-Task Review Config",
+  "description": "Optional per-project knob at sessions/{project}/.review-config.json (V11.15). Controls the post-task adversarial-lite review loop. Absent file = all defaults = review every completed task (user-decided default).",
+  "type": "object",
+  "properties": {
+    "enabled": {
+      "type": "boolean",
+      "default": true,
+      "description": "Master switch. false = orchestrator skips the post-task review step entirely."
+    },
+    "scope": {
+      "enum": ["all", "risk-gated", "sampled"],
+      "default": "all",
+      "description": "all = every completed task (default). risk-gated = only risk in {medium,high} OR complexity in {complex,novel}. sampled = every sample_rate-th task + always complex/novel."
+    },
+    "sample_rate": {
+      "type": "integer",
+      "minimum": 1,
+      "default": 1,
+      "description": "Used only when scope=sampled: review 1 of every N routine tasks. 1 = review all."
+    },
+    "min_difficulty_to_review": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 5,
+      "default": 1,
+      "description": "Reserved: skip recording reviews whose difficulty is below this (1 = record all)."
+    },
+    "severity_autofix": {
+      "type": "array",
+      "items": { "enum": ["LOW", "MEDIUM", "HIGH"] },
+      "default": ["LOW", "MEDIUM", "HIGH"],
+      "description": "Severities the orchestrator may auto-dispatch adversarial-lite-fixer for (A3+ autonomy gated). CRITICAL is never auto-fixable by contract."
+    },
+    "severity_escalate": {
+      "type": "array",
+      "items": { "enum": ["CRITICAL", "HIGH", "MEDIUM", "LOW"] },
+      "default": ["CRITICAL"],
+      "description": "Severities that create a blocker task + escalate to orchestrator instead of auto-fixing."
+    }
+  },
+  "additionalProperties": false
+}

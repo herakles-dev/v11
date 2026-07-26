@@ -1,0 +1,17 @@
+id: BT-005
+title: "Hook latency within SLA bounds"
+tier: 0
+type: latency-sla
+category: latency-sla
+description: |
+  Measures --test mode latency for key hooks against SLA thresholds.
+  P50 must stay within bounds to prevent CLI slowdown.
+slas:
+  detect-project: 500
+  guard-enforcement: 500
+  guard-effort: 500
+  guard-write-gates: 500
+  verify-syntax: 500
+  track-autonomy: 500
+  sync-tasks: 500
+  enforce-test-coverage: 500

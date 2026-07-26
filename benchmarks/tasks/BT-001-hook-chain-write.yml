@@ -1,0 +1,32 @@
+id: BT-001
+title: "Write triggers correct PreToolUse hook chain"
+tier: 0
+type: hook-chain
+category: hook-chain
+description: |
+  Verifies that a Write tool call fires guard-write-gates before guard-enforcement,
+  both allowing the write for an agent writing to its owned directory.
+steps:
+  - name: "PreToolUse Write to owned dir"
+    event: PreToolUse
+    tool: Write
+    agent_id: backend-impl
+    payload:
+      tool_name: Write
+      tool_input:
+        file_path: "__PROJECT__/src/new_file.py"
+        content: "x = 1\n"
+    assertions:
+      - type: hook_fired
+        hook: guard-write-gates
+      - type: hook_fired
+        hook: guard-enforcement
+      - type: hook_order
+        before: guard-write-gates
+        after: guard-enforcement
+      - type: exit_code
+        hook: guard-write-gates
+        code: 0
+      - type: exit_code
+        hook: guard-enforcement
+        code: 0

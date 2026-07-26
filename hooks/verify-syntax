@@ -1,0 +1,116 @@
+#!/bin/bash
+# V11 Hook: verify-syntax (PostToolUse — Write|Edit, TeammateIdle, TaskCompleted)
+# Checks syntax of modified files after writes/edits.
+#
+# Extracted from V8 update-state (335 lines, lines 91-161).
+# V11 strips everything except syntax checking — no state.md writing,
+# no archival, no degraded-state detection.
+#
+# Advisory only — prints warnings to stdout, never blocks.
+#
+# Exit codes:
+#   0 - Always (never blocks)
+
+source "$(dirname "${BASH_SOURCE[0]}")/lib/common.sh"
+
+# Self-test for hook validation
+if [ "$1" == "--test" ]; then
+    echo "verify-syntax v1"
+    exit 0
+fi
+
+# --- Parse input ---
+v11_parse_input
+
+# Skip if no file path provided
+[ -z "$V11_FILE_PATH" ] && exit 0
+
+# Skip metadata/infrastructure files
+v11_is_metadata_file "$V11_FILE_PATH" && exit 0
+
+# Skip if file no longer exists (deleted after write)
+[ -f "$V11_FILE_PATH" ] || exit 0
+
+# --- Determine file extension ---
+BASENAME=$(basename "$V11_FILE_PATH")
+FILE_EXT="${BASENAME##*.}"
+# Handle extensionless files
+[ "$FILE_EXT" = "$BASENAME" ] && FILE_EXT=""
+
+# --- Syntax check by extension ---
+case "$FILE_EXT" in
+    py)
+        if command -v python3 &>/dev/null; then
+            if ! python3 -m py_compile "$V11_FILE_PATH" 2>/dev/null; then
+                echo "SYNTAX WARNING: Python syntax error in $V11_FILE_PATH"
+            fi
+        fi
+        ;;
+    js|jsx)
+        if command -v node &>/dev/null; then
+            if ! node --check "$V11_FILE_PATH" 2>/dev/null; then
+                echo "SYNTAX WARNING: JS syntax error in $V11_FILE_PATH"
+            fi
+        fi
+        ;;
+    ts|tsx)
+        # node --check does not understand TypeScript syntax — use tsc instead
+        if command -v tsc &>/dev/null; then
+            if ! tsc --noEmit --allowJs --checkJs false "$V11_FILE_PATH" 2>/dev/null; then
+                echo "SYNTAX WARNING: TypeScript syntax error in $V11_FILE_PATH"
+            fi
+        elif command -v npx &>/dev/null; then
+            if ! npx --yes tsc --noEmit "$V11_FILE_PATH" 2>/dev/null; then
+                echo "SYNTAX WARNING: TypeScript syntax error in $V11_FILE_PATH"
+            fi
+        fi
+        # No tsc available: skip silently (better than false positive from node --check)
+        ;;
+    json)
+        if ! jq empty "$V11_FILE_PATH" 2>/dev/null; then
+            echo "SYNTAX WARNING: Invalid JSON in $V11_FILE_PATH"
+        fi
+        ;;
+    yml|yaml)
+        if command -v python3 &>/dev/null; then
+            if ! python3 -c 'import sys, yaml; yaml.safe_load(open(sys.argv[1]))' -- "$V11_FILE_PATH" 2>/dev/null; then
+                echo "SYNTAX WARNING: Invalid YAML in $V11_FILE_PATH"
+            fi
+        fi
+        ;;
+    sh|bash)
+        if ! bash -n "$V11_FILE_PATH" 2>/dev/null; then
+            echo "SYNTAX WARNING: Shell syntax error in $V11_FILE_PATH"
+        fi
+        ;;
+    go)
+        if command -v gofmt &>/dev/null; then
+            if ! gofmt -e "$V11_FILE_PATH" &>/dev/null; then
+                echo "SYNTAX WARNING: Go syntax error in $V11_FILE_PATH"
+            fi
+        fi
+        ;;
+esac
+
+# --- Docker-compose validation (regardless of extension match above) ---
+if [[ "$BASENAME" == "docker-compose.yml" || "$BASENAME" == "docker-compose.yaml" ]]; then
+    if command -v docker-compose &>/dev/null; then
+        if ! docker-compose -f "$V11_FILE_PATH" config --quiet 2>/dev/null; then
+            echo "SYNTAX WARNING: Invalid docker-compose in $V11_FILE_PATH"
+        fi
+    fi
+fi
+
+# V11: Trigger delta memory index when markdown files in sessions/ are written
+if [[ "$V11_FILE_PATH" == */sessions/*.md ]] || [[ "$V11_FILE_PATH" == */sessions/*/notes/* ]]; then
+    INDEX_SCRIPT="$(dirname "$(dirname "${BASH_SOURCE[0]}")")/scripts/index-project-memory"
+    if [ -x "$INDEX_SCRIPT" ]; then
+        v11_detect_project "$V11_FILE_PATH"
+        if [ -n "$V11_PROJECT" ]; then
+            "$INDEX_SCRIPT" "$V11_PROJECT" --delta "$V11_FILE_PATH" &>/dev/null &
+        fi
+    fi
+fi
+
+# Advisory only — always allow
+exit 0

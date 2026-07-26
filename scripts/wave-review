@@ -1,0 +1,229 @@
+#!/bin/bash
+# V11 Wave Review — Gather wave output and generate adversarial review prompts
+# Usage: ./scripts/wave-review PROJECT [WAVE_NUMBER] [--save]
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+V11_HOME="${V11_HOME:-$(dirname "$SCRIPT_DIR")}"
+# shellcheck source=../hooks/lib/common.sh
+source "$V11_HOME/hooks/lib/common.sh"
+
+if [ "${1:-}" == "--help" ] || [ "${1:-}" == "-h" ]; then
+  cat << 'HELP'
+V11 Wave Review — Generate adversarial review prompt for a completed wave
+
+USAGE:
+    ./scripts/wave-review PROJECT [WAVE_NUMBER] [--save]
+    ./scripts/wave-review [WAVE_NUMBER] [--save]   (auto-detect project)
+    ./scripts/wave-review --attribute PROJECT WAVE  (V11.20: attribute findings → ledger)
+
+OPTIONS:
+    --save        Write prompt to sessions/PROJECT/reviews/wave-N.json
+                  If findings include CRITICAL/HIGH security issues, also writes
+                  sessions/PROJECT/security-plan.md
+    --attribute   V11.20: after the orchestrator persists adversarial-reviewer
+                  findings into sessions/PROJECT/reviews/wave-N.json, run this
+                  mode to attribute every finding to the executing agent.
+                  Delegates to scripts/wave-review-attribute (all its flags
+                  flow through: --dry-run, --mark-done, --quiet, --report-file).
+                  Honors V11_WAVE_ATTRIBUTE=off rollback.
+    --help        Show this help
+
+EXAMPLES:
+    ./scripts/wave-review nova-forge
+    ./scripts/wave-review nova-forge 2
+    ./scripts/wave-review nova-forge 2 --save
+    ./scripts/wave-review --attribute nova-forge 2     # V11.20
+
+INTEGRATION PIPELINE (V11.20):
+    1. ./scripts/wave-review PROJECT N --save        → prompt + empty findings file
+    2. Orchestrator runs adversarial-reviewer, captures verdict JSON
+    3. Orchestrator persists verdict.findings into wave-N.json
+    4. ./scripts/wave-review --attribute PROJECT N   → findings → agent-errors.jsonl
+HELP
+  exit 0
+fi
+
+# V11.20: --attribute mode delegates to scripts/wave-review-attribute.
+# Placed early so it short-circuits all the prompt-generation logic below.
+if [ "${1:-}" = "--attribute" ]; then
+    shift
+    if [ "${V11_WAVE_ATTRIBUTE:-}" = "off" ]; then
+        echo "[wave-review --attribute] V11_WAVE_ATTRIBUTE=off — skipping" >&2
+        exit 0
+    fi
+    if [ ! -x "$SCRIPT_DIR/wave-review-attribute" ]; then
+        echo "[wave-review --attribute] missing scripts/wave-review-attribute" >&2
+        exit 1
+    fi
+    # Pass-through args (PROJECT WAVE plus any --dry-run/--mark-done/--quiet/--report-file PATH)
+    exec "$SCRIPT_DIR/wave-review-attribute" "$@"
+fi
+
+# --- Arg parsing ---
+PROJECT="" WAVE_NUMBER="" SAVE=false
+for arg in "$@"; do
+  case "$arg" in
+    --save) SAVE=true ;;
+    --help|-h) ;;
+    *)
+      if   [ -z "$PROJECT" ];     then PROJECT="$arg"
+      elif [ -z "$WAVE_NUMBER" ]; then WAVE_NUMBER="$arg"
+      fi ;;
+  esac
+done
+
+# Auto-detect project
+# SEC-C-02 (Wave 3a): use common.sh sanitizing reader instead of ad-hoc tr pattern.
+# Consistent with scripts/handoff, scripts/plan-sync, scripts/tracker-status.
+if [ -z "$PROJECT" ]; then
+  PROJECT="$(v11_read_active_project)"
+fi
+# Sanitize user-supplied PROJECT argument (v11_read_active_project already sanitizes
+# the auto-detected case; CLI arg still needs validation).
+if [[ -n "$PROJECT" ]] && [[ "$PROJECT" == *".."* || "$PROJECT" == *"/"* || "$PROJECT" =~ [^a-zA-Z0-9._-] ]]; then
+  echo "Error: Invalid project name: $PROJECT" >&2; exit 1
+fi
+[ -n "$PROJECT" ] || { echo "Error: PROJECT required (or set active-project)" >&2; exit 1; }
+
+# --- Locate task-state ---
+TASK_STATE_FILE="$TASK_STATE_DIR/${PROJECT}.json"
+[ -f "$TASK_STATE_FILE" ] || {
+  echo "Error: No task-state for '$PROJECT' — expected: $TASK_STATE_FILE" >&2; exit 1; }
+
+# --- Spec excerpt ---
+SPEC_FILE="$SESSIONS_ROOT/$PROJECT/spec.md"
+SPEC_FIRST_LINE="" SPEC_EXCERPT=""
+if [ -f "$SPEC_FILE" ]; then
+  SPEC_FIRST_LINE="$(head -1 "$SPEC_FILE" | sed 's/^#* *//')"
+  SPEC_EXCERPT="$(head -10 "$SPEC_FILE")"
+fi
+
+# --- Auto wave number ---
+if [ -z "$WAVE_NUMBER" ]; then
+  EXISTING=$(find "$SESSIONS_ROOT/$PROJECT/reviews" -name "wave-*.json" 2>/dev/null | wc -l | tr -d ' \n' || echo 0)
+  WAVE_NUMBER=$(( ${EXISTING:-0} + 1 ))
+fi
+
+# --- Python: extract artifacts, build prompt, optionally save ---
+python3 - "$TASK_STATE_FILE" "$PROJECT" "$WAVE_NUMBER" \
+          "$SPEC_FIRST_LINE" "$SPEC_EXCERPT" "$SAVE" "$SESSIONS_ROOT" << 'PY'
+import json, sys, os
+from datetime import datetime, timezone
+
+state_file, project, wave, spec_line, spec_excerpt, save_flag, sessions_root = sys.argv[1:]
+wave = int(wave)
+save_flag = save_flag.lower() == "true"
+
+try:
+    with open(state_file) as f:
+        task_state = json.load(f)
+except (json.JSONDecodeError, ValueError):
+    print(f"Warning: task-state for '{project}' is empty or invalid — no artifacts available.", file=sys.stderr)
+    task_state = {}
+
+artifacts = task_state.get("task_artifacts", {})
+
+# --- Collect wave files from implementation artifacts ---
+seen, wave_files = set(), []
+for task_id, art in artifacts.items():
+    if not isinstance(art, dict):
+        continue
+    files = art.get("files_changed", []) + art.get("files_created", [])
+    if not files:
+        continue
+    subject = art.get("summary", art.get("subject", ""))
+    for path in files:
+        if path not in seen:
+            seen.add(path)
+            wave_files.append({"path": path, "task_id": task_id, "task_subject": subject})
+
+# --- Collect security findings (severity CRITICAL|HIGH + lens security) ---
+security_findings = []
+for task_id, art in artifacts.items():
+    if not isinstance(art, dict):
+        continue
+    severity = art.get("severity", "")
+    finding  = art.get("finding", {})
+    lens     = finding.get("lens", finding.get("category", ""))
+    if severity.lower() in ("critical", "high") and "security" in lens.lower():
+        security_findings.append({
+            "task_id": task_id,
+            "severity": severity,
+            "problem":  finding.get("problem", art.get("summary", "")),
+            "fix":      finding.get("fix", ""),
+            "file":     finding.get("location", {}).get("file", ""),
+        })
+
+files_section = "\n".join(
+    f"- {w['path']} (from task #{w['task_id']}: {w['task_subject']})"
+    for w in wave_files
+) or "(no files in task artifacts — ensure tasks include files_changed metadata)"
+
+prompt = f"""## Adversarial Review — Wave {wave}
+Project: {project}
+Spec: {spec_line}
+
+### Files Changed This Wave
+{files_section}
+
+### Review Instructions
+Read each file. Apply all 5 lenses (quality, completeness, integration, security, rationale).
+Return findings as structured JSON per the adversarial-reviewer protocol.
+
+For Lens 5 (Architectural Rationale / Dark Code Layer 4):
+- Populate `design_rationale.decisions[]` with every non-trivial design choice
+  visible in the wave. For each: cite source (code line + spec section),
+  justification, alternatives considered, blast radius, and status
+  (justified | rationale-missing | rationale-weak).
+- Any `rationale-missing` decision must also appear as a `lens: rationale`
+  finding with severity >= MEDIUM. Do NOT invent plausible-sounding rationale
+  — absence of justification IS the finding.
+- Cross-check each decision against the spec excerpt below. If the spec does
+  not sanction the choice and the code does not explain it, mark it missing.
+
+Spec excerpt:
+{spec_excerpt}
+"""
+
+print(prompt)
+
+if not save_flag:
+    sys.exit(0)
+
+# --- Save review JSON ---
+try:
+    reviews_dir = os.path.join(sessions_root, project, "reviews")
+    os.makedirs(reviews_dir, exist_ok=True)
+    review_path = os.path.join(reviews_dir, f"wave-{wave}.json")
+except OSError as e:
+    print(f"ERROR: Cannot create reviews directory: {e}", file=sys.stderr)
+    sys.exit(1)
+try:
+  with open(review_path, "w") as f:
+    json.dump({
+        "wave": wave, "project": project,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "files_reviewed": wave_files, "prompt": prompt, "findings": [],
+    }, f, indent=2)
+  print(f"[saved] {review_path}", file=sys.stderr)
+except OSError as e:
+    print(f"ERROR: Cannot write review file: {e}", file=sys.stderr)
+    sys.exit(1)
+
+# --- Write security-plan.md if CRITICAL/HIGH security findings exist ---
+if security_findings:
+    sec_path = os.path.join(sessions_root, project, "security-plan.md")
+    with open(sec_path, "w") as f:
+        f.write(f"# Security Plan — Wave {wave}\n")
+        f.write(f"Generated: {datetime.now(timezone.utc).isoformat()}\n\n")
+        for sf in security_findings:
+            f.write(f"## [{sf['severity'].upper()}] {sf['problem']}\n")
+            if sf['file']:
+                f.write(f"**File**: `{sf['file']}`\n\n")
+            if sf['fix']:
+                f.write(f"**Fix**: {sf['fix']}\n\n")
+            f.write("---\n\n")
+    print(f"[security-plan] {sec_path}", file=sys.stderr)
+PY

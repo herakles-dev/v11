@@ -1,0 +1,227 @@
+#!/bin/bash
+# V11 Hook: guard-enforcement (PreToolUse — Write|Edit|Bash)
+# Consolidated enforcement hook: risk assessment + autonomy grants.
+# V11.11: Tool policy cascade removed — native agent tool_profile handles it.
+# V11.34 (improvement 13, F4): observable Bash source-write bypass advisory.
+# V11.34.1 (Q5): narrowed F4 — drop command-substitution heredoc FP, exempt metadata targets.
+#
+# Exit codes:
+#   0 - Allow operation (low risk or auto-approved)
+#   2 - Block operation (high-risk without approval or medium-risk without grant)
+
+source "$(dirname "${BASH_SOURCE[0]}")/lib/common.sh" || {
+    echo "ERROR: hooks/lib/common.sh failed to source — guard-enforcement cannot run" >&2
+    exit 2
+}
+
+# Test mode
+if [ "$1" == "--test" ]; then
+    echo "guard-enforcement v4 (V11.34.1: risk + autonomy + narrowed bash-write advisory)"
+    exit 0
+fi
+
+# === V11.34 (improvement 13, F4): Bash source-write bypass detector ===
+# V11.34.1 (Q5): narrowed after a confirmed false-positive sweep. The bare
+# heredoc branch used to fire on `git commit -m "$(cat <<'EOF' ... EOF)"` and
+# `gh pr create --body "$(cat <<'EOF' ...)"` — the MANDATED commit/PR message
+# styles — because a heredoc feeding a $(...) command substitution builds a
+# string; it writes no file. That branch is removed entirely: a heredoc that
+# DOES write a file is `cat > file <<EOF`, already caught by the redirect
+# branch below. Also adds a metadata-target exemption so atomic
+# `... > X.tmp && mv X.tmp X` writes to V11's own tracking files (e.g.
+# .task-state.json) don't self-trigger the advisory this detector protects
+# against — see _v11_bash_write_target_exempt.
+#
+# Self-contained heuristic — deliberately NOT added to hooks/lib/common.sh (a
+# parallel agent owns that file this cycle) — except for delegating to the
+# already-shared v11_is_metadata_file classifier for the exemption check; no
+# parallel metadata-filename list is maintained here.
+#
+# Detects Bash commands that write to a real file via a path other than
+# Write/Edit: tee, sed -i / --in-place, dd of=, or a plain >/>> redirect into
+# a file path. Bash writes classify as LOW risk (v11_risk_level only flags
+# rm|git|docker|npm|pip as medium), so v11_check_risk allows them, and
+# guard-write-gates self-exits for any tool other than Write|Edit — so these
+# commands skip both the task-state gate AND the Write/Edit audit trail
+# (verify-syntax, track-autonomy attribution) entirely. This detector makes
+# that bypass observable.
+#
+# Conservative on false positives: strips [[ ... ]]/[ ... ] test expressions
+# before checking '>' redirects (so `[[ x > y ]]` string comparisons and
+# `[ x > y ]` test-operator forms don't trigger), skips fd-only redirects (2>,
+# 1>&2, >&2) and /dev/* targets, and exempts metadata/atomic-staging/scratch
+# targets (see _v11_bash_write_target_exempt). Returns 0 (match — command
+# writes to a source-like path) or 1 (no match). A rare miss is acceptable —
+# this hook only ever warns, it never blocks, so under-detection is the safe
+# failure direction.
+
+# Strip one layer of matching quotes (' or ") from a raw token, if present.
+# Bash-command text arrives unevaluated (never executed), so a quoted target
+# like "$P/.task-state.json.tmp" keeps its literal quote characters in the
+# captured string — strip them before classifying the path.
+_v11_bw_unquote() {
+    local s="$1"
+    if [[ "${#s}" -ge 2 && "$s" == \"*\" && "$s" == *\" ]]; then
+        s="${s:1:${#s}-2}"
+    elif [[ "${#s}" -ge 2 && "$s" == \'*\' && "$s" == *\' ]]; then
+        s="${s:1:${#s}-2}"
+    fi
+    printf '%s' "$s"
+}
+
+# Should a detected Bash-write target be exempt from the advisory? Delegates
+# the canonical check to v11_is_metadata_file (common.sh) — reused, not
+# reimplemented, for consistency with the Write/Edit gate's own exemption.
+# Also covers the atomic-write staging suffix (X.tmp / X.tmp.PID before a
+# `mv` to the real metadata filename, e.g. `jq ... > .task-state.json.tmp &&
+# mv .task-state.json.tmp .task-state.json`) and other conservative
+# non-source sinks. A rare miss here (see KNOWN GAP notes at the tee/sed -i
+# call sites) is acceptable; a false warn is the problem this fix addresses.
+_v11_bash_write_target_exempt() {
+    local target
+    target="$(_v11_bw_unquote "$1")"
+    [ -z "$target" ] && return 1
+
+    v11_is_metadata_file "$target" && return 0
+
+    # Atomic-write staging suffix: X.tmp or X.tmp.12345 -> re-check X.
+    if [[ "$target" =~ ^(.*)\.tmp(\.[0-9]+)?$ ]]; then
+        v11_is_metadata_file "${BASH_REMATCH[1]}" && return 0
+    fi
+
+    # Other conservative non-source sinks: bare .tmp files, scratch/report dirs.
+    case "$target" in
+        *.tmp) return 0 ;;
+        */scratchpad/*|*/.reports/*) return 0 ;;
+    esac
+
+    return 1
+}
+
+_v11_bash_is_source_write() {
+    local cmd="$1"
+    [ -z "$cmd" ] && return 1
+
+    # tee, as a standalone command token (not a substring like "committee").
+    # KNOWN GAP: target-path extraction for tee is not attempted (e.g.
+    # `tee file1 file2` or `tee -a file`) — a tee into a metadata/scratch file
+    # still warns. Rare and advisory-only; see self-review.
+    if [[ "$cmd" =~ (^|[[:space:]\;\|\&])tee([[:space:]]|$) ]]; then
+        return 0
+    fi
+
+    # sed -i / --in-place (in-place file edit).
+    # KNOWN GAP: same as tee above — target extraction not attempted.
+    if [[ "$cmd" =~ (^|[[:space:]\;\|\&])sed[[:space:]]+(-[a-zA-Z]*i|--in-place) ]]; then
+        return 0
+    fi
+
+    # dd of=<path>, skipping /dev/null|/dev/stdout targets and exempt targets.
+    if [[ "$cmd" =~ (^|[[:space:]\;\|\&])dd[[:space:]]+([^\;\|\&]*[[:space:]])?of=([^[:space:]\;\|\&]+) ]]; then
+        local ddtarget="${BASH_REMATCH[3]}"
+        if [[ "$ddtarget" != "/dev/null" && "$ddtarget" != "/dev/stdout" ]] \
+           && ! _v11_bash_write_target_exempt "$ddtarget"; then
+            return 0
+        fi
+    fi
+
+    # Plain redirect '>'/'>>' into a real path. Strip [[ ]]/[ ] test
+    # expressions first — their '>' is a string-comparison/lexical-test
+    # operator, not a redirect (best-effort; simple non-nested brackets only).
+    local stripped
+    stripped="$(printf '%s' "$cmd" | sed -E 's/\[[^]]*\]//g')"
+    if [[ "$stripped" =~ [^0-9]\>{1,2}[[:space:]]*([^\&[:space:]\;\|][^[:space:]\;\|\&]*) ]]; then
+        local target="${BASH_REMATCH[1]}"
+        if [[ -n "$target" && "$target" != /dev/* ]] && ! _v11_bash_write_target_exempt "$target"; then
+            return 0
+        fi
+    fi
+
+    return 1
+}
+
+# Parse hook input
+v11_parse_input
+
+# Only guard Write, Edit, and Bash
+case "$V11_TOOL_NAME" in
+    Write|Edit|Bash) ;;
+    *) exit 0 ;;
+esac
+
+# Bash: check risk level (includes high-risk blocking)
+if [ "$V11_TOOL_NAME" == "Bash" ]; then
+    [ -z "$V11_COMMAND" ] && exit 0
+
+    # v11_check_risk handles high-risk blocking + A4 auto-approval
+    if ! v11_check_risk; then
+        exit 2  # High-risk blocked
+    fi
+fi
+
+# Detect project from file path or command for downstream checks
+v11_detect_project "$V11_FILE_PATH"
+if [ -z "$V11_PROJECT" ] && [ -n "$V11_COMMAND" ]; then
+    CMD_PATH=$(printf '%s' "$V11_COMMAND" | grep -oE "$V11_WORKSPACE_ROOT/[^ ]+" | head -1)
+    [ -n "$CMD_PATH" ] && v11_detect_project "$CMD_PATH"
+fi
+
+# === V11.34 (improvement 13, F4): Bash source-write bypass advisory ===
+# Advisory only — never exit 2 from this block. Gated by V11_BASH_WRITE_WARN
+# (default on); set to "off" to disable entirely (rollback lever).
+if [ "$V11_TOOL_NAME" == "Bash" ] && [ "${V11_BASH_WRITE_WARN:-on}" != "off" ] \
+   && [ -n "$V11_COMMAND" ] && [ -n "$V11_PROJECT" ]; then
+
+    # "Task-bearing project" = same definition guard-write-gates uses for the
+    # task-state gate: an aggregate at TASK_STATE_DIR/<project>.json, or a
+    # per-project mirror at SESSIONS_ROOT/<project>/.task-state.json.
+    _BW_TASK_STATE=""
+    if [ -f "$TASK_STATE_DIR/${V11_PROJECT}.json" ]; then
+        _BW_TASK_STATE="$TASK_STATE_DIR/${V11_PROJECT}.json"
+    elif [ -f "$SESSIONS_ROOT/$V11_PROJECT/.task-state.json" ]; then
+        _BW_TASK_STATE="$SESSIONS_ROOT/$V11_PROJECT/.task-state.json"
+    fi
+
+    if [ -n "$_BW_TASK_STATE" ] && _v11_bash_is_source_write "$V11_COMMAND"; then
+        echo "[V11] Bash write to a source file bypasses the Write/Edit audit trail (verify-syntax, attribution). Prefer Write/Edit for tracked edits. (guard-enforcement: bash-write advisory)" >&2
+
+        # Best-effort synthetic audit row — attribution breadcrumb only.
+        # Never fatal: any failure here must not affect the exit code.
+        if [ -n "$METRICS_DIR" ] && [ -d "$METRICS_DIR" ]; then
+            _BW_CALLER_KIND="$(v11_caller_kind 2>/dev/null || true)"
+            _BW_AUDIT_LINE="$(jq -nc \
+                --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+                --arg sid "${V11_SESSION_ID:-unknown}" \
+                --arg proj "$V11_PROJECT" \
+                --arg tool "Bash" \
+                --arg note "bash-source-write" \
+                --arg caller_kind "${_BW_CALLER_KIND:-}" \
+                '({timestamp:$ts, session_id:$sid, project:$proj, action:$tool,
+                   tool:$tool, note:$note, outcome:"advisory"}
+                  + (if $caller_kind=="" then {} else {caller_kind:$caller_kind} end))' \
+                2>/dev/null)"
+            [ -n "$_BW_AUDIT_LINE" ] && printf '%s\n' "$_BW_AUDIT_LINE" >> "$METRICS_DIR/autonomy-audit.jsonl" 2>/dev/null
+        fi
+    fi
+fi
+
+# Check autonomy grants for medium-risk operations
+# v11_check_autonomy returns 0 if auto-approved, 1 if needs manual approval
+if ! v11_check_autonomy; then
+    # Medium-risk operation without autonomy grant — advisory only
+    # guard-write-gates enforces task-state requirement; autonomy is informational
+    # HS-004/FH-014 (Wave 3c): extract level to local with jq-validated read. V11_PROJECT
+    # is pre-validated by v11_detect_project at the top of this hook, but guard against
+    # empty V11_PROJECT causing reads of $SESSIONS_ROOT//.autonomy-state.
+    _LEVEL="A0"
+    if [ -n "$V11_PROJECT" ]; then
+        _GE_STATE="$SESSIONS_ROOT/$V11_PROJECT/.autonomy-state"
+        if [ -f "$_GE_STATE" ] && [ -s "$_GE_STATE" ] && jq empty "$_GE_STATE" 2>/dev/null; then
+            _LEVEL="A$(jq -r '.level // 0' "$_GE_STATE" 2>/dev/null)"
+        fi
+    fi
+    echo "V11 ADVISORY: medium-risk operation at autonomy level $_LEVEL" >&2
+    exit 0
+fi
+
+exit 0

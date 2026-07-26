@@ -1,0 +1,210 @@
+#!/bin/bash
+# V11 Script: audit-query
+# CLI tool for querying the autonomy audit trail.
+#
+# Usage:
+#   audit-query --task 5              # All edits for task #5
+#   audit-query --agent a123456       # All edits by agent
+#   audit-query --project athenaeum   # All project edits
+#   audit-query --since 1h            # Last hour
+#   audit-query --session abc123      # Session replay (chronological)
+#   audit-query --with-diffs          # Include git diff reconstruction
+#   audit-query --stats               # Summary statistics
+#   audit-query --test                # Self-test
+
+set -euo pipefail
+
+V11_WORKSPACE_ROOT="${V11_WORKSPACE_ROOT:-$HOME/.v11}"
+SESSIONS_ROOT="${SESSIONS_ROOT:-$V11_WORKSPACE_ROOT/sessions}"
+METRICS_DIR="$V11_WORKSPACE_ROOT/.agent-metrics"
+AUDIT_LOG="$METRICS_DIR/autonomy-audit.jsonl"
+
+# --- CLI flags ---
+if [ "${1:-}" == "--test" ]; then
+    echo "audit-query v1.0 (V11.4)"
+    exit 0
+fi
+
+if [ ! -f "$AUDIT_LOG" ]; then
+    echo "No audit log found at: $AUDIT_LOG" >&2
+    exit 1
+fi
+
+# Parse arguments
+FILTER_TASK=""
+FILTER_AGENT=""
+FILTER_PROJECT=""
+FILTER_SINCE=""
+FILTER_SESSION=""
+WITH_DIFFS=false
+SHOW_STATS=false
+LIMIT=50
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --task)     FILTER_TASK="$2"; shift 2 ;;
+        --agent)    FILTER_AGENT="$2"; shift 2 ;;
+        --project)  FILTER_PROJECT="$2"; shift 2 ;;
+        --since)    FILTER_SINCE="$2"; shift 2 ;;
+        --session)  FILTER_SESSION="$2"; shift 2 ;;
+        --with-diffs) WITH_DIFFS=true; shift ;;
+        --stats)    SHOW_STATS=true; shift ;;
+        --limit)    LIMIT="$2"; shift 2 ;;
+        --help|-h)
+            cat << 'USAGE'
+V11 Audit Query — search the autonomy audit trail
+
+Usage:
+  audit-query --task 5              All edits for task #5
+  audit-query --agent a123456       All edits by agent ID
+  audit-query --project athenaeum   All project edits
+  audit-query --since 1h            Last hour (1h, 30m, 2d)
+  audit-query --session abc123      Session replay
+  audit-query --with-diffs          Include diff reconstruction
+  audit-query --stats               Summary statistics
+  audit-query --limit N             Max results (default: 50)
+
+Combine filters:
+  audit-query --project myapp --since 1h --with-diffs
+USAGE
+            exit 0
+            ;;
+        *) echo "Unknown option: $1" >&2; exit 1 ;;
+    esac
+done
+
+# --- Stats mode ---
+if [ "$SHOW_STATS" = true ]; then
+    TOTAL=$(wc -l < "$AUDIT_LOG")
+    echo "=== V11 Audit Trail Statistics ==="
+    echo "Total entries: $TOTAL"
+    echo ""
+
+    echo "By project:"
+    jq -r '.project // "unknown"' "$AUDIT_LOG" | sort | uniq -c | sort -rn | head -10
+    echo ""
+
+    echo "By action:"
+    jq -r '.action // "unknown"' "$AUDIT_LOG" | sort | uniq -c | sort -rn
+    echo ""
+
+    echo "By risk level:"
+    jq -r '.risk_level // "unknown"' "$AUDIT_LOG" | sort | uniq -c | sort -rn
+    echo ""
+
+    echo "By outcome:"
+    jq -r '.outcome // "unknown"' "$AUDIT_LOG" | sort | uniq -c | sort -rn
+    echo ""
+
+    # V11.4 fields
+    TASK_ENTRIES=$(jq -r 'select(.task_id != null and .task_id != "") | .task_id' "$AUDIT_LOG" 2>/dev/null | wc -l)
+    AGENT_ENTRIES=$(jq -r 'select(.agent_id != null and .agent_id != "") | .agent_id' "$AUDIT_LOG" 2>/dev/null | wc -l)
+    echo "V11.4 coverage:"
+    echo "  Entries with task_id: $TASK_ENTRIES / $TOTAL"
+    echo "  Entries with agent_id: $AGENT_ENTRIES / $TOTAL"
+
+    exit 0
+fi
+
+# --- Build jq filter using --arg for safe parameter binding ---
+JQ_ARGS=()
+JQ_FILTER="."
+
+if [ -n "$FILTER_TASK" ]; then
+    JQ_ARGS+=(--arg filter_task "$FILTER_TASK")
+    JQ_FILTER="$JQ_FILTER | select(.task_id == \$filter_task)"
+fi
+
+if [ -n "$FILTER_AGENT" ]; then
+    JQ_ARGS+=(--arg filter_agent "$FILTER_AGENT")
+    JQ_FILTER="$JQ_FILTER | select(.agent_id == \$filter_agent)"
+fi
+
+if [ -n "$FILTER_PROJECT" ]; then
+    JQ_ARGS+=(--arg filter_project "$FILTER_PROJECT")
+    JQ_FILTER="$JQ_FILTER | select(.project == \$filter_project)"
+fi
+
+if [ -n "$FILTER_SESSION" ]; then
+    JQ_ARGS+=(--arg filter_session "$FILTER_SESSION")
+    JQ_FILTER="$JQ_FILTER | select(.session_id | startswith(\$filter_session))"
+fi
+
+if [ -n "$FILTER_SINCE" ]; then
+    # Parse duration: 1h -> 3600, 30m -> 1800, 2d -> 172800
+    DURATION_VAL=$(echo "$FILTER_SINCE" | grep -oP '\d+')
+    DURATION_UNIT=$(echo "$FILTER_SINCE" | grep -oP '[a-z]+$')
+    case "$DURATION_UNIT" in
+        m|min)  SECONDS_AGO=$((DURATION_VAL * 60)) ;;
+        h|hour) SECONDS_AGO=$((DURATION_VAL * 3600)) ;;
+        d|day)  SECONDS_AGO=$((DURATION_VAL * 86400)) ;;
+        *)      SECONDS_AGO=$((DURATION_VAL * 3600)) ;; # default hours
+    esac
+    CUTOFF=$(date -d "-${SECONDS_AGO} seconds" -Iseconds 2>/dev/null \
+        || date -v-${SECONDS_AGO}S -Iseconds 2>/dev/null \
+        || echo "")
+    if [ -n "$CUTOFF" ]; then
+        JQ_ARGS+=(--arg cutoff "$CUTOFF")
+        JQ_FILTER="$JQ_FILTER | select(.timestamp >= \$cutoff)"
+    fi
+fi
+
+# --- Execute query ---
+RESULTS=$(jq -c "${JQ_ARGS[@]}" "$JQ_FILTER" "$AUDIT_LOG" 2>/dev/null | tail -n "$LIMIT")
+
+if [ -z "$RESULTS" ]; then
+    echo "No matching audit entries found."
+    exit 0
+fi
+
+RESULT_COUNT=$(echo "$RESULTS" | wc -l)
+echo "=== V11 Audit Query Results ($RESULT_COUNT entries) ==="
+echo ""
+
+echo "$RESULTS" | while IFS= read -r entry; do
+    TS=$(echo "$entry" | jq -r '.timestamp // "?"')
+    ACTION=$(echo "$entry" | jq -r '.action // "?"')
+    FILE=$(echo "$entry" | jq -r '.file // "?"')
+    PROJ=$(echo "$entry" | jq -r '.project // "-"')
+    RISK=$(echo "$entry" | jq -r '.risk_level // "?"')
+    OUTCOME=$(echo "$entry" | jq -r '.outcome // "?"')
+    TASK_ID=$(echo "$entry" | jq -r '.task_id // "-"')
+    AGENT_ID=$(echo "$entry" | jq -r '.agent_id // "-"')
+    DIFF_SUMMARY=$(echo "$entry" | jq -r '.diff_summary // ""')
+
+    # Format timestamp (strip timezone for readability)
+    SHORT_TS=$(echo "$TS" | cut -c1-19)
+
+    printf "[%s] %s %s (%s) — task:#%s agent:%s %s\n" \
+        "$SHORT_TS" "$ACTION" "$FILE" "$RISK/$OUTCOME" "$TASK_ID" "$AGENT_ID" "$DIFF_SUMMARY"
+
+    # Reconstruct diff if requested
+    if [ "$WITH_DIFFS" = true ] && [ "$FILE" != "?" ] && [ "$FILE" != "-" ]; then
+        # Check for opt-in stored diffs first
+        DIFF_HASH=$(echo "$entry" | jq -r '.diff_hash // ""')
+        if [ -n "$DIFF_HASH" ] && [ -n "$PROJ" ] && [ "$PROJ" != "-" ] \
+           && [[ "$DIFF_HASH" =~ ^[0-9a-f]{8}$ ]] \
+           && [[ "$PROJ" =~ ^[a-zA-Z0-9._-]+$ ]]; then
+            PATCH_DIR="$SESSIONS_ROOT/$PROJ/audit-diffs"
+            # Find matching patch file
+            PATCH_FILE=$(find "$PATCH_DIR" -name "*-${DIFF_HASH}.patch" 2>/dev/null | head -1)
+            if [ -n "$PATCH_FILE" ] && [ -f "$PATCH_FILE" ]; then
+                echo "  --- Stored diff ---"
+                head -20 "$PATCH_FILE"
+                LINES=$(wc -l < "$PATCH_FILE")
+                [ "$LINES" -gt 20 ] && echo "  ... ($((LINES - 20)) more lines)"
+                echo "  ---"
+                continue
+            fi
+        fi
+
+        # Fallback: try git diff for the file
+        if [ -f "$FILE" ]; then
+            FILE_DIR=$(dirname "$FILE")
+            GIT_DIFF=$(cd "$FILE_DIR" 2>/dev/null && git log --oneline -1 -- "$(basename "$FILE")" 2>/dev/null || echo "")
+            if [ -n "$GIT_DIFF" ]; then
+                echo "  git: $GIT_DIFF"
+            fi
+        fi
+    fi
+done

@@ -1,0 +1,16 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "GuardBlock",
+  "description": "One entry in guard-blocks.jsonl — a write blocked by guard-write-gates",
+  "type": "object",
+  "required": ["timestamp", "file", "reason"],
+  "properties": {
+    "timestamp":        { "type": "string", "format": "date-time" },
+    "project":          { "type": ["string", "null"] },
+    "file":             { "type": "string" },
+    "reason":           { "type": "string", "pattern": "^[a-z][a-z0-9-]*$",
+                          "description": "Block reason code. Current values: no-task-in-progress. Future codes allowed; pattern is permissive to avoid spec drift." },
+    "detection_method": { "type": ["string", "null"] }
+  },
+  "additionalProperties": false
+}

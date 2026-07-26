@@ -1,0 +1,136 @@
+#!/bin/bash
+# token-baseline — Snapshot per-agent output-token capture stats from
+# dispatch-trace.jsonl completion events (W3-T12/T13: --tokens is optional,
+# so most entries have no "tokens" field — this script measures how much
+# coverage actually exists before/after a capture-rollout change).
+#
+# Source:
+#   ~/.agent-metrics/dispatch-trace.jsonl   completion-event "tokens" field
+#
+# Output (default): writes ~/.agent-metrics/token-baseline-YYYYMMDD.json
+#   { generated_at, trace_total_entries, entries_with_tokens,
+#     capture_rate_pct, per_agent: { AGENT: { spawns, with_tokens,
+#     min, median, max } } }
+#   "spawns" / "with_tokens" and min/median/max are computed only over
+#   entries carrying the "tokens" field for that spawned_agent.
+#
+# Usage:
+#   token-baseline               # write ~/.agent-metrics/token-baseline-YYYYMMDD.json
+#   token-baseline --stdout      # print JSON instead of writing
+#   token-baseline --test        # self-test
+#   token-baseline --help
+#
+# Idempotent: re-running the same day overwrites that day's file (date comes
+# from the system clock, not user input).
+
+set -euo pipefail
+
+V11_WORKSPACE_ROOT="${V11_WORKSPACE_ROOT:-$HOME/.v11}"
+METRICS_DIR="${METRICS_DIR:-$V11_WORKSPACE_ROOT/.agent-metrics}"
+
+if [ "${1:-}" == "--test" ]; then
+    echo "token-baseline v1.0 (V11.30)"
+    exit 0
+fi
+
+if [ "${1:-}" == "--help" ] || [ "${1:-}" == "-h" ]; then
+    sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'
+    exit 0
+fi
+
+STDOUT_MODE=false
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --stdout) STDOUT_MODE=true ;;
+        --*) echo "token-baseline: unknown flag '$1'" >&2; exit 2 ;;
+        *) echo "token-baseline: unexpected arg '$1'" >&2; exit 2 ;;
+    esac
+    shift
+done
+
+TRACE_LEDGER="$METRICS_DIR/dispatch-trace.jsonl"
+DATE_STAMP="$(date +%Y%m%d)"
+OUT_FILE="$METRICS_DIR/token-baseline-${DATE_STAMP}.json"
+
+RESULT_JSON="$(V11_TB_TRACE="$TRACE_LEDGER" python3 - <<'PYEOF'
+import json
+import os
+import statistics
+import sys
+from datetime import datetime, timezone
+
+trace_path = os.environ["V11_TB_TRACE"]
+
+total_entries = 0
+with_tokens = 0
+per_agent = {}  # agent -> {"spawns": int, "with_tokens": int, "values": [int]}
+
+if os.path.isfile(trace_path):
+    with open(trace_path) as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            total_entries += 1
+            try:
+                rec = json.loads(line)
+            except (json.JSONDecodeError, ValueError):
+                continue
+
+            agent = rec.get("spawned_agent") or "unknown"
+            slot = per_agent.setdefault(
+                agent, {"spawns": 0, "with_tokens": 0, "values": []}
+            )
+            slot["spawns"] += 1
+
+            tok = rec.get("tokens")
+            if tok is None:
+                continue
+            # Null-vs-missing guard: only count numeric token values.
+            if not isinstance(tok, (int, float)):
+                continue
+
+            with_tokens += 1
+            slot["with_tokens"] += 1
+            slot["values"].append(tok)
+
+capture_rate_pct = (
+    round((with_tokens / total_entries) * 100, 2) if total_entries > 0 else 0.0
+)
+
+per_agent_out = {}
+for agent, slot in per_agent.items():
+    values = slot["values"]
+    entry = {
+        "spawns": slot["spawns"],
+        "with_tokens": slot["with_tokens"],
+    }
+    if values:
+        entry["min"] = min(values)
+        entry["median"] = statistics.median(values)
+        entry["max"] = max(values)
+    else:
+        entry["min"] = None
+        entry["median"] = None
+        entry["max"] = None
+    per_agent_out[agent] = entry
+
+result = {
+    "generated_at": datetime.now(timezone.utc).isoformat(),
+    "trace_total_entries": total_entries,
+    "entries_with_tokens": with_tokens,
+    "capture_rate_pct": capture_rate_pct,
+    "per_agent": per_agent_out,
+}
+
+print(json.dumps(result, indent=2))
+PYEOF
+)"
+
+if [ "$STDOUT_MODE" = true ]; then
+    printf '%s\n' "$RESULT_JSON"
+else
+    mkdir -p "$METRICS_DIR"
+    printf '%s\n' "$RESULT_JSON" > "$OUT_FILE"
+    echo "token-baseline: wrote $OUT_FILE" >&2
+fi

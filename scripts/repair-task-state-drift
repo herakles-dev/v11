@@ -1,0 +1,161 @@
+#!/bin/bash
+# V11 Script: repair-task-state-drift
+#
+# Heals counter drift in task-state JSON files where total != sum of buckets,
+# completed > total, or recently_completed contains entries from other projects.
+#
+# Drift sources (background): sync-tasks reconciles only on UNFILTERED TaskList
+# in active sessions; dormant projects accumulate drift. Cross-session
+# contamination occurs when TaskUpdate fires without metadata.project and
+# falls back to whatever active-project happens to be set, polluting the
+# wrong state file.
+#
+# Usage:
+#   repair-task-state-drift                   # repair all dirty files (with confirm)
+#   repair-task-state-drift --dry-run         # preview — print intended changes only
+#   repair-task-state-drift --apply           # repair without confirmation
+#   repair-task-state-drift --project NAME    # repair one project only
+#   repair-task-state-drift --report          # show drift report, do not modify
+#
+# Safety:
+#   - Never deletes a state file. Never reduces total below max bucket count.
+#   - Backs up each modified file to .repair-YYYYMMDD-HHMMSS.bak alongside it.
+#   - Recompute strategy: total = max(current_total, sum_of_buckets). Conservative
+#     because a real TaskList may show MORE tasks than the sum if some are filtered.
+#     Prefer running an in-session TaskList when possible — that does authoritative
+#     reconciliation via the sync-tasks hook.
+
+set -euo pipefail
+
+V11_WORKSPACE_ROOT="${V11_WORKSPACE_ROOT:-$HOME/.v11}"
+METRICS_DIR="$V11_WORKSPACE_ROOT/.agent-metrics"
+TASK_STATE_DIR="$METRICS_DIR/task-state"
+
+DRY_RUN=0
+APPLY=0
+REPORT=0
+ONLY_PROJECT=""
+
+for arg in "$@"; do
+    case "$arg" in
+        --help|-h)
+            sed -n '3,26p' "$0" | sed 's/^# \{0,1\}//'
+            exit 0
+            ;;
+        --dry-run) DRY_RUN=1 ;;
+        --apply)   APPLY=1 ;;
+        --report)  REPORT=1 ;;
+        --project) shift; ONLY_PROJECT="${1:-}" ;;
+        *)
+            if [ -z "$ONLY_PROJECT" ] && [ "$arg" != "" ]; then
+                # positional project name
+                ONLY_PROJECT="$arg"
+            fi
+            ;;
+    esac
+done
+
+if [ ! -d "$TASK_STATE_DIR" ]; then
+    echo "ERROR: $TASK_STATE_DIR not found" >&2
+    exit 1
+fi
+
+# Find candidate files
+if [ -n "$ONLY_PROJECT" ]; then
+    FILES=("$TASK_STATE_DIR/${ONLY_PROJECT}.json")
+    [ ! -f "${FILES[0]}" ] && { echo "ERROR: $ONLY_PROJECT.json not found in $TASK_STATE_DIR" >&2; exit 1; }
+else
+    mapfile -t FILES < <(find "$TASK_STATE_DIR" -maxdepth 1 -name '*.json' -type f -size +0c | sort)
+fi
+
+# Drift detection — emit one TSV row per dirty file.
+# Format: project<TAB>kind<TAB>total<TAB>completed<TAB>pending<TAB>in_progress<TAB>blocked<TAB>sum<TAB>fix_total
+DIRTY=()
+for f in "${FILES[@]}"; do
+    [ ! -s "$f" ] && continue
+    proj=$(basename "$f" .json)
+    read -r total completed pending in_progress blocked < <(jq -r '"\(.total // 0) \(.completed // 0) \(.pending // 0) \(.in_progress // 0) \(.blocked // 0)"' "$f" 2>/dev/null || echo "0 0 0 0 0")
+    sum=$((completed + pending + in_progress + blocked))
+
+    kind=""
+    fix_total="$total"
+    if [ "$sum" -gt "$total" ]; then
+        kind="sum_exceeds_total"
+        fix_total="$sum"
+    elif [ "$completed" -gt "$total" ]; then
+        kind="completed_exceeds_total"
+        fix_total="$completed"  # at least
+        if [ "$sum" -gt "$fix_total" ]; then fix_total="$sum"; fi
+    fi
+
+    if [ -n "$kind" ]; then
+        DIRTY+=("${proj}	${kind}	${total}	${completed}	${pending}	${in_progress}	${blocked}	${sum}	${fix_total}")
+    fi
+done
+
+# Report
+if [ "${#DIRTY[@]}" -eq 0 ]; then
+    echo "No drift detected across $((${#FILES[@]})) state file(s)."
+    exit 0
+fi
+
+echo "Drift detected in ${#DIRTY[@]} project(s):"
+echo ""
+printf '%-30s %-25s %5s %5s %5s %5s %5s %5s %5s\n' \
+    "PROJECT" "KIND" "tot" "comp" "pend" "prog" "blkd" "sum" "→tot"
+printf '%-30s %-25s %5s %5s %5s %5s %5s %5s %5s\n' \
+    "------------------------------" "-------------------------" "-----" "-----" "-----" "-----" "-----" "-----" "-----"
+for row in "${DIRTY[@]}"; do
+    IFS=$'\t' read -r proj kind total completed pending in_progress blocked sum fix_total <<<"$row"
+    printf '%-30s %-25s %5d %5d %5d %5d %5d %5d %5d\n' \
+        "$proj" "$kind" "$total" "$completed" "$pending" "$in_progress" "$blocked" "$sum" "$fix_total"
+done
+echo ""
+
+if [ "$REPORT" -eq 1 ]; then
+    echo "(report mode — no changes applied)"
+    exit 0
+fi
+
+if [ "$DRY_RUN" -eq 1 ]; then
+    echo "(--dry-run — would set total = max(current_total, sum_of_buckets) for each row above; no changes applied)"
+    exit 0
+fi
+
+if [ "$APPLY" -ne 1 ]; then
+    printf "Apply repairs to %d files? [y/N] " "${#DIRTY[@]}"
+    read -r confirm
+    case "$confirm" in
+        y|Y|yes|YES) ;;
+        *) echo "Aborted."; exit 0 ;;
+    esac
+fi
+
+# Apply
+TS=$(date +%Y%m%d-%H%M%S)
+FIXED=0
+FAILED=0
+for row in "${DIRTY[@]}"; do
+    IFS=$'\t' read -r proj kind total completed pending in_progress blocked sum fix_total <<<"$row"
+    f="$TASK_STATE_DIR/${proj}.json"
+    backup="${f}.repair-${TS}.bak"
+    cp "$f" "$backup" || { echo "ERROR: backup failed for $f" >&2; FAILED=$((FAILED+1)); continue; }
+    tmp=$(mktemp)
+    if jq --argjson new_total "$fix_total" --arg ts "$(date -Iseconds)" \
+           '.total = $new_total | .last_updated = $ts' "$f" > "$tmp" 2>/dev/null; then
+        mv "$tmp" "$f"
+        echo "  fixed $proj: total $total → $fix_total (backup: ${backup##*/})"
+        FIXED=$((FIXED+1))
+    else
+        rm -f "$tmp"
+        echo "  ERROR: jq failed on $proj" >&2
+        FAILED=$((FAILED+1))
+    fi
+done
+
+echo ""
+echo "Repaired $FIXED file(s). Failed: $FAILED."
+echo "Note: backup files end in .repair-${TS}.bak — remove after verifying."
+echo "Recommended: run TaskList in each repaired project to authoritative-reconcile via sync-tasks."
+
+exit 0

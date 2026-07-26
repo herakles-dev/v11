@@ -1,0 +1,76 @@
+#!/bin/bash
+# context-status — Show heuristic context window usage estimate.
+#
+# Usage: ./scripts/context-status [--json]
+#
+# With no arguments, prints a human-readable summary.
+# With --json, prints the raw JSON estimate dict.
+
+SCRIPTS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LIB_DIR="${SCRIPTS_DIR}/lib"
+
+exec python3 - "$@" <<PYEOF
+import sys, os
+
+sys.path.insert(0, "${LIB_DIR}")
+
+try:
+    from context_tracker import ContextTracker
+except ImportError as exc:
+    print(f"ERROR: could not import context_tracker: {exc}", file=sys.stderr)
+    sys.exit(1)
+
+import json
+
+args = sys.argv[1:]
+want_json = "--json" in args
+
+tracker = ContextTracker()
+e = tracker.get_estimate()
+
+if want_json:
+    print(json.dumps(e, indent=2))
+    sys.exit(0)
+
+# Human-readable output
+threshold = e["threshold"].upper()
+percent   = e["percent_used"]
+tokens    = e["estimated_tokens"]
+events    = e["events"]
+window    = e["context_window"]
+
+# Colour codes (degrade gracefully when not a TTY)
+USE_COLOR = sys.stdout.isatty()
+RESET  = "\033[0m"  if USE_COLOR else ""
+BOLD   = "\033[1m"  if USE_COLOR else ""
+GREEN  = "\033[32m" if USE_COLOR else ""
+YELLOW = "\033[33m" if USE_COLOR else ""
+RED    = "\033[31m" if USE_COLOR else ""
+BRED   = "\033[1;31m" if USE_COLOR else ""
+
+color_map = {
+    "OK":       GREEN,
+    "WARNING":  YELLOW,
+    "ALERT":    RED,
+    "CRITICAL": BRED,
+}
+color = color_map.get(threshold, "")
+
+print(f"{BOLD}Context Window Usage Estimate{RESET}")
+print(f"  Usage : {color}{percent:.1f}%{RESET}  (~{tokens:,} / {window:,} tokens)")
+print(f"  Status: {color}{BOLD}{threshold}{RESET}")
+print(f"  Events: {events} tool calls tracked")
+
+counts = e.get("event_counts", {})
+if counts:
+    print()
+    print("  Breakdown by event type:")
+    for etype, count in sorted(counts.items(), key=lambda kv: -kv[1]):
+        print(f"    {etype:<15} {count:>5}")
+
+if e.get("session_start"):
+    print()
+    print(f"  Session started : {e['session_start']}")
+if e.get("last_updated"):
+    print(f"  Last updated    : {e['last_updated']}")
+PYEOF

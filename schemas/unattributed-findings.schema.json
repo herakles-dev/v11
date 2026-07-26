@@ -1,0 +1,34 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "unattributed-findings.schema.json",
+  "title": "V11.20 Unattributed Finding Line",
+  "description": "Schema for ONE line of ~/.agent-metrics/unattributed-findings.jsonl. Written by wave-review-attribute and swarm-review-attribute when a finding cannot be mapped to a task via v11_resolve_file_to_task. Findings are NEVER dropped silently — they land here with a reason for investigation. Periodically reviewed; entries can be re-resolved retroactively if task-state catches up.",
+  "type": "object",
+  "properties": {
+    "timestamp":       { "type": "string", "format": "date-time" },
+    "project":         { "type": ["string", "null"] },
+    "file":            { "type": "string", "maxLength": 4096, "description": "The finding's file path that failed resolution." },
+    "line":            { "type": ["integer", "null"], "description": "Line number from the finding, if present." },
+    "error_id":        { "type": ["string", "null"], "description": "Error ID from the finding (e.g. 'E1', 'E2'), if present." },
+    "severity":        { "enum": ["CRITICAL", "HIGH", "MEDIUM", "LOW"] },
+    "error_type":      { "type": "string" },
+    "error_message":   { "type": "string", "maxLength": 500 },
+    "found_by":        { "type": "string" },
+    "found_by_layer":  { "enum": ["wave", "swarm"] },
+    "attribution_key": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$",
+      "description": "OPTIONAL: a deterministic key is only computable when project+task_id+file+line+error_id are all present. Findings with reason in (parse_ambiguity, file_missing_in_artifacts) typically lack a computable key and omit this field. Findings with reason in (file_outside_task_scope, task_found_no_owner) have a file and therefore a key, used for retroactive re-resolution if task-state catches up."
+    },
+    "reason": {
+      "enum": ["file_outside_task_scope", "no_completed_tasks_in_project", "parse_ambiguity", "file_missing_in_artifacts", "task_state_unreadable", "task_found_no_owner"],
+      "description": "Why resolution failed. file_outside_task_scope=no task's files_changed includes the file. no_completed_tasks_in_project=project has no tasks with artifacts. parse_ambiguity=swarm markdown parser could not extract a file. file_missing_in_artifacts=finding has no file field. task_state_unreadable=I/O failure. task_found_no_owner=a task DID touch the file (files_changed match) but active_agent_id was null/empty at attribution time — distinct from file_outside_task_scope; triage path is different (chase down the owner, not the file)."
+    },
+    "source_report": {
+      "type": "string",
+      "description": "Absolute path to the source wave-reports/*.json or audit-report.md file that originated this finding. Useful for re-resolution after task-state updates."
+    }
+  },
+  "required": ["timestamp", "file", "severity", "found_by_layer", "reason"],
+  "additionalProperties": false
+}

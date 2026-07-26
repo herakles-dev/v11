@@ -1,0 +1,547 @@
+#!/bin/bash
+# V11 Hook: session-end
+# Stop hook that fires when a Claude session ends.
+# Updates session metrics and logs session summary.
+#
+# Exit codes:
+#   0 - Always exit 0 (never block session end)
+
+source "$(dirname "${BASH_SOURCE[0]}")/lib/common.sh"
+
+# Test mode
+if [ "$1" == "--test" ]; then
+    echo "session-end v1"
+    exit 0
+fi
+
+# P4: parse stdin to capture session_id for session-scoped cleanup.
+# Stop event JSON includes session_id; read it before active-project lookup
+# so v11_read_active_project tier-1 read can resolve session-scoped state.
+_STDIN_JSON="$(cat 2>/dev/null || true)"
+if [ -n "$_STDIN_JSON" ]; then
+    V11_SESSION_ID="$(printf '%s' "$_STDIN_JSON" | jq -r '.session_id // empty' 2>/dev/null || true)"
+    export V11_SESSION_ID
+fi
+
+# V11.15.6 (Solution A): fold the session's FINAL state into the durable
+# aggregate BEFORE anything else — in particular before the no-aggregate-yet
+# early-exit below and before the per-session dir is destroyed at the end of
+# this hook. The aggregate is otherwise updated only by sync-tasks; a turn
+# that ended without a trailing sync-tasks call (or whose last sync raced, or
+# whose project had no aggregate yet) lost its final state entirely once the
+# per-session dir was removed — the exact mechanism by which a live session's
+# "5/5" evaporated. Keyed off the session's OWN .project stamp (never ambient
+# active-project — Bug E/H lesson); the Part 1 quarantine filter still applies
+# inside the rebuild so a mis-stamped session cannot poison another project.
+# Best-effort, never fails session-end.
+#
+# V11.16 (sprint-2 #4 cutover): this fold is now a BACKSTOP, not the primary
+# durability mechanism. v11_rebuild_project_aggregate is cutover-aware — when
+# the project ledger exists and is equal-or-superset of legacy, the rebuild it
+# performs here REPLAYS THE LEDGER (the durable, cross-session-identity source
+# of truth) rather than the lossy ephemeral session-fold. Solution A survives
+# only to bound worst-case loss for not-yet-seeded projects and to keep the
+# legacy guard-reference fresh; the append-only ledger (B) is what actually
+# carries a task completed in a *different* since-deleted session across the
+# handoff boundary. The auto-rollback guard in the rebuild guarantees this
+# call can never regress a project that has not been backfilled yet.
+if [ -n "${V11_SESSION_ID:-}" ] \
+   && printf '%s' "$V11_SESSION_ID" | grep -qE '^[a-zA-Z0-9._-]{1,64}$'; then
+    _SESS_STATE="$METRICS_DIR/sessions/$V11_SESSION_ID/task-state.json"
+    if [ -f "$_SESS_STATE" ] && [ -s "$_SESS_STATE" ] && jq empty "$_SESS_STATE" 2>/dev/null; then
+        # v11.33 (E1): drain any pending scratch-reconcile marker for THIS session
+        # BEFORE the rebuild folds the scratch. A race on the session's LAST
+        # TaskUpdate (the common real shape) leaves no subsequent locked sync-tasks
+        # call to drain it, so session-end is the backstop — otherwise the marker
+        # orphans permanently and handoff keeps seeing a stale under-count. Mirrors
+        # the sync-tasks top-of-hook drain (v11_apply_reconcile_markers), but on
+        # disk under its own bounded lock (FD 205 on the same scratch lock file;
+        # session-end holds no other lock here, so no deadlock). Best-effort; never
+        # fails session-end. Rollback: V11_SYNC_SCRATCH_RECONCILE=off.
+        _SE_MARKER="$_SESS_STATE.needs-reconcile"
+        if [ "${V11_SYNC_SCRATCH_RECONCILE:-on}" != "off" ] && [ -s "$_SE_MARKER" ]; then
+            (
+                exec 205>"$_SESS_STATE.lock"
+                if flock -w 5 205; then
+                    _SE_CUR="$(cat "$_SESS_STATE" 2>/dev/null)"
+                    _SE_NEW="$(printf '%s' "$_SE_CUR" | v11_apply_reconcile_markers "$_SE_MARKER" "$V11_SESSION_ID" "$(date -Iseconds)")"
+                    if [ -n "$_SE_NEW" ] && printf '%s' "$_SE_NEW" | jq empty 2>/dev/null; then
+                        _SE_TMP="$_SESS_STATE.tmp.$$"
+                        if printf '%s' "$_SE_NEW" | jq '.' > "$_SE_TMP" 2>/dev/null && [ -s "$_SE_TMP" ]; then
+                            mv "$_SE_TMP" "$_SESS_STATE" \
+                                && rm -f "$_SE_MARKER" "$_SESS_STATE".needs-reconcile.artifacts.*.json 2>/dev/null
+                        else
+                            rm -f "$_SE_TMP" 2>/dev/null
+                        fi
+                    fi
+                fi
+            ) 2>/dev/null || true
+        fi
+        _SESS_PROJECT="$(jq -r '.project // empty' "$_SESS_STATE" 2>/dev/null)"
+        if [ -n "$_SESS_PROJECT" ] \
+           && printf '%s' "$_SESS_PROJECT" | grep -qE '^[a-zA-Z0-9._-]{1,64}$'; then
+            v11_rebuild_project_aggregate "$_SESS_PROJECT" 2>/dev/null || true
+        fi
+    fi
+fi
+
+# Read active project from ACTIVE_PROJECT_FILE
+# SEC-C-02: sanitized read — rejects path-traversal / metacharacter payloads
+PROJECT="$(v11_read_active_project)"
+
+# If no active project, exit silently
+if [ -z "$PROJECT" ]; then
+    exit 0
+fi
+
+# Read task state from TASK_STATE_DIR
+STATE_FILE="$TASK_STATE_DIR/${PROJECT}.json"
+
+# If state file doesn't exist, exit silently
+if [ ! -f "$STATE_FILE" ]; then
+    exit 0
+fi
+
+# Extract stats from task state JSON
+TOTAL=$(jq -r '.total // 0' "$STATE_FILE" 2>/dev/null || echo "0")
+COMPLETED=$(jq -r '.completed // 0' "$STATE_FILE" 2>/dev/null || echo "0")
+PENDING=$(jq -r '.pending // 0' "$STATE_FILE" 2>/dev/null || echo "0")
+IN_PROGRESS=$(jq -r '.in_progress // 0' "$STATE_FILE" 2>/dev/null || echo "0")
+
+# Ensure all variables are valid integers (strip non-digits, default to 0 if empty)
+TOTAL="${TOTAL//[!0-9]/}"; TOTAL="${TOTAL:-0}"
+COMPLETED="${COMPLETED//[!0-9]/}"; COMPLETED="${COMPLETED:-0}"
+PENDING="${PENDING//[!0-9]/}"; PENDING="${PENDING:-0}"
+IN_PROGRESS="${IN_PROGRESS//[!0-9]/}"; IN_PROGRESS="${IN_PROGRESS:-0}"
+
+# Update last_session_end timestamp in task state
+# Fix 1: Lock + atomicize — use same flock that sync-tasks holds, PID-suffixed tmp,
+# validate before mv so a concurrent TaskUpdate landing during jq read is not silently lost.
+TIMESTAMP=$(date -Iseconds)
+(
+    _TMP="$STATE_FILE.tmp.$$"
+    {
+        flock -w 5 200 || { echo "session-end: could not acquire lock for task-state update" >&2; exit 0; }
+        jq --arg ts "$TIMESTAMP" '.last_session_end = $ts' "$STATE_FILE" > "$_TMP" 2>/dev/null
+        if [ -s "$_TMP" ] && jq empty "$_TMP" 2>/dev/null; then
+            mv "$_TMP" "$STATE_FILE"
+        else
+            rm -f "$_TMP"
+            echo "session-end: skipped task-state update (jq produced invalid/empty output)" >&2
+        fi
+    } 200>"$STATE_FILE.lock"
+) 2>/dev/null || true
+
+# Write session summary to session-log.jsonl
+mkdir -p "$METRICS_DIR"
+SESSION_LOG="$METRICS_DIR/session-log.jsonl"
+
+# Read session-start for duration (used in both session-log and last-session.json)
+_SLOG_START_TS=""
+_SLOG_DURATION=0
+_SLOG_START_FILE="$SESSIONS_ROOT/$PROJECT/.session-start"
+if [ -f "$_SLOG_START_FILE" ]; then
+    _SLOG_START_TS=$(tr -d '[:space:]' < "$_SLOG_START_FILE" 2>/dev/null || true)
+    if [ -n "$_SLOG_START_TS" ]; then
+        _SE=$(date -d "$_SLOG_START_TS" +%s 2>/dev/null || echo 0)
+        _SLOG_DURATION=$(( $(date +%s) - _SE ))
+        [ "$_SLOG_DURATION" -lt 0 ] && _SLOG_DURATION=0
+    fi
+fi
+
+# Create session summary JSON
+SESSION_SUMMARY=$(jq -c -n \
+  --arg timestamp "$TIMESTAMP" \
+  --arg project "$PROJECT" \
+  --argjson total "$TOTAL" \
+  --argjson completed "$COMPLETED" \
+  --argjson pending "$PENDING" \
+  --argjson in_progress "$IN_PROGRESS" \
+  --arg session_start "$_SLOG_START_TS" \
+  --argjson duration_secs "$_SLOG_DURATION" \
+  '{
+    timestamp: $timestamp,
+    project: $project,
+    total: $total,
+    completed: $completed,
+    pending: $pending,
+    in_progress: $in_progress,
+    session_start: (if $session_start == "" then null else $session_start end),
+    duration_secs: $duration_secs
+  }')
+
+# V11.6: Enrich session summary with plan-context metadata
+PLAN_CONTEXT_FILE="$SESSIONS_ROOT/$PROJECT/.plan-context.json"
+if [ -f "$PLAN_CONTEXT_FILE" ]; then
+    PC_HYPO_COUNT=$(jq -r '(.hypotheses // []) | length' "$PLAN_CONTEXT_FILE" 2>/dev/null || echo "0")
+    PC_DEC_COUNT=$(jq -r '(.decisions // []) | length' "$PLAN_CONTEXT_FILE" 2>/dev/null || echo "0")
+    PC_CYNEFIN=$(jq -r '.domain.cynefin // ""' "$PLAN_CONTEXT_FILE" 2>/dev/null || echo "")
+    [ "$PC_CYNEFIN" = "null" ] && PC_CYNEFIN=""
+    SESSION_SUMMARY=$(printf '%s' "$SESSION_SUMMARY" | jq -c \
+        --argjson hypo "${PC_HYPO_COUNT:-0}" \
+        --argjson dec "${PC_DEC_COUNT:-0}" \
+        --arg cynefin "$PC_CYNEFIN" '
+        . + {hypothesis_count: $hypo, decision_count: $dec}
+        | if $cynefin != "" then . + {cynefin: $cynefin} else . end
+    ')
+fi
+
+# Append to session-log.jsonl
+printf '%s\n' "$SESSION_SUMMARY" >> "$SESSION_LOG" 2>/dev/null
+
+# V11.10: Retrospective counter — flywheel input for /v11 retrospective.
+# Project-aware: increments sessions/{project}/.retro-counter on every CLOSE.
+# Threshold env var: V11_RETRO_THRESHOLD (default 5; consumers read the counter directly).
+# Surfaced by: scripts/v11-retro PROJECT, /v11 retrospective, DETECT dashboard.
+# Reset by:    scripts/v11-retro PROJECT --reset (after running /v11 retrospective).
+(
+    RETRO_FILE="$SESSIONS_ROOT/$PROJECT/.retro-counter"
+    [ ! -d "$SESSIONS_ROOT/$PROJECT" ] && exit 0
+
+    # V11.27 T2: flock the read-increment-write so two concurrent session-end
+    # CLOSEs can't lose a write (read-read / inc-inc / write-write → +1 not +2).
+    # fd 201: 200 is held by the task-state flock, 202 by the aggregate flock
+    # (common.sh:535) — 201 is collision-free. Best-effort: a >5s timeout (never
+    # realistic for a microsecond critical section) falls through unlocked rather
+    # than blocking CLOSE. Honors V11_RETRO_SANITY_GUARD=off → original path.
+    if [ "${V11_RETRO_SANITY_GUARD:-on}" != "off" ]; then
+        exec 201>"$RETRO_FILE.lock" 2>/dev/null || true
+        flock -w 5 201 2>/dev/null || true
+    fi
+
+    _COUNT=0
+    [ -f "$RETRO_FILE" ] && _COUNT=$(tr -dc '0-9' < "$RETRO_FILE" 2>/dev/null || echo "0")
+    _COUNT="${_COUNT:-0}"
+    _COUNT=$((_COUNT + 1))
+
+    _TMP="$RETRO_FILE.tmp.$$"
+    printf '%s\n' "$_COUNT" > "$_TMP" 2>/dev/null && mv "$_TMP" "$RETRO_FILE" 2>/dev/null
+    rm -f "$_TMP" 2>/dev/null || true
+    exit 0
+) 2>/dev/null || true
+
+# V11.4: Sync plan file on session end (captures final state for context resume)
+PLAN_SYNC_SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/scripts/plan-sync"
+if [ -x "$PLAN_SYNC_SCRIPT" ] && [ -n "$PROJECT" ]; then
+    "$PLAN_SYNC_SCRIPT" "$PROJECT" &>/dev/null || true
+fi
+
+# V11.18 T2 (v11-handoff-hygiene): run the discipline detector BEFORE auto-emit
+# so the resulting handoff.md includes "may need completion" warnings for any
+# in_progress task with recent file activity. Best-effort; honors
+# V11_DISCIPLINE_DETECTOR=off and never fails session-end.
+(
+    _DC="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/scripts/handoff-discipline-check"
+    [ -x "$_DC" ] && [ -n "$PROJECT" ] || exit 0
+    V11_WORKSPACE_ROOT="$V11_WORKSPACE_ROOT" \
+    SESSIONS_ROOT="$SESSIONS_ROOT" \
+    METRICS_DIR="$METRICS_DIR" \
+    timeout 10 "$_DC" "$PROJECT" >/dev/null 2>&1 || true
+    exit 0
+) 2>/dev/null || true
+
+# V11.17 Fix 2 + V11.25.1 reorder: Auto-emit handoff.md as safety net.
+# When the user closes a session without running /handoff, the next session
+# has nothing structured to read. This block emits handoff.md unless:
+#   (a) V11_AUTO_HANDOFF=off  (b) PROJECT empty
+#   (c) handoff.md younger than 60s (user just ran /handoff — don't stomp).
+#
+# V11.25.1 REORDER: this block is now defined as a function and invoked AFTER
+# last-session.json is written (search "v11.25.1 invoke" below). The legacy
+# order ran auto-emit BEFORE last-session.json, so the handoff read the PRIOR
+# session's enrichment fields (.active_task, .git_status, .reasoning.*) —
+# a stale-data bug surfaced 2026-06-19 when v11-sharpening's handoff embedded
+# a 48-day-old summary into the Zeus spawn.
+# Rollback: V11_SESSION_END_REORDER=off restores legacy order.
+_v11_auto_emit_handoff() {
+    [ "${V11_AUTO_HANDOFF:-}" = "off" ] && return 0
+    [ -z "$PROJECT" ] && return 0
+
+    local _HANDOFF_SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/scripts/handoff"
+    [ -x "$_HANDOFF_SCRIPT" ] || return 0
+
+    local _HO_FILE="$SESSIONS_ROOT/$PROJECT/handoff.md"
+    local _NOW_EPOCH=$(date +%s 2>/dev/null || echo 0)
+    local _HO_MTIME=0
+    if [ -f "$_HO_FILE" ]; then
+        _HO_MTIME=$(stat -c %Y "$_HO_FILE" 2>/dev/null || echo 0)
+    fi
+    local _HO_AGE=$(( _NOW_EPOCH - _HO_MTIME ))
+
+    # Skip if user-written handoff.md is fresh (< 60s old) — don't stomp manual /handoff
+    if [ -f "$_HO_FILE" ] && [ "$_HO_AGE" -lt 60 ]; then
+        return 0
+    fi
+
+    # V11.28.1 (F1): do NOT pass --file "$_HO_FILE". scripts/handoff writes the
+    # structured handoff.md (with V11.28 steer markers) to $SESSION_DIR/handoff.md
+    # unconditionally; --file pointed at that same path would overwrite it AFTER the
+    # steer sidecar was already consumed, with the markerless $PROMPT — silently
+    # dropping the steer on this safety-net path. Let handoff own the file write.
+    V11_WORKSPACE_ROOT="$V11_WORKSPACE_ROOT" \
+    SESSIONS_ROOT="$SESSIONS_ROOT" \
+    METRICS_DIR="$METRICS_DIR" \
+    V11_HOME="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)" \
+    timeout 20 "$_HANDOFF_SCRIPT" "$PROJECT" >/dev/null 2>&1 || true
+
+    if [ -f "$_HO_FILE" ]; then
+        date -Iseconds > "$SESSIONS_ROOT/$PROJECT/.handoff-autoemit-at" 2>/dev/null || true
+    fi
+    return 0
+}
+
+# Legacy-order invocation (only when reorder is OFF). V11.25.1: auto-emit
+# runs BEFORE last-session.json — this means handoff reads STALE prior-session
+# enrichment fields. Kept solely as a rollback path.
+if [ "${V11_SESSION_END_REORDER:-on}" = "off" ]; then
+    ( _v11_auto_emit_handoff ) 2>/dev/null || true
+fi
+
+# V11.7: Write emergency black-box state dump (last-session.json)
+# Wrapped entirely in a subshell — session-end must NEVER fail.
+(
+    DUMP_FILE="$SESSIONS_ROOT/$PROJECT/last-session.json"
+
+    # --- task counts (already extracted above) ---
+    BLOCKED=$(jq -r '.blocked // 0' "$STATE_FILE" 2>/dev/null || echo "0")
+    BLOCKED="${BLOCKED//[!0-9]/}"; BLOCKED="${BLOCKED:-0}"
+
+    # --- active task ---
+    ACTIVE_ID=$(jq -r '.active_task_ids[0] // empty' "$STATE_FILE" 2>/dev/null || true)
+    ACTIVE_SUBJECT=$(jq -r '.active_task // empty' "$STATE_FILE" 2>/dev/null || true)
+    [ "$ACTIVE_ID" = "null" ] && ACTIVE_ID=""
+    [ "$ACTIVE_SUBJECT" = "null" ] && ACTIVE_SUBJECT=""
+
+    # --- autonomy state ---
+    AUTONOMY_FILE="$SESSIONS_ROOT/$PROJECT/.autonomy-state"
+    [ ! -f "$AUTONOMY_FILE" ] && AUTONOMY_FILE="$V11_WORKSPACE_ROOT/$PROJECT/.autonomy-state"
+    AUTONOMY_LEVEL=0; AUTONOMY_OK=0; AUTONOMY_ERRORS=0
+    if [ -f "$AUTONOMY_FILE" ]; then
+        AUTONOMY_LEVEL=$(jq -r '.level // 0' "$AUTONOMY_FILE" 2>/dev/null || echo "0")
+        AUTONOMY_OK=$(jq -r '.successful // 0' "$AUTONOMY_FILE" 2>/dev/null || echo "0")
+        AUTONOMY_ERRORS=$(jq -r '.errors // 0' "$AUTONOMY_FILE" 2>/dev/null || echo "0")
+        AUTONOMY_LEVEL="${AUTONOMY_LEVEL//[!0-9]/}"; AUTONOMY_LEVEL="${AUTONOMY_LEVEL:-0}"
+        AUTONOMY_OK="${AUTONOMY_OK//[!0-9]/}"; AUTONOMY_OK="${AUTONOMY_OK:-0}"
+        AUTONOMY_ERRORS="${AUTONOMY_ERRORS//[!0-9]/}"; AUTONOMY_ERRORS="${AUTONOMY_ERRORS:-0}"
+    fi
+
+    # --- formation name ---
+    FORMATION_NAME=""
+    FORMATION_FILE="$SESSIONS_ROOT/$PROJECT/.formation-registry.json"
+    [ ! -f "$FORMATION_FILE" ] && FORMATION_FILE="$V11_WORKSPACE_ROOT/$PROJECT/.formation-registry.json"
+    if [ -f "$FORMATION_FILE" ]; then
+        FORMATION_NAME=$(jq -r '.formation // empty' "$FORMATION_FILE" 2>/dev/null || true)
+        [ "$FORMATION_NAME" = "null" ] && FORMATION_NAME=""
+    fi
+    # V11.11+ fallback: spec.md is the canonical place for formation declaration
+    # (see v11/CLAUDE.md §3-4). When .formation-registry.json is absent, parse the
+    # first non-empty line under "## Formation" in spec.md.
+    if [ -z "$FORMATION_NAME" ]; then
+        _SPEC_FILE="$SESSIONS_ROOT/$PROJECT/spec.md"
+        [ ! -f "$_SPEC_FILE" ] && _SPEC_FILE="$V11_WORKSPACE_ROOT/$PROJECT/spec.md"
+        if [ -f "$_SPEC_FILE" ]; then
+            FORMATION_NAME=$(awk '/^## Formation/{flag=1; next} flag && NF{print; exit}' "$_SPEC_FILE" 2>/dev/null \
+                | sed -E 's/^[`*_[:space:]]*([^`*_]+)[`*_].*/\1/; s/[[:space:]]+$//' \
+                | head -c 64)
+        fi
+    fi
+
+    # --- git diff stat (2-second timeout, project path detection) ---
+    GIT_STAT=""
+    PROJECT_PATH="$V11_WORKSPACE_ROOT/$PROJECT"
+    [ ! -d "$PROJECT_PATH" ] && PROJECT_PATH="$SESSIONS_ROOT/$PROJECT"
+    if [ -d "$PROJECT_PATH" ]; then
+        GIT_STAT=$(timeout 2 git -C "$PROJECT_PATH" diff --stat 2>/dev/null | tail -1 || true)
+        GIT_STAT=$(printf '%s' "$GIT_STAT" | xargs 2>/dev/null || true)
+    fi
+
+    # --- session start + duration ---
+    SESSION_START_TS=""
+    SESSION_DURATION_SECS=0
+    _START_FILE="$SESSIONS_ROOT/$PROJECT/.session-start"
+    if [ -f "$_START_FILE" ]; then
+        SESSION_START_TS=$(tr -d '[:space:]' < "$_START_FILE" 2>/dev/null || true)
+        if [ -n "$SESSION_START_TS" ]; then
+            _START_EPOCH=$(date -d "$SESSION_START_TS" +%s 2>/dev/null || echo 0)
+            _NOW_EPOCH=$(date +%s)
+            SESSION_DURATION_SECS=$(( _NOW_EPOCH - _START_EPOCH ))
+            [ "$SESSION_DURATION_SECS" -lt 0 ] && SESSION_DURATION_SECS=0
+        fi
+    fi
+
+    # --- plan-context reasoning fields ---
+    PC_DOMAIN=""; PC_BOTTLENECK=""; PC_HYPO_COUNT=0
+    if [ -f "$PLAN_CONTEXT_FILE" ]; then
+        PC_DOMAIN=$(jq -r '.domain.cynefin // empty' "$PLAN_CONTEXT_FILE" 2>/dev/null || true)
+        [ "$PC_DOMAIN" = "null" ] && PC_DOMAIN=""
+        PC_BOTTLENECK=$(jq -r '.bottleneck.current // empty' "$PLAN_CONTEXT_FILE" 2>/dev/null || true)
+        [ "$PC_BOTTLENECK" = "null" ] && PC_BOTTLENECK=""
+        PC_HYPO_COUNT=$(jq -r '(.hypotheses // []) | length' "$PLAN_CONTEXT_FILE" 2>/dev/null || echo "0")
+        PC_HYPO_COUNT="${PC_HYPO_COUNT//[!0-9]/}"; PC_HYPO_COUNT="${PC_HYPO_COUNT:-0}"
+    fi
+
+    # --- build and write JSON (Fix 3: atomic tmp.$$ + validate + mv) ---
+    _TMP="$DUMP_FILE.tmp.$$"
+    jq -c -n \
+      --arg timestamp "$TIMESTAMP" \
+      --arg project "$PROJECT" \
+      --argjson total "$TOTAL" \
+      --argjson completed "$COMPLETED" \
+      --argjson in_progress "$IN_PROGRESS" \
+      --argjson pending "$PENDING" \
+      --argjson blocked "$BLOCKED" \
+      --arg active_id "$ACTIVE_ID" \
+      --arg active_subject "$ACTIVE_SUBJECT" \
+      --argjson autonomy_level "$AUTONOMY_LEVEL" \
+      --argjson autonomy_ok "$AUTONOMY_OK" \
+      --argjson autonomy_errors "$AUTONOMY_ERRORS" \
+      --arg formation "$FORMATION_NAME" \
+      --arg git_status "$GIT_STAT" \
+      --arg domain "$PC_DOMAIN" \
+      --arg bottleneck "$PC_BOTTLENECK" \
+      --argjson hypo_count "$PC_HYPO_COUNT" \
+      --arg session_start "$SESSION_START_TS" \
+      --argjson duration_secs "$SESSION_DURATION_SECS" \
+      '{
+        timestamp: $timestamp,
+        project: $project,
+        tasks: {
+          total: $total,
+          completed: $completed,
+          in_progress: $in_progress,
+          pending: $pending,
+          blocked: $blocked
+        },
+        active_task: {
+          id: (if $active_id == "" then null else $active_id end),
+          subject: (if $active_subject == "" then null else $active_subject end)
+        },
+        autonomy: {
+          level: $autonomy_level,
+          successful: $autonomy_ok,
+          errors: $autonomy_errors
+        },
+        formation: (if $formation == "" then null else $formation end),
+        git_status: (if $git_status == "" then null else $git_status end),
+        reasoning: {
+          domain: (if $domain == "" then null else $domain end),
+          bottleneck: (if $bottleneck == "" then null else $bottleneck end),
+          active_hypotheses: $hypo_count
+        },
+        session_start: (if $session_start == "" then null else $session_start end),
+        duration_secs: $duration_secs
+      }' > "$_TMP" 2>/dev/null
+    if [ -s "$_TMP" ] && jq empty "$_TMP" 2>/dev/null; then
+        mv "$_TMP" "$DUMP_FILE"
+    else
+        rm -f "$_TMP"
+        echo "session-end: skipped last-session.json write (jq produced invalid/empty output)" >&2
+    fi
+    exit 0
+) 2>/dev/null || true
+
+# V11.25.1 invoke: auto-emit handoff AFTER last-session.json is fresh on disk.
+# This is the corrected order — the handoff script reads last-session.json for
+# enrichment fields (active_subject, git_status, reasoning.*) and previously
+# got the prior session's values because auto-emit ran first.
+# Default ON; rollback via V11_SESSION_END_REORDER=off (legacy order above).
+if [ "${V11_SESSION_END_REORDER:-on}" != "off" ]; then
+    ( _v11_auto_emit_handoff ) 2>/dev/null || true
+fi
+
+# V11.7: Refresh session manifest with current artifact status
+# Fix 2: Schema-correct artifact entries (name, exists, path, tier, category) + atomic write.
+# Only session-end writes the manifest, so no lock needed — PID-suffixed tmp + validate + mv.
+(
+    MANIFEST="$SESSIONS_ROOT/$PROJECT/.session-manifest.json"
+    if [ -d "$SESSIONS_ROOT/$PROJECT" ]; then
+        # Read scope signals
+        _M_TASKS="${TOTAL:-0}"
+        # has_formation: .formation-registry.json (legacy) OR spec.md ## Formation/## Agents (V11.11+)
+        _M_FORMATION=false
+        if [ -f "$SESSIONS_ROOT/$PROJECT/.formation-registry.json" ]; then
+            _M_FORMATION=true
+        elif [ -f "$SESSIONS_ROOT/$PROJECT/spec.md" ] && \
+             grep -qE '^## (Formation|Agents)\b' "$SESSIONS_ROOT/$PROJECT/spec.md" 2>/dev/null; then
+            _M_FORMATION=true
+        fi
+        _M_CYNEFIN="confused"
+        [ -f "$SESSIONS_ROOT/$PROJECT/.plan-context.json" ] && \
+            _M_CYNEFIN=$(jq -r '.domain.cynefin // "confused"' "$SESSIONS_ROOT/$PROJECT/.plan-context.json" 2>/dev/null || echo "confused")
+        _M_MULTI=false; [ "$_M_TASKS" -ge 21 ] && _M_MULTI=true
+        [ -f "$SESSIONS_ROOT/$PROJECT/gates.md" ] && _M_MULTI=true
+
+        # tier/category lookup tables (positional — keep in sync with _FILES below)
+        # Format: "filename:tier:category"
+        declare -A _TIER=(
+            ["spec.md"]="required"
+            [".task-state.json"]="required"
+            [".autonomy-state"]="required"
+            [".plan-context.json"]="required"
+            ["roadmap.md"]="conditional"
+            ["architecture.md"]="conditional"
+            ["gates.md"]="conditional"
+            [".formation-registry.json"]="conditional"
+            ["handoff.md"]="conditional"
+        )
+        declare -A _CAT=(
+            ["spec.md"]="spec"
+            [".task-state.json"]="state"
+            [".autonomy-state"]="state"
+            [".plan-context.json"]="state"
+            ["roadmap.md"]="doc"
+            ["architecture.md"]="doc"
+            ["gates.md"]="doc"
+            [".formation-registry.json"]="team"
+            ["handoff.md"]="session"
+        )
+
+        # Build artifact status array — all five required schema fields
+        _artifacts="[]"
+        for _f in spec.md .task-state.json .autonomy-state .plan-context.json roadmap.md architecture.md gates.md .formation-registry.json handoff.md; do
+            _exists=false; [ -f "$SESSIONS_ROOT/$PROJECT/$_f" ] && _exists=true
+            _path="$SESSIONS_ROOT/$PROJECT/$_f"
+            _tier="${_TIER[$_f]:-conditional}"
+            _cat="${_CAT[$_f]:-session}"
+            _artifacts=$(printf '%s' "$_artifacts" | jq -c \
+                --arg n "$_f" \
+                --argjson e "$_exists" \
+                --arg p "$_path" \
+                --arg t "$_tier" \
+                --arg c "$_cat" \
+                '. + [{"name":$n,"exists":$e,"path":$p,"tier":$t,"category":$c}]' \
+                2>/dev/null || printf '%s' "$_artifacts")
+        done
+
+        _TMP="$MANIFEST.tmp.$$"
+        jq -c -n \
+            --arg project "$PROJECT" \
+            --arg ts "$TIMESTAMP" \
+            --argjson tasks "$_M_TASKS" \
+            --argjson formation "$_M_FORMATION" \
+            --arg cynefin "$_M_CYNEFIN" \
+            --argjson multi "$_M_MULTI" \
+            --argjson artifacts "$_artifacts" \
+            '{
+                project: $project, version: "1.0.0", last_checked: $ts,
+                scope_signals: {task_count: $tasks, has_formation: $formation, cynefin: $cynefin, multi_sprint: $multi},
+                artifacts: $artifacts
+            }' > "$_TMP" 2>/dev/null
+        if [ -s "$_TMP" ] && jq empty "$_TMP" 2>/dev/null; then
+            mv "$_TMP" "$MANIFEST"
+        else
+            rm -f "$_TMP"
+            echo "session-end: skipped session-manifest.json write (jq produced invalid/empty output)" >&2
+        fi
+    fi
+    exit 0
+) 2>/dev/null || true
+
+# P4: clean up session-scoped active-project dir (best-effort, never fails session-end)
+if [ -n "${V11_SESSION_ID:-}" ] \
+   && printf '%s' "$V11_SESSION_ID" | grep -qE '^[a-zA-Z0-9._-]{1,64}$'; then
+    _SCOPED_DIR="$METRICS_DIR/sessions/$V11_SESSION_ID"
+    [ -d "$_SCOPED_DIR" ] && rm -rf "$_SCOPED_DIR" 2>/dev/null || true
+fi
+
+exit 0

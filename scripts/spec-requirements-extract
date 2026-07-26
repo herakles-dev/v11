@@ -1,0 +1,159 @@
+#!/bin/bash
+# V11 Spec Requirements Extract — Propose spec_test_requirements from spec.md
+# Usage: ./scripts/spec-requirements-extract PROJECT [--json]
+#
+# Reads sessions/PROJECT/spec.md and extracts candidate executable assertions
+# from the "## Requirements", "## Constraints", and bullet-list sections.
+# Output is a proposal — the human (or Phase 3 interview) picks and refines.
+#
+# Addresses Dark Code Layer 1 Gap 3 (Specs-as-Evals): spec clauses become
+# checkable assertions that travel with the implementer task.
+
+set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+V11_HOME="${V11_HOME:-$(dirname "$SCRIPT_DIR")}"
+V11_WORKSPACE_ROOT="${V11_WORKSPACE_ROOT:-$HOME/.v11}"
+SESSIONS_ROOT="${SESSIONS_ROOT:-$V11_WORKSPACE_ROOT/sessions}"
+
+if [ "${1:-}" == "--help" ] || [ "${1:-}" == "-h" ] || [ -z "${1:-}" ]; then
+  cat << 'HELP'
+V11 Spec Requirements Extract — Propose spec_test_requirements from spec.md
+
+USAGE:
+    ./scripts/spec-requirements-extract PROJECT [--json]
+
+OPTIONS:
+    --json    Output as JSON array (ready to paste into task metadata.spec_test_requirements)
+              Default: markdown proposal
+
+DESCRIPTION:
+    Parses spec.md for sentences that read like requirements (MUST, SHALL,
+    NEVER, ALWAYS, specific numeric constraints, named behaviors). Proposes
+    a spec_test_requirement entry per matched clause with a stable STR-NNN
+    ID and suggested verification method.
+
+    This is a proposal. Edit, prune, and paste the ones you keep into the
+    implementer task's metadata. The orchestrator's Phase 3 interview should
+    call this before TaskCreate.
+HELP
+  exit 0
+fi
+
+PROJECT="$1"
+FORMAT="md"
+[ "${2:-}" == "--json" ] && FORMAT="json"
+
+# spec.md may live in sessions/{project}/ (canonical) OR in the project root
+# (legacy pattern for projects pre-dating V11 sessions layout).
+SPEC_FILE=""
+for candidate in \
+    "$SESSIONS_ROOT/$PROJECT/spec.md" \
+    "$V11_WORKSPACE_ROOT/$PROJECT/spec.md"; do
+    if [ -f "$candidate" ]; then
+        SPEC_FILE="$candidate"
+        break
+    fi
+done
+[ -n "$SPEC_FILE" ] || { echo "Error: spec.md not found in sessions/$PROJECT/ or $V11_WORKSPACE_ROOT/$PROJECT/" >&2; exit 1; }
+
+python3 - "$SPEC_FILE" "$FORMAT" "$PROJECT" << 'PY'
+import sys, re, json
+
+spec_path, fmt, project = sys.argv[1:]
+with open(spec_path) as f:
+    spec = f.read()
+
+# Track current section for spec_section field
+lines = spec.splitlines()
+current_section = "spec.md"
+candidates = []  # list of (section_anchor, raw_text, verification_hint)
+
+# Patterns that look like requirements
+REQ_PATTERNS = [
+    (re.compile(r"\b(MUST|SHALL|REQUIRED|NEVER|ALWAYS)\b", re.I), "high"),
+    (re.compile(r"\b(should|must not|cannot|no more than|at most|at least)\b", re.I), "medium"),
+    (re.compile(r"\b\d+\s*(ms|seconds?|minutes?|hours?|days?|requests?|users?|%)\b", re.I), "medium"),
+    (re.compile(r"\b(p50|p95|p99|latency|throughput|timeout)\b", re.I), "medium"),
+]
+
+def section_anchor(heading):
+    a = re.sub(r"[^a-z0-9]+", "-", heading.lower()).strip("-")
+    return f"spec.md#{a}"
+
+# Verification hint by keyword
+def guess_verification(text):
+    t = text.lower()
+    if any(w in t for w in ["ms", "latency", "throughput", "p99", "qps", "rps"]):
+        return "integration-test"
+    if any(w in t for w in ["validate", "format", "reject", "error"]):
+        return "unit-test"
+    if any(w in t for w in ["security", "auth", "permission", "access"]):
+        return "integration-test"
+    if any(w in t for w in ["ui", "layout", "display", "visible"]):
+        return "manual"
+    return "unit-test"
+
+for line in lines:
+    line = line.strip()
+    if not line:
+        continue
+    m = re.match(r"^#{1,6}\s+(.+)", line)
+    if m:
+        current_section = section_anchor(m.group(1).strip())
+        continue
+    # Split bullet points or sentences
+    items = []
+    if line.startswith(("-", "*", "+")) or re.match(r"^\d+[.)]", line):
+        items.append(re.sub(r"^[\-\*\+\d.)\s]+", "", line).strip())
+    else:
+        # one sentence per candidate
+        for sentence in re.split(r"(?<=[.!?])\s+", line):
+            s = sentence.strip()
+            if s:
+                items.append(s)
+
+    for item in items:
+        if len(item) < 10 or len(item) > 300:
+            continue
+        for pat, _weight in REQ_PATTERNS:
+            if pat.search(item):
+                candidates.append((current_section, item, guess_verification(item)))
+                break
+
+# Dedupe and build STR-NNN IDs
+seen = set()
+requirements = []
+for i, (section, text, verification) in enumerate(candidates, 1):
+    key = (section, text[:80])
+    if key in seen:
+        continue
+    seen.add(key)
+    requirements.append({
+        "id": f"STR-{len(requirements)+1:03d}",
+        "spec_section": section,
+        "assertion": text,
+        "verification": verification,
+        "status": "open",
+    })
+
+if fmt == "json":
+    json.dump(requirements, sys.stdout, indent=2)
+    print()
+else:
+    print(f"# Candidate spec_test_requirements for {project}")
+    print(f"> Source: {spec_path}")
+    print(f"> Found {len(requirements)} candidates. Prune ruthlessly — keep only assertions the implementer will actually verify.")
+    print()
+    if not requirements:
+        print("_No requirement-shaped clauses detected. Your spec may be too narrative — consider adding MUST/SHALL clauses for testable constraints._")
+    for r in requirements:
+        print(f"## {r['id']} — {r['spec_section']}")
+        print()
+        print(f"**Assertion:** {r['assertion']}")
+        print(f"**Verification:** {r['verification']}")
+        print()
+    print("## To use")
+    print()
+    print("Rerun with `--json` and paste the trimmed result into the implementer task's")
+    print("`metadata.spec_test_requirements` field during TaskCreate.")
+PY

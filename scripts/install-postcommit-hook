@@ -1,0 +1,259 @@
+#!/usr/bin/env bash
+# Install the V11 post-commit-close-tasks hook for a git repository.
+#
+# Usage:
+#   ./scripts/install-postcommit-hook [--dry-run] [PROJECT_PATH]
+#
+# PROJECT_PATH defaults to the current working directory.
+#
+# Behavior:
+#   - If .git/hooks/post-commit does NOT exist: creates a symlink pointing to
+#     the V11 hook.
+#   - If .git/hooks/post-commit already exists AND is already the V11 hook
+#     (or a shim/wrapper calling it): exits 0 with "already installed" (idempotent).
+#   - If .git/hooks/post-commit is a SYMLINK pointing to a tracked source file
+#     (a common pattern for repos with an existing hook manager): replaces the symlink with a chain-wrapper script that
+#     delegates to both the original target and the V11 hook.  The tracked source
+#     file is NOT modified.
+#   - If .git/hooks/post-commit exists as a regular file (not a symlink): backs
+#     it up to .git/hooks/post-commit.pre-v11 and appends a shim call at the end.
+#
+# Symlink-to-tracked-file detection:
+#   When the target is a symlink the installer resolves it to the final file via
+#   readlink -f, then verifies md5 of the original is unchanged after install.
+#   The replacement wrapper contains the marker comment:
+#     # v11-chain-wrapper-v1
+#   Re-running the installer on a repo where that marker is present is a no-op.
+#
+# Rollback (per-project):
+#   V11_POSTCOMMIT_AUTOCLOSE=off   — disables the hook for this session/project
+#   To fully remove: rm .git/hooks/post-commit (and restore .pre-v11 if present)
+#
+# Rollout cohort guidance (v11.25-postcommit-spec.md §"Rollout Cohort"):
+#   1. example-project:  2-sprint dry-run (V11_POSTCOMMIT_DRYRUN=on) before live
+#   2. free-chicago:    1-sprint dry-run before live
+#   3. v11-sharpening:  live from V11.25 inception (dogfood)
+
+set -euo pipefail
+
+V11_HOME="$(cd "$(dirname "$(dirname "$(realpath "${BASH_SOURCE[0]}")")")" && pwd)"
+V11_HOOK="${V11_HOME}/hooks/post-commit-close-tasks"
+
+# ── Args ─────────────────────────────────────────────────────────────────────
+DRY_RUN=0
+PROJECT_PATH=""
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --dry-run)
+            DRY_RUN=1
+            shift
+            ;;
+        -*)
+            echo "Unknown option: $1" >&2
+            exit 1
+            ;;
+        *)
+            PROJECT_PATH="$1"
+            shift
+            ;;
+    esac
+done
+
+PROJECT_PATH="${PROJECT_PATH:-$(pwd)}"
+
+# ── Validate ─────────────────────────────────────────────────────────────────
+if [ ! -f "$V11_HOOK" ]; then
+    echo "ERROR: V11 hook not found at $V11_HOOK" >&2
+    echo "       Run from the v11 repo root or set V11_HOME." >&2
+    exit 1
+fi
+
+if ! git -C "$PROJECT_PATH" rev-parse --git-dir >/dev/null 2>&1; then
+    echo "ERROR: $PROJECT_PATH is not a git repository" >&2
+    exit 1
+fi
+
+GIT_DIR="$(git -C "$PROJECT_PATH" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)"
+if [ -z "$GIT_DIR" ]; then
+    # Fallback for older git without --path-format support: resolve
+    # --git-common-dir (may be relative) against the repo root.
+    _common="$(git -C "$PROJECT_PATH" rev-parse --git-common-dir)"
+    GIT_DIR="$(cd "$PROJECT_PATH" && realpath "$_common")"
+fi
+HOOK_TARGET="${GIT_DIR}/hooks/post-commit"
+
+# ── core.hooksPath detection ─────────────────────────────────────────────────
+# git never reads $GIT_DIR/hooks when core.hooksPath is set — it reads the
+# configured dir instead (often a TRACKED working-tree path). Symlinking into
+# $GIT_DIR/hooks in that case installs a dead hook silently. Detect the
+# EFFECTIVE hooks dir and skip (don't chain) when it differs.
+EFFECTIVE_HOOKS_DIR="$(git -C "$PROJECT_PATH" rev-parse --path-format=absolute --git-path hooks 2>/dev/null || true)"
+if [ -z "$EFFECTIVE_HOOKS_DIR" ]; then
+    # Fallback for older git without --path-format support: resolve
+    # --git-path hooks (may be relative) against the repo root.
+    _hookspath="$(git -C "$PROJECT_PATH" rev-parse --git-path hooks)"
+    EFFECTIVE_HOOKS_DIR="$(cd "$PROJECT_PATH" && realpath "$_hookspath")"
+fi
+
+if [ "$EFFECTIVE_HOOKS_DIR" != "${GIT_DIR}/hooks" ]; then
+    if [ "$DRY_RUN" -eq 1 ]; then
+        echo "DRY-RUN: action=skip reason=core-hooksPath-set effective_hooks_dir=$EFFECTIVE_HOOKS_DIR"
+    else
+        echo "[install-postcommit-hook] action=skip reason=core-hooksPath-set effective_hooks_dir=$EFFECTIVE_HOOKS_DIR" >&2
+    fi
+    echo "" >&2
+    echo "core.hooksPath is set for this repo, so git never reads ${GIT_DIR}/hooks —" >&2
+    echo "a symlink there would be dead. $EFFECTIVE_HOOKS_DIR is usually a TRACKED" >&2
+    echo "working-tree path, so we skip rather than silently pollute the repo." >&2
+    echo "To wire manually: ln -sf $V11_HOOK $EFFECTIVE_HOOKS_DIR/post-commit" >&2
+    exit 0
+fi
+
+# Ensure hooks directory exists
+if [ "$DRY_RUN" -eq 0 ]; then
+    mkdir -p "${GIT_DIR}/hooks"
+fi
+
+# ── Idempotency check: already a direct symlink to V11 hook ──────────────────
+if [ -L "$HOOK_TARGET" ]; then
+    _current_target="$(readlink -f "$HOOK_TARGET" 2>/dev/null || true)"
+    if [ "$_current_target" = "$(realpath "$V11_HOOK")" ]; then
+        echo "[install-postcommit-hook] Already installed (symlink) at $HOOK_TARGET — no changes made." >&2
+        if [ "$DRY_RUN" -eq 1 ]; then
+            echo "DRY-RUN: action=no-op reason=already-installed-symlink target=$HOOK_TARGET"
+        fi
+        exit 0
+    fi
+fi
+
+# ── Idempotency check: file already contains V11 marker ──────────────────────
+# Only applies to regular (non-symlink) hook files: a symlink pointing at some
+# OTHER tracked file (Case 2 below) must not be short-circuited here just
+# because the tracked file's content happens to contain a marker string.
+if [ -f "$HOOK_TARGET" ] && [ ! -L "$HOOK_TARGET" ] && grep -q "post-commit-close-tasks\|V11_POSTCOMMIT\|v11-chain-wrapper-v1" "$HOOK_TARGET" 2>/dev/null; then
+    echo "[install-postcommit-hook] V11 hook shim/wrapper already present in $HOOK_TARGET — no changes made." >&2
+    if [ "$DRY_RUN" -eq 1 ]; then
+        echo "DRY-RUN: action=no-op reason=marker-already-present target=$HOOK_TARGET"
+    fi
+    exit 0
+fi
+
+# ── Install ───────────────────────────────────────────────────────────────────
+if [ ! -e "$HOOK_TARGET" ]; then
+    # ── Case 1: No existing hook — install as symlink ─────────────────────────
+    if [ "$DRY_RUN" -eq 1 ]; then
+        echo "DRY-RUN: action=install-symlink target=$HOOK_TARGET link_to=$V11_HOOK"
+    else
+        ln -sf "$V11_HOOK" "$HOOK_TARGET"
+        chmod +x "$HOOK_TARGET"
+        echo "[install-postcommit-hook] method=install-symlink Installed symlink: $HOOK_TARGET → $V11_HOOK" >&2
+    fi
+
+elif [ -L "$HOOK_TARGET" ]; then
+    # ── Case 2: Symlink pointing to some OTHER file (tracked source pattern) ──
+    #
+    # Resolve through all symlink layers to the final real file.
+    _resolved="$(readlink -f "$HOOK_TARGET" 2>/dev/null || true)"
+    if [ -z "$_resolved" ] || [ ! -f "$_resolved" ]; then
+        echo "ERROR: $HOOK_TARGET is a symlink but resolves to a missing or non-regular file: $_resolved" >&2
+        exit 1
+    fi
+
+    # Capture MD5 of the tracked source BEFORE we touch anything.
+    _md5_before="$(md5sum "$_resolved" 2>/dev/null | awk '{print $1}' || true)"
+
+    if [ "$DRY_RUN" -eq 1 ]; then
+        echo "DRY-RUN: action=symlink-replaced-with-wrapper target=$HOOK_TARGET resolved_source=$_resolved"
+        echo "DRY-RUN: wrapper will delegate to: $_resolved AND $V11_HOOK"
+        echo "DRY-RUN: tracked source $( [ -n "$_md5_before" ] && echo "md5=$_md5_before" || echo "(no md5)" ) will NOT be modified"
+    else
+        # Remove the symlink and write a real wrapper script in its place.
+        rm "$HOOK_TARGET"
+        cat > "$HOOK_TARGET" <<WRAPPER
+#!/usr/bin/env bash
+# v11-chain-wrapper-v1
+# Auto-generated by install-postcommit-hook — DO NOT EDIT MANUALLY.
+# Delegates to:
+#   1. Original tracked hook: $_resolved
+#   2. V11 post-commit-close-tasks: $V11_HOOK
+#
+# To reinstall cleanly: rm this file and re-run install-postcommit-hook.
+# Rollback: V11_POSTCOMMIT_AUTOCLOSE=off
+
+set -euo pipefail
+
+# Delegate 1: original tracked hook
+bash "$_resolved" "\$@"
+_d1_exit=\$?
+
+# Delegate 2: V11 post-commit-close-tasks
+if [ "\${V11_POSTCOMMIT_AUTOCLOSE:-on}" = "off" ]; then
+    exit \$_d1_exit
+fi
+if [ -x "${V11_HOOK}" ]; then
+    "${V11_HOOK}" "\$@" || true
+elif [ -n "\${V11_HOME:-}" ] && [ -x "\${V11_HOME}/hooks/post-commit-close-tasks" ]; then
+    "\${V11_HOME}/hooks/post-commit-close-tasks" "\$@" || true
+fi
+
+exit \$_d1_exit
+WRAPPER
+        chmod +x "$HOOK_TARGET"
+
+        # Verify the tracked source file is UNMODIFIED.
+        _md5_after="$(md5sum "$_resolved" 2>/dev/null | awk '{print $1}' || true)"
+        if [ -n "$_md5_before" ] && [ "$_md5_before" != "$_md5_after" ]; then
+            echo "ERROR: tracked source file was modified during install (md5 changed)!" >&2
+            echo "       Before: $_md5_before  After: $_md5_after" >&2
+            echo "       File: $_resolved" >&2
+            exit 1
+        fi
+
+        echo "[install-postcommit-hook] method=symlink-replaced-with-wrapper target=$HOOK_TARGET" >&2
+        echo "[install-postcommit-hook] Tracked source preserved (md5=$_md5_before): $_resolved" >&2
+    fi
+
+else
+    # ── Case 3: Regular file — back up and append shim ────────────────────────
+    _BACKUP="${HOOK_TARGET}.pre-v11"
+
+    if [ "$DRY_RUN" -eq 1 ]; then
+        echo "DRY-RUN: action=append-shim target=$HOOK_TARGET backup=$_BACKUP"
+        echo "DRY-RUN: existing content will be preserved, V11 shim appended at end"
+    else
+        if [ ! -f "$_BACKUP" ]; then
+            cp "$HOOK_TARGET" "$_BACKUP"
+            echo "[install-postcommit-hook] Backed up existing hook to $_BACKUP" >&2
+        fi
+
+        # Append shim call (won't fire if hook already contains V11 marker — guarded above)
+        cat >> "$HOOK_TARGET" <<'SHIM'
+
+# --- V11 post-commit-close-tasks shim (appended by install-postcommit-hook) ---
+# Auto-close matching V11 tasks on commit. Rollback: V11_POSTCOMMIT_AUTOCLOSE=off
+if [ -n "${V11_HOME:-}" ] && [ -x "${V11_HOME}/hooks/post-commit-close-tasks" ]; then
+    "${V11_HOME}/hooks/post-commit-close-tasks" "$@" || true
+elif [ -x "$HOME/v11/hooks/post-commit-close-tasks" ]; then
+    "$HOME/v11/hooks/post-commit-close-tasks" "$@" || true
+fi
+SHIM
+
+        chmod +x "$HOOK_TARGET"
+        echo "[install-postcommit-hook] method=appended-shim Appended V11 shim to existing hook at $HOOK_TARGET" >&2
+    fi
+fi
+
+if [ "$DRY_RUN" -eq 0 ]; then
+    echo ""
+    echo "V11 post-commit-close-tasks installed for: $PROJECT_PATH"
+    echo ""
+    echo "Rollback env vars:"
+    echo "  V11_POSTCOMMIT_AUTOCLOSE=off  — disable auto-close entirely"
+    echo "  V11_POSTCOMMIT_DRYRUN=on      — dry-run: plan to stderr, write nothing"
+    echo ""
+    echo "Dry-run gate (recommended before going live):"
+    echo "  export V11_POSTCOMMIT_DRYRUN=on"
+    echo "  git commit --allow-empty -m 'test: verify dry-run'"
+    echo "  unset V11_POSTCOMMIT_DRYRUN"
+fi

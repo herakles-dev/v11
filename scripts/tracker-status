@@ -1,0 +1,227 @@
+#!/bin/bash
+# V11 Script: tracker-status
+# Shows which tracking artifacts exist/missing for a V11 project.
+# Checks required artifacts (always needed) and conditional artifacts
+# (needed based on scope: task count, formation, Cynefin domain).
+#
+# Usage: ./scripts/tracker-status [PROJECT_NAME] [--json]
+#
+# Exit codes:
+#   0 - All required/applicable artifacts present
+#   1 - Missing required or applicable conditional artifacts
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+V11_HOME="$(cd "$SCRIPT_DIR/.." && pwd)"
+source "$SCRIPT_DIR/../hooks/lib/common.sh" 2>/dev/null || {
+  echo "ERROR: hooks/lib/common.sh not found" >&2; exit 1
+}
+
+# ---------------------------------------------------------------------------
+# Args
+# ---------------------------------------------------------------------------
+JSON_MODE=false
+PROJECT=""
+
+for arg in "$@"; do
+  case "$arg" in
+    --json) JSON_MODE=true ;;
+    --help|-h) echo "Usage: $(basename "$0") [PROJECT_NAME] [--json]"; exit 0 ;;
+    *) PROJECT="$arg" ;;
+  esac
+done
+
+# Auto-detect project if not specified
+# SEC-C-02 (Wave 3a): use sanitizing reader, not raw cat. Consistent with
+# hooks/session-end, hooks/fix-team-model, scripts/handoff et al.
+if [ -z "$PROJECT" ]; then
+  PROJECT="$(v11_read_active_project)"
+fi
+
+if [ -z "$PROJECT" ]; then
+  echo "ERROR: No project specified and no active project detected." >&2
+  echo "Usage: $(basename "$0") PROJECT_NAME [--json]" >&2
+  exit 1
+fi
+
+# Sanitize user-supplied PROJECT argument (v11_read_active_project already sanitized
+# the auto-detected case, but CLI arg still needs validation).
+if [[ "$PROJECT" == *".."* ]] || [[ "$PROJECT" == *"/"* ]] || [[ "$PROJECT" =~ [^a-zA-Z0-9._-] ]]; then
+  echo "ERROR: Invalid project name: $PROJECT" >&2; exit 1
+fi
+
+SESSION_DIR="$SESSIONS_ROOT/$PROJECT"
+if [ ! -d "$SESSION_DIR" ]; then
+  echo "ERROR: Session directory not found: $SESSION_DIR" >&2
+  exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# Read scope signals
+# ---------------------------------------------------------------------------
+TASK_COUNT=0
+HAS_FORMATION=false
+CYNEFIN="confused"
+MULTI_SPRINT=false
+HAS_AUDIT=false
+
+# Task count from task-state
+TASK_STATE=""
+if [ -f "$TASK_STATE_DIR/${PROJECT}.json" ]; then
+  TASK_STATE="$TASK_STATE_DIR/${PROJECT}.json"
+elif [ -f "$SESSION_DIR/.task-state.json" ]; then
+  TASK_STATE="$SESSION_DIR/.task-state.json"
+fi
+
+if [ -n "$TASK_STATE" ]; then
+  TASK_COUNT=$(jq -r '.total // 0' "$TASK_STATE" 2>/dev/null || echo 0)
+fi
+
+# Formation: .formation-registry.json (legacy) OR spec.md ## Formation/## Agents (V11.11+)
+if [ -f "$SESSION_DIR/.formation-registry.json" ]; then
+  HAS_FORMATION=true
+elif [ -f "$SESSION_DIR/spec.md" ] && \
+     grep -qE '^## (Formation|Agents)\b' "$SESSION_DIR/spec.md" 2>/dev/null; then
+  HAS_FORMATION=true
+fi
+
+# Cynefin from plan-context
+if [ -f "$SESSION_DIR/.plan-context.json" ]; then
+  CYNEFIN=$(jq -r '.domain.cynefin // "confused"' "$SESSION_DIR/.plan-context.json" 2>/dev/null || echo "confused")
+fi
+
+# Multi-sprint (task count > 20 or gates.md exists)
+if [ "$TASK_COUNT" -ge 21 ] || [ -f "$SESSION_DIR/gates.md" ]; then
+  MULTI_SPRINT=true
+fi
+
+# Audit (findings in task-state)
+if [ -n "$TASK_STATE" ]; then
+  AUDIT_TOTAL=$(jq -r '.findings_summary.total_raw // 0' "$TASK_STATE" 2>/dev/null || echo 0)
+  if [ "$AUDIT_TOTAL" -gt 0 ]; then
+    HAS_AUDIT=true
+  fi
+fi
+
+# ---------------------------------------------------------------------------
+# Define artifact checks
+# ---------------------------------------------------------------------------
+FAILURES=0
+WARNINGS=0
+
+check_artifact() {
+  local name="$1"
+  local path="$2"
+  local tier="$3"       # required, conditional, optional
+  local condition="$4"  # human-readable condition
+  local applicable="$5" # true/false — is the condition met?
+
+  local exists=false
+  local status=""
+  local last_mod=""
+
+  if [ -f "$SESSION_DIR/$path" ]; then
+    exists=true
+    last_mod=$(stat -c %Y "$SESSION_DIR/$path" 2>/dev/null || echo "")
+  fi
+
+  if [ "$tier" = "required" ]; then
+    if [ "$exists" = true ]; then
+      status="PASS"
+    else
+      status="FAIL"
+      FAILURES=$((FAILURES + 1))
+    fi
+  elif [ "$tier" = "conditional" ]; then
+    if [ "$applicable" = "true" ]; then
+      if [ "$exists" = true ]; then
+        status="PASS"
+      else
+        status="WARN"
+        WARNINGS=$((WARNINGS + 1))
+      fi
+    else
+      if [ "$exists" = true ]; then
+        status="PASS"
+      else
+        status="SKIP"
+      fi
+    fi
+  else  # optional
+    if [ "$exists" = true ]; then
+      status="PASS"
+    else
+      status="SKIP"
+    fi
+  fi
+
+  if [ "$JSON_MODE" = true ]; then
+    echo "{\"name\":\"$name\",\"path\":\"$path\",\"tier\":\"$tier\",\"exists\":$exists,\"status\":\"$status\",\"condition\":\"$condition\"}"
+  else
+    printf "  [%-4s] %-25s %-12s %s\n" "$status" "$name" "$tier" "$condition"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Run checks
+# ---------------------------------------------------------------------------
+if [ "$JSON_MODE" = false ]; then
+  echo "=== V11 Tracker Status: $PROJECT ==="
+  echo ""
+  echo "Scope Signals:"
+  echo "  Tasks: $TASK_COUNT | Formation: $HAS_FORMATION | Cynefin: $CYNEFIN"
+  echo "  Multi-sprint: $MULTI_SPRINT | Audit: $HAS_AUDIT"
+  echo ""
+  echo "Artifacts:"
+fi
+
+if [ "$JSON_MODE" = true ]; then
+  echo "["
+fi
+
+# Required artifacts (always)
+check_artifact "spec.md" "spec.md" "required" "always" "true"
+check_artifact ".task-state.json" ".task-state.json" "required" "always" "true"
+check_artifact ".autonomy-state" ".autonomy-state" "required" "always" "true"
+check_artifact ".plan-context.json" ".plan-context.json" "required" "always" "true"
+
+# Conditional: roadmap (10+ tasks)
+ROAD_APPLICABLE=false
+[ "$TASK_COUNT" -ge 10 ] && ROAD_APPLICABLE=true
+check_artifact "roadmap.md" "roadmap.md" "conditional" "task_count >= 10" "$ROAD_APPLICABLE"
+
+# Conditional: architecture (Complex/Chaotic)
+ARCH_APPLICABLE=false
+[ "$CYNEFIN" = "complex" ] || [ "$CYNEFIN" = "chaotic" ] && ARCH_APPLICABLE=true
+check_artifact "architecture.md" "architecture.md" "conditional" "cynefin=complex|chaotic" "$ARCH_APPLICABLE"
+
+# Conditional: gates (multi-sprint)
+check_artifact "gates.md" "gates.md" "conditional" "multi_sprint" "$MULTI_SPRINT"
+
+# Conditional: formation registry
+check_artifact ".formation-registry.json" ".formation-registry.json" "conditional" "has_formation" "$HAS_FORMATION"
+
+# Optional
+check_artifact "handoff.md" "handoff.md" "optional" "" "false"
+check_artifact ".session-manifest.json" ".session-manifest.json" "optional" "" "false"
+
+if [ "$JSON_MODE" = true ]; then
+  echo "]"
+fi
+
+# ---------------------------------------------------------------------------
+# Summary
+# ---------------------------------------------------------------------------
+if [ "$JSON_MODE" = false ]; then
+  echo ""
+  if [ "$FAILURES" -gt 0 ]; then
+    echo "Result: $FAILURES FAIL, $WARNINGS WARN — missing required artifacts"
+  elif [ "$WARNINGS" -gt 0 ]; then
+    echo "Result: 0 FAIL, $WARNINGS WARN — consider creating conditional artifacts"
+  else
+    echo "Result: All applicable artifacts present"
+  fi
+fi
+
+exit "$FAILURES"

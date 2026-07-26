@@ -1,0 +1,3007 @@
+#!/bin/bash
+# V11 Hook: sync-tasks (PostToolUse — TaskCreate|TaskUpdate|TaskList)
+# Writes centralized task state to ~/.agent-metrics/task-state/{project}.json
+#
+# Replaces V8 sync-task-state (198 lines) by using lib/common.sh and flock.
+# Project detection: metadata.project -> active-project file
+#
+# Exit codes:
+#   0 - Always (PostToolUse hooks never block)
+
+source "$(dirname "${BASH_SOURCE[0]}")/lib/common.sh"
+
+# Self-test for hook validation
+if [ "$1" == "--test" ]; then
+    echo "sync-tasks v1"
+    exit 0
+fi
+
+# --- Parse input ---
+v11_parse_input
+
+# Only handle Task tools
+case "$V11_TOOL_NAME" in
+    TaskCreate|TaskUpdate|TaskList|TaskGet) ;;
+    *) exit 0 ;;
+esac
+
+# --- Session heartbeat (subdir-staleness fix) ---
+# v11_session_is_live() judges liveness by the newest TOP-LEVEL file mtime in
+# sessions/$uuid/ (find -maxdepth 1). A session whose only recent writes land
+# in a subdirectory is misjudged dead even though it's actively working,
+# letting another session steal its claims. Fix: touch a dedicated top-level
+# file once per sync-tasks invocation so there's always a guaranteed-fresh
+# top-level signal. Cheap (empty touch), idempotent, skipped for legacy-cli
+# (never considered live regardless, per v11_session_is_live).
+_v11_hb_uuid="$(v11_session_uuid)"
+if [ "$_v11_hb_uuid" != "legacy-cli" ]; then
+    _v11_hb_dir="$METRICS_DIR/sessions/$_v11_hb_uuid"
+    mkdir -p "$_v11_hb_dir" 2>/dev/null
+    touch "$_v11_hb_dir/.heartbeat" 2>/dev/null
+fi
+
+# --- Parse task details from output ---
+TASK_ID=""
+TASK_STATUS=""
+
+# HS-005 (Wave 3c): POSIX-compatible task ID extraction.
+# Was: grep -oiP 'task #\K\d+' (GNU grep only — silently returns empty on BSD/macOS/Alpine).
+# Now: sed -n fallback works on any POSIX sed. Kept sed-only since primary path is
+# jq against structured output; the regex is only a fallback for text-only responses.
+_extract_task_id() {
+    sed -n 's/.*[Tt]ask #\([0-9][0-9]*\).*/\1/p' | head -1
+}
+
+case "$V11_TOOL_NAME" in
+    TaskCreate)
+        # Claude Code emits tool_response = {task: {id, subject}}. Legacy text fixtures
+        # use "Task #N created successfully: SUBJECT". Chain: structured .task.id →
+        # bare .id → regex on raw text. The regex preserves back-compat for any
+        # legacy fixture that bypasses the structured response.
+        TASK_ID=$(printf '%s' "$V11_TOOL_OUTPUT" | jq -r '.task.id // .id // ""' 2>/dev/null)
+        [ -z "$TASK_ID" ] && TASK_ID=$(printf '%s' "$V11_TOOL_OUTPUT" | _extract_task_id)
+        TASK_STATUS="pending"
+        TASK_SUBJECT=$(printf '%s' "$V11_RAW_INPUT" | jq -r '.tool_input.subject // ""' 2>/dev/null)
+        TASK_DESCRIPTION=$(printf '%s' "$V11_RAW_INPUT" | jq -r '.tool_input.description // ""' 2>/dev/null)
+        ;;
+    TaskUpdate)
+        # Primary: structured tool_input.taskId. Fallbacks: tool_response.taskId
+        # (Claude Code emits {success, taskId, statusChange}) then legacy text regex.
+        TASK_ID=$(printf '%s' "$V11_RAW_INPUT" | jq -r '.tool_input.taskId // ""' 2>/dev/null)
+        [ -z "$TASK_ID" ] && TASK_ID=$(printf '%s' "$V11_TOOL_OUTPUT" | jq -r '.taskId // ""' 2>/dev/null)
+        [ -z "$TASK_ID" ] && TASK_ID=$(printf '%s' "$V11_TOOL_OUTPUT" | _extract_task_id)
+        TASK_STATUS=$(printf '%s' "$V11_RAW_INPUT" | jq -r '.tool_input.status // ""' 2>/dev/null)
+        # Legacy aliasing: TASK_SUBJECT pulls from .tool_input.description for the
+        # recent_completed/blocked_tasks audit trail and active_task display. Kept
+        # for back-compat; the audit subject "best-effort" reads the description
+        # because pre-V11.14 TaskUpdate had no real subject field plumbed here.
+        TASK_SUBJECT=$(printf '%s' "$V11_RAW_INPUT" | jq -r '.tool_input.description // ""' 2>/dev/null)
+        # V11.14.1: real subject refresh, used to update open_tasks[$id].subject
+        # without clobbering it with the description payload. Empty when the
+        # caller didn't pass a subject (the common case for status flips).
+        TASK_SUBJECT_NEW=$(printf '%s' "$V11_RAW_INPUT" | jq -r '.tool_input.subject // ""' 2>/dev/null)
+        TASK_DESCRIPTION=$(printf '%s' "$V11_RAW_INPUT" | jq -r '.tool_input.description // ""' 2>/dev/null)
+        ;;
+esac
+# Normalize jq "null" → empty for downstream conditionals
+[ "$TASK_DESCRIPTION" = "null" ] && TASK_DESCRIPTION=""
+[ "${TASK_SUBJECT_NEW:-}" = "null" ] && TASK_SUBJECT_NEW=""
+[ "${TASK_SUBJECT:-}" = "null" ] && TASK_SUBJECT=""
+
+# R2.3 (W1-T2): never-null subjects. TaskCreate previously stored subject as
+# null whenever tool_input.subject was empty, producing "Task #N: unknown" in
+# handoffs. Fall back to the first 60 chars of description (single line,
+# trimmed) when subject is empty; only remain null when BOTH are empty.
+if [ "$V11_TOOL_NAME" = "TaskCreate" ] && [ -z "$TASK_SUBJECT" ] && [ -n "$TASK_DESCRIPTION" ]; then
+    TASK_SUBJECT=$(printf '%s' "$TASK_DESCRIPTION" | tr '\n\r\t' '   ' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' | cut -c1-60)
+fi
+
+# Guard: if TASK_ID is still empty for TaskCreate/TaskUpdate, log and exit cleanly
+if [ -z "$TASK_ID" ] && { [ "$V11_TOOL_NAME" = "TaskCreate" ] || [ "$V11_TOOL_NAME" = "TaskUpdate" ]; }; then
+    echo "sync-tasks: could not extract task id from $V11_TOOL_NAME" >&2
+    exit 0
+fi
+
+# --- Detect project ---
+PROJECT=""
+
+# Strategy 1: Explicit metadata.project in tool input
+PROJECT=$(printf '%s' "$V11_RAW_INPUT" | jq -r '.tool_input.metadata.project // ""' 2>/dev/null)
+[ "$PROJECT" = "null" ] && PROJECT=""
+PROJECT_SOURCE="metadata"
+# V11.15.3: remember whether the caller passed metadata.project explicitly.
+# Drives the Bug-E quick-win advisory below and distinguishes a clean Strategy
+# 1 attribution from the recovered-from-task-record path.
+EXPLICIT_METADATA_PROJECT="$PROJECT"
+
+# Strategy 1.5a (V11.15.3 — Bug E root fix, refined V11.24): when metadata.project
+# is absent but a TASK_ID is present, resolve from the task's OWN open_tasks
+# entry in the per-session state. Note V11.24 split: the existing fallthrough
+# to .project (the session's bound project) used to live here, but it could
+# silently misroute when the session is bound to project A while the task was
+# created against project B via metadata.project (V11.18+ session-bind drift).
+# That fallback now lives at Strategy 1.5c BELOW Strategy 1.6, so the durable
+# ledger gets first pass at finding the task's true home.
+#
+# Perf: single jq pass captures BOTH the task-specific path and the
+# session-state .project. _v11_sess_project_cached is consumed by Strategy
+# 1.5c below to avoid a second jq invocation on the same file (saves ~50ms
+# per sync-tasks call on the hot TaskUpdate path).
+_v11_sess_project_cached=""
+_v11_ss_path_cached=""
+if [ -z "$PROJECT" ] && [ -n "$TASK_ID" ]; then
+    _v11_ss_path_cached="$(v11_session_state_path)"
+    if [ -f "$_v11_ss_path_cached" ] && [ -s "$_v11_ss_path_cached" ]; then
+        # Tab-separated: <task_metadata_project>\t<session_state_project>.
+        # neither value can contain a TAB by SEC-C-02 whitelist.
+        _v11_ss_combo=$(jq -r --arg id "$TASK_ID" '
+            [(.open_tasks[$id].metadata.project // ""),
+             (.project // "")] | @tsv
+        ' "$_v11_ss_path_cached" 2>/dev/null)
+        _v11_rec_project=$(printf '%s' "$_v11_ss_combo" | cut -f1)
+        _v11_sess_project_cached=$(printf '%s' "$_v11_ss_combo" | cut -f2)
+        [ "$_v11_rec_project" = "null" ] && _v11_rec_project=""
+        [ "$_v11_sess_project_cached" = "null" ] && _v11_sess_project_cached=""
+        # SEC-C-02 parity: enforce the same whitelist v11_read_active_project
+        # applies, since this value is concatenated into filesystem paths
+        # (sessions/$PROJECT/...) downstream.
+        if [ -n "$_v11_rec_project" ] \
+           && printf '%s' "$_v11_rec_project" | grep -qE '^[a-zA-Z0-9._-]{1,64}$'; then
+            PROJECT="$_v11_rec_project"
+            PROJECT_SOURCE="task-own-record"
+        fi
+    fi
+fi
+
+# Strategy 1.6 (V11.24 — session-bind drift fix): consult the durable V11.16
+# ledger for the task's true home, keyed by (session_uuid, task_id).
+#
+# Why this exists: detect-project (V11.18+) BINDS each session to the first
+# project it sees and suppresses cross-project drift — a safety feature.
+# But when a session is bound to project A and the user creates tasks for
+# project B (via metadata.project on TaskCreate), the TaskCreate events
+# correctly land in project B's ledger (Strategy 1 / 1.5a), but later
+# TaskUpdate(completed) calls without an explicit metadata.project would
+# fall through to .project (project A) at the old Strategy 1.5 fallthrough,
+# silently misrouting the terminal completion event. The completion + its
+# artifacts + counters_delta would all go to project A's ledger and never
+# fold into project B's aggregate — exactly the V11.15.4 misroute class.
+#
+# Fix: since (session_uuid, task_id) is a unique pair within a Claude Code
+# session (IDs start at 1 per session), we can ask the durable ledger
+# directly: "which project saw a 'created' event for THIS session_uuid +
+# TASK_ID?". That project IS the task's home, by V11.23 per-task routing
+# contract. Strategies 1 and 1.5a still take precedence (cheaper + no
+# filesystem scan); 1.6 runs only when those fail to resolve.
+#
+# Cost: one grep + jq per ledger file. ~100-200 jsonl files on typical hosts;
+# bounded by file count, not file size (we early-out on grep miss). Acceptable
+# for the rare path (never fires when Strategy 1 succeeds).
+#
+# Rollback: V11_LEDGER_TASK_HOME=off restores old behavior (Strategy 1.5
+# fallthrough to .project).
+if [ -z "$PROJECT" ] && [ -n "$TASK_ID" ] && [ "${V11_LEDGER_TASK_HOME:-on}" != "off" ]; then
+    _v11_sess_uuid="$(v11_session_uuid)"
+    _v11_ledger_dir="${METRICS_DIR}/ledger"
+    # Will hold the matched created event's subject_norm + create_seq so the
+    # downstream identity-resolution ladder (Step 1-4) finds them pre-populated
+    # instead of falling through to LEDGER-IDENTITY-MISS. TaskUpdate payloads
+    # don't carry a subject, so without this we'd resolve PROJECT correctly
+    # but still skip the ledger write — defeating the purpose of Strategy 1.6.
+    V11_LEDGER_TASK_HOME_SUBJ_NORM=""
+    V11_LEDGER_TASK_HOME_CREATE_SEQ=""
+    if [ -n "$_v11_sess_uuid" ] && [ "$_v11_sess_uuid" != "legacy-cli" ] \
+       && [ -d "$_v11_ledger_dir" ]; then
+        _v11_found_project=""
+        for _f in "$_v11_ledger_dir"/*.jsonl; do
+            [ -f "$_f" ] || continue
+            # Cheap pre-filter: most ledgers won't contain this session_uuid.
+            # Two greps because session_uuid and task_id may not be adjacent.
+            if grep -q "\"session_uuid\":\"$_v11_sess_uuid\"" "$_f" 2>/dev/null \
+               && grep -q "\"task_id\":\"$TASK_ID\"" "$_f" 2>/dev/null; then
+                # Single jq pass extracts project + subject_norm + create_seq
+                # as TAB-separated. subject_norm is whitespace-normalized at
+                # TaskCreate so it never contains a TAB (v11_normalize_subject).
+                _v11_match=$(jq -r --arg sid "$_v11_sess_uuid" --arg tid "$TASK_ID" '
+                    select(.ev == "created" and .session_uuid == $sid and .task_id == $tid)
+                    | [(.project // ""), (.subject_norm // ""), ((.create_seq // 0) | tostring)]
+                    | @tsv
+                ' "$_f" 2>/dev/null | head -n 1)
+                if [ -n "$_v11_match" ]; then
+                    _v11_found_project=$(printf '%s' "$_v11_match" | cut -f1)
+                    V11_LEDGER_TASK_HOME_SUBJ_NORM=$(printf '%s' "$_v11_match" | cut -f2)
+                    V11_LEDGER_TASK_HOME_CREATE_SEQ=$(printf '%s' "$_v11_match" | cut -f3)
+                    if [ -n "$_v11_found_project" ] && [ "$_v11_found_project" != "null" ]; then
+                        break
+                    fi
+                    _v11_found_project=""
+                fi
+            fi
+        done
+        if [ -n "$_v11_found_project" ] \
+           && printf '%s' "$_v11_found_project" | grep -qE '^[a-zA-Z0-9._-]{1,64}$'; then
+            PROJECT="$_v11_found_project"
+            PROJECT_SOURCE="ledger-task-home"
+            echo "[v11.24-strategy-1.6] resolved project='${_v11_found_project}' via ledger-task-home for task #${TASK_ID} (session=${_v11_sess_uuid})" >&2
+        else
+            # Clear identity fields if project didn't validate so we don't
+            # cross-contaminate the downstream ladder with stale state.
+            V11_LEDGER_TASK_HOME_SUBJ_NORM=""
+            V11_LEDGER_TASK_HOME_CREATE_SEQ=""
+        fi
+    fi
+fi
+
+# Strategy 1.5c (was the .project fallthrough of pre-V11.24 Strategy 1.5):
+# the session's bound .project field. Runs AFTER Strategy 1.6 so a task with
+# a known home in the ledger always wins over the session's ambient bind.
+# Still preserves the original Bug E protection — immune to active-project
+# global drift, just deferred so it can't shadow the durable ledger.
+#
+# Perf: reuses _v11_sess_project_cached from Strategy 1.5a's combined jq pass.
+if [ -z "$PROJECT" ] && [ -n "$TASK_ID" ] && [ -n "$_v11_sess_project_cached" ]; then
+    if printf '%s' "$_v11_sess_project_cached" | grep -qE '^[a-zA-Z0-9._-]{1,64}$'; then
+        PROJECT="$_v11_sess_project_cached"
+        PROJECT_SOURCE="session-state-project"
+    fi
+fi
+
+# Strategy 2: Active project file (set by guard-task-state or previous sync)
+# SEC-C-02: sanitized read — rejects path-traversal / metacharacter payloads
+# Last resort only: ambient + globally mutable. Strategies 1 and 1.5 run first
+# so signal drift can never overwrite a task with a known home (Bug E).
+if [ -z "$PROJECT" ]; then
+    PROJECT="$(v11_read_active_project)"
+    PROJECT_SOURCE="active-project-fallback"
+fi
+
+# No project found -> nothing to sync
+[ -z "$PROJECT" ] && exit 0
+
+# M3 (meta-improvement 2026-05): warn when TaskCreate falls back to active-project.
+# This is the most common cross-session contamination vector: a task created in
+# session A without metadata.project gets attributed to whatever active-project
+# is set, polluting that project's task list. The warning makes the implicit
+# attribution visible. TaskUpdate/TaskList don't typically carry metadata in
+# the input, so we only warn on TaskCreate to keep noise low.
+if [ "$V11_TOOL_NAME" = "TaskCreate" ] && [ "$PROJECT_SOURCE" = "active-project-fallback" ]; then
+    echo "sync-tasks: TaskCreate without metadata.project — implicitly attributed to '$PROJECT' via active-project. Pass metadata.project explicitly to be safe." >&2
+fi
+
+# V11.15.3 (Bug E quick-win): a terminal completed TaskUpdate is the moment
+# review/meta-feedback artifacts are persisted and per-agent ledger lines are
+# written — the highest-blast-radius event for cross-project contamination.
+# Warn whenever it arrives without an explicit metadata.project, even when
+# Strategy 1.5 successfully recovered it, so the discipline slip stays visible
+# (CLAUDE.md §1: ALWAYS pass metadata.project on the terminal completed
+# TaskUpdate, not just TaskCreate).
+if [ "$V11_TOOL_NAME" = "TaskUpdate" ] && [ "$TASK_STATUS" = "completed" ] \
+   && [ -z "$EXPLICIT_METADATA_PROJECT" ]; then
+    echo "sync-tasks: ADVISORY — TaskUpdate(completed) for task #${TASK_ID:-?} without metadata.project; resolved to '$PROJECT' via ${PROJECT_SOURCE}. Artifact + ledger writes ride this event — pass metadata.project explicitly on terminal completions (CLAUDE.md §1, Bug E)." >&2
+fi
+
+# --- V11.8 (S1-7, S1-8): STR candidate cache + advisory helper ---
+# Refresh STR candidates from spec-requirements-extract when cache is older than spec.md.
+# Cached output is used to surface candidates inline with the sync-tasks advisory.
+_v11_refresh_str_candidates() {
+    local project="$1"
+    local spec_file="$SESSIONS_ROOT/$project/spec.md"
+    local cache_file="$SESSIONS_ROOT/$project/.str-candidates.json"
+    local extract_script="$V11_HOME/scripts/spec-requirements-extract"
+    [ -f "$spec_file" ] || return 1
+    [ -x "$extract_script" ] || return 1
+    # Reuse cache if newer than spec.md
+    if [ -f "$cache_file" ] && [ "$cache_file" -nt "$spec_file" ]; then
+        return 0
+    fi
+    # Refresh cache (best-effort; any failure leaves cache stale but usable)
+    "$extract_script" "$project" --json >"$cache_file" 2>/dev/null || return 1
+    return 0
+}
+
+# Emit STR advisory on complex/novel task transitions (in_progress or completed).
+# Respects metadata.no_str=true override. Surfaces candidates from cache when available.
+_v11_str_advisory() {
+    local task_id="$1" complexity="$2" str_count="$3" no_str="$4" phase="$5"
+    [ "$complexity" = "complex" ] || [ "$complexity" = "novel" ] || return 0
+    [ "${str_count:-0}" = "0" ] || return 0
+    [ "$no_str" = "true" ] && return 0
+
+    local severity="ADVISORY"
+    [ "$phase" = "completed" ] && severity="GATE-12-VIOLATION"
+
+    echo "" >&2
+    echo "${severity} (Dark Code Layer 1, V11.8): Task #${task_id} is complexity=${complexity} with zero spec_test_requirements." >&2
+
+    # Surface cached candidates when available
+    local cache_file="$SESSIONS_ROOT/$PROJECT/.str-candidates.json"
+    _v11_refresh_str_candidates "$PROJECT" 2>/dev/null
+    if [ -f "$cache_file" ] && command -v jq >/dev/null 2>&1; then
+        local candidate_sample
+        candidate_sample=$(jq -r '.[0:3] | .[] | "  - " + .id + ": " + (.description // .title // "")' "$cache_file" 2>/dev/null)
+        if [ -n "$candidate_sample" ]; then
+            echo "  Candidate STRs from spec.md:" >&2
+            printf '%s\n' "$candidate_sample" >&2
+        fi
+    fi
+
+    if [ "$phase" = "completed" ]; then
+        echo "  This task should not have completed without STRs or metadata.no_str=true." >&2
+        echo "  Remedy: either attach STRs (TaskUpdate metadata.spec_test_requirements=[...])" >&2
+        echo "  or set metadata.no_str=true as an explicit override with justification." >&2
+    else
+        echo "  Attach STRs before marking completed:" >&2
+        echo "    - TaskUpdate metadata.spec_test_requirements=[\"STR-XXX\", ...]" >&2
+        echo "    - OR metadata.no_str=true (explicit override; use sparingly)" >&2
+    fi
+    echo "" >&2
+    return 1  # caller uses this to bump a counter
+}
+
+# Persist active project for downstream hooks
+mkdir -p "$(dirname "$ACTIVE_PROJECT_FILE")"
+printf '%s\n' "$PROJECT" > "$ACTIVE_PROJECT_FILE"
+
+# --- Load or initialize task state ---
+# V11.13: per-session ownership. Source of truth is now
+#   $METRICS_DIR/sessions/$V11_SESSION_ID/task-state.json
+# (or sessions/legacy-cli/task-state.json when V11_SESSION_ID is unset).
+# Project aggregate at $TASK_STATE_DIR/$PROJECT.json + mirror is rebuilt at the
+# end of this hook by v11_rebuild_project_aggregate (no per-session "+= 1"
+# against a shared project file, no cross-session destructive merges).
+SESSION_UUID="$(v11_session_uuid)"
+STATE_FILE="$(v11_session_state_path)"
+mkdir -p "$(dirname "$STATE_FILE")"
+NOW=$(date -Iseconds)
+
+# --- V11.15.3 (Bug G): serialize the ENTIRE read-modify-write ---
+# Pre-fix, STATE was read below OUTSIDE any lock and only the final write took
+# flock. Two sync-tasks invocations firing for one assistant message (e.g.
+# parallel TaskUpdate calls) both snapshotted the same STATE; the second write
+# clobbered the first's counter increments / recent_completed entries (classic
+# lost update). flock guarding only the write cannot fix this — the READ must
+# be in the same critical section. We acquire the per-session lock here, before
+# the read, on a dedicated FD. v11.33: it is released explicitly right after the
+# LAST STATE write (before the aggregate rebuild — see the "(d)-lite" release
+# below), not held to process exit; every STATE write still happens inside the
+# hold, so the nested-flock-removal rationale below is unchanged. Lock
+# granularity is the per-session STATE_FILE, so distinct
+# Claude sessions never falsely contend (each owns its own file → own lock).
+# -w timeout: on pathological (>10s) contention, warn and proceed rather than
+# hang the user's TaskUpdate — a rare lost update beats a stuck tool. The
+# nested flock in the final write block is removed (we already hold this lock;
+# re-locking the same file via another FD in-process would deadlock).
+# T7-round3: made the wait budget overridable (default unchanged at 10s) —
+# under real pytest-xdist -n8 contention, 4 same-session concurrent
+# TaskUpdate(completed) calls reliably blew past 10s (each full sync-tasks
+# invocation holds this lock for its ENTIRE lifetime, not just the
+# read-modify-write, so 4 concurrent callers serialize to ~4x one call's
+# duration), hitting this exact fallback and losing an update — confirmed via
+# the literal "lock contention >10s ... proceeding unserialized" stderr line.
+# No hook-side fix closes this without either the override below or removing
+# the fallback's lossiness outright; tests that intentionally exercise heavy
+# same-session concurrency can raise their own budget via this var without
+# changing default production behavior.
+_V11_SYNC_LOCK_TIMEOUT="${V11_SYNC_TASKS_LOCK_TIMEOUT:-10}"
+# v11.33: _V11_SYNC_RACED records whether we took the unserialized fallback so
+# the end-of-hook scratch-reconcile record + the top-of-hook marker drain can
+# make the derived per-session scratch converge to the (already lossless) ledger.
+_V11_SYNC_RACED=0
+exec 201>"$STATE_FILE.lock"
+flock -w "$_V11_SYNC_LOCK_TIMEOUT" 201 || { _V11_SYNC_RACED=1; echo "sync-tasks: lock contention >${_V11_SYNC_LOCK_TIMEOUT}s on $STATE_FILE.lock; proceeding unserialized (ledger stays lossless; per-session scratch reconciled on next locked call — v11.33)" >&2; }
+
+if [ -f "$STATE_FILE" ] && [ -s "$STATE_FILE" ] && jq empty "$STATE_FILE" 2>/dev/null; then
+    STATE=$(cat "$STATE_FILE")
+    # Self-heal: ensure session_uuid + project are stamped (e.g. file pre-dates V11.13)
+    STATE=$(printf '%s' "$STATE" | jq \
+        --arg sid "$SESSION_UUID" \
+        --arg project "$PROJECT" '
+        (.session_uuid //= $sid)
+        | (.project //= $project)
+    ')
+else
+    # File missing, empty, or invalid JSON — initialize fresh state
+    [ -f "$STATE_FILE" ] && ! [ -s "$STATE_FILE" ] && echo "sync-tasks: state file empty/invalid, reinitializing ($STATE_FILE)" >&2
+    STATE=$(jq -n --arg sid "$SESSION_UUID" --arg project "$PROJECT" --arg now "$NOW" '{
+        session_uuid: $sid,
+        project: $project,
+        total: 0, completed: 0, pending: 0,
+        in_progress: 0, blocked: 0,
+        phase: "discovery",
+        active_task: null, active_task_ids: [],
+        recent_completed: [],
+        last_updated: $now
+    }')
+fi
+
+# --- v11.33: scratch-reconcile marker drain ---
+# A prior invocation that took the unserialized fallback (FD-201 timeout) may
+# have had its terminal (completed|blocked) STATE write clobbered by a concurrent
+# same-session writer, recording the lost delta in $STATE_FILE.needs-reconcile
+# (+ per-task artifact sidecars). We hold FD-201 now (non-raced path), so fold
+# those lost transitions back into the in-memory STATE before the current event
+# processes; the normal end-of-hook write then persists them and the marker files
+# are removed only AFTER that write succeeds (below), so a write failure never
+# drops an un-persisted delta. v11_apply_reconcile_markers is presence-gated and
+# idempotent, so a delta whose write actually survived is a no-op. Skipped on the
+# raced path (a re-lost drain helps nobody) and under the rollback lever.
+# Rollback: V11_SYNC_SCRATCH_RECONCILE=off.
+_V11_RECONCILE_MARKER="$STATE_FILE.needs-reconcile"
+_V11_RECON_DRAINED=0
+if [ "${V11_SYNC_SCRATCH_RECONCILE:-on}" != "off" ] && [ "${_V11_SYNC_RACED:-0}" != "1" ] \
+   && [ -s "$_V11_RECONCILE_MARKER" ]; then
+    _RC_NEW=$(printf '%s' "$STATE" | v11_apply_reconcile_markers "$_V11_RECONCILE_MARKER" "$SESSION_UUID" "$NOW")
+    if [ -n "$_RC_NEW" ] && printf '%s' "$_RC_NEW" | jq empty 2>/dev/null; then
+        STATE="$_RC_NEW"
+        _V11_RECON_DRAINED=1   # cleanup deferred until the end-of-hook STATE write lands
+        echo "sync-tasks: drained scratch-reconcile marker for session $SESSION_UUID (v11.33)" >&2
+    fi
+fi
+
+# --- V11.16: Ledger event accumulator ---
+# LEDGER_EVENT_JSON is set by each branch and emitted once after the STATE write.
+# Invariant: only Strategy-1 (metadata.project) or Strategy-1.5 (task-own-record)
+# attribution is used for the ledger (Bug E/H immunity per ADR §2.3). If the
+# project was resolved only via the active-project fallback (Strategy 2), the
+# ledger write is SKIPPED with an advisory — ambient/mutable global state must
+# never be in the ledger write path.
+LEDGER_EVENT_JSON=""
+
+# --- Update state based on action ---
+case "$V11_TOOL_NAME" in
+    TaskCreate)
+        # S1-B1: accumulator for prescope/scope advisory TEXT (V11_PRESCOPE_ADVISORY /
+        # V11_SCOPE_WARN / V11_PRESCOPE_SMELL below). Those three blocks remain
+        # stderr-only (operator/log visibility, unchanged) but now ALSO append their
+        # message here so the end-of-script PostToolUse block (near the context-usage
+        # tracker) can surface them to the orchestrator MODEL via stdout
+        # hookSpecificOutput.additionalContext — stderr is never read by the model.
+        _V11_ADVISORY_CTX=""
+
+        # S1-B2: accumulator for fired-advisory REASON CODES (missing_scope,
+        # invalid_scope, scope_large, complex_no_deliverable, smell_conjunction,
+        # smell_runbook_steps, smell_length). Each of the three advisory blocks
+        # below appends one reason code per firing; drained into durable-ledger
+        # ev:"prescope" rows after the smell block (see S1-B2 emission below).
+        _V11_PRESCOPE_LEDGER_REASONS=()
+
+        # V11: Advisory schema validation on task metadata
+        METADATA=$(printf '%s' "$V11_RAW_INPUT" | jq -c '.tool_input.metadata // empty' 2>/dev/null)
+        if [ -n "$METADATA" ] && [ "$METADATA" != "null" ] && [ "$METADATA" != "" ]; then
+            SCHEMA_WARN=$(mktemp /tmp/v11-schema-XXXXXX.txt)
+            if ! v11_validate_json "$METADATA" "task-metadata.schema.json" 2>"$SCHEMA_WARN"; then
+                echo "ADVISORY: Task metadata validation warning (task #$TASK_ID):" >&2
+                cat "$SCHEMA_WARN" >&2
+            fi
+            rm -f "$SCHEMA_WARN"
+
+            # V11.7.2: Dark Code Layer 1 — complex/novel tasks should carry
+            # spec_test_requirements so implementers see checkable assertions.
+            # Advisory is also persisted in task-state as a counter so
+            # compliance gate 12 can surface it.
+            COMPLEXITY=$(printf '%s' "$METADATA" | jq -r '.complexity // ""' 2>/dev/null)
+            STR_COUNT=$(printf '%s' "$METADATA" | jq -r '.spec_test_requirements // [] | length' 2>/dev/null)
+            STR_MISSING_THIS_CALL=0
+            if { [ "$COMPLEXITY" = "complex" ] || [ "$COMPLEXITY" = "novel" ]; } && [ "${STR_COUNT:-0}" = "0" ]; then
+                echo "ADVISORY (Dark Code Layer 1): Task #$TASK_ID is complexity=$COMPLEXITY but has no spec_test_requirements." >&2
+                echo "  Consider running: ./scripts/spec-requirements-extract $PROJECT --json" >&2
+                echo "  …then paste the trimmed result into metadata.spec_test_requirements." >&2
+                STR_MISSING_THIS_CALL=1
+            fi
+
+            # V11.11: extract metadata.agent (push-recommend). Stored in
+            # recommended_agents map keyed by task_id; downstream hooks
+            # (track-autonomy, post-compact) read it for audit attribution
+            # when owner/active_agent_id is empty.
+            RECOMMENDED_AGENT=$(printf '%s' "$METADATA" | jq -r '.agent // ""' 2>/dev/null)
+
+            # W2-T10: extract metadata.scope + metadata.deliverable_of for the
+            # pre-scope advisory below. metadata.scope has been settable at
+            # TaskCreate since early V11 but was read by nothing — this is
+            # the wiring that closes that gap.
+            TASK_SCOPE=$(printf '%s' "$METADATA" | jq -r '.scope // ""' 2>/dev/null)
+            DELIVERABLE_OF=$(printf '%s' "$METADATA" | jq -r '.deliverable_of // ""' 2>/dev/null)
+
+            # S1-A1: extract metadata.review_of + metadata.blocker for the
+            # scope advisory below — reviewer/blocker tasks are exempt from
+            # the missing/invalid-scope check (they aren't "work" tasks in
+            # the deliverable-sizing sense).
+            META_REVIEW_OF=$(printf '%s' "$METADATA" | jq -r '.review_of // ""' 2>/dev/null)
+            META_BLOCKER=$(printf '%s' "$METADATA" | jq -r '.blocker // ""' 2>/dev/null)
+        fi
+
+        # V11.11: advisory when TaskCreate lacks metadata.agent. Push-recommend
+        # is the new default — every task should declare its intended owner.
+        # Pull-confirm via TaskUpdate(owner=...) may still override.
+        if [ -z "${RECOMMENDED_AGENT:-}" ] || [ "${RECOMMENDED_AGENT}" = "null" ]; then
+            echo "ADVISORY: Task #$TASK_ID created without metadata.agent." >&2
+            echo "  Consider running agent-assignment on this task batch:" >&2
+            echo "    Agent(subagent_type='agent-assignment', prompt='Route batch: ...')" >&2
+            echo "  Then TaskUpdate(metadata={agent: ...}) to apply the recommendation." >&2
+            RECOMMENDED_AGENT=""
+        fi
+
+        # ── W2-T10: TaskCreate pre-scope advisory ────────────────────────────
+        # metadata.scope (small|medium|large) is set at TaskCreate but was
+        # read by nothing downstream. This wires it as a pre-scope backstop
+        # mirroring the advisory cluster above (STR / agent / dedupe):
+        # advisory-only, stderr-only, NEVER blocks or alters the tool result.
+        #
+        # Fires when either:
+        #   (a) metadata.scope == "large", OR
+        #   (b) metadata.complexity in {complex, novel} AND
+        #       metadata.deliverable_of is absent/empty (no split-child link)
+        #
+        # NOTE on scripts/lib/context_tracker.py::get_estimate() (used by
+        # ./scripts/context-status and referenced near sync-tasks:2539): that
+        # is a heuristic CONTEXT-WINDOW token estimator (conversation token
+        # budget: 50/70/85% warnings), not task-size/deliverable-size
+        # machinery. It is unrelated latent infrastructure — not reused here.
+        if [ "${V11_PRESCOPE_ADVISORY:-on}" != "off" ]; then
+            _PRESCOPE_FIRE=0
+            _PRESCOPE_REASON=""
+            if [ "${TASK_SCOPE:-}" = "large" ]; then
+                _PRESCOPE_FIRE=1
+                _PRESCOPE_REASON="scope_large"
+            elif { [ "${COMPLEXITY:-}" = "complex" ] || [ "${COMPLEXITY:-}" = "novel" ]; } \
+                 && { [ -z "${DELIVERABLE_OF:-}" ] || [ "${DELIVERABLE_OF}" = "null" ]; }; then
+                _PRESCOPE_FIRE=1
+                _PRESCOPE_REASON="complex_no_deliverable"
+            fi
+            if [ "$_PRESCOPE_FIRE" = "1" ]; then
+                _PRESCOPE_MSG="⚠ PRE-SCOPE: task looks oversized (scope=${TASK_SCOPE:-unset}) — author deliverable-sized siblings instead: one file/one concern + its verify step each; tests as sibling tasks. Set metadata.deliverable_of on split children. See task-patterns.md §Pre-scoping discipline."
+                echo "ADVISORY: $_PRESCOPE_MSG" >&2
+                _V11_ADVISORY_CTX="${_V11_ADVISORY_CTX}${_V11_ADVISORY_CTX:+$'\n'}$_PRESCOPE_MSG"
+                _V11_PRESCOPE_LEDGER_REASONS+=("$_PRESCOPE_REASON")
+            fi
+        fi
+
+        # ── S1-A1: TaskCreate missing/invalid scope advisory ─────────────────
+        # metadata.scope (small|medium|large) is settable at TaskCreate but is
+        # frequently omitted, or set to a stray value that silently slides past
+        # the pre-scope advisory above (which only fires on scope=="large" or
+        # complex/novel without deliverable_of). This closes that gap: any
+        # work task with scope missing OR set to a value outside
+        # small|medium|large gets an advisory. Independent of
+        # V11_PRESCOPE_ADVISORY — separate env knob, separate concern.
+        #
+        # Exempt (not "work" tasks in the deliverable-sizing sense):
+        #   - review tasks (metadata.review_of set — paired adversarial-lite
+        #     reviewer siblings, V11.21)
+        #   - blocker tasks (subject starts with "BLOCKER", case-insensitive,
+        #     or metadata.blocker is truthy)
+        #
+        # stderr-only, NEVER blocks or alters the tool result.
+        if [ "${V11_SCOPE_WARN:-on}" != "off" ]; then
+            _SCOPE_WARN_EXEMPT=0
+            if [ -n "${META_REVIEW_OF:-}" ] && [ "${META_REVIEW_OF}" != "null" ]; then
+                _SCOPE_WARN_EXEMPT=1
+            elif printf '%s' "${TASK_SUBJECT:-}" | tr '[:lower:]' '[:upper:]' | grep -q '^BLOCKER'; then
+                _SCOPE_WARN_EXEMPT=1
+            elif [ -n "${META_BLOCKER:-}" ] && [ "${META_BLOCKER}" != "null" ] \
+                 && [ "${META_BLOCKER}" != "false" ] && [ "${META_BLOCKER}" != "0" ]; then
+                _SCOPE_WARN_EXEMPT=1
+            fi
+
+            if [ "$_SCOPE_WARN_EXEMPT" = "0" ]; then
+                if [ -z "${TASK_SCOPE:-}" ] || [ "${TASK_SCOPE}" = "null" ]; then
+                    _SCOPE_MSG="⚠ SCOPE: metadata.scope missing on work task — set small|medium|large at TaskCreate (V11_SCOPE_WARN=off to silence)"
+                    echo "ADVISORY: $_SCOPE_MSG" >&2
+                    _V11_ADVISORY_CTX="${_V11_ADVISORY_CTX}${_V11_ADVISORY_CTX:+$'\n'}$_SCOPE_MSG"
+                    _V11_PRESCOPE_LEDGER_REASONS+=("missing_scope")
+                elif [ "${TASK_SCOPE}" != "small" ] && [ "${TASK_SCOPE}" != "medium" ] && [ "${TASK_SCOPE}" != "large" ]; then
+                    _SCOPE_MSG="⚠ SCOPE: metadata.scope=\"${TASK_SCOPE}\" is invalid on work task — must be small|medium|large (V11_SCOPE_WARN=off to silence)"
+                    echo "ADVISORY: $_SCOPE_MSG" >&2
+                    _V11_ADVISORY_CTX="${_V11_ADVISORY_CTX}${_V11_ADVISORY_CTX:+$'\n'}$_SCOPE_MSG"
+                    _V11_PRESCOPE_LEDGER_REASONS+=("invalid_scope")
+                fi
+            fi
+        fi
+
+        # ── S1-A2: TaskCreate multi-deliverable smell advisory ───────────────
+        # S1-A1 above catches a missing/invalid metadata.scope tag, but a task
+        # can carry a perfectly valid scope tag and still bundle several
+        # deliverables inside its DESCRIPTION text ("implement X and test Y",
+        # a 5-step runbook crammed into one task, or a wall of prose). This is
+        # a cheap textual smell-check on the description itself — independent
+        # of, and complementary to, the scope/complexity checks above. Reuses
+        # TASK_DESCRIPTION (already extracted near :65/:83) and the
+        # META_REVIEW_OF/META_BLOCKER variables S1-A1 extracts — no new jq
+        # pass over the payload.
+        #
+        # Exempt (same work-task exemptions as S1-A1 — these aren't "work"
+        # tasks in the deliverable-sizing sense):
+        #   - review tasks (metadata.review_of set)
+        #   - blocker tasks (subject starts with "BLOCKER", case-insensitive,
+        #     or metadata.blocker is truthy)
+        #
+        # Fires when ANY of:
+        #   (a) conjunction-of-deliverables language (e.g. "... and test ...",
+        #       "+ tests", "then add ...")
+        #   (b) 3+ numbered runbook-style steps (line-starts matching
+        #       ^[0-9]+[.)])
+        #   (c) description > 600 chars AND metadata.scope != "small"
+        #
+        # Independent env-var gate (V11_PRESCOPE_SMELL) — separate knob from
+        # both V11_PRESCOPE_ADVISORY and V11_SCOPE_WARN, separate concern.
+        # stderr-only, NEVER blocks or alters the tool result.
+        if [ "${V11_PRESCOPE_SMELL:-on}" != "off" ]; then
+            _SMELL_EXEMPT=0
+            if [ -n "${META_REVIEW_OF:-}" ] && [ "${META_REVIEW_OF}" != "null" ]; then
+                _SMELL_EXEMPT=1
+            elif printf '%s' "${TASK_SUBJECT:-}" | tr '[:lower:]' '[:upper:]' | grep -q '^BLOCKER'; then
+                _SMELL_EXEMPT=1
+            elif [ -n "${META_BLOCKER:-}" ] && [ "${META_BLOCKER}" != "null" ] \
+                 && [ "${META_BLOCKER}" != "false" ] && [ "${META_BLOCKER}" != "0" ]; then
+                _SMELL_EXEMPT=1
+            fi
+
+            if [ "$_SMELL_EXEMPT" = "0" ] && [ -n "${TASK_DESCRIPTION:-}" ]; then
+                _SMELL_REASON=""
+                if printf '%s' "$TASK_DESCRIPTION" | grep -Eiq ' and (test|document|deploy|implement|add|update|fix|wire)|\+ tests?|then (add|implement|wire|update)'; then
+                    _SMELL_REASON="conjunction"
+                elif [ "$(printf '%s\n' "$TASK_DESCRIPTION" | grep -cE '^[0-9]+[.)]')" -ge 3 ]; then
+                    _SMELL_REASON="runbook-steps"
+                elif [ "${#TASK_DESCRIPTION}" -gt 600 ] && [ "${TASK_SCOPE:-}" != "small" ]; then
+                    _SMELL_REASON="length"
+                fi
+
+                if [ -n "$_SMELL_REASON" ]; then
+                    _SMELL_MSG="⚠ PRE-SCOPE SMELL: description looks multi-deliverable (${_SMELL_REASON}) — split into deliverable-sized siblings (V11_PRESCOPE_SMELL=off to silence)"
+                    echo "ADVISORY: $_SMELL_MSG" >&2
+                    _V11_ADVISORY_CTX="${_V11_ADVISORY_CTX}${_V11_ADVISORY_CTX:+$'\n'}$_SMELL_MSG"
+                    case "$_SMELL_REASON" in
+                        conjunction)    _V11_PRESCOPE_LEDGER_REASONS+=("smell_conjunction") ;;
+                        runbook-steps)  _V11_PRESCOPE_LEDGER_REASONS+=("smell_runbook_steps") ;;
+                        length)         _V11_PRESCOPE_LEDGER_REASONS+=("smell_length") ;;
+                    esac
+                fi
+            fi
+        fi
+
+        # ── S1-B2: durable-ledger rows for fired prescope/scope/smell advisories ────
+        # Persists each fired advisory above (V11_PRESCOPE_ADVISORY / V11_SCOPE_WARN /
+        # V11_PRESCOPE_SMELL) as a status-neutral ev:"prescope" ledger row, mirroring
+        # the ev:"review" verdict fold-back pattern (v11.30, _v11_review_ledger_event
+        # in lib/common.sh) — identity_unresolved:true sentinel, since the FD-207-
+        # confirmed create_seq for THIS task_id's "created" event isn't assigned until
+        # v11_ledger_append runs for it later in this same TaskCreate call. Gated on
+        # V11_PRESCOPE_LEDGER (default on) and the same PROJECT_SOURCE !=
+        # "active-project-fallback" guard the main "created" ledger event uses below
+        # (ambient/mutable global state must never be in the ledger write path).
+        # Advisory-grade: never fails the hook (v11_ledger_append is side-effect-
+        # never-fails; loop errors are swallowed).
+        if [ "${V11_PRESCOPE_LEDGER:-on}" != "off" ] && [ -n "$TASK_ID" ] \
+           && [ "$PROJECT_SOURCE" != "active-project-fallback" ] \
+           && [ "${#_V11_PRESCOPE_LEDGER_REASONS[@]}" -gt 0 ]; then
+            for _v11_pr_reason in "${_V11_PRESCOPE_LEDGER_REASONS[@]}"; do
+                _v11_prescope_ledger_event "$PROJECT" "$TASK_ID" "$_v11_pr_reason" "$SESSION_UUID" >/dev/null 2>/dev/null || true
+            done
+        fi
+
+        # ── V11 R2.1: TaskCreate dedupe advisory ─────────────────────────────
+        # Compares the new task's normalized subject against OPEN (pending/
+        # in_progress) tasks in the same project via salient-token Jaccard/
+        # overlap — mirrors scripts/lib/family_fold.py's algorithm and
+        # thresholds (jac=0.25, ovl=0.45) without importing the py module into
+        # this hot bash path; jq is already loaded for every other branch here,
+        # so an inline jq filter is cheaper than a python3 subprocess spawn.
+        # Advisory-only: NEVER blocks TaskCreate (hooks must not corrupt tool
+        # flow). Skipped when open_tasks exceeds 200 entries (hot-path budget)
+        # or when V11_TASKCREATE_DEDUPE=off. Modes:
+        #   advisory (default) — create + stderr advisory + ledger dup_of tag
+        #   strict             — same, wording says "duplicate suppressed
+        #                        recommendation" (still never suppresses)
+        #   off                — skip entirely
+        _DEDUPE_MODE="${V11_TASKCREATE_DEDUPE:-advisory}"
+        _DEDUPE_DUP_OF=""
+        if [ "$_DEDUPE_MODE" != "off" ] && [ -n "$TASK_SUBJECT" ]; then
+            _DEDUPE_OPEN_COUNT=$(printf '%s' "$STATE" | jq --arg project "$PROJECT" '
+                (.open_tasks // {}) | to_entries
+                | map(select(
+                    ((.value.status // "pending") | IN("pending", "in_progress"))
+                    and ((.value._proj // (.value.metadata.project // "")) == $project)
+                  ))
+                | length
+            ' 2>/dev/null || echo 0)
+            if [ "${_DEDUPE_OPEN_COUNT:-0}" -le 200 ] 2>/dev/null; then
+                _DEDUPE_RESULT=$(printf '%s' "$STATE" | jq -c \
+                    --arg new_subj "$TASK_SUBJECT" \
+                    --arg project "$PROJECT" \
+                    --arg self_id "$TASK_ID" '
+                    # Salient-token extraction — same stopword family as
+                    # family_fold.py::salient_tokens (V11.18 handoff fold).
+                    def stopwords: [
+                        "the","a","an","of","to","is","it","on","in","this","and","or",
+                        "for","not","be","as","by","we","i","its","itself","per","still",
+                        "so","use","uses","needs","which","should","sets","real","that",
+                        "with","into","any","value","off","only","run","runs","single",
+                        "each","fresh","are","was","has","have","had","but","if","then",
+                        "else","when","from","at","out","non","can","may","must","more",
+                        "most","less","than","over","under","via","no","yes","new","old",
+                        "all","both","task","tasks","todo","todos"
+                    ];
+                    def sal_tokens:
+                        ascii_downcase
+                        | [scan("[a-z0-9][a-z0-9_+.-]*")]
+                        | map(select((length > 2) and (. as $t | (stopwords | index($t)) | not)))
+                        | unique;
+                    ($new_subj | sal_tokens) as $new_tok
+                    | if ($new_tok | length) == 0 then {match: false}
+                      else
+                        ((.open_tasks // {}) | to_entries
+                          | map(select(
+                              .key != $self_id
+                              and ((.value.status // "pending") | IN("pending", "in_progress"))
+                              and ((.value._proj // (.value.metadata.project // "")) == $project)
+                            ))
+                          | map(. + {tok: ((.value.subject // "") | sal_tokens)})
+                          | map(select((.tok | length) > 0))
+                          | map(
+                              ($new_tok) as $a
+                              | (.tok) as $b
+                              | (($a - ($a - $b)) | length) as $inter
+                              | (($a + $b) | unique | length) as $union
+                              | (if $union > 0 then ($inter / $union) else 0 end) as $jac
+                              | ((if ($a | length) < ($b | length) then ($a | length) else ($b | length) end)) as $minlen
+                              | (if $minlen > 0 then ($inter / $minlen) else 0 end) as $ovl
+                              | . + {jac: $jac, ovl: $ovl}
+                            )
+                          | map(select(.jac >= 0.25 or .ovl >= 0.45))
+                          | sort_by(-(.jac + .ovl))
+                          | .[0] as $best
+                          | if $best == null then {match: false}
+                            else {match: true, id: $best.key, subject: ($best.value.subject // ""), jac: $best.jac, ovl: $best.ovl}
+                            end
+                        )
+                      end
+                ' 2>/dev/null || { echo "[V11 DEDUPE] filter error — dedupe skipped" >&2; echo '{"match":false}'; })
+                _DEDUPE_MATCH=$(printf '%s' "${_DEDUPE_RESULT:-}" | jq -r '.match // false' 2>/dev/null || echo false)
+                if [ "$_DEDUPE_MATCH" = "true" ]; then
+                    _DEDUPE_DUP_ID=$(printf '%s' "$_DEDUPE_RESULT" | jq -r '.id // ""' 2>/dev/null)
+                    _DEDUPE_DUP_SUBJ=$(printf '%s' "$_DEDUPE_RESULT" | jq -r '.subject // ""' 2>/dev/null)
+                    if [ -n "$_DEDUPE_DUP_ID" ]; then
+                        if [ "$_DEDUPE_MODE" = "strict" ]; then
+                            echo "[V11 DEDUPE] duplicate suppressed recommendation: Task appears to duplicate #$_DEDUPE_DUP_ID '$_DEDUPE_DUP_SUBJ' — consider TaskUpdate instead" >&2
+                        else
+                            echo "[V11 DEDUPE] Task appears to duplicate #$_DEDUPE_DUP_ID '$_DEDUPE_DUP_SUBJ' — consider TaskUpdate instead" >&2
+                        fi
+                        _DEDUPE_DUP_OF="$_DEDUPE_DUP_ID"
+                    fi
+                fi
+            fi
+        fi
+
+        # ADR §2.3 (LOW): normalize subject ONLY — do NOT predict create_seq.
+        # Pre-lock prediction of create_seq is FORBIDDEN: concurrent same-subject
+        # creates in different sessions race to the same predicted value, producing
+        # duplicate create_seq values in the ledger (violates identity uniqueness).
+        # The FD-207-confirmed create_seq is returned by v11_ledger_append on stdout
+        # after the atomic seqno increment; a second targeted STATE write (below,
+        # after the ledger append call site) stamps the authoritative value.
+        # _idk.create_seq is set to 0 (sentinel "unconfirmed") until then.
+        _LEDGER_SUBJ_NORM=""
+        if [ -n "$TASK_ID" ] && [ "$PROJECT_SOURCE" != "active-project-fallback" ]; then
+            _LEDGER_SUBJ_NORM=$(v11_normalize_subject "${TASK_SUBJECT}" 2>/dev/null || printf '__empty__')
+            [ -z "$_LEDGER_SUBJ_NORM" ] && _LEDGER_SUBJ_NORM="__empty__"
+        fi
+
+        STATE=$(printf '%s' "$STATE" | jq \
+            --arg now "$NOW" \
+            --arg subj "$TASK_SUBJECT" \
+            --arg desc "$TASK_DESCRIPTION" \
+            --arg complexity "${COMPLEXITY:-}" \
+            --arg task_id "$TASK_ID" \
+            --arg rec_agent "${RECOMMENDED_AGENT:-}" \
+            --argjson meta "${METADATA:-null}" \
+            --argjson str_missing "${STR_MISSING_THIS_CALL:-0}" \
+            --arg subj_norm "${_LEDGER_SUBJ_NORM:-}" \
+            --arg project "$PROJECT" \
+            --arg proj_source "$PROJECT_SOURCE" \
+            --argjson live_reconcile "$([ "${V11_HANDOFF_LIVE_RECONCILE:-on}" != "off" ] && echo 'true' || echo 'false')" '
+            .total += 1 | .pending += 1 | .last_updated = $now
+            # V11.14.3: do NOT set .active_task on TaskCreate. A newly-created task
+            # is pending, not active. Pre-V11.14.3, every TaskCreate overwrote
+            # .active_task with the new task subject, making the handoff display
+            # show the latest-created (pending) task as "in progress".
+            | .recommended_agents //= {}
+            | if $rec_agent != "" and $task_id != "" then .recommended_agents[$task_id] = $rec_agent else . end
+            | .dark_code_advisories //= {"str_missing_count": 0, "str_missing_complex": 0, "str_missing_novel": 0, "last_advisory_at": null}
+            | if $str_missing == 1 then
+                .dark_code_advisories.str_missing_count += 1
+                | .dark_code_advisories.last_advisory_at = $now
+                | if $complexity == "complex" then .dark_code_advisories.str_missing_complex += 1
+                  elif $complexity == "novel" then .dark_code_advisories.str_missing_novel += 1
+                  else . end
+              else . end
+            # V11.13: track open task for rehydration on handoff.
+            # V11.14: description captured alongside subject so handoff-tasks.json
+            # preserves the full task body (subject alone is too thin for resume).
+            # V11.16: _idk stamped with subject_norm at creation; create_seq=0 is a
+            # sentinel ("unconfirmed") — patched to the FD-207-confirmed value by the
+            # second STATE write below (after v11_ledger_append returns confirmed seq).
+            # ADR §2.3: pre-lock create_seq prediction is FORBIDDEN.
+            # V11.W1: _proj is the hook-resolved project, stamped ONLY when the
+            # source is authoritative (metadata or task-own-record). When resolved
+            # via the ambient active-project fallback, _proj is OMITTED — an
+            # ambient-derived stamp is potentially wrong and once written it poisons
+            # the snapshot JOIN forever. Unstamped tasks land in the ambient bucket
+            # with stamped=false (visible, not silently-wrong). E1 fix.
+            # Gated on V11_HANDOFF_LIVE_RECONCILE (E3 fix).
+            | if $task_id != "" then
+                .open_tasks = ((.open_tasks // {}) + {($task_id): {
+                    subject: (if $subj != "" and $subj != "null" then $subj else null end),
+                    description: (if $desc != "" and $desc != "null" then $desc else null end),
+                    status: "pending",
+                    metadata: $meta,
+                    _proj: (if $live_reconcile and $proj_source != "active-project-fallback" then $project else null end),
+                    _idk: (if $subj_norm != "" then {subject_norm: $subj_norm, create_seq: 0} else null end)
+                }})
+              else . end
+        ')
+
+        # Build the ledger event (emitted after the STATE atomic write, ADR §4.2).
+        # Only emit when project attribution is not ambiguous (Strategy 1 or 1.5 only).
+        if [ -n "$TASK_ID" ] && [ -n "$_LEDGER_SUBJ_NORM" ] \
+           && [ "$PROJECT_SOURCE" != "active-project-fallback" ]; then
+            LEDGER_EVENT_JSON=$(jq -cn \
+                --arg project "$PROJECT" \
+                --arg subj "$TASK_SUBJECT" \
+                --arg subj_norm "$_LEDGER_SUBJ_NORM" \
+                --arg desc "${TASK_DESCRIPTION:-}" \
+                --arg task_id "$TASK_ID" \
+                --arg sid "$SESSION_UUID" \
+                --arg ts "$NOW" \
+                --arg rec_agent "${RECOMMENDED_AGENT:-}" \
+                --arg dup_of "${_DEDUPE_DUP_OF:-}" \
+                --argjson meta "${METADATA:-null}" '
+                {
+                    v: 1,
+                    ev: "created",
+                    ts: $ts,
+                    project: $project,
+                    subject_norm: $subj_norm,
+                    subject: $subj,
+                    task_id: $task_id,
+                    session_uuid: $sid,
+                    recommended_agent: (if $rec_agent != "" and $rec_agent != "null" then $rec_agent else null end),
+                    dup_of: (if $dup_of != "" and $dup_of != "null" then $dup_of else null end),
+                    metadata: $meta,
+                    description: (if $desc != "" and $desc != "null" then $desc else null end),
+                    counters_delta: {total: 1, pending: 1}
+                } | with_entries(select(.value != null))
+            ' 2>/dev/null || true)
+        fi
+
+        # ── V11.21: auto-pair review sibling (producer side) ─────────────────
+        # Guard 1: V11_AUTO_PAIR_REVIEW must not be "off" (default ON).
+        # Guard 2: parent complexity in {medium, complex, novel} OR risk in {medium, high}.
+        # Guard 3: parent must NOT already have metadata.review_task_id set.
+        # Action: synthesize a sibling task entry with ID pair_<sid8>_<seq> in open_tasks
+        #         and stamp parent.metadata.review_task_id = pair_<sid8>_<seq>. The sid8
+        #         (8-char SESSION_UUID fragment) scopes the ID to this session so two
+        #         concurrent sessions never mint the same ID (see fix note below).
+        # The sibling status pending_parent is the V11.21 activation protocol marker —
+        # the existing activation path at TaskUpdate(completed) flips it to pending.
+        # Rollback: V11_AUTO_PAIR_REVIEW=off
+        if [ "${V11_AUTO_PAIR_REVIEW:-on}" != "off" ] && [ -n "$TASK_ID" ]; then
+            # Evaluate guards 2+3 via single jq pass.
+            # CRITICAL jq pattern: bind root with `. as $root` before the boolean
+            # pipe — without this, .open_tasks[$id] after the pipe would try to index
+            # the string "yes"/"no", producing an error and falling through to "no|".
+            _AP_EVAL=$(printf '%s' "$STATE" | jq -r \
+                --arg id "$TASK_ID" \
+                --arg complexity "${COMPLEXITY:-}" '
+                def reviewable: (. == "medium" or . == "complex" or . == "novel");
+                def risk_reviewable: (. == "medium" or . == "high");
+                . as $root |
+                (($complexity | reviewable) or ($root.open_tasks[$id].metadata.risk // "" | risk_reviewable))
+                | if . then "yes" else "no" end
+                | . as $should
+                | [$should, ($root.open_tasks[$id].metadata.review_task_id // "")] | @tsv
+            ' 2>/dev/null || printf 'no\t')
+            _AP_SHOULD="${_AP_EVAL%%	*}"
+            _AP_EXISTING="${_AP_EVAL##*	}"
+            if [ "$_AP_SHOULD" = "yes" ] && [ -z "$_AP_EXISTING" ]; then
+                # Allocate pair_<sid8>_<seq> ID: increment _v11_pair_seq counter in STATE.
+                # Single jq pass: read new seq, write sibling into open_tasks,
+                # stamp parent's metadata.review_task_id = pair_<sid8>_<seq>.
+                _AP_NOW="$NOW"
+                _AP_PARENT_SUBJ=$(printf '%s' "$STATE" | jq -r \
+                    --arg id "$TASK_ID" '.open_tasks[$id].subject // ""' 2>/dev/null || true)
+                _AP_PARENT_META=$(printf '%s' "$STATE" | jq -c \
+                    --arg id "$TASK_ID" '.open_tasks[$id].metadata // {}' 2>/dev/null || echo '{}')
+                _AP_SPRINT=$(printf '%s' "$_AP_PARENT_META" | jq -r '.sprint // ""' 2>/dev/null || true)
+                _AP_RISK=$(printf '%s' "$_AP_PARENT_META" | jq -r '.risk // ""' 2>/dev/null || true)
+                _AP_PROJ_M=$(printf '%s' "$_AP_PARENT_META" | jq -r '.project // ""' 2>/dev/null || true)
+                [ -z "$_AP_PROJ_M" ] && _AP_PROJ_M="$PROJECT"
+
+                _AP_NEW_STATE=$(printf '%s' "$STATE" | jq \
+                    --arg parent_id "$TASK_ID" \
+                    --arg parent_subj "${_AP_PARENT_SUBJ:-}" \
+                    --arg sprint "${_AP_SPRINT:-}" \
+                    --arg risk "${_AP_RISK:-}" \
+                    --arg proj "${_AP_PROJ_M:-}" \
+                    --arg proj_src "$PROJECT_SOURCE" \
+                    --argjson live_reconcile "$([ "${V11_HANDOFF_LIVE_RECONCILE:-on}" != "off" ] && echo 'true' || echo 'false')" \
+                    --arg now "$_AP_NOW" \
+                    --arg sid "$SESSION_UUID" '
+                    # Allocate counter (0 when field absent → first pair is pair_1).
+                    # Collision fix: the counter is per-session STATE, so two concurrent
+                    # sessions on the same project could each mint bare "pair_1", and
+                    # v11_rebuild_project_aggregate merges open_tasks from all sessions by
+                    # task_id — silently colliding/misattributing review pairing. Scope
+                    # the ID to this session via an 8-char SESSION_UUID fragment (opaque
+                    # string ID; no consumer parses the numeric suffix positionally).
+                    ._v11_pair_seq = (._v11_pair_seq // 0) + 1
+                    | ($sid | .[0:8]) as $sid_frag
+                    | ("pair_" + $sid_frag + "_" + (._v11_pair_seq | tostring)) as $pair_id
+                    # Stamp review_task_id on parent
+                    | .open_tasks[$parent_id].metadata.review_task_id = $pair_id
+                    # Synthesize sibling entry
+                    | .open_tasks[$pair_id] = {
+                        subject: ("Review: " + $parent_subj),
+                        description: ("Adversarial-lite review of parent task " + $parent_id + ". Activated on parent completion."),
+                        status: "pending_parent",
+                        metadata: (
+                            {review_of: $parent_id, parent_status: "pending_parent",
+                             project: $proj, agent: "adversarial-lite-reviewer", scope: "small"}
+                            + (if $sprint != "" then {sprint: $sprint} else {} end)
+                            + (if $risk   != "" then {risk:   $risk}   else {} end)
+                        ),
+                        _proj: (if $live_reconcile and $proj_src != "active-project-fallback" then $proj else null end),
+                        _idk: null
+                    }
+                    # Increment .total so TaskList shows the full picture;
+                    # pending_parent siblings are NOT counted in .pending.
+                    | .total += 1
+                ' 2>/dev/null)
+                if [ -n "$_AP_NEW_STATE" ]; then
+                    STATE="$_AP_NEW_STATE"
+                    _AP_PAIR_ID=$(printf '%s' "$STATE" | jq -r \
+                        --arg id "$TASK_ID" \
+                        '.open_tasks[$id].metadata.review_task_id // ""' 2>/dev/null || true)
+                    if [ -n "$_AP_PAIR_ID" ]; then
+                        echo "[v11.21-auto-pair] Synthesized review sibling ${_AP_PAIR_ID} for task #${TASK_ID} (complexity=${COMPLEXITY:-<unset>} project=${_AP_PROJ_M})" >&2
+
+                        # Stage a synthetic ledger event for the sibling.
+                        # Guard: only emit when PROJECT attribution is authoritative.
+                        if [ -n "$_AP_PROJ_M" ] && [ "$PROJECT_SOURCE" != "active-project-fallback" ]; then
+                            _AP_PAIR_SUBJ="Review: ${_AP_PARENT_SUBJ:-}"
+                            _AP_PAIR_SUBJ_NORM=$(v11_normalize_subject "$_AP_PAIR_SUBJ" 2>/dev/null || printf '__empty__')
+                            [ -z "$_AP_PAIR_SUBJ_NORM" ] && _AP_PAIR_SUBJ_NORM="__empty__"
+                            _AP_SIBLING_META=$(printf '%s' "$STATE" | jq -c \
+                                --arg pid "$_AP_PAIR_ID" '.open_tasks[$pid].metadata // {}' 2>/dev/null || echo '{}')
+                            _AP_LEDGER_EVENT=$(jq -cn \
+                                --arg project "$_AP_PROJ_M" \
+                                --arg subj "$_AP_PAIR_SUBJ" \
+                                --arg subj_norm "$_AP_PAIR_SUBJ_NORM" \
+                                --arg desc "Adversarial-lite review of parent task ${TASK_ID}. Activated on parent completion." \
+                                --arg task_id "$_AP_PAIR_ID" \
+                                --arg sid "$SESSION_UUID" \
+                                --arg ts "$NOW" \
+                                --argjson meta "${_AP_SIBLING_META:-null}" '
+                                {v:1, ev:"created", ts:$ts, project:$project,
+                                 subject_norm:$subj_norm, subject:$subj,
+                                 task_id:$task_id, session_uuid:$sid,
+                                 recommended_agent:"adversarial-lite-reviewer",
+                                 metadata:$meta, description:$desc,
+                                 counters_delta:{total:1}}
+                                | with_entries(select(.value != null))
+                            ' 2>/dev/null || true)
+                            if [ -n "$_AP_LEDGER_EVENT" ]; then
+                                v11_ledger_append "$_AP_PROJ_M" "$_AP_LEDGER_EVENT" >/dev/null 2>/dev/null || true
+                            fi
+                        fi
+                    fi
+                fi
+            fi
+        fi
+        ;;
+    TaskUpdate)
+        # V11.8 (S1-7): STR advisory on in_progress and completed transitions
+        TU_COMPLEXITY=$(printf '%s' "$V11_RAW_INPUT" | jq -r '.tool_input.metadata.complexity // ""' 2>/dev/null)
+        TU_STR_COUNT=$(printf '%s' "$V11_RAW_INPUT" | jq -r '.tool_input.metadata.spec_test_requirements // [] | length' 2>/dev/null)
+        TU_NO_STR=$(printf '%s' "$V11_RAW_INPUT" | jq -r '.tool_input.metadata.no_str // false' 2>/dev/null)
+
+        # V11.16 (ledger wiring): capture prior bucket from open_tasks BEFORE the fold
+        # (ADR §1.3.0 writer prior-bucket rule). Also resolve _idk for identity.
+        # These are used in the per-transition ledger event builds below.
+        _TU_PRIOR_STATUS="absent"
+        _TU_IDK_SUBJ_NORM=""
+        _TU_IDK_CREATE_SEQ=""
+        if [ -n "$TASK_ID" ] && [ "$PROJECT_SOURCE" != "active-project-fallback" ]; then
+            # Read prior status + _idk from current STATE (before this fold mutates it)
+            _TU_STATE_INFO=$(printf '%s' "$STATE" | jq -r \
+                --arg id "$TASK_ID" '
+                (.open_tasks[$id].status // "absent") + "|" +
+                (.open_tasks[$id]._idk.subject_norm // "") + "|" +
+                ((.open_tasks[$id]._idk.create_seq // "") | tostring)
+            ' 2>/dev/null || echo "absent||")
+            _TU_PRIOR_STATUS="${_TU_STATE_INFO%%|*}"
+            _TU_REST="${_TU_STATE_INFO#*|}"
+            _TU_IDK_SUBJ_NORM="${_TU_REST%%|*}"
+            _TU_IDK_CREATE_SEQ="${_TU_REST##*|}"
+            [ "$_TU_IDK_CREATE_SEQ" = "null" ] && _TU_IDK_CREATE_SEQ=""
+            [ "$_TU_PRIOR_STATUS" = "null" ] && _TU_PRIOR_STATUS="absent"
+            # V11.24 Strategy 1.6 hand-off: when PROJECT was resolved via the
+            # durable ledger lookup (session_uuid + task_id), we captured the
+            # task's subject_norm + create_seq from the same matched 'created'
+            # event. The per-session STATE.open_tasks above won't have this
+            # task (different per-session state — that's why 1.6 fired), so
+            # _TU_IDK_* would otherwise stay empty and the downstream ladder
+            # would skip Step 1 / Step 2 and rely on Step 3 (subject lookup)
+            # which can't fire on TaskUpdate (no subject in payload). Pre-
+            # populating here makes the ledger write complete cleanly.
+            if [ "$PROJECT_SOURCE" = "ledger-task-home" ] \
+               && [ -z "$_TU_IDK_SUBJ_NORM" ] \
+               && [ -n "${V11_LEDGER_TASK_HOME_SUBJ_NORM:-}" ] \
+               && [ -n "${V11_LEDGER_TASK_HOME_CREATE_SEQ:-}" ] \
+               && [ "${V11_LEDGER_TASK_HOME_CREATE_SEQ}" != "0" ]; then
+                _TU_IDK_SUBJ_NORM="$V11_LEDGER_TASK_HOME_SUBJ_NORM"
+                _TU_IDK_CREATE_SEQ="$V11_LEDGER_TASK_HOME_CREATE_SEQ"
+                # Treat prior_status as 'absent' (cross-session reopen) so the
+                # ladder's Step 3 ledger lookup still has an escape hatch if
+                # this identity disagrees with the ledger.
+            fi
+            # Also check recent_completed and blocked_tasks for prior bucket if not in open_tasks
+            if [ "$_TU_PRIOR_STATUS" = "absent" ]; then
+                _TU_IN_COMPLETED=$(printf '%s' "$STATE" | jq -r \
+                    --arg id "$TASK_ID" '
+                    if ([(.recent_completed // [])[] | select(.id == $id)] | length) > 0
+                    then "completed" else "" end
+                ' 2>/dev/null || echo "")
+                [ -n "$_TU_IN_COMPLETED" ] && _TU_PRIOR_STATUS="$_TU_IN_COMPLETED"
+            fi
+            if [ "$_TU_PRIOR_STATUS" = "absent" ]; then
+                _TU_IN_BLOCKED=$(printf '%s' "$STATE" | jq -r \
+                    --arg id "$TASK_ID" '
+                    if ([(.blocked_tasks // [])[] | select(.id == $id)] | length) > 0
+                    then "blocked" else "" end
+                ' 2>/dev/null || echo "")
+                [ -n "$_TU_IN_BLOCKED" ] && _TU_PRIOR_STATUS="$_TU_IN_BLOCKED"
+            fi
+            # ADR §A.1/§A.2: 4-step identity resolution ladder for non-created events.
+            # Step 1: open_tasks[$id]._idk (already extracted above into _TU_IDK_SUBJ_NORM/SEQ).
+            # Step 2: _terminal_idk[$id] — same-session tombstone (blocked/completed tasks
+            #         that have left open_tasks but are being re-opened this session).
+            # Step 3: ledger durable fallback — Phase-1 lock-free reverse-scan
+            #         (v11_ledger_identity_fallback); Phase-2 is inside v11_ledger_append.
+            #         IMPORTANT: fires even when prior_status is "absent" — cross-session
+            #         reopens appear absent in the new session's STATE but are durably
+            #         recorded in the ledger (ADR §A.2: "task's originating session is gone").
+            # Step 4: LEDGER-IDENTITY-MISS — should-never-happen after Addendum A is live.
+            _IDRESLV_NEEDED=0
+            if [ -z "$_TU_IDK_SUBJ_NORM" ] || [ -z "$_TU_IDK_CREATE_SEQ" ] || [ "$_TU_IDK_CREATE_SEQ" = "0" ]; then
+                _IDRESLV_NEEDED=1
+            fi
+            if [ "$_IDRESLV_NEEDED" = "1" ] && [ "$_TU_PRIOR_STATUS" != "absent" ]; then
+                # Step 2: check _terminal_idk (same-session, not durable)
+                _TERM_IDK=$(printf '%s' "$STATE" | jq -r \
+                    --arg id "$TASK_ID" '
+                    (._terminal_idk[$id] // null)
+                    | if . != null then (.subject_norm + "|" + (.create_seq | tostring)) else "" end
+                ' 2>/dev/null || echo "")
+                if [ -n "$_TERM_IDK" ] && [ "$_TERM_IDK" != "|" ] && [ "$_TERM_IDK" != "|0" ]; then
+                    _TU_IDK_SUBJ_NORM="${_TERM_IDK%%|*}"
+                    _TU_IDK_CREATE_SEQ="${_TERM_IDK##*|}"
+                    [ "$_TU_IDK_CREATE_SEQ" = "0" ] && { _TU_IDK_SUBJ_NORM=""; _TU_IDK_CREATE_SEQ=""; }
+                    _IDRESLV_NEEDED=0
+                    [ -z "$_TU_IDK_SUBJ_NORM" ] && _IDRESLV_NEEDED=1
+                fi
+            fi
+            # Step 3: ledger durable fallback — fires for BOTH non-absent AND absent prior
+            # (the absent case is the genuine cross-session reopen: session A is gone, session B
+            # has no open_tasks record, but the ledger has the `created` line durably).
+            # Subject preference: TASK_SUBJECT_NEW (real .tool_input.subject from TaskUpdate)
+            # over TASK_SUBJECT (legacy .tool_input.description alias) — description payloads
+            # carry progress notes, not the canonical task title, so they rarely match
+            # the original subject_norm in the ledger.
+            _FALLBACK_SUBJECT="${TASK_SUBJECT_NEW:-}"
+            [ -z "$_FALLBACK_SUBJECT" ] && _FALLBACK_SUBJECT="${TASK_SUBJECT:-}"
+            if [ "$_IDRESLV_NEEDED" = "1" ] && [ -n "$_FALLBACK_SUBJECT" ] && [ -n "$PROJECT" ]; then
+                _FALLBACK=$(v11_ledger_identity_fallback "$PROJECT" "$_FALLBACK_SUBJECT" 50000 2>/dev/null || echo "MISS")
+                if [ "$_FALLBACK" != "MISS" ] && [ -n "$_FALLBACK" ]; then
+                    # Fallback output is "SUBJECT_NORM\tCREATE_SEQ" (tab-separated).
+                    # subject_norm never contains tabs (§2.1 collapses all whitespace to
+                    # ASCII space), so split on the last tab is unambiguous even for
+                    # multi-word subject_norms like "fix the parser".
+                    _TU_IDK_SUBJ_NORM="${_FALLBACK%$'\t'*}"
+                    _TU_IDK_CREATE_SEQ="${_FALLBACK##*$'\t'}"
+                    if [ -z "$_TU_IDK_SUBJ_NORM" ] || [ "$_TU_IDK_CREATE_SEQ" = "0" ]; then
+                        _TU_IDK_SUBJ_NORM=""; _TU_IDK_CREATE_SEQ=""; _IDRESLV_NEEDED=1
+                    else
+                        _IDRESLV_NEEDED=0
+                    fi
+                else
+                    _TU_IDK_SUBJ_NORM=""; _TU_IDK_CREATE_SEQ=""; _IDRESLV_NEEDED=1
+                fi
+            fi
+            # Step 4: LEDGER-IDENTITY-MISS (should-never-happen after Addendum A live).
+            # Only log for non-absent prior status — truly absent tasks (no history anywhere)
+            # just produce no ledger line (correct: nothing to record).
+            if [ "$_IDRESLV_NEEDED" = "1" ] && [ "$_TU_PRIOR_STATUS" != "absent" ]; then
+                echo "sync-tasks: LEDGER-IDENTITY-MISS task=${TASK_ID} project=${PROJECT} — all 4 resolution steps exhausted; ledger line will be SKIPPED (run scripts/migrate-ledger / verify backfill)" >&2
+                # Clear so the ledger emit below skips cleanly (side-effect-never-fails)
+                _TU_IDK_SUBJ_NORM=""
+                _TU_IDK_CREATE_SEQ=""
+            elif [ "$_IDRESLV_NEEDED" = "1" ] && [ "$_TU_PRIOR_STATUS" = "absent" ]; then
+                # No prior record anywhere — either a brand-new task or unknown session origin.
+                # Clear _idk so no ledger line is emitted (silent, correct).
+                _TU_IDK_SUBJ_NORM=""
+                _TU_IDK_CREATE_SEQ=""
+            fi
+        fi
+
+        case "$TASK_STATUS" in
+            in_progress)
+                TASK_PHASE=$(printf '%s' "$V11_RAW_INPUT" | jq -r '.tool_input.metadata.phase // ""' 2>/dev/null)
+                TASK_OWNER=$(printf '%s' "$V11_RAW_INPUT" | jq -r '.tool_input.owner // ""' 2>/dev/null)
+                TASK_SPRINT=$(printf '%s' "$V11_RAW_INPUT" | jq -r '.tool_input.metadata.sprint // ""' 2>/dev/null)
+                TASK_GATE=$(printf '%s' "$V11_RAW_INPUT" | jq -r '.tool_input.metadata.gate // ""' 2>/dev/null)
+                TU_STR_VIOLATED=0
+                if ! _v11_str_advisory "$TASK_ID" "$TU_COMPLEXITY" "$TU_STR_COUNT" "$TU_NO_STR" "in_progress"; then
+                    TU_STR_VIOLATED=1
+                fi
+                # V11.29 (W1-T5): lane lease claim. Advisory only -- never blocks or
+                # alters the tool result, mirroring every other sync-tasks invariant.
+                # Skipped when V11_LANE_LEASE=off or PROJECT is empty/unresolved.
+                if [ "${V11_LANE_LEASE:-on}" != "off" ] && [ -n "$PROJECT" ] && [ -n "$TASK_ID" ]; then
+                    _LANE_CLAIM_RESULT=$(v11_lane_claim "$PROJECT" "$TASK_ID" 2>/dev/null)
+                    case "$_LANE_CLAIM_RESULT" in
+                        owned_by_other:*)
+                            _LANE_OTHER_UUID="${_LANE_CLAIM_RESULT#owned_by_other:}"
+                            echo "⚠ LANE CONFLICT: task ${TASK_ID} lane is held by live session ${_LANE_OTHER_UUID} — a concurrent orchestrator is executing this task. Coordinate or run: scripts/lanes status ${PROJECT}" >&2
+                            ;;
+                    esac
+                fi
+                STATE=$(printf '%s' "$STATE" | jq \
+                    --arg id "$TASK_ID" \
+                    --arg phase "$TASK_PHASE" \
+                    --arg owner "$TASK_OWNER" \
+                    --arg subj "$TASK_SUBJECT" \
+                    --arg subj_new "${TASK_SUBJECT_NEW:-}" \
+                    --arg desc "$TASK_DESCRIPTION" \
+                    --arg sprint "$TASK_SPRINT" \
+                    --arg gate "$TASK_GATE" \
+                    --arg now "$NOW" \
+                    --arg project "$PROJECT" \
+                    --arg proj_source "$PROJECT_SOURCE" \
+                    --argjson live_reconcile "$([ "${V11_HANDOFF_LIVE_RECONCILE:-on}" != "off" ] && echo 'true' || echo 'false')" '
+                    .pending = ([.pending - 1, 0] | max)
+                    | .in_progress += 1
+                    | .active_task_ids = ((.active_task_ids // []) + (if ($id | tostring) != "" and $id != null then [$id] else [] end) | unique)
+                    | .active_agent_id = (if $owner == "" or $owner == "null" then .active_agent_id else $owner end)
+                    | .phase = (if $phase == "" or $phase == "null" then .phase else $phase end)
+                    | .active_task_sprint = (if $sprint != "" and $sprint != "null" then $sprint else .active_task_sprint end)
+                    | .active_task_gate = (if $gate != "" and $gate != "null" then $gate else .active_task_gate end)
+                    | .last_updated = $now
+                    # V11.13:   open_tasks status flip + subject refresh
+                    # V11.14:   description refresh — TaskUpdate often carries an enriched
+                    #           body (progress notes, decisions); preserve that on the
+                    #           in_progress transition so handoff-tasks.json reflects
+                    #           latest content.
+                    # V11.14.1: subject refresh now gated on $subj_new (real
+                    #           .tool_input.subject), not $subj (legacy description
+                    #           alias). Prevents description payloads from clobbering
+                    #           the open_tasks subject during status-flip updates.
+                    # V11.W1: upsert _proj (hook-resolved project) so the snapshot
+                    #         JOIN has a reliable key even when metadata was absent at
+                    #         TaskCreate (e.g. legacy-cli sessions, no V11_SESSION_ID).
+                    | if $id != "" then
+                        .open_tasks //= {}
+                        | .open_tasks[$id] //= {subject: null, description: null, status: "pending", metadata: null}
+                        | .open_tasks[$id].status = "in_progress"
+                        | (if $live_reconcile and $proj_source != "active-project-fallback" and (.open_tasks[$id]._proj // "") == "" then .open_tasks[$id]._proj = $project else . end)
+                        | (if $subj_new != "" and $subj_new != "null" then .open_tasks[$id].subject = $subj_new else . end)
+                        | (if $desc != "" and $desc != "null" then .open_tasks[$id].description = $desc else . end)
+                        # V11.14.3: sync .active_task from the canonical open_tasks subject
+                        # (post-V11.14.1 this is the real subject, not the description alias).
+                        # Falls back to $subj (legacy alias) only when no subject was ever
+                        # stored — rare for tasks created post-V11.14.
+                        | .active_task = (.open_tasks[$id].subject
+                                          // (if $subj != "" and $subj != "null" then $subj else .active_task end))
+                      else . end
+                ')
+                # V11.16 (ledger wiring): build in_progress event.
+                # counters_delta per ADR §1.3 exhaustive prior-bucket table (§1.3.0):
+                #   pending→in_progress: {pending:-1,in_progress:+1}
+                #   blocked→in_progress: {blocked:-1,in_progress:+1}
+                #   completed→in_progress: {completed:-1,in_progress:+1}
+                #   in_progress→in_progress (idempotent): {}
+                #   absent→in_progress (half-delta): {in_progress:+1}
+                if [ -n "$_TU_IDK_SUBJ_NORM" ] && [ -n "$_TU_IDK_CREATE_SEQ" ]; then
+                    _IP_DELTA=$(case "$_TU_PRIOR_STATUS" in
+                        pending)     printf '{"pending":-1,"in_progress":1}' ;;
+                        blocked)     printf '{"blocked":-1,"in_progress":1}' ;;
+                        completed)   printf '{"completed":-1,"in_progress":1}' ;;
+                        in_progress) printf '{}' ;;
+                        absent|*)    printf '{"in_progress":1}' ;;
+                    esac)
+                    LEDGER_EVENT_JSON=$(jq -cn \
+                        --arg project "$PROJECT" \
+                        --arg subj_norm "$_TU_IDK_SUBJ_NORM" \
+                        --argjson create_seq "$_TU_IDK_CREATE_SEQ" \
+                        --arg task_id "$TASK_ID" \
+                        --arg sid "$SESSION_UUID" \
+                        --arg ts "$NOW" \
+                        --arg owner "${TASK_OWNER:-}" \
+                        --arg sprint "${TASK_SPRINT:-}" \
+                        --arg gate "${TASK_GATE:-}" \
+                        --arg subj_new "${TASK_SUBJECT_NEW:-}" \
+                        --arg desc "${TASK_DESCRIPTION:-}" \
+                        --argjson delta "$_IP_DELTA" '
+                        {
+                            v: 1,
+                            ev: "in_progress",
+                            ts: $ts,
+                            project: $project,
+                            subject_norm: $subj_norm,
+                            create_seq: $create_seq,
+                            task_id: $task_id,
+                            session_uuid: $sid,
+                            owner: (if $owner != "" and $owner != "null" then $owner else null end),
+                            sprint: (if $sprint != "" and $sprint != "null" then $sprint else null end),
+                            gate: (if $gate != "" and $gate != "null" then $gate else null end),
+                            subject: (if $subj_new != "" and $subj_new != "null" then $subj_new else null end),
+                            description: (if $desc != "" and $desc != "null" then $desc else null end),
+                            counters_delta: $delta
+                        } | with_entries(select(.value != null))
+                        | . + {counters_delta: $delta}
+                    ' 2>/dev/null || true)
+                fi
+                ;;
+            completed)
+                # V11.29 (W1-T5): lane lease release. Idempotent no-op if not held /
+                # held by a different session. Advisory-only invariant preserved: never
+                # blocks or alters the tool result. Skipped when V11_LANE_LEASE=off or
+                # PROJECT is empty/unresolved.
+                if [ "${V11_LANE_LEASE:-on}" != "off" ] && [ -n "$PROJECT" ] && [ -n "$TASK_ID" ]; then
+                    v11_lane_release "$PROJECT" "$TASK_ID" >/dev/null 2>&1
+                fi
+                # V11.8 (S1-7): Gate-12-level advisory when complex/novel completes without STRs.
+                # Post-hook: can't block the transition, but emits loud advisory + bumps counter
+                # so v11-compliance-check Gate 12 surfaces the violation.
+                TU_COMPLETED_VIOLATED=0
+                if ! _v11_str_advisory "$TASK_ID" "$TU_COMPLEXITY" "$TU_STR_COUNT" "$TU_NO_STR" "completed"; then
+                    TU_COMPLETED_VIOLATED=1
+                fi
+                # V11.14.3: prefer the canonical subject stored in open_tasks (set on
+                # TaskCreate, survives status transitions). Falls back to .active_task
+                # for legacy state files where open_tasks may be empty (pre-V11.13).
+                ACTIVE_SUBJECT=$(printf '%s' "$STATE" | jq -r --arg id "$TASK_ID" '
+                    (.open_tasks[$id].subject) // .active_task // "unknown"
+                ')
+                # V11.19: snapshot per-task metadata BEFORE the completed STATE fold
+                # removes the open_tasks entry. The review-queue enqueue block
+                # consumes these. Without this pre-snapshot, the V11.19 block reads
+                # an already-cleared open_tasks (reviewer E1, 2026-05-23) and the
+                # post-fold completed counter (reviewer E2 — off-by-one for the
+                # sampled-scope filter's task_index).
+                _RQ_PREFOLD_RISK=$(printf '%s' "$STATE" | jq -r --arg id "$TASK_ID" \
+                    '.open_tasks[$id].metadata.risk // ""' 2>/dev/null || true)
+                _RQ_PREFOLD_COMPLEXITY=$(printf '%s' "$STATE" | jq -r --arg id "$TASK_ID" \
+                    '.open_tasks[$id].metadata.complexity // ""' 2>/dev/null || true)
+                _RQ_PREFOLD_TASK_IDX=$(printf '%s' "$STATE" | jq -r '.completed // 0' 2>/dev/null || echo 0)
+                # V11 loop-keystone Fix 3: sprint snapshot for the dispatch-trace
+                # auto-emit block below (also needs pre-fold open_tasks metadata).
+                _RQ_PREFOLD_SPRINT=$(printf '%s' "$STATE" | jq -r --arg id "$TASK_ID" \
+                    '.open_tasks[$id].metadata.sprint // ""' 2>/dev/null || true)
+                # V11.21: snapshot the parent's review pairing markers from STATE BEFORE the
+                # completed fold removes them from open_tasks. These drive:
+                #   * V11.19 enqueue suppression (mutual exclusion when parent already has a paired sibling)
+                #   * sibling status transition (pending_parent → pending on parent completion)
+                # Also honor markers passed directly on this TaskUpdate (rare, but supported).
+                _V21_REVIEW_TASK_ID=$(printf '%s' "$STATE" | jq -r --arg id "$TASK_ID" \
+                    '.open_tasks[$id].metadata.review_task_id // ""' 2>/dev/null || true)
+                if [ -z "$_V21_REVIEW_TASK_ID" ]; then
+                    _V21_REVIEW_TASK_ID=$(printf '%s' "$V11_RAW_INPUT" | jq -r '.tool_input.metadata.review_task_id // ""' 2>/dev/null || true)
+                fi
+                _V21_REVIEW_OF=$(printf '%s' "$STATE" | jq -r --arg id "$TASK_ID" \
+                    '.open_tasks[$id].metadata.review_of // ""' 2>/dev/null || true)
+                if [ -z "$_V21_REVIEW_OF" ]; then
+                    _V21_REVIEW_OF=$(printf '%s' "$V11_RAW_INPUT" | jq -r '.tool_input.metadata.review_of // ""' 2>/dev/null || true)
+                fi
+                _V21_SYNTHETIC=$(printf '%s' "$V11_RAW_INPUT" | jq -r '.tool_input.metadata.synthetic_completion // false' 2>/dev/null || echo false)
+                STATE=$(printf '%s' "$STATE" | jq \
+                    --arg id "$TASK_ID" \
+                    --arg subject "$ACTIVE_SUBJECT" \
+                    --arg sid "$SESSION_UUID" \
+                    --arg now "$NOW" \
+                    --argjson str_violated "${TU_COMPLETED_VIOLATED:-0}" '
+                    .in_progress = ([.in_progress - 1, 0] | max)
+                    | .completed += 1
+                    | (if $str_violated == 1 then
+                        .dark_code_advisories //= {"str_missing_count": 0, "str_missing_complex": 0, "str_missing_novel": 0, "last_advisory_at": null, "completions_without_str": 0}
+                        | .dark_code_advisories.completions_without_str = ((.dark_code_advisories.completions_without_str // 0) + 1)
+                        | .dark_code_advisories.last_advisory_at = $now
+                      else . end)
+                    | .recent_completed = ([{id: $id, subject: $subject, at: $now, session_uuid: $sid}] + (.recent_completed // []))[:10]
+                    | .active_task = null
+                    | .active_task_ids = ((.active_task_ids // []) | map(select(. != $id)))
+                    | .active_agent_id = null
+                    | .last_updated = $now
+                    # ADR §A.1.1: tombstone _idk into _terminal_idk BEFORE del(.open_tasks[$id]).
+                    # Same-session O(1) cache so step-2 identity resolution can find it
+                    # if this task is re-opened within the same session.
+                    | if $id != "" and (.open_tasks[$id]._idk) != null then
+                        ._terminal_idk = (._terminal_idk // {})
+                        | ._terminal_idk[$id] = (
+                            .open_tasks[$id]._idk
+                            + {terminal_status: "completed", tombstoned_at: $now}
+                            + (if .open_tasks[$id].subject != null then {subject: .open_tasks[$id].subject} else {} end)
+                          )
+                      else . end
+                    # V11.13: clear from open_tasks (no longer pending rehydration)
+                    | if $id != "" then .open_tasks = ((.open_tasks // {}) | del(.[$id])) else . end
+                ')
+
+                # V11.21: sibling status transition (pending_parent → pending) when the
+                # parent has a paired review sibling. This is the "Phase 4 dispatch unblock"
+                # signal — the sibling's TaskList status stays pending, but its
+                # metadata.parent_status flips so the orchestrator's dispatch filter (T13)
+                # picks it up on the next iteration. Idempotent: re-running on an already-
+                # pending sibling is a no-op (jq pattern check).
+                # Rollback: V11_AUTO_PAIR_REVIEW=off skips the transition entirely.
+                if [ "${V11_AUTO_PAIR_REVIEW:-on}" != "off" ] \
+                   && [ -n "$_V21_REVIEW_TASK_ID" ] && [ "$_V21_REVIEW_TASK_ID" != "null" ]; then
+                    STATE=$(printf '%s' "$STATE" | jq \
+                        --arg rid "$_V21_REVIEW_TASK_ID" '
+                        if ($rid != "" and (.open_tasks[$rid].metadata.parent_status // "") == "pending_parent")
+                        then
+                            .open_tasks[$rid].metadata.parent_status = "pending"
+                            | .open_tasks[$rid].metadata.parent_unblocked_at = (.last_updated // (now | strftime("%Y-%m-%dT%H:%M:%S+00:00")))
+                        else . end
+                    ' 2>/dev/null || printf '%s' "$STATE")
+                fi
+
+                # V11: Persist artifacts from completed task metadata
+                ARTIFACTS=$(printf '%s' "$V11_RAW_INPUT" | jq -r '.tool_input.metadata.artifacts // empty' 2>/dev/null)
+                if [ -n "$ARTIFACTS" ] && [ "$ARTIFACTS" != "null" ]; then
+                    # Store artifacts indexed by task ID
+                    STATE=$(printf '%s' "$STATE" | jq \
+                        --arg id "$TASK_ID" \
+                        --argjson arts "$ARTIFACTS" '
+                        .task_artifacts = ((.task_artifacts // {}) + {($id): $arts})
+                    ')
+
+                    # Handle external storage for large artifact_refs
+                    if [ -n "$PROJECT" ]; then
+                        ARTIFACT_DIR="$SESSIONS_ROOT/$PROJECT/artifacts/$TASK_ID"
+                        mkdir -p "$ARTIFACT_DIR" 2>/dev/null
+                    fi
+                fi
+
+                # ── V11 loop-keystone Fix 3 (step 2): mechanize CLAUDE.md §23's ──
+                # advisory-only "log orchestrator-override when self-executing
+                # tagged tasks" rule. If this completed task carries metadata.agent
+                # (a TaskCreate push-recommendation to a specific agent) but no
+                # Task/Agent tool was ever spawned for it — i.e. track-agents (see
+                # hooks/track-agents) never fired and no dispatch-trace.jsonl entry
+                # exists for this (project, task_id) — the orchestrator silently
+                # self-executed a task it had recommended to an agent. Auto-emit
+                # the missing attribution record so this fires even when the
+                # orchestrator LLM forgets to call dispatch-trace-append manually.
+                #
+                # Dedup key is (project, task_id) rather than session_uuid: the
+                # frozen v1 dispatch-trace schema (schemas/dispatch-trace.schema.json,
+                # additionalProperties:false) has no session_uuid field, and
+                # task_ids are unique within a project regardless of which
+                # session completed them — matching on session would either
+                # require a schema-breaking field or under-dedup across handoffs.
+                #
+                # Rollback: V11_CALLER_KIND_INFERENCE=off skips this block entirely
+                # (restores pre-fix behavior: no auto-emit, advisory-only).
+                #
+                # Post-adversarial-review fixes (2026-07-01, task #7/original-#3
+                # review, E2+E3):
+                #  - E2: gate on PROJECT_SOURCE != "active-project-fallback",
+                #    matching every other ledger-write guard in this file (Bug
+                #    E/H immunity) — ambient/mutable project resolution is not
+                #    safe for durable attribution writes.
+                #  - E3: the "does an entry already exist" check and the
+                #    dispatch-trace-append call are now a single locked
+                #    check-then-write critical section (mirrors the existing
+                #    flock pattern used elsewhere in this file, e.g. the
+                #    agent-errors.jsonl append above) instead of two
+                #    unsynchronized steps — closes the double-fire duplicate-
+                #    append race the reviewer flagged.
+                if [ "${V11_CALLER_KIND_INFERENCE:-on}" != "off" ] && [ -n "$PROJECT" ] && [ -n "$TASK_ID" ] \
+                   && [ "$PROJECT_SOURCE" != "active-project-fallback" ]; then
+                    _DTC_AGENT=$(printf '%s' "$V11_RAW_INPUT" | jq -r '.tool_input.metadata.agent // ""' 2>/dev/null)
+                    if [ -z "$_DTC_AGENT" ] || [ "$_DTC_AGENT" = "null" ]; then
+                        # Fall back to the TaskCreate-time push-recommendation, which
+                        # survives the completed-fold (recommended_agents is a
+                        # top-level STATE key, not nested under open_tasks).
+                        _DTC_AGENT=$(printf '%s' "$STATE" | jq -r --arg id "$TASK_ID" \
+                            '.recommended_agents[$id] // ""' 2>/dev/null)
+                    fi
+                    if [ -n "$_DTC_AGENT" ] && [ "$_DTC_AGENT" != "null" ]; then
+                        _DTC_TRACE_FILE="$METRICS_DIR/dispatch-trace.jsonl"
+                        _DTC_SPRINT=$(printf '%s' "$V11_RAW_INPUT" | jq -r '.tool_input.metadata.sprint // ""' 2>/dev/null)
+                        [ -z "$_DTC_SPRINT" ] && _DTC_SPRINT="${_RQ_PREFOLD_SPRINT:-}"
+                        [ -z "$_DTC_SPRINT" ] && _DTC_SPRINT="unknown"
+                        _DTC_AUTONOMY=$(jq -r '.level // 0' "$SESSIONS_ROOT/$PROJECT/.autonomy-state" 2>/dev/null)
+                        case "$_DTC_AUTONOMY" in
+                            3)   _DTC_MODE="acceptEdits" ;;
+                            4|5) _DTC_MODE="bypassPermissions" ;;
+                            *)   _DTC_MODE="default" ;;
+                        esac
+                        (
+                            flock -x 202
+                            _DTC_EXISTS=""
+                            if [ -f "$_DTC_TRACE_FILE" ]; then
+                                _DTC_EXISTS=$(jq -c --arg proj "$PROJECT" --arg tid "$TASK_ID" \
+                                    'select(.project == $proj and .task_id == $tid)' \
+                                    "$_DTC_TRACE_FILE" 2>/dev/null | head -1)
+                            fi
+                            if [ -z "$_DTC_EXISTS" ]; then
+                                "$V11_HOME/scripts/dispatch-trace-append" \
+                                    --task-id "$TASK_ID" \
+                                    --project "$PROJECT" \
+                                    --sprint "$_DTC_SPRINT" \
+                                    --recommended-agent "$_DTC_AGENT" \
+                                    --spawned-agent "orchestrator" \
+                                    --override-reason "unattributed-self-exec" \
+                                    --model "inherit" \
+                                    --mode "$_DTC_MODE" \
+                                    --caller-kind "orchestrator" 2>/dev/null || true
+                            fi
+                        ) 202>"$_DTC_TRACE_FILE.checklock" 2>/dev/null || true
+                    fi
+                fi
+
+                # ── V11.15: per-task review loop → agent metrics ledgers ──────
+                # Backward compatible: absent metadata.artifacts.review ⇒ this
+                # whole block is skipped and the completed path is byte-for-byte
+                # identical to pre-V11.15. Comprehension gate: replaces the
+                # 100%-orchestrator attribution blindspot with per-agent signal.
+                #
+                # V11.21: when synthetic_completion=true (orchestrator INV-11 auto-NONE
+                # transitions for cancelled/abandoned paired reviews), the WHOLE ledger
+                # block is skipped to avoid ledger pollution from framework machinery.
+                REVIEW=$(printf '%s' "$V11_RAW_INPUT" | jq -c '.tool_input.metadata.artifacts.review // empty' 2>/dev/null || true)
+                if [ "$_V21_SYNTHETIC" = "true" ]; then
+                    REVIEW=""   # short-circuit: don't write per-agent ledgers for synthetic completions
+                fi
+
+                # ── V11.22: self-review-missing nudge (instrument-only) ─────────
+                # When a REVIEWABLE task completes without metadata.artifacts.self_review,
+                # emit one stderr line so the gap is observable. Mirrors V11.19 review-
+                # queue nudge pattern. NEVER blocks. The reviewable filter (sprint-02+
+                # OR risk medium/high OR complexity medium/complex/novel) matches the
+                # V11.21 pair-at-TaskCreate scope.
+                # Rollback: V11_SELF_REVIEW_NUDGE=off
+                # F2 fix: detection must run when EITHER lever is on — NUDGE gates only
+                # the stderr line (below), ACTUATE gates only the absence-row append
+                # (further below); they must not be nested such that one disables the
+                # other. Single-sourced reviewable-filter logic below serves both.
+                if { [ "${V11_SELF_REVIEW_NUDGE:-on}" != "off" ] || [ "${V11_SELF_REVIEW_ACTUATE:-on}" != "off" ]; } \
+                    && [ "$_V21_SYNTHETIC" != "true" ]; then
+                    # Single-pass jq: extract self_review + reviewable-filter fields + agent
+                    # from raw_input AND STATE in one invocation. Collapses 6-8 jq calls
+                    # into 1 to respect the 5s test-harness timeout (handoff lesson:
+                    # "further additions need single-pass"). TSV-emit with bash IFS read.
+                    # W5-T15 fix: the "completed" fold above (V11.13) already deleted
+                    # open_tasks[$id] from $STATE by this point, so a live lookup of
+                    # $st.open_tasks[$tid].metadata.{sprint,risk,complexity} always
+                    # misses — the reviewable gate silently never fired. Use the same
+                    # pre-fold snapshots the V11.19 review-queue block already relies
+                    # on (_RQ_PREFOLD_*, captured before the fold at ~1077-1088).
+                    _SRN_STATE_ARG="${STATE:-{\}}"
+                    _SRN_TSV=$(printf '%s' "$V11_RAW_INPUT" | jq -r \
+                        --argjson st "$_SRN_STATE_ARG" \
+                        --arg tid "$TASK_ID" \
+                        --arg pf_sprint "${_RQ_PREFOLD_SPRINT:-}" \
+                        --arg pf_risk "${_RQ_PREFOLD_RISK:-}" \
+                        --arg pf_complexity "${_RQ_PREFOLD_COMPLEXITY:-}" '
+                        def coal(a; b): (a | select(. != null and . != "")) // (b | select(. != null and . != "")) // "";
+                        [
+                            (.tool_input.metadata.artifacts.self_review | tostring),
+                            coal(.tool_input.metadata.sprint;     $pf_sprint),
+                            coal(.tool_input.metadata.risk;       $pf_risk),
+                            coal(.tool_input.metadata.complexity; $pf_complexity),
+                            coal($st.active_agent_id;             $st.recommended_agents[$tid])
+                        ] | join("")
+                    ' 2>/dev/null || true)
+                    # W5-T15 fix: @tsv (tab-joined) is unsafe here — bash `read` treats
+                    # TAB as an IFS-whitespace char regardless of the IFS assignment, so
+                    # consecutive tabs (the common case: sprint is usually empty) collapse
+                    # and silently shift every field right, corrupting risk/complexity/
+                    # agent. Join on ASCII RS (\x1e, not IFS-whitespace) so empty fields
+                    # are preserved positionally.
+                    if [ -n "$_SRN_TSV" ]; then
+                        IFS=$'\x1e' read -r _SRN_SR _SRN_SPRINT _SRN_RISK _SRN_COMP _SRN_AGENT <<< "$_SRN_TSV"
+                        if [ "$_SRN_SR" = "null" ] || [ -z "$_SRN_SR" ]; then
+                            _SRN_REVIEWABLE="no"
+                            # Match sprint-02 through sprint-99 (single + double digit).
+                            case "$_SRN_SPRINT" in
+                                sprint-0[2-9]-*|sprint-[1-9][0-9]-*) _SRN_REVIEWABLE="yes" ;;
+                            esac
+                            case "$_SRN_RISK" in medium|high) _SRN_REVIEWABLE="yes" ;; esac
+                            case "$_SRN_COMP" in medium|complex|novel) _SRN_REVIEWABLE="yes" ;; esac
+                            if [ "$_SRN_REVIEWABLE" = "yes" ]; then
+                                _SRN_DEGRADED="false"
+                                if [ -z "$_SRN_AGENT" ] || [ "$_SRN_AGENT" = "null" ]; then
+                                    _SRN_AGENT="unknown"
+                                    _SRN_DEGRADED="true"
+                                fi
+                                if [ "${V11_SELF_REVIEW_NUDGE:-on}" != "off" ]; then
+                                    echo "⚠ Self-review missing on T${TASK_ID} (executor=${_SRN_AGENT}); Layer A not observed (V11.22 INV-3). Rollback: V11_SELF_REVIEW_NUDGE=off" >&2
+                                fi
+
+                                # ── W5-T15: symmetric absence row (Layer A actuation) ──
+                                # Missing self_review is penalized as invisibly as malformed
+                                # self_review is penalized visibly (1315-1373 above). Mirrors
+                                # that block's jq construction + flock append + attribution_key
+                                # formula exactly (file/line empty, error_id sentinel below).
+                                # Never fails the hook. Rollback: V11_SELF_REVIEW_ACTUATE=off.
+                                if [ "${V11_SELF_REVIEW_ACTUATE:-on}" != "off" ]; then
+                                    _SRA_METRICS="${METRICS_DIR:-$V11_WORKSPACE_ROOT/.agent-metrics}"
+                                    mkdir -p "$_SRA_METRICS" 2>/dev/null
+                                    _SRA_KEY=$(printf '%s|%s|%s|%s|%s' "${PROJECT:-}" "$TASK_ID" "" "" "missing_self_review" \
+                                        | sha256sum 2>/dev/null | awk '{print $1}' || echo "")
+                                    _SRA_CK=$(v11_caller_kind 2>/dev/null || true)
+                                    jq -cn \
+                                        --arg ts "$NOW" \
+                                        --arg tid "$TASK_ID" \
+                                        --arg agent "$_SRN_AGENT" \
+                                        --arg key "$_SRA_KEY" \
+                                        --arg proj "${PROJECT:-}" \
+                                        --arg ck "$_SRA_CK" \
+                                        --argjson degraded "$_SRN_DEGRADED" '
+                                        {
+                                            timestamp: $ts,
+                                            task_id: $tid,
+                                            agent_id: $agent,
+                                            error_type: "completeness",
+                                            severity: "LOW",
+                                            error_message: "self_review absent on reviewable completion (synthetic W5-T15 marker)",
+                                            found_by: $agent,
+                                            fix_suggested: "Emit self_review ({severity, summary, errors[], reviewed_at, agent_id}) on TaskUpdate(completed)",
+                                            fixed: false,
+                                            escalated: false,
+                                            trace_id: null,
+                                            project: ($proj | if . == "" then null else . end),
+                                            found_by_layer: "lite_self",
+                                            task_id_inferred: false,
+                                            attribution_key: $key,
+                                            executor_kind: "self",
+                                            attribution_degraded: $degraded
+                                        } + (if $ck == "" then {} else {caller_kind: $ck} end)
+                                    ' 2>/dev/null | (
+                                        # Atomic-append using flock; never fail the hook.
+                                        _SRA_LOG="$_SRA_METRICS/agent-errors.jsonl"
+                                        (
+                                            flock -x 9
+                                            cat >> "$_SRA_LOG"
+                                        ) 9>"$_SRA_LOG.lock" 2>/dev/null || true
+                                    ) || true
+                                fi
+                            fi
+                        fi
+                    fi
+                fi
+
+                # ── V11.21: self-review (Layer A) malformed-JSON guard ──────────
+                # The implementing agent emits metadata.artifacts.self_review on its
+                # own TaskUpdate(completed). Validate the shape; never fail the hook.
+                # On malformed JSON or missing required severity: emit a synthetic
+                # lite_self error entry to agent-errors.jsonl so the calibration
+                # miss counter sees the slip. Honest agents lose nothing; sloppy
+                # ones surface a signal.
+                # Rollback: V11_SELF_REVIEW_REQUIRED=off skips the validation entirely.
+                if [ "${V11_SELF_REVIEW_REQUIRED:-on}" != "off" ] && [ "$_V21_SYNTHETIC" != "true" ]; then
+                    SELF_REVIEW=$(printf '%s' "$V11_RAW_INPUT" | jq -c '.tool_input.metadata.artifacts.self_review // empty' 2>/dev/null || true)
+                    if [ -n "$SELF_REVIEW" ] && [ "$SELF_REVIEW" != "null" ]; then
+                        _SR_SEV=$(printf '%s' "$SELF_REVIEW" | jq -r '.severity // empty' 2>/dev/null || true)
+                        _SR_OK="yes"
+                        # Severity must be in the enum
+                        case "$_SR_SEV" in
+                            NONE|LOW|MEDIUM|HIGH|CRITICAL) ;;
+                            *) _SR_OK="no" ;;
+                        esac
+                        if [ "$_SR_OK" = "no" ]; then
+                            # Synthetic lite_self error entry — warn, do not block
+                            echo "[V11.21] sync-tasks: self_review malformed on task #$TASK_ID (severity=$_SR_SEV). Logging synthetic lite_self error." >&2
+                            _SR_AGENT=$(printf '%s' "$STATE" | jq -r '.active_agent_id // empty' 2>/dev/null)
+                            if [ -z "$_SR_AGENT" ] || [ "$_SR_AGENT" = "null" ]; then
+                                _SR_AGENT=$(printf '%s' "$STATE" | jq -r --arg id "$TASK_ID" '.recommended_agents[$id] // empty' 2>/dev/null)
+                            fi
+                            [ -z "$_SR_AGENT" ] || [ "$_SR_AGENT" = "null" ] && _SR_AGENT="unknown"
+                            _SR_METRICS="${METRICS_DIR:-$V11_WORKSPACE_ROOT/.agent-metrics}"
+                            mkdir -p "$_SR_METRICS" 2>/dev/null
+                            # Compute attribution key the same way as the bash helper.
+                            # File/line empty; error_id=malformed_self_review (sentinel).
+                            _SR_KEY=$(printf '%s|%s|%s|%s|%s' "${PROJECT:-}" "$TASK_ID" "" "" "malformed_self_review" \
+                                | sha256sum 2>/dev/null | awk '{print $1}' || echo "")
+                            _SR_CK=$(v11_caller_kind 2>/dev/null || true)
+                            jq -cn \
+                                --arg ts "$NOW" \
+                                --arg tid "$TASK_ID" \
+                                --arg agent "$_SR_AGENT" \
+                                --arg found_by "$_SR_AGENT" \
+                                --arg key "$_SR_KEY" \
+                                --arg proj "${PROJECT:-}" \
+                                --arg ck "$_SR_CK" '
+                                {
+                                    timestamp: $ts,
+                                    task_id: $tid,
+                                    agent_id: $agent,
+                                    error_type: "completeness",
+                                    severity: "MEDIUM",
+                                    error_message: "self_review JSON malformed or severity missing (synthetic V11.21 marker)",
+                                    found_by: $found_by,
+                                    fix_suggested: "Re-emit self_review with severity ∈ {NONE,LOW,MEDIUM,HIGH,CRITICAL}",
+                                    fixed: false,
+                                    escalated: false,
+                                    trace_id: null,
+                                    project: ($proj | if . == "" then null else . end),
+                                    found_by_layer: "lite_self",
+                                    task_id_inferred: false,
+                                    attribution_key: $key,
+                                    executor_kind: "self"
+                                } + (if $ck == "" then {} else {caller_kind: $ck} end)
+                            ' 2>/dev/null | (
+                                # Atomic-append using flock; never fail the hook.
+                                _SR_LOG="$_SR_METRICS/agent-errors.jsonl"
+                                (
+                                    flock -x 9
+                                    cat >> "$_SR_LOG"
+                                ) 9>"$_SR_LOG.lock" 2>/dev/null || true
+                            ) || true
+                        fi
+                    fi
+                fi
+                if [ -n "$REVIEW" ] && [ "$REVIEW" != "null" ]; then
+                    # agent_id: review.agent_id → task-state active_agent_id → 'unknown'
+                    RV_AGENT=$(printf '%s' "$REVIEW" | jq -r '.agent_id // empty' 2>/dev/null || true)
+                    if [ -z "$RV_AGENT" ] || [ "$RV_AGENT" = "null" ]; then
+                        RV_AGENT=$(printf '%s' "$STATE" | jq -r '.active_agent_id // empty' 2>/dev/null || true)
+                    fi
+                    [ -z "$RV_AGENT" ] && RV_AGENT="unknown"
+                    RV_TRACE=$(printf '%s' "$V11_RAW_INPUT" | jq -r '.tool_input.metadata.artifacts.trace_id // ""' 2>/dev/null || true)
+                    RV_META=$(printf '%s' "$V11_RAW_INPUT" | jq -c '.tool_input.metadata.artifacts.meta_feedback // empty' 2>/dev/null || true)
+
+                    # Project-scoped rollup into session STATE (exact; advisory).
+                    # Compute into a temp; only adopt if jq produced valid JSON —
+                    # otherwise STATE is left verbatim (never emptied).
+                    RV_NEWSTATE=$(printf '%s' "$STATE" | jq --argjson r "$REVIEW" '
+                        .review_summary //= {tasks_reviewed:0,total_errors:0,by_severity:{critical:0,high:0,medium:0,low:0},auto_fixed:0,escalated:0,avg_difficulty:0}
+                        | .review_summary.tasks_reviewed += 1
+                        | .review_summary.total_errors += ($r.error_count // 0)
+                        | .review_summary.by_severity.critical += ([ ($r.errors//[])[] | select(.severity=="CRITICAL") ] | length)
+                        | .review_summary.by_severity.high     += ([ ($r.errors//[])[] | select(.severity=="HIGH")     ] | length)
+                        | .review_summary.by_severity.medium   += ([ ($r.errors//[])[] | select(.severity=="MEDIUM")   ] | length)
+                        | .review_summary.by_severity.low      += ([ ($r.errors//[])[] | select(.severity=="LOW")      ] | length)
+                        | .review_summary.auto_fixed += (($r.auto_fix.fixed // []) | length)
+                        # escalated = deduped union of auto_fix.escalated ids and
+                        # CRITICAL error ids. CRITICAL is always escalated by
+                        # contract; the orchestrator may ALSO list it in
+                        # auto_fix.escalated (pre-V11.15.2 convention) — a naive
+                        # sum would double-count, so union+unique.
+                        | .review_summary.escalated  += (
+                            ( ($r.auto_fix.escalated // [])
+                              + [ ($r.errors//[])[]
+                                  | select(.severity=="CRITICAL") | .id
+                                  | select(. != null and . != "") ] )
+                            | unique | length )
+                        | .review_summary.avg_difficulty =
+                            (((.review_summary.avg_difficulty * (.review_summary.tasks_reviewed - 1)) + ($r.difficulty // 0))
+                             / .review_summary.tasks_reviewed)
+                    ' 2>/dev/null || true)
+                    if [ -n "$RV_NEWSTATE" ] && printf '%s' "$RV_NEWSTATE" | jq empty 2>/dev/null; then
+                        STATE="$RV_NEWSTATE"
+                    fi
+
+                    # V11.16 F1: per-event review_summary_delta for the ledger.
+                    # MUST mirror the STATE fold above (and common.sh replay fold)
+                    # EXACTLY — same severity counting and same escalated
+                    # union(auto_fix.escalated + CRITICAL ids)|unique — so
+                    # ledger replay == legacy session-fold by construction
+                    # (gate-1 zero-divergence). Computed only here, inside the
+                    # validated REVIEW block; absent ⇒ field omitted ⇒ replay
+                    # folds nothing (byte-identical to a no-review completion).
+                    _RV_SUMMARY_DELTA=$(printf '%s' "$REVIEW" | jq -c '{
+                        tasks_reviewed: 1,
+                        total_errors: (.error_count // 0),
+                        by_severity: {
+                            critical: ([ (.errors//[])[] | select(.severity=="CRITICAL") ] | length),
+                            high:     ([ (.errors//[])[] | select(.severity=="HIGH")     ] | length),
+                            medium:   ([ (.errors//[])[] | select(.severity=="MEDIUM")   ] | length),
+                            low:      ([ (.errors//[])[] | select(.severity=="LOW")      ] | length)
+                        },
+                        auto_fixed: ((.auto_fix.fixed // []) | length),
+                        escalated: ( ( (.auto_fix.escalated // [])
+                                        + [ (.errors//[])[]
+                                            | select(.severity=="CRITICAL") | .id
+                                            | select(. != null and . != "") ] )
+                                      | unique | length ),
+                        difficulty: (.difficulty // 0)
+                    }' 2>/dev/null || true)
+
+                    # V11.20: caller-kind for this completion event. Empty under
+                    # V11_CALLER_KIND=off rollback → field is OMITTED from each
+                    # agent-errors line below (preserves V11.15 schema shape).
+                    RV_CALLER_KIND=$(v11_caller_kind 2>/dev/null || true)
+
+                    # V11.21: detect if this completion is on a REVIEW SIBLING
+                    # (metadata.review_of present) vs a normal work task.
+                    # On a review sibling, the ledger lines emit found_by_layer=
+                    # "lite_adversarial" + executor_kind="adversarial".
+                    # Otherwise (legacy V11.15 in-flight review on the work task),
+                    # found_by_layer stays "lite" (read-time aliased to
+                    # lite_adversarial by consumers per the cutover policy).
+                    if [ -n "$_V21_REVIEW_OF" ] && [ "$_V21_REVIEW_OF" != "null" ]; then
+                        RV_LAYER="lite_adversarial"
+                        RV_EXECUTOR_KIND="adversarial"
+                    else
+                        RV_LAYER="lite"
+                        RV_EXECUTOR_KIND=""
+                    fi
+                    # Rollback: V11_AUTO_PAIR_REVIEW=off forces legacy "lite" layer
+                    # so cross-layer attribution scripts treat V11.21 entries identically.
+                    if [ "${V11_AUTO_PAIR_REVIEW:-on}" = "off" ]; then
+                        RV_LAYER="lite"
+                        RV_EXECUTOR_KIND=""
+                    fi
+
+                    # External JSONL ledgers + meta-feedback file: side effects,
+                    # atomic flock-append, must NEVER fail the hook (|| true).
+                    V11_REVIEW="$REVIEW" V11_RV_META="$RV_META" V11_RV_AGENT="$RV_AGENT" \
+                    V11_RV_TRACE="$RV_TRACE" V11_RV_NOW="$NOW" V11_RV_TASK="$TASK_ID" \
+                    V11_RV_REVIEW_OF="$_V21_REVIEW_OF" \
+                    V11_RV_PROJECT="${PROJECT:-}" V11_RV_METRICS="${METRICS_DIR:-$V11_WORKSPACE_ROOT/.agent-metrics}" \
+                    V11_RV_SESSIONS="${SESSIONS_ROOT:-}" \
+                    V11_RV_CALLER_KIND="$RV_CALLER_KIND" \
+                    V11_RV_LAYER="${RV_LAYER:-lite}" \
+                    V11_RV_EXECUTOR_KIND="${RV_EXECUTOR_KIND:-}" \
+                    python3 - <<'PYEOF' 2>/dev/null || true
+import os, json, time, fcntl, datetime, pathlib, re, hashlib
+
+def jenv(k):
+    v = os.environ.get(k, "")
+    if not v:
+        return None
+    try:
+        return json.loads(v)
+    except Exception:
+        return None
+
+review = jenv("V11_REVIEW")
+if not isinstance(review, dict):
+    raise SystemExit(0)
+
+agent    = os.environ.get("V11_RV_AGENT") or "unknown"
+now      = os.environ.get("V11_RV_NOW") or datetime.datetime.utcnow().isoformat()
+
+# INV-3 join-key fix (v11-loop-keystone Fix 1): this block runs on completion
+# of the REVIEWER SIBLING task, not the parent work task. V11_RV_TASK is the
+# reviewer's own task_id — writing agent-errors.jsonl keyed on it breaks the
+# calibration join in scripts/agent-scorecard, which looks up self-reviews by
+# the PARENT task_id (task_state.task_artifacts[parent_id].self_review).
+# Resolve the true parent, in priority order:
+#   1. review["task_id"] — the verdict object's own parent-task field, set by
+#      the reviewer agent per its output contract (agents/adversarial-lite-
+#      reviewer.md: "task_id" == parent_task_id). Most authoritative — it's
+#      what the reviewer explicitly attested to be reviewing.
+#   2. V11_RV_REVIEW_OF — the reviewer task's own metadata.review_of, stamped
+#      at TaskCreate pairing time (V11.21). Already resolved by the caller
+#      from STATE / raw tool_input before this block runs.
+#   3. V11_RV_TASK (reviewer's own id) — last-resort fallback. Degrades back
+#      to the original bug, so surface it loudly rather than silently.
+#
+# NOT every "else" hit here is a bug: when V11_RV_LAYER=="lite" (no paired
+# reviewer sibling at all — the legacy pre-V11.21 shape where the review
+# verdict is written directly onto the WORK task's own completion, or the
+# V11_AUTO_PAIR_REVIEW=off rollback), V11_RV_TASK IS already the correct
+# task_id — there's no separate parent to resolve, so this is expected
+# behavior, not degradation. Only flag/warn when V11_RV_LAYER=="lite_adversarial"
+# (we structurally know this completion IS a paired reviewer sibling with a
+# real parent) yet BOTH sources failed to produce it — that combination
+# should be unreachable given how RV_LAYER is derived (it's only set to
+# "lite_adversarial" when review_of was non-empty), but is checked
+# defensively rather than assumed.
+_reviewer_task_id = os.environ.get("V11_RV_TASK") or ""
+_review_of = os.environ.get("V11_RV_REVIEW_OF") or ""
+_layer_hint = os.environ.get("V11_RV_LAYER") or "lite"
+_review_task_id_field = None
+if isinstance(review, dict):
+    _rtf = review.get("task_id")
+    if isinstance(_rtf, str) and _rtf.strip():
+        _review_task_id_field = _rtf.strip()
+
+_join_key_fallback = False
+if _review_task_id_field:
+    task_id = _review_task_id_field
+elif _review_of and _review_of != "null":
+    task_id = _review_of
+else:
+    task_id = _reviewer_task_id
+    _join_key_fallback = bool(task_id) and _layer_hint == "lite_adversarial"
+
+project  = os.environ.get("V11_RV_PROJECT") or None
+trace    = os.environ.get("V11_RV_TRACE") or None
+metrics  = os.environ.get("V11_RV_METRICS")
+sessions = os.environ.get("V11_RV_SESSIONS")
+if not metrics:
+    raise SystemExit(0)
+mdir = pathlib.Path(metrics)
+mdir.mkdir(parents=True, exist_ok=True)
+
+reviewer  = review.get("reviewer") or "adversarial-lite-reviewer"
+errors    = review.get("errors") or []
+auto      = review.get("auto_fix") or {}
+fixed_ids = set(auto.get("fixed") or [])
+esc_ids   = set(auto.get("escalated") or [])
+
+def append_atomic(path, lines):
+    if not lines:
+        return
+    with open(path, "a") as fh:
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        for ln in lines:
+            fh.write(json.dumps(ln, separators=(",", ":")) + "\n")
+        fcntl.flock(fh, fcntl.LOCK_UN)
+
+def parse_ts(s):
+    try:
+        return datetime.datetime.fromisoformat(str(s).replace("Z", "+00:00")).timestamp()
+    except Exception:
+        return None
+
+# 1. agent-errors.jsonl — one schema-valid line per error
+# CRITICAL invariant (V11.15 contract): CRITICAL is NEVER auto-fixed and is
+# ALWAYS escalated (blocker task + orchestrator). It therefore has no auto_fix
+# block, so esc_ids/fixed_ids never cover it — escalation must be derived from
+# severity, else an escalated CRITICAL is indistinguishable from an ignored LOW.
+#
+# V11.20: each line now carries found_by_layer="lite" (explicit), an
+# attribution_key (SHA256 of project|task_id|file|line|error_id — same formula
+# as v11_compute_attribution_key), caller_kind (orchestrator|subagent|unknown,
+# OMITTED entirely under V11_CALLER_KIND=off rollback to preserve legacy shape),
+# and task_id_inferred=false (lite path knows the task_id explicitly).
+caller_kind = os.environ.get("V11_RV_CALLER_KIND") or ""
+
+def _attribution_key(proj, tid, file_, line_, eid_):
+    """SHA256 of '|'-joined args. Mirrors v11_compute_attribution_key contract:
+    empty segments preserved as empty strings (NOT None/null) so the bash and
+    python paths produce identical keys for identical findings.
+
+    Critical: integer 0 (`line=0` for a file-level finding that still has a
+    line column) must serialize as "0", not "". `or` would short-circuit on 0
+    and break cross-path dedup — use explicit `is None` check.
+    """
+    parts = [
+        proj or "",
+        tid or "",
+        file_ or "",
+        "" if line_ is None else str(line_),
+        eid_ or "",
+    ]
+    payload = "|".join(parts).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+err_lines = []
+for e in errors:
+    eid = e.get("id", "")
+    sev = (e.get("severity") or "LOW").upper()
+    is_critical = sev == "CRITICAL"
+    escalated = (eid in esc_ids) or is_critical
+    fixed = (eid in fixed_ids) and not is_critical
+
+    e_file = e.get("file") or ""
+    e_line = e.get("line")  # may be int, None, or str
+    line = {
+        "timestamp": now,
+        "task_id": task_id,
+        "agent_id": agent,
+        "error_type": e.get("type") or "unknown",
+        "severity": sev,
+        "error_message": (e.get("detail") or "")[:500],
+        "found_by": reviewer,
+        "fix_suggested": (e.get("fix_hint") or "")[:300],
+        "fixed": fixed,
+        "escalated": escalated,
+        "trace_id": trace,
+        "project": project,
+        # V11.20 additive fields
+        "found_by_layer": os.environ.get("V11_RV_LAYER") or "lite",
+        # INV-3 join-key fix: normally the lite path knows the parent task_id
+        # explicitly (via review.task_id or the reviewer's metadata.review_of),
+        # so task_id_inferred stays False. Only the last-resort fallback (both
+        # sources absent, reusing the reviewer sibling's own id) sets this True
+        # — the row is intentionally unjoinable and downstream calibration
+        # (scripts/agent-scorecard) should not trust it as a paired record.
+        "task_id_inferred": _join_key_fallback,
+        "attribution_key": _attribution_key(project, task_id, e_file, e_line, eid),
+    }
+    # caller_kind: omit field entirely under rollback, write value otherwise.
+    # Legacy consumers (pre-V11.20) tolerate either absence or presence per
+    # the additive-only schema contract.
+    if caller_kind:
+        line["caller_kind"] = caller_kind
+    # V11.21: executor_kind disambiguates self vs adversarial reviews when both
+    # share found_by_layer family. Optional, additive — schema accepts absence.
+    ek = os.environ.get("V11_RV_EXECUTOR_KIND") or ""
+    if ek:
+        line["executor_kind"] = ek
+    err_lines.append(line)
+err_path = mdir / "agent-errors.jsonl"
+append_atomic(err_path, err_lines)
+
+# INV-3 join-key fallback warning: this whole python3 invocation runs under
+# `2>/dev/null || true` in the caller (deliberate — external ledger writes
+# must never fail the hook), so a plain stderr print here is silently
+# swallowed and effectively invisible. Write to a durable, greppable advisory
+# log instead so the degraded-join event is NOT silent (v11-loop-keystone
+# Fix 1 requirement: "log a warning line so it's visible").
+if _join_key_fallback and err_lines:
+    try:
+        warn_path = mdir / "join-key-fallback-warnings.log"
+        with open(warn_path, "a") as wf:
+            fcntl.flock(wf, fcntl.LOCK_EX)
+            wf.write(
+                f"{now} task_id={task_id} agent={agent} project={project} "
+                f"reviewer={reviewer} reason=review.task_id and review_of both "
+                f"absent; reused reviewer sibling's own task_id -- row will NOT "
+                f"join with self_review for INV-3 calibration\n"
+            )
+            fcntl.flock(wf, fcntl.LOCK_UN)
+    except Exception:
+        pass
+
+# 2. agent-effectiveness.jsonl — rolling 30d snapshot for this agent
+WINDOW = 30
+now_ts = parse_ts(now) or time.time()
+cutoff = now_ts - WINDOW * 86400
+
+# A task may be reviewed more than once (orchestrator retry after a BLOCKED
+# verdict). Each review re-appends that task's error lines, so a naive count
+# double-counts. Collapse to the LATEST review per task_id (max line
+# timestamp), so error_count/error_types reflect the task's current state,
+# not its review history. Single-review tasks are unaffected.
+_by_task = {}  # task_id -> {"ts": float, "errs": [error_type,...]}
+if err_path.exists():
+    for raw in err_path.read_text().splitlines():
+        try:
+            r = json.loads(raw)
+        except Exception:
+            continue
+        if r.get("agent_id") != agent:
+            continue
+        ts = parse_ts(r.get("timestamp"))
+        if ts is None or ts < cutoff:
+            continue
+        tid = r.get("task_id")
+        et = r.get("error_type", "unknown")
+        slot = _by_task.get(tid)
+        if slot is None or ts > slot["ts"]:
+            _by_task[tid] = {"ts": ts, "errs": [et]}
+        elif ts == slot["ts"]:
+            slot["errs"].append(et)  # same review pass, distinct error line
+        # ts < slot["ts"] => stale earlier review pass for this task; drop it
+
+etypes = {}
+err_task_ids = set(_by_task.keys())
+ec = 0
+for tid, slot in _by_task.items():
+    for et in slot["errs"]:
+        ec += 1
+        etypes[et] = etypes.get(et, 0) + 1
+
+eff_path = mdir / "agent-effectiveness.jsonl"
+prior_n = 0
+prev_avg = 0.0
+prev_success = None
+if eff_path.exists():
+    for raw in eff_path.read_text().splitlines():
+        try:
+            s = json.loads(raw)
+        except Exception:
+            continue
+        if s.get("agent_id") != agent:
+            continue
+        ts = parse_ts(s.get("timestamp"))
+        if ts is None or ts < cutoff:
+            continue
+        prior_n += 1            # one prior in-window snapshot == one reviewed task
+        prev_avg = s.get("avg_difficulty", prev_avg)
+        prev_success = s.get("success_rate", prev_success)
+
+tasks_completed = prior_n + 1   # include the review being recorded now
+difficulty = review.get("difficulty") or 0
+avg_difficulty = ((prev_avg * prior_n) + difficulty) / tasks_completed
+tasks_error_free = max(tasks_completed - len(err_task_ids), 0)
+success_rate = (tasks_error_free / tasks_completed) if tasks_completed else 0.0
+if prev_success is None:
+    trend = "stable"
+elif success_rate > prev_success + 0.05:
+    trend = "improving"
+elif success_rate < prev_success - 0.05:
+    trend = "degrading"
+else:
+    trend = "stable"
+
+append_atomic(eff_path, [{
+    "timestamp": now,
+    "agent_id": agent,
+    "window_days": WINDOW,
+    "tasks_completed": tasks_completed,
+    "tasks_error_free": tasks_error_free,
+    "success_rate": round(success_rate, 4),
+    "avg_difficulty": round(avg_difficulty, 4),
+    "error_count": ec,
+    "error_types": etypes,
+    "trend": trend,
+}])
+
+# 3. meta-feedback persisted for scripts/flywheel-ingest
+meta = jenv("V11_RV_META")
+if isinstance(meta, dict) and project and sessions:
+    mfdir = pathlib.Path(sessions) / project / "meta-feedback"
+    mfdir.mkdir(parents=True, exist_ok=True)
+    rec = dict(meta)
+    rec.setdefault("task_id", task_id)
+    rec.setdefault("agent_id", agent)
+    rec.setdefault("timestamp", now)
+    # Sanitize task_id before using it as a filename — never let a crafted
+    # taskId (e.g. "../../etc/x") escape the meta-feedback directory.
+    safe_tid = task_id if re.match(r"^[A-Za-z0-9._-]+$", task_id or "") else "unknown"
+    (mfdir / f"{safe_tid}.json").write_text(json.dumps(rec, indent=2))
+PYEOF
+                fi
+
+                # ── V11.19: review-queue enforcement ─────────────────────────
+                # Root-cause fix for the V11.15 silent skip: completed-without-
+                # review used to be byte-identical to completed-with-review, so
+                # the orchestrator could skip Phase 4r entirely with no observable
+                # consequence. The queue makes it observable.
+                #
+                # Branches (symmetric T3/T4 of V11.19 spec):
+                #   * REVIEW present (above block wrote ledgers) → mark queue done
+                #   * REVIEW absent → consult .review-config.json scope filter;
+                #     if reviewable, enqueue + stderr nudge
+                #
+                # Rollback: V11_REVIEW_ENFORCEMENT=off disables enqueue+nudge.
+                # The mark-done path is also gated (so disabling=off cleanly
+                # stops all queue interaction while leaving the existing V11.15
+                # ledger path untouched).
+                #
+                # V11.21 mutual exclusion (per-task): when the parent has
+                # metadata.review_task_id set (its paired sibling), the V11.21
+                # Phase-4 path handles review. Skip the V11.19 queue for this task.
+                # Likewise skip when synthetic_completion=true. O(1) checks; no scan.
+                _V21_SUPPRESS_QUEUE="no"
+                if [ "${V11_AUTO_PAIR_REVIEW:-on}" != "off" ] && [ -n "$_V21_REVIEW_TASK_ID" ] && [ "$_V21_REVIEW_TASK_ID" != "null" ]; then
+                    _V21_SUPPRESS_QUEUE="yes"
+                fi
+                if [ "$_V21_SYNTHETIC" = "true" ]; then
+                    _V21_SUPPRESS_QUEUE="yes"
+                fi
+                if [ "${V11_REVIEW_ENFORCEMENT:-on}" != "off" ] && [ "$_V21_SUPPRESS_QUEUE" != "yes" ]; then
+                    if [ -n "$REVIEW" ] && [ "$REVIEW" != "null" ]; then
+                        # T4: review verdict present → mark queue done.
+                        # Severity = highest severity across errors[*] (NONE if zero errors).
+                        RV_MAX_SEV=$(printf '%s' "$REVIEW" | jq -r '
+                            [ (.errors // [])[] | .severity // "NONE" ]
+                            | if length == 0 then "NONE"
+                              elif index("CRITICAL") then "CRITICAL"
+                              elif index("HIGH") then "HIGH"
+                              elif index("MEDIUM") then "MEDIUM"
+                              elif index("LOW") then "LOW"
+                              else "NONE" end
+                        ' 2>/dev/null || echo "NONE")
+                        v11_review_queue_mark_done "$PROJECT" "$TASK_ID" "$RV_MAX_SEV" "$SESSION_UUID" >/dev/null 2>&1 || true
+                    else
+                        # T3: review absent → maybe enqueue.
+                        # Defense (V11.19): the per-session STATE is owned by
+                        # exactly one Claude session (V11.13). Its `.project`
+                        # field records the project that session is bound to.
+                        # If PROJECT (resolved from event metadata or global
+                        # active-project) disagrees with STATE.project, we are
+                        # in the active-project-leakage case (V11.15.5 Bug H
+                        # shape) — the event truly belongs to STATE.project,
+                        # not PROJECT. Skip the enqueue.
+                        #
+                        # Reviewer E3 (2026-05-23): set _RQ_SHOULD='no'
+                        # directly here rather than relying on
+                        # v11_should_review_task to honor enabled:false. The
+                        # behavior is unchanged (v11_should_review_task DOES
+                        # honor it), but the explicit short-circuit removes the
+                        # integration assumption.
+                        _RQ_SESSION_PROJECT=$(printf '%s' "$STATE" | jq -r '.project // ""' 2>/dev/null || echo "")
+                        _RQ_SHOULD="yes"
+                        if [ -n "$_RQ_SESSION_PROJECT" ] && [ "$_RQ_SESSION_PROJECT" != "$PROJECT" ]; then
+                            echo "[V11.19] sync-tasks: review queue enqueue SKIPPED for task #$TASK_ID — session project '$_RQ_SESSION_PROJECT' != resolved PROJECT '$PROJECT' (cross-session active-project leakage; pass metadata.project on TaskUpdate to prevent)." >&2
+                            _RQ_SHOULD="no"
+                        else
+                            # Risk/complexity for the scope filter: prefer this
+                            # event's metadata; fall back to the PRE-FOLD
+                            # snapshot we captured before the completed STATE
+                            # fold cleared open_tasks (reviewer E1).
+                            _RQ_RISK=$(printf '%s' "$V11_RAW_INPUT" | jq -r '.tool_input.metadata.risk // ""' 2>/dev/null)
+                            _RQ_COMPLEXITY=$(printf '%s' "$V11_RAW_INPUT" | jq -r '.tool_input.metadata.complexity // ""' 2>/dev/null)
+                            [ -z "$_RQ_RISK" ] && _RQ_RISK="${_RQ_PREFOLD_RISK:-}"
+                            [ -z "$_RQ_COMPLEXITY" ] && _RQ_COMPLEXITY="${_RQ_PREFOLD_COMPLEXITY:-}"
+                            # task_index = pre-fold completed counter (reviewer E2):
+                            # the scope filter's sampled mode should see this task's
+                            # position within the project, not the post-increment.
+                            _RQ_TASK_IDX="${_RQ_PREFOLD_TASK_IDX:-0}"
+                            _RQ_CFG=$(v11_resolve_review_config "$PROJECT" 2>/dev/null || echo '{}')
+                            _RQ_SHOULD=$(v11_should_review_task "$_RQ_CFG" "$_RQ_RISK" "$_RQ_COMPLEXITY" "$_RQ_TASK_IDX" 2>/dev/null || echo "yes")
+                        fi
+
+                        if [ "$_RQ_SHOULD" = "yes" ]; then
+                            # files_changed from this event's artifacts (best signal)
+                            _RQ_FILES=$(printf '%s' "$V11_RAW_INPUT" | jq -c '.tool_input.metadata.artifacts.files_changed // []' 2>/dev/null)
+                            [ -z "$_RQ_FILES" ] && _RQ_FILES="[]"
+
+                            # W3.5 (audit 2026-06-01 M22): if files_changed is empty,
+                            # the adversarial-lite-reviewer has nothing scoped to review.
+                            # By default we still enqueue (legacy behavior) + warn loudly.
+                            # Set V11_FILES_CHANGED_REQUIRED=on to refuse-enqueue and force
+                            # the orchestrator to TaskUpdate with the file list before review.
+                            _RQ_FILES_LEN=$(printf '%s' "$_RQ_FILES" | jq 'length' 2>/dev/null || echo 0)
+                            if [ "$_RQ_FILES_LEN" = "0" ]; then
+                                if [ "${V11_FILES_CHANGED_REQUIRED:-off}" = "on" ]; then
+                                    echo "[V11.W3.5] REVIEW ENQUEUE REFUSED: task #${TASK_ID} completed without metadata.artifacts.files_changed[]. Backfill via TaskUpdate(${TASK_ID}, metadata={artifacts:{files_changed:[\"path/to/file\",...]}}) then re-trigger review-queue enqueue." >&2
+                                    # Skip the enqueue entirely; the V11.19 queue stays
+                                    # honest (no empty-scope entries).
+                                    continue 2>/dev/null || true
+                                else
+                                    echo "[V11.W3.5] WARN: task #${TASK_ID} completed with empty files_changed[]. Review queue entry will be unreviewable. Backfill via TaskUpdate or set V11_FILES_CHANGED_REQUIRED=on to refuse." >&2
+                                fi
+                            fi
+                            # agent_id: STATE.active_agent_id (set by in_progress
+                            # owner=...) → STATE.recommended_agents[TASK_ID]
+                            # (set by TaskCreate metadata.agent) → "unknown"
+                            _RQ_AGENT=$(printf '%s' "$STATE" | jq -r '.active_agent_id // empty' 2>/dev/null)
+                            if [ -z "$_RQ_AGENT" ] || [ "$_RQ_AGENT" = "null" ]; then
+                                _RQ_AGENT=$(printf '%s' "$STATE" | jq -r --arg id "$TASK_ID" '.recommended_agents[$id] // empty' 2>/dev/null)
+                            fi
+                            [ -z "$_RQ_AGENT" ] || [ "$_RQ_AGENT" = "null" ] && _RQ_AGENT="unknown"
+
+                            v11_review_queue_add "$PROJECT" "$TASK_ID" "$_RQ_AGENT" "${ACTIVE_SUBJECT:-}" "$_RQ_FILES" "$SESSION_UUID" >/dev/null 2>&1 || true
+                            # Always emit the nudge (already-pending tasks still get the signal)
+                            _RQ_PENDING=$(v11_review_queue_pending_count "$PROJECT" 2>/dev/null || echo "?")
+                            echo "[V11] REVIEW PENDING: task #${TASK_ID} in ${PROJECT} (pending queue: ${_RQ_PENDING}). Spawn adversarial-lite-reviewer." >&2
+                        fi
+                    fi
+                fi
+
+                # V11.16 (ledger wiring): build completed event.
+                # counters_delta per ADR §1.3 exhaustive prior-bucket table (§1.3.0):
+                #   in_progress→completed: {in_progress:-1,completed:+1}
+                #   pending→completed: {pending:-1,completed:+1}
+                #   blocked→completed: {blocked:-1,completed:+1}
+                #   completed→completed (idempotent): {}
+                #   absent→completed (half-delta): {completed:+1}
+                if [ -n "$_TU_IDK_SUBJ_NORM" ] && [ -n "$_TU_IDK_CREATE_SEQ" ]; then
+                    _COMP_DELTA=$(case "$_TU_PRIOR_STATUS" in
+                        in_progress) printf '{"in_progress":-1,"completed":1}' ;;
+                        pending)     printf '{"pending":-1,"completed":1}' ;;
+                        blocked)     printf '{"blocked":-1,"completed":1}' ;;
+                        completed)   printf '{}' ;;
+                        absent|*)    printf '{"completed":1}' ;;
+                    esac)
+                    # V11.22: executor attribution (additive, additive-only — old events
+                    # lack the field, new events add it). Source chain:
+                    #   active_agent_id (set by TaskUpdate in_progress owner=X)
+                    #   → recommended_agents[task_id] (set by TaskCreate metadata.agent)
+                    #   → "orchestrator" (default — current session executed it)
+                    # caller_kind via v11_caller_kind helper (returns "subagent" when
+                    # spawned-from-subagent env present; else "orchestrator"). Rollback:
+                    # V11_LEDGER_EXECUTOR=off omits both fields entirely.
+                    _LE_EXECUTOR=""
+                    _LE_CK=""
+                    if [ "${V11_LEDGER_EXECUTOR:-on}" != "off" ]; then
+                        # Single jq pass — cascade active_agent_id → recommended_agents[id]
+                        _LE_EXECUTOR=$(printf '%s' "$STATE" | jq -r --arg id "$TASK_ID" \
+                            '.active_agent_id // .recommended_agents[$id] // empty' 2>/dev/null)
+                        if [ -z "$_LE_EXECUTOR" ] || [ "$_LE_EXECUTOR" = "null" ]; then
+                            _LE_EXECUTOR="orchestrator"
+                        fi
+                        _LE_CK=$(v11_caller_kind 2>/dev/null)
+                        [ -z "$_LE_CK" ] && _LE_CK="orchestrator"
+                    fi
+                    LEDGER_EVENT_JSON=$(jq -cn \
+                        --arg project "$PROJECT" \
+                        --arg subj_norm "$_TU_IDK_SUBJ_NORM" \
+                        --argjson create_seq "$_TU_IDK_CREATE_SEQ" \
+                        --arg task_id "$TASK_ID" \
+                        --arg sid "$SESSION_UUID" \
+                        --arg ts "$NOW" \
+                        --arg subj "${ACTIVE_SUBJECT:-}" \
+                        --arg desc "${TASK_DESCRIPTION:-}" \
+                        --argjson arts "${ARTIFACTS:-null}" \
+                        --argjson rsd "${_RV_SUMMARY_DELTA:-null}" \
+                        --argjson delta "$_COMP_DELTA" \
+                        --arg executor "$_LE_EXECUTOR" \
+                        --arg ck "$_LE_CK" '
+                        {
+                            v: 1,
+                            ev: "completed",
+                            ts: $ts,
+                            at: $ts,
+                            project: $project,
+                            subject_norm: $subj_norm,
+                            create_seq: $create_seq,
+                            task_id: $task_id,
+                            session_uuid: $sid,
+                            subject: (if $subj != "" and $subj != "null" then $subj else null end),
+                            description: (if $desc != "" and $desc != "null" then $desc else null end),
+                            artifacts: (if ($arts | type) == "object" then $arts else null end),
+                            review_summary_delta: (if ($rsd | type) == "object" then $rsd else null end),
+                            executor: (if $executor != "" then $executor else null end),
+                            caller_kind: (if $ck != "" then $ck else null end),
+                            counters_delta: $delta
+                        } | with_entries(select(.value != null))
+                        | . + {counters_delta: $delta, at: $ts}
+                    ' 2>/dev/null || true)
+                fi
+                ;;
+            blocked)
+                # V11.29 (W1-T2): lane lease release. Idempotent no-op if not held /
+                # held by a different session. Advisory-only invariant preserved: never
+                # blocks or alters the tool result. Skipped when V11_LANE_LEASE=off or
+                # PROJECT is empty/unresolved. Mirrors the completed-branch release --
+                # a blocked task must not keep starving other live sessions of the lane.
+                if [ "${V11_LANE_LEASE:-on}" != "off" ] && [ -n "$PROJECT" ] && [ -n "$TASK_ID" ]; then
+                    v11_lane_release "$PROJECT" "$TASK_ID" >/dev/null 2>&1
+                fi
+                BLOCK_REASON=$(printf '%s' "$V11_RAW_INPUT" | jq -r '.tool_input.description // ""' 2>/dev/null)
+                # V11.14.3: prefer the canonical subject stored in open_tasks; see
+                # completed-path note above for rationale.
+                ACTIVE_SUBJECT=$(printf '%s' "$STATE" | jq -r --arg id "$TASK_ID" '
+                    (.open_tasks[$id].subject) // .active_task // "unknown"
+                ')
+                STATE=$(printf '%s' "$STATE" | jq \
+                    --arg id "$TASK_ID" \
+                    --arg reason "$BLOCK_REASON" \
+                    --arg subject "$ACTIVE_SUBJECT" \
+                    --arg sid "$SESSION_UUID" \
+                    --arg now "$NOW" '
+                    .in_progress = ([.in_progress - 1, 0] | max)
+                    | .blocked += 1
+                    | .active_task = null
+                    | .active_task_ids = ((.active_task_ids // []) | map(select(. != $id)))
+                    | .active_agent_id = null
+                    | .blocked_tasks = ([{id: $id, subject: $subject, reason: (if $reason != "" and $reason != "null" then $reason else "unspecified" end), at: $now, session_uuid: $sid}] + (.blocked_tasks // []))[:5]
+                    | .last_updated = $now
+                    # ADR §A.1.1: tombstone _idk into _terminal_idk BEFORE del(.open_tasks[$id]).
+                    # Same-session O(1) cache for step-2 identity resolution on re-open.
+                    | if $id != "" and (.open_tasks[$id]._idk) != null then
+                        ._terminal_idk = (._terminal_idk // {})
+                        | ._terminal_idk[$id] = (
+                            .open_tasks[$id]._idk
+                            + {terminal_status: "blocked", tombstoned_at: $now}
+                            + (if .open_tasks[$id].subject != null then {subject: .open_tasks[$id].subject} else {} end)
+                          )
+                      else . end
+                    # V11.13: drop blocked task from open_tasks (no auto-rehydrate)
+                    | if $id != "" then .open_tasks = ((.open_tasks // {}) | del(.[$id])) else . end
+                ')
+                # V11.16 (ledger wiring): build blocked event.
+                # counters_delta per ADR §1.3 exhaustive prior-bucket table (§1.3.0):
+                #   in_progress→blocked: {in_progress:-1,blocked:+1}
+                #   pending→blocked: {pending:-1,blocked:+1}
+                #   completed→blocked: {completed:-1,blocked:+1}
+                #   blocked→blocked (idempotent): {}
+                #   absent→blocked (half-delta): {blocked:+1}
+                if [ -n "$_TU_IDK_SUBJ_NORM" ] && [ -n "$_TU_IDK_CREATE_SEQ" ]; then
+                    _BLOCK_DELTA=$(case "$_TU_PRIOR_STATUS" in
+                        in_progress) printf '{"in_progress":-1,"blocked":1}' ;;
+                        pending)     printf '{"pending":-1,"blocked":1}' ;;
+                        completed)   printf '{"completed":-1,"blocked":1}' ;;
+                        blocked)     printf '{}' ;;
+                        absent|*)    printf '{"blocked":1}' ;;
+                    esac)
+                    LEDGER_EVENT_JSON=$(jq -cn \
+                        --arg project "$PROJECT" \
+                        --arg subj_norm "$_TU_IDK_SUBJ_NORM" \
+                        --argjson create_seq "$_TU_IDK_CREATE_SEQ" \
+                        --arg task_id "$TASK_ID" \
+                        --arg sid "$SESSION_UUID" \
+                        --arg ts "$NOW" \
+                        --arg subj "${ACTIVE_SUBJECT:-}" \
+                        --arg reason "${BLOCK_REASON:-}" \
+                        --argjson delta "$_BLOCK_DELTA" '
+                        {
+                            v: 1,
+                            ev: "blocked",
+                            ts: $ts,
+                            at: $ts,
+                            project: $project,
+                            subject_norm: $subj_norm,
+                            create_seq: $create_seq,
+                            task_id: $task_id,
+                            session_uuid: $sid,
+                            subject: (if $subj != "" and $subj != "null" then $subj else null end),
+                            reason: (if $reason != "" and $reason != "null" then $reason else null end),
+                            counters_delta: $delta
+                        } | with_entries(select(.value != null))
+                        | . + {counters_delta: $delta, at: $ts}
+                    ' 2>/dev/null || true)
+                fi
+                ;;
+            *)
+                # V11.14.2: Field-only TaskUpdate (no status transition) — caller
+                # changed subject and/or description without flipping status. Without
+                # this branch the open_tasks entry silently misses the update and
+                # handoff-tasks.json carries stale content forward. No counter
+                # bookkeeping needed (status unchanged); just refresh fields.
+                # V11.14.4: when the touched task is the currently-active one,
+                # resync the denormalized .active_task field from the new subject
+                # so handoff-prose readers (last-session.json, handoff.md "Next Up")
+                # don't display stale subjects.
+                if [ -n "$TASK_ID" ] && { [ -n "${TASK_SUBJECT_NEW:-}" ] || [ -n "${TASK_DESCRIPTION:-}" ]; }; then
+                    STATE=$(printf '%s' "$STATE" | jq \
+                        --arg id "$TASK_ID" \
+                        --arg subj_new "${TASK_SUBJECT_NEW:-}" \
+                        --arg desc "${TASK_DESCRIPTION:-}" \
+                        --arg now "$NOW" '
+                        .last_updated = $now
+                        | if $id != "" then
+                            .open_tasks //= {}
+                            | .open_tasks[$id] //= {subject: null, description: null, status: "pending", metadata: null}
+                            | (if $subj_new != "" and $subj_new != "null" then .open_tasks[$id].subject = $subj_new else . end)
+                            | (if $desc != "" and $desc != "null" then .open_tasks[$id].description = $desc else . end)
+                            | (if ((.active_task_ids // []) | index($id)) != null
+                                  and ($subj_new != "" and $subj_new != "null") then
+                                  .active_task = $subj_new
+                               else . end)
+                          else . end
+                    ')
+                    # V11.16 (ledger wiring): build field_update event (ADR §1.3 field_update).
+                    # counters_delta is {} (required, no status change). Only emit when
+                    # _idk is present on the record so identity is known (HIGH-4).
+                    if [ -n "$_TU_IDK_SUBJ_NORM" ] && [ -n "$_TU_IDK_CREATE_SEQ" ]; then
+                        LEDGER_EVENT_JSON=$(jq -cn \
+                            --arg project "$PROJECT" \
+                            --arg subj_norm "$_TU_IDK_SUBJ_NORM" \
+                            --argjson create_seq "$_TU_IDK_CREATE_SEQ" \
+                            --arg task_id "$TASK_ID" \
+                            --arg sid "$SESSION_UUID" \
+                            --arg ts "$NOW" \
+                            --arg subj_new "${TASK_SUBJECT_NEW:-}" \
+                            --arg desc "${TASK_DESCRIPTION:-}" '
+                            {
+                                v: 1,
+                                ev: "field_update",
+                                ts: $ts,
+                                project: $project,
+                                subject_norm: $subj_norm,
+                                create_seq: $create_seq,
+                                task_id: $task_id,
+                                session_uuid: $sid,
+                                subject: (if $subj_new != "" and $subj_new != "null" then $subj_new else null end),
+                                description: (if $desc != "" and $desc != "null" then $desc else null end),
+                                counters_delta: {}
+                            } | with_entries(select(.value != null))
+                            | . + {counters_delta: {}}
+                        ' 2>/dev/null || true)
+                    fi
+                fi
+                ;;
+        esac
+        ;;
+    TaskList)
+        # Always sanitize active_task_ids: drop nulls and empty strings (corruption guard).
+        # Past TaskUpdate(in_progress) calls with missing taskId injected "" entries; this
+        # purges them on every TaskList without waiting for full reconciliation to fire.
+        STATE=$(printf '%s' "$STATE" | jq --arg now "$NOW" '
+            .last_updated = $now
+            | .active_task_ids = ((.active_task_ids // []) | map(select(. != null and . != "")))
+        ')
+        # Counter reconciliation: recount from TaskList output to fix drift on long-running projects.
+        # Claude Code emits tool_response = {tasks: [{id, status, ...}, ...]}; legacy
+        # fixtures stringify "N. subject [status]". jq counts the structured form
+        # when present; grep is the back-compat path. grep -c exits 1 on no match;
+        # `|| true` keeps that benign and the post-process strips to a clean integer.
+        _has_structured_tasks() {
+            printf '%s' "$V11_TOOL_OUTPUT" | jq -e 'type == "object" and (.tasks | type) == "array"' >/dev/null 2>&1
+        }
+        _count_status() {
+            local status="$1" n
+            if _has_structured_tasks; then
+                n=$(printf '%s' "$V11_TOOL_OUTPUT" | jq -r --arg s "$status" '[.tasks[] | select(.status == $s)] | length' 2>/dev/null)
+            else
+                n=$(printf '%s' "$V11_TOOL_OUTPUT" | grep -c "\[$status\]" 2>/dev/null || true)
+            fi
+            n="${n%%$'\n'*}"
+            n="${n//[^0-9]/}"
+            printf '%s' "${n:-0}"
+        }
+        PENDING_ACTUAL=$(_count_status pending)
+        IN_PROGRESS_ACTUAL=$(_count_status in_progress)
+        COMPLETED_ACTUAL=$(_count_status completed)
+        BLOCKED_ACTUAL=$(_count_status blocked)
+        TOTAL_ACTUAL=$((PENDING_ACTUAL + IN_PROGRESS_ACTUAL + COMPLETED_ACTUAL + BLOCKED_ACTUAL))
+        # Only reconcile if TaskList returned real data (TOTAL_ACTUAL > 0) and counters differ by >1
+        if [ "$TOTAL_ACTUAL" -gt 0 ]; then
+            TOTAL_STATE=$(printf '%s' "$STATE" | jq -r '.total // 0')
+            COMPLETED_STATE=$(printf '%s' "$STATE" | jq -r '.completed // 0')
+            PENDING_STATE=$(printf '%s' "$STATE" | jq -r '.pending // 0')
+            IN_PROG_STATE=$(printf '%s' "$STATE" | jq -r '.in_progress // 0')
+            BLOCKED_STATE=$(printf '%s' "$STATE" | jq -r '.blocked // 0')
+            _TOTAL_DRIFT=$(( TOTAL_ACTUAL - TOTAL_STATE ))
+            _COMP_DRIFT=$(( COMPLETED_ACTUAL - COMPLETED_STATE ))
+            _PEND_DRIFT=$(( PENDING_ACTUAL - PENDING_STATE ))
+            _PROG_DRIFT=$(( IN_PROGRESS_ACTUAL - IN_PROG_STATE ))
+            _BLOCK_DRIFT=$(( BLOCKED_ACTUAL - BLOCKED_STATE ))
+            [ "$_TOTAL_DRIFT" -lt 0 ] && _TOTAL_DRIFT=$(( -_TOTAL_DRIFT ))
+            [ "$_COMP_DRIFT" -lt 0 ]  && _COMP_DRIFT=$(( -_COMP_DRIFT ))
+            [ "$_PEND_DRIFT" -lt 0 ]  && _PEND_DRIFT=$(( -_PEND_DRIFT ))
+            [ "$_PROG_DRIFT" -lt 0 ]  && _PROG_DRIFT=$(( -_PROG_DRIFT ))
+            [ "$_BLOCK_DRIFT" -lt 0 ] && _BLOCK_DRIFT=$(( -_BLOCK_DRIFT ))
+            # M2 (meta-improvement 2026-05): drop the >1 drift threshold. Any drift
+            # on UNFILTERED TaskList is reconciled — TaskList output IS ground truth
+            # for that moment, so accepting it is always safe and self-healing. The
+            # old >1 threshold left 1-task drift to compound across sessions.
+            if [ "$_TOTAL_DRIFT" -gt 0 ] || [ "$_COMP_DRIFT" -gt 0 ] || \
+               [ "$_PEND_DRIFT" -gt 0 ]  || [ "$_PROG_DRIFT" -gt 0 ] || \
+               [ "$_BLOCK_DRIFT" -gt 0 ]; then
+                echo "sync-tasks: counter reconcile for $PROJECT (total: ${TOTAL_STATE}→${TOTAL_ACTUAL}, completed: ${COMPLETED_STATE}→${COMPLETED_ACTUAL}, pending: ${PENDING_STATE}→${PENDING_ACTUAL}, in_progress: ${IN_PROG_STATE}→${IN_PROGRESS_ACTUAL}, blocked: ${BLOCKED_STATE}→${BLOCKED_ACTUAL})" >&2
+                STATE=$(printf '%s' "$STATE" | jq \
+                    --argjson total "$TOTAL_ACTUAL" \
+                    --argjson completed "$COMPLETED_ACTUAL" \
+                    --argjson pending "$PENDING_ACTUAL" \
+                    --argjson in_progress "$IN_PROGRESS_ACTUAL" \
+                    --argjson blocked "$BLOCKED_ACTUAL" \
+                    '.total = $total | .completed = $completed | .pending = $pending |
+                     .in_progress = $in_progress | .blocked = $blocked')
+                # V11.16 (ledger wiring): emit reconcile event on counter drift (ADR §1.3 reconcile).
+                # scope=project, counters_abs = authoritative recount from TaskList output.
+                # Sentinel: subject_norm="" create_seq=-1 (ADR MED-B). NO counters_delta.
+                # Bug E/H immunity: only emit when project was not resolved via ambient fallback.
+                if [ "$PROJECT_SOURCE" != "active-project-fallback" ]; then
+                    LEDGER_EVENT_JSON=$(jq -cn \
+                        --arg project "$PROJECT" \
+                        --arg sid "$SESSION_UUID" \
+                        --arg ts "$NOW" \
+                        --argjson total "$TOTAL_ACTUAL" \
+                        --argjson completed "$COMPLETED_ACTUAL" \
+                        --argjson pending "$PENDING_ACTUAL" \
+                        --argjson in_progress "$IN_PROGRESS_ACTUAL" \
+                        --argjson blocked "$BLOCKED_ACTUAL" '
+                        {
+                            v: 1,
+                            ev: "reconcile",
+                            ts: $ts,
+                            project: $project,
+                            subject_norm: "",
+                            create_seq: -1,
+                            task_id: "",
+                            session_uuid: $sid,
+                            scope: "project",
+                            counters_abs: {
+                                total: $total,
+                                pending: $pending,
+                                in_progress: $in_progress,
+                                completed: $completed,
+                                blocked: $blocked
+                            },
+                            reason: "tasklist-recount",
+                            source: "tasklist"
+                        }
+                    ' 2>/dev/null || true)
+                fi
+            fi
+
+            # active_task_ids reconciliation: trim orphan IDs against the actual
+            # [in_progress] set in TaskList output. Past sprints accumulated zombies
+            # (e.g. 15, 41, 47) that no TaskUpdate path could clean.
+            #
+            # Safety: only run on UNFILTERED TaskList. A filtered call (e.g.
+            # tool_input.status="completed") would hide legit in-progress tasks
+            # from the output and cause us to wrongly purge them.
+            LIST_FILTER_STATUS=$(printf '%s' "$V11_RAW_INPUT" | jq -r '.tool_input.status // ""' 2>/dev/null || true)
+            if [ -z "$LIST_FILTER_STATUS" ] || [ "$LIST_FILTER_STATUS" = "null" ] || [ "$LIST_FILTER_STATUS" = "in_progress" ]; then
+                # Extract in_progress IDs. Prefer Claude Code's structured tool_response
+                # ({tasks:[{id,status}]}). Fall back to text formats:
+                #   "<id>. <subject> [in_progress]"   ← legacy text TaskList
+                #   "Task #<id> ... [in_progress]"    ← older text fixtures
+                # IDs are alphanumeric + - + _ to handle T63, voice-mode, plain digits.
+                REAL_IDS_JSON='[]'
+                if _has_structured_tasks; then
+                    REAL_IDS_JSON=$(printf '%s' "$V11_TOOL_OUTPUT" | jq -c '[.tasks[] | select(.status == "in_progress") | .id | tostring] | unique' 2>/dev/null || echo '[]')
+                    REAL_IDS_JSON="${REAL_IDS_JSON:-[]}"
+                else
+                    REAL_IDS_RAW=$(printf '%s' "$V11_TOOL_OUTPUT" | grep -F '[in_progress]' 2>/dev/null || true)
+                    if [ -n "$REAL_IDS_RAW" ]; then
+                        REAL_IDS_JSON=$(printf '%s' "$REAL_IDS_RAW" | sed -n -E '
+                                s/^[[:space:]]*([A-Za-z0-9_-]+)[.:].*/\1/p
+                                s/.*[Tt]ask #([0-9]+).*/\1/p
+                            ' | grep -v '^$' | sort -u | jq -R . | jq -sc 'unique' 2>/dev/null || echo '[]')
+                        REAL_IDS_JSON="${REAL_IDS_JSON:-[]}"
+                    fi
+                fi
+                IDS_BEFORE=$(printf '%s' "$STATE" | jq -c '.active_task_ids // []')
+                STATE=$(printf '%s' "$STATE" | jq --argjson real "$REAL_IDS_JSON" '
+                    .active_task_ids = ((.active_task_ids // []) | map(select(. as $x | $real | index($x) != null)))
+                ')
+                IDS_AFTER=$(printf '%s' "$STATE" | jq -c '.active_task_ids // []')
+                if [ "$IDS_BEFORE" != "$IDS_AFTER" ]; then
+                    ZOMBIES=$(jq -nc --argjson b "$IDS_BEFORE" --argjson a "$IDS_AFTER" '$b - $a' 2>/dev/null || echo '[]')
+                    echo "sync-tasks: trimmed orphan active_task_ids for $PROJECT (zombies: $ZOMBIES)" >&2
+                fi
+            fi
+        fi
+
+        # V11.W1 (handoff-accuracy): live TaskList snapshot write.
+        # Problem: handoff quality gate reads disk task-state.json, which only
+        # has scalar counters — it lags the live in-memory TaskList. Smoking
+        # gun: 13 live tasks → gate read empty disk → scored 1/5 → forced
+        # --spawn-anyway override. Fix: write a complete snapshot from the
+        # TaskList tool response on every UNFILTERED call. Gate and handoff
+        # read this file, which is always current because the orchestrator
+        # calls TaskList constantly (no flush discipline needed).
+        #
+        # Design invariants:
+        #   ONE cheap write — single jq pass. No cascade. (jq latency lesson:
+        #   2 calls in this hook once broke 15 parallel tests at 5s timeout.)
+        #   DRIFT-IMMUNE project keying: each task's OWN metadata.project
+        #   (same Bug E/H principle as Strategy 1.5 above). Tasks with no
+        #   metadata.project go to the ambient $PROJECT bucket (warned, not
+        #   dropped — they are unstamped, not invalid).
+        #   BACKWARD-COMPATIBLE: gated by V11_HANDOFF_LIVE_RECONCILE (default
+        #   ON). When =off, this entire block is skipped (no disk writes).
+        #   UNFILTERED only: a filtered TaskList (status=completed, etc.) would
+        #   give a partial snapshot. Skip for filtered calls.
+        #
+        # Snapshot file: $METRICS_DIR/ledger/${PROJECT}.live-snapshot.json
+        # Format: {ts, project, total, completed, pending, in_progress,
+        #          blocked, tasks: [{id, status, subject, blockedBy,
+        #          metadata_project}], unstamped_count, session_uuid}
+        # Rollback: V11_HANDOFF_LIVE_RECONCILE=off
+        # LIST_FILTER_STATUS was already set above; reuse here (no re-parse).
+        _SNAP_IS_UNFILTERED="no"
+        if [ -z "${LIST_FILTER_STATUS:-}" ] || [ "${LIST_FILTER_STATUS:-}" = "null" ]; then
+            _SNAP_IS_UNFILTERED="yes"
+        fi
+        if [ "${V11_HANDOFF_LIVE_RECONCILE:-on}" != "off" ] \
+           && [ "$_SNAP_IS_UNFILTERED" = "yes" ] \
+           && [ "${TOTAL_ACTUAL:-0}" -gt 0 ]; then
+            if _has_structured_tasks; then
+                # Drift-immune snapshot: resolve each task's project from its OWN
+                # stored record (open_tasks[$id].metadata.project stamped at TaskCreate
+                # when tool_input DID carry metadata — NOT from the TaskList response
+                # which carries NO metadata per Claude Code's design).
+                #
+                # Root cause of v1: TaskList tool_response has {id, status, subject,
+                # blockedBy} — metadata is absent. Reading .metadata.project there
+                # always returns null → every task appeared "unstamped" → all tasks
+                # landed in the ambient-project bucket (wrong project). Live dogfood
+                # confirmed: 7 tasks stamped "handoff-accuracy" showed unstamped_count=7
+                # and wrote to v11-meta-improvement.live-snapshot.json (the active-project).
+                #
+                # Fix: JOIN live TaskList status with stored open_tasks project map.
+                #   live side:  {id, status, subject, blockedBy, owner} from tool_response
+                #   stored side: {id → metadata.project} from $STATE (already in memory)
+                # Single jq pass: --argjson state feeds the already-loaded STATE variable.
+                # One write per distinct resolved project; ambient project hosts unstamped.
+                # TOTAL_ACTUAL > 0 guard prevents overwriting a good snapshot with zero.
+                mkdir -p "${METRICS_DIR}/ledger" 2>/dev/null || true
+                # Single jq pass: join + group by resolved project + emit one JSON
+                # object per group. Output is newline-delimited JSON objects (one per
+                # project), each complete snapshot. We then split on \n and write files.
+                _SNAP_GROUPED=$(printf '%s' "$V11_TOOL_OUTPUT" | jq -c \
+                    --arg ts "$NOW" \
+                    --arg ambient "$PROJECT" \
+                    --arg sid "$SESSION_UUID" \
+                    --argjson state "$STATE" '
+                    # Build id→project map from stored open_tasks.
+                    # Resolution order per task (Bug E/H drift-immunity):
+                    #   1. _proj  — hook-resolved project stamped at TaskCreate/TaskUpdate
+                    #               (always present when V11_HANDOFF_LIVE_RECONCILE=on;
+                    #               reliable even when metadata was absent, e.g. legacy-cli)
+                    #   2. metadata.project — explicit caller-passed project in tool_input
+                    #               (subset of _proj when both present; kept as corroboration)
+                    #   3. $ambient — fallback; task is flagged stamped=false (unstamped)
+                    ($state.open_tasks // {}) as $ot
+                    | (.tasks // []) as $live
+                    | ($live | map(
+                        (.id | tostring) as $id
+                        | ($ot[$id]._proj // $ot[$id].metadata.project // null) as $stored_proj
+                        | {
+                            id:       $id,
+                            status:   (.status // "pending"),
+                            subject:  (.subject // null),
+                            blockedBy: (.blockedBy // []),
+                            owner:    (.owner // null),
+                            resolved_project: ($stored_proj // $ambient),
+                            stamped:  ($stored_proj != null)
+                          }
+                      )) as $enriched
+                    # Group by resolved_project; emit one snapshot object per group.
+                    | ($enriched | group_by(.resolved_project))
+                    | map(
+                        (.[0].resolved_project) as $proj
+                        | {
+                            ts:              $ts,
+                            project:         $proj,
+                            session_uuid:    $sid,
+                            total:       (length),
+                            completed:   (map(select(.status == "completed"))   | length),
+                            pending:     (map(select(.status == "pending"))     | length),
+                            in_progress: (map(select(.status == "in_progress")) | length),
+                            blocked:     (map(select(.status == "blocked"))     | length),
+                            unstamped_count: (map(select(.stamped == false))   | length),
+                            tasks: (map({
+                                id:       .id,
+                                status:   .status,
+                                subject:  .subject,
+                                blockedBy: .blockedBy,
+                                owner:    .owner,
+                                stamped:  .stamped
+                            }))
+                        }
+                      )
+                    | .[]
+                ' 2>/dev/null || true)
+                # Write one snapshot file per project group (newline-delimited objects).
+                if [ -n "$_SNAP_GROUPED" ]; then
+                    while IFS= read -r _SNAP_OBJ; do
+                        [ -z "$_SNAP_OBJ" ] && continue
+                        _SNAP_PROJ=$(printf '%s' "$_SNAP_OBJ" | jq -r '.project // ""' 2>/dev/null || true)
+                        # SEC-C-02: validate project name before using as path component
+                        if [ -z "$_SNAP_PROJ" ] || ! printf '%s' "$_SNAP_PROJ" | grep -qE '^[a-zA-Z0-9._-]{1,64}$'; then
+                            continue
+                        fi
+                        _SNAP_FILE="${METRICS_DIR}/ledger/${_SNAP_PROJ}.live-snapshot.json"
+                        _SNAP_TMP="${_SNAP_FILE}.tmp.$$"
+                        printf '%s\n' "$_SNAP_OBJ" | jq '.' > "$_SNAP_TMP" 2>/dev/null
+                        if [ -s "$_SNAP_TMP" ] && jq empty "$_SNAP_TMP" 2>/dev/null; then
+                            mv "$_SNAP_TMP" "$_SNAP_FILE"
+                        else
+                            rm -f "$_SNAP_TMP" 2>/dev/null || true
+                        fi
+                    done <<< "$_SNAP_GROUPED"
+                fi
+            fi
+        fi
+
+        # V11.18 T3 (v11-handoff-hygiene): one-shot discipline nudge.
+        # When TaskList runs AND the project has in_progress tasks with recent
+        # file-edit audit activity (a "work shipped but never closed" signal),
+        # emit a single stderr nudge per session. Honors V11_DISCIPLINE_NUDGE=off.
+        # Per-session marker prevents re-nag; clears on session-end.
+        if [ "${V11_DISCIPLINE_NUDGE:-on}" != "off" ] && [ -n "$PROJECT" ] && [ -n "${V11_SESSION_ID:-}" ]; then
+            _T3_MARKER="$METRICS_DIR/sessions/$V11_SESSION_ID/.discipline-nudged"
+            if [ ! -f "$_T3_MARKER" ]; then
+                # Run the discipline check (idempotent, writes .handoff-discipline-log.json)
+                _T3_DC="$V11_HOME/scripts/handoff-discipline-check"
+                if [ -x "$_T3_DC" ]; then
+                    V11_WORKSPACE_ROOT="$V11_WORKSPACE_ROOT" \
+                    SESSIONS_ROOT="$SESSIONS_ROOT" \
+                    METRICS_DIR="$METRICS_DIR" \
+                    timeout 10 "$_T3_DC" "$PROJECT" >/dev/null 2>&1 || true
+                fi
+                _T3_LOG="$SESSIONS_ROOT/$PROJECT/.handoff-discipline-log.json"
+                if [ -f "$_T3_LOG" ] && jq empty "$_T3_LOG" 2>/dev/null; then
+                    _T3_COUNT=$(jq -r '.stale_in_progress_count // 0' "$_T3_LOG" 2>/dev/null || echo 0)
+                    [[ "$_T3_COUNT" =~ ^[0-9]+$ ]] || _T3_COUNT=0
+                    if [ "$_T3_COUNT" -gt 0 ]; then
+                        echo "[V11] ${_T3_COUNT} in_progress task(s) have recent file activity but no completion event — likely shipped but not closed. See $_T3_LOG. Run TaskUpdate(status=\"completed\") for any that are done." >&2
+                        mkdir -p "$(dirname "$_T3_MARKER")" 2>/dev/null || true
+                        date -Iseconds > "$_T3_MARKER" 2>/dev/null || true
+                    fi
+                fi
+            fi
+        fi
+        ;;
+    TaskGet)
+        STATE=$(printf '%s' "$STATE" | jq --arg now "$NOW" '.last_updated = $now')
+        ;;
+esac
+
+# --- Findings summary update ---
+# v11_update_findings_summary: detect finding tasks and maintain findings_summary in state
+# Called after state counters are updated. No-op when no finding tasks exist.
+v11_update_findings_summary() {
+    local project="$1"
+    local current_type
+    local current_severity
+
+    # Extract type and severity from the current event's tool input
+    current_type=$(printf '%s' "$V11_RAW_INPUT" | jq -r '.tool_input.metadata.type // ""' 2>/dev/null)
+    [ "$current_type" = "null" ] && current_type=""
+
+    # Fast path: if current event isn't a finding AND state has no findings_summary, skip entirely
+    if [ "$current_type" != "finding" ]; then
+        local has_findings
+        has_findings=$(printf '%s' "$STATE" | jq -r 'if .findings_summary then "yes" else "no" end' 2>/dev/null)
+        [ "$has_findings" = "no" ] && return 0
+    fi
+
+    # For a finding task event, record severity in per-task index within state
+    if [ "$current_type" = "finding" ] && [ -n "$TASK_ID" ]; then
+        current_severity=$(printf '%s' "$V11_RAW_INPUT" | jq -r '.tool_input.metadata.severity // "low"' 2>/dev/null)
+        [ "$current_severity" = "null" ] && current_severity="low"
+
+        case "$TASK_STATUS" in
+            "")
+                # TaskCreate: new finding task
+                STATE=$(printf '%s' "$STATE" | jq \
+                    --arg id "$TASK_ID" \
+                    --arg sev "$current_severity" '
+                    .finding_tasks = ((.finding_tasks // {}) + {($id): $sev})
+                ')
+                ;;
+            completed|cancelled)
+                # Remove from active findings index on terminal status
+                STATE=$(printf '%s' "$STATE" | jq \
+                    --arg id "$TASK_ID" '
+                    .finding_tasks = ((.finding_tasks // {}) | del(.[$id]))
+                ')
+                ;;
+            *)
+                # in_progress/blocked/pending: upsert severity (may have changed)
+                STATE=$(printf '%s' "$STATE" | jq \
+                    --arg id "$TASK_ID" \
+                    --arg sev "$current_severity" '
+                    .finding_tasks = ((.finding_tasks // {}) + {($id): $sev})
+                ')
+                ;;
+        esac
+    fi
+
+    # Recompute findings_summary from the per-task severity index
+    local finding_count
+    finding_count=$(printf '%s' "$STATE" | jq -r '(.finding_tasks // {}) | length' 2>/dev/null)
+
+    if [ "${finding_count:-0}" -eq 0 ]; then
+        # No active findings — clear findings_summary if present
+        STATE=$(printf '%s' "$STATE" | jq 'del(.findings_summary)')
+        return 0
+    fi
+
+    STATE=$(printf '%s' "$STATE" | jq '
+        .findings_summary = {
+            critical: ([ (.finding_tasks // {}) | to_entries[] | select(.value == "critical") ] | length),
+            high:     ([ (.finding_tasks // {}) | to_entries[] | select(.value == "high") ]     | length),
+            medium:   ([ (.finding_tasks // {}) | to_entries[] | select(.value == "medium") ]   | length),
+            low:      ([ (.finding_tasks // {}) | to_entries[] | select(.value == "low") ]      | length),
+            total_raw: ((.finding_tasks // {}) | length)
+        }
+    ')
+}
+
+# Invoke findings summary update before writing state to disk
+v11_update_findings_summary "$PROJECT"
+
+# --- Atomic write (per-session file) ---
+# Write to PID-suffixed tmp, validate, then mv — never truncates target on
+# failure. V11.15.3 (Bug G): the read-modify-write is already serialized by the
+# exclusive flock acquired (FD 201) before the STATE read above and held from
+# the STATE read through the LAST STATE write (v11.33: released just after, before
+# the aggregate rebuild), so NO nested flock here — re-locking the same file via a
+# second in-process FD would deadlock. mv is atomic; the held lock guarantees
+# no concurrent same-session reader/writer observes a torn update. (v11.33: on the
+# rare unserialized-fallback path the lock was NOT held — the end-of-hook
+# scratch-reconcile marker + next-call drain repair any lost update from the
+# durable ledger; see _V11_SYNC_RACED.)
+_TMP="$STATE_FILE.tmp.$$"
+printf '%s' "$STATE" | jq '.' > "$_TMP"
+if [ -s "$_TMP" ] && jq empty "$_TMP" 2>/dev/null; then
+    mv "$_TMP" "$STATE_FILE"
+    # Deletion breadcrumb (2026-07-21): per-session task-state.json (+.lock/
+    # .heartbeat) has been observed vanishing mid-session for a LIVE session,
+    # deleter unidentified — which empties the aggregate rebuild's scan and
+    # freezes counters (see frozen-aggregate guard in lib/common.sh). Stamp
+    # every successful write so a later disappearance can be dated against
+    # this file's survival or absence.
+    date -Iseconds > "$(dirname "$STATE_FILE")/.task-state-last-write" 2>/dev/null || true
+    # v11.33: the reconciled STATE is now persisted — safe to remove the drained
+    # marker + its per-task artifact sidecars. Still under FD-201, so no racer can
+    # slip a new marker in between the drain and this cleanup. On a write failure
+    # (else branch) the marker is intentionally LEFT so a later call retries.
+    if [ "${_V11_RECON_DRAINED:-0}" = "1" ]; then
+        rm -f "$STATE_FILE.needs-reconcile" "$STATE_FILE".needs-reconcile.artifacts.*.json 2>/dev/null || true
+    fi
+else
+    rm -f "$_TMP"
+    echo "sync-tasks: jq produced empty/invalid output; existing state preserved ($STATE_FILE)" >&2
+fi
+
+# --- V11.16: Ledger append (ADR §4.2 call site) ---
+# Emit the ledger event that was prepared inside the per-tool branch above.
+# MUST fire: after the per-session STATE atomic write (above), before
+#   v11_rebuild_project_aggregate (below) — exactly per ADR §4.1/§4.2.
+# FD discipline (ADR §4.2): FD 201 (STATE lock) is still held here (v11.33 releases
+#   it just after the LAST STATE write / the create_seq patch below, before the
+#   aggregate rebuild — not at process exit).
+#   v11_ledger_append uses its own FD 207 on a distinct inode (no deadlock).
+# Side-effect-never-fails: v11_ledger_append returns 0 on all paths (|| true
+#   semantics are inside the function). The per-session STATE write already
+#   happened; ledger emission failure is non-fatal (shadow-diff will flag gaps).
+# Bug E/H immunity: LEDGER_EVENT_JSON is only populated when PROJECT_SOURCE is
+#   not "active-project-fallback" — the active-project file is never in the
+#   ledger write path per ADR §2.3.
+#
+# ADR §2.3 (LOW): For `created` events, v11_ledger_append prints the
+# FD-207-confirmed create_seq on stdout.  Capture it and do a second targeted
+# STATE write to patch open_tasks[$TASK_ID]._idk.create_seq from the sentinel
+# value 0 to the authoritative value.  The second write also flushes to disk
+# (STATE_FILE) so the per-session file is always consistent.
+if [ -n "$LEDGER_EVENT_JSON" ] && [ "$LEDGER_EVENT_JSON" != "null" ] \
+   && [ "$PROJECT_SOURCE" != "active-project-fallback" ]; then
+    _LEDGER_CONFIRMED_SEQ=$(v11_ledger_append "$PROJECT" "$LEDGER_EVENT_JSON" 2>/dev/null || true)
+    # If this was a `created` event, patch _idk.create_seq with the confirmed value.
+    _LEDGER_EV_TYPE=$(printf '%s' "${LEDGER_EVENT_JSON:-}" | jq -r '.ev // ""' 2>/dev/null || true)
+    if [ "$_LEDGER_EV_TYPE" = "created" ] \
+       && [ -n "$_LEDGER_CONFIRMED_SEQ" ] \
+       && [ "$_LEDGER_CONFIRMED_SEQ" != "0" ] \
+       && [ -n "$TASK_ID" ]; then
+        # Second targeted STATE write: stamp authoritative create_seq into _idk.
+        # The jq expression is a no-op if _idk is null (guards against absent _idk).
+        STATE=$(printf '%s' "$STATE" | jq \
+            --arg id "$TASK_ID" \
+            --argjson confirmed_seq "$_LEDGER_CONFIRMED_SEQ" '
+            if $id != "" and (.open_tasks[$id]._idk) != null then
+                .open_tasks[$id]._idk.create_seq = $confirmed_seq
+            else . end
+        ' 2>/dev/null) || true
+        # Flush patched STATE to disk (same atomic-write pattern as above).
+        # FD-201 is still held; no concurrent writer can race us.
+        if [ -n "$STATE" ]; then
+            _TMP2="$STATE_FILE.tmp2.$$"
+            printf '%s' "$STATE" | jq '.' > "$_TMP2"
+            if [ -s "$_TMP2" ] && jq empty "$_TMP2" 2>/dev/null; then
+                mv "$_TMP2" "$STATE_FILE"
+            else
+                rm -f "$_TMP2"
+                echo "sync-tasks: second STATE write failed; _idk.create_seq may be 0 for task ${TASK_ID}" >&2
+            fi
+        fi
+    fi
+fi
+
+# --- v11.33 (d)-lite: release FD-201 before the aggregate rebuild ---
+# Both STATE writes (first write above at ~:2753 and the create_seq patch at
+# ~:2801) are done and were performed inside the FD-201 hold. Everything below
+# uses its OWN locks — v11_ledger_append already ran under FD-207, and
+# v11_rebuild_project_aggregate uses FD-202/203 — so continuing to hold FD-201
+# through the full-fleet rebuild (the single biggest cost, ~seconds) only
+# inflates the per-session lock hold and drives the unserialized fallback. Verify
+# invariant: no `$STATE_FILE` write exists after this point (writes are only at
+# :2753 and :2801, both above). On the raced path FD-201 was never acquired, so
+# `flock -u` is a harmless no-op. Rollback: V11_SYNC_NARROW_HOLD=off keeps the
+# legacy whole-process hold.
+if [ "${V11_SYNC_NARROW_HOLD:-on}" != "off" ]; then
+    flock -u 201 2>/dev/null || true
+fi
+
+# --- Rebuild project aggregate from all session files (V11.13) ---
+# The aggregate at $TASK_STATE_DIR/$PROJECT.json and the mirror at
+# $SESSIONS_ROOT/$PROJECT/.task-state.json are derived views. v11_rebuild_project_aggregate
+# walks every $METRICS_DIR/sessions/*/task-state.json where .project == $PROJECT
+# and folds them into a single view. Run after the per-session write so the
+# aggregate always reflects the latest per-session truth.
+v11_rebuild_project_aggregate "$PROJECT"
+
+# --- v11.33: scratch-reconcile record (raced terminal write) ---
+# We took the unserialized fallback, so this terminal (completed|blocked) write
+# may have been clobbered by a concurrent same-session writer. The durable ledger
+# already recorded this event (FD-207, above) and the aggregate self-heals from
+# it; record the per-session scratch delta so the next LOCKED call (or session-end,
+# for a race on the session's LAST TaskUpdate) folds it back into the scratch
+# (which scripts/handoff reads). Presence is re-checked at drain time, so a delta
+# whose write actually survived is a no-op.
+#   * The marker LINE is a small JSON object appended with O_APPEND. E3: the
+#     subject is capped (${_RC_SUBJ:0:500} — 500 chars) so the line stays well
+#     under PIPE_BUF and remains atomic vs concurrent racers even with a
+#     pathological (multi-KB) subject.
+#   * E2a: review_task_id (small) rides on the line to replay the V11.21 sibling
+#     pending_parent→pending flip.
+#   * E2b: metadata.artifacts (which can exceed PIPE_BUF) is NOT inlined; it is
+#     written to a per-task whole-file sidecar $STATE_FILE.needs-reconcile.artifacts.<tid>.json
+#     (atomic tmp+mv, distinct filename per racer → no PIPE_BUF / collision risk).
+# Best-effort; never fails the hook. Rollback: V11_SYNC_SCRATCH_RECONCILE=off.
+if [ "${V11_SYNC_SCRATCH_RECONCILE:-on}" != "off" ] && [ "${_V11_SYNC_RACED:-0}" = "1" ] \
+   && [ -n "$TASK_ID" ] && { [ "$TASK_STATUS" = "completed" ] || [ "$TASK_STATUS" = "blocked" ]; }; then
+    _RC_SUBJ="${ACTIVE_SUBJECT:-unknown}"; _RC_SUBJ="${_RC_SUBJ:0:500}"
+    jq -cn --arg tid "$TASK_ID" --arg st "$TASK_STATUS" --arg subj "$_RC_SUBJ" \
+        --arg rtid "${_V21_REVIEW_TASK_ID:-}" \
+        '{task_id:$tid, status:$st, subject:$subj} + (if $rtid != "" and $rtid != "null" then {review_task_id:$rtid} else {} end)' \
+        2>/dev/null >> "$STATE_FILE.needs-reconcile" 2>/dev/null || true
+    # E2b: persist artifacts to a whole-file sidecar (only for a completed event
+    # carrying an artifacts object, and a filesystem-safe task id).
+    if [ "$TASK_STATUS" = "completed" ] && [ -n "${ARTIFACTS:-}" ] && [ "${ARTIFACTS:-null}" != "null" ]; then
+        case "$TASK_ID" in
+            *[!A-Za-z0-9._-]*) : ;;   # unsafe id — line still recorded, sidecar skipped
+            *)
+                if printf '%s' "$ARTIFACTS" | jq -e 'type == "object"' >/dev/null 2>&1; then
+                    _RC_ART="$STATE_FILE.needs-reconcile.artifacts.$TASK_ID.json"
+                    _RC_ART_TMP="$_RC_ART.tmp.$$"
+                    printf '%s' "$ARTIFACTS" | jq '.' > "$_RC_ART_TMP" 2>/dev/null \
+                        && mv "$_RC_ART_TMP" "$_RC_ART" 2>/dev/null || rm -f "$_RC_ART_TMP" 2>/dev/null
+                fi
+                ;;
+        esac
+    fi
+    echo "sync-tasks: recorded scratch-reconcile marker for T${TASK_ID} (${TASK_STATUS}); folds in on next locked call / session-end (v11.33). Rollback: V11_SYNC_SCRATCH_RECONCILE=off" >&2
+fi
+
+# V11.11: Formation heartbeat pulse removed — formations are no longer the
+# primary runtime model. Wave-coordinated background agents replace
+# TeamCreate-based formations; the orchestrator drives wave progress
+# directly via TaskList polling, not a hook-side pulse.
+
+# V11.4: Sync plan file on task status transitions (background, no latency impact)
+if [ "$TASK_STATUS" = "completed" ] || [ "$TASK_STATUS" = "in_progress" ]; then
+    PLAN_SYNC_SCRIPT="$(dirname "$(dirname "${BASH_SOURCE[0]}")")/scripts/plan-sync"
+    if [ -x "$PLAN_SYNC_SCRIPT" ] && [ -n "$PROJECT" ]; then
+        # HS-013 (Wave 3c): disown fire-and-forget job to prevent zombie accumulation
+        "$PLAN_SYNC_SCRIPT" "$PROJECT" &>/dev/null &
+        disown $! 2>/dev/null || true
+    fi
+fi
+
+# V11: Trigger delta memory index on task completion with artifacts
+if [ "$TASK_STATUS" = "completed" ] && [ -n "$ARTIFACTS" ] && [ "$ARTIFACTS" != "null" ]; then
+    INDEX_SCRIPT="$(dirname "$(dirname "${BASH_SOURCE[0]}")")/scripts/index-project-memory"
+    if [ -x "$INDEX_SCRIPT" ] && [ -n "$PROJECT" ]; then
+        # Background delta index — no performance impact on hook
+        "$INDEX_SCRIPT" "$PROJECT" --delta "$STATE_FILE" &>/dev/null &
+        disown $! 2>/dev/null || true
+    fi
+fi
+
+# ── Context usage tracking (V11.6) ────────────────────────────────────────
+# Record this tool call in the context tracker.
+# S1-B1: captured into a variable instead of printed directly — see the
+# stdout-arbitration block below for why (mixing plain text with the JSON
+# hookSpecificOutput emission on the same stdout stream is invalid).
+_V11_CTX_MSG="$(python3 - "$V11_HOME" <<'PYEOF' 2>/dev/null
+import sys; sys.path.insert(0, sys.argv[1] + '/scripts/lib')
+from context_tracker import ContextTracker
+t = ContextTracker()
+t.record_event('task')
+e = t.get_estimate()
+if e['threshold'] == 'warning':
+    print('INFO: Context ~{:.0f}% used. Consider /handoff soon.'.format(e['percent_used']))
+elif e['threshold'] == 'alert':
+    print('WARNING: Context ~{:.0f}% used. Recommend /handoff now.'.format(e['percent_used']))
+elif e['threshold'] == 'critical':
+    print('ALERT: Context ~{:.0f}% used! Run /handoff immediately.'.format(e['percent_used']))
+PYEOF
+)"
+
+# ── S1-B1: PostToolUse additionalContext for prescope/scope advisories ────
+# V11_PRESCOPE_ADVISORY / V11_SCOPE_WARN / V11_PRESCOPE_SMELL (all TaskCreate,
+# above) are stderr-only — stderr is operator/log-visible but the orchestrator
+# MODEL never sees it. Claude Code's PostToolUse hook contract supports a
+# second channel: JSON on stdout shaped
+#   {"hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": "..."}}
+# is parsed and injected into the model's context. This does NOT replace the
+# stderr advisories above (those still fire unconditionally, unchanged, for
+# operator/log visibility) — it is an additional surface for the same text.
+#
+# Stdout arbitration: this hook has exactly one other stdout producer — the
+# context-usage tracker just above, captured into $_V11_CTX_MSG rather than
+# printed directly (V11.6, unconditional across all Task* tool events, plain
+# text). Since Claude Code parses the FULL stdout stream as JSON when looking
+# for hookSpecificOutput, plain text and JSON cannot coexist on stdout in one
+# invocation. This block is the single point deciding which channel wins:
+#   - TaskCreate + at least one advisory fired + gate on → JSON (advisories
+#     and the context-tracker line, if any, folded into one
+#     additionalContext string)
+#   - anything else (ctx msg alone, gate off, non-TaskCreate calls) → plain
+#     text, preserving the pre-S1-B1 behavior exactly.
+if [ "$V11_TOOL_NAME" = "TaskCreate" ] && [ -n "${_V11_ADVISORY_CTX:-}" ] \
+   && [ "${V11_PRESCOPE_CONTEXT:-on}" != "off" ]; then
+    _V11_CTX_FULL="$_V11_ADVISORY_CTX"
+    if [ -n "$_V11_CTX_MSG" ]; then
+        _V11_CTX_FULL="${_V11_CTX_FULL}
+${_V11_CTX_MSG}"
+    fi
+    jq -n -c --arg ctx "$_V11_CTX_FULL" \
+        '{hookSpecificOutput: {hookEventName: "PostToolUse", additionalContext: $ctx}}' \
+        2>/dev/null || true
+elif [ -n "$_V11_CTX_MSG" ]; then
+    printf '%s\n' "$_V11_CTX_MSG"
+fi
+
+exit 0

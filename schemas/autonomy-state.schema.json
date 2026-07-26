@@ -1,0 +1,116 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "autonomy-state.schema.json",
+  "title": "V11 Autonomy State",
+  "description": "Schema for .autonomy-state — per-project autonomy level and grants. Field names match hooks/track-autonomy writes verbatim (Wave 3b alignment).",
+  "type": "object",
+  "properties": {
+    "level": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 5,
+      "description": "Autonomy level: A0=manual, A1=guided, A2=supervised, A3=trusted, A4=autonomous, A5=self-organizing"
+    },
+    "successful": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Consecutive successful actions (for escalation tracking). Written by track-autonomy on every medium-risk success."
+    },
+    "errors": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Recent error count (for de-escalation). Written by track-autonomy on tool-use errors."
+    },
+    "approved_categories": {
+      "type": "array",
+      "items": {
+        "enum": ["typescript", "python", "shell", "markdown", "config", "git", "docker", "npm"]
+      },
+      "description": "Pre-approved file categories for A1+ levels"
+    },
+    "grants": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/grant" },
+      "description": "File pattern grants for A2+ levels, plus explicit A4/A5 grants from scripts/autonomy-grant"
+    },
+    "high_risk_history": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Previously approved high-risk patterns for A4 auto-approval"
+    },
+    "recent_errors": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "timestamp": { "type": "string", "format": "date-time" },
+          "tool": { "type": "string" },
+          "summary": { "type": "string" }
+        }
+      },
+      "description": "Ring buffer of recent errors used by de-escalation rules"
+    },
+    "last_updated": {
+      "type": "string",
+      "format": "date-time",
+      "description": "Last state mutation timestamp (track-autonomy)"
+    },
+    "last_escalation": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "last_deescalation": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "repaired_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "Set by scripts/repair-empty-state when 0-byte file was reseeded"
+    },
+    "repaired_reason": {
+      "type": "string",
+      "description": "Repair provenance (e.g. '0-byte corruption — seeded from repair-empty-state')"
+    }
+  },
+  "required": ["level"],
+  "additionalProperties": false,
+  "$defs": {
+    "grant": {
+      "type": "object",
+      "properties": {
+        "pattern": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 100,
+          "description": "File path pattern to match. Length capped at 100 to block ReDoS payloads (HS-002)."
+        },
+        "type": {
+          "enum": ["glob", "regex", "prefix"],
+          "default": "glob",
+          "description": "Pattern matching strategy. regex patterns with nested quantifiers like (x+)+ are rejected at runtime (HS-002)."
+        },
+        "level": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 5,
+          "description": "Autonomy level this grant applies to (for explicit A4/A5 grants from scripts/autonomy-grant)"
+        },
+        "granted_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "granted_by": {
+          "type": "string",
+          "description": "Who granted this (user, orchestrator, auto-escalation)"
+        },
+        "reason": {
+          "type": "string",
+          "description": "Why this grant was approved"
+        }
+      },
+      "required": ["pattern"],
+      "additionalProperties": false
+    }
+  }
+}

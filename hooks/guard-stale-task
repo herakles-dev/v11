@@ -1,0 +1,113 @@
+#!/bin/bash
+# V11 Hook: guard-stale-task (PostToolUse — TaskList)
+# Detects zombie-task pattern: in_progress tasks with recent file-edit audit
+# activity but no completion event. Companion to handoff-discipline-check
+# (the same script writes .handoff-discipline-log.json — this hook surfaces
+# its findings DURING the session, not just at handoff).
+#
+# Audit reference: reviews/audit-2026-06-01-swarm-studio.md §L5-01 / H9.
+# Memory: [[feedback-prefer-noting-over-deletion]] — we NOTE the pattern,
+# never auto-edit task state. The user (or orchestrator) decides.
+#
+# Risk: Advisory only (never blocks).
+# Cooldown: 60 min between alerts per project; max 3 alerts before backoff.
+
+source "$(dirname "${BASH_SOURCE[0]}")/lib/common.sh"
+
+# Test mode
+if [ "$1" == "--test" ]; then
+    echo "guard-stale-task v1.0 (2026-06-01 audit H9 — zombie-task discipline)"
+    exit 0
+fi
+
+# Rollback lever
+if [ "${V11_GUARD_STALE_TASK:-on}" = "off" ]; then
+    exit 0
+fi
+
+# Parse input
+v11_parse_input
+
+# Only run on TaskList invocations (matches guard-agent-stall pattern)
+if [ "$V11_TOOL_NAME" != "TaskList" ]; then
+    exit 0
+fi
+
+# Detect active project
+PROJECT="$(v11_read_active_project)"
+[ -z "$PROJECT" ] && exit 0
+
+# Configuration
+COOLDOWN_MINUTES=${STALE_COOLDOWN_MINUTES:-60}
+MAX_ALERTS=${STALE_MAX_ALERTS:-3}
+DEBUG_STALE=${DEBUG_STALE:-false}
+
+# Re-run the discipline checker to refresh the artifact. The script is cheap
+# (tails 1000 audit lines + jq pass) and idempotent — safe to call on every
+# TaskList. It writes/clears $SESSION_DIR/.handoff-discipline-log.json.
+DISCIPLINE_SCRIPT="$(dirname "${BASH_SOURCE[0]}")/../scripts/handoff-discipline-check"
+if [ -x "$DISCIPLINE_SCRIPT" ]; then
+    "$DISCIPLINE_SCRIPT" "$PROJECT" 2>/dev/null || true
+fi
+
+# Read the artifact
+SESSION_DIR="${SESSIONS_ROOT:-$HOME/.v11/sessions}/$PROJECT"
+DISC_LOG="$SESSION_DIR/.handoff-discipline-log.json"
+[ -f "$DISC_LOG" ] || exit 0
+[ -s "$DISC_LOG" ] || exit 0
+
+STALE_COUNT=$(jq -r '.stale_in_progress_count // 0' "$DISC_LOG" 2>/dev/null)
+STALE_COUNT="${STALE_COUNT//[!0-9]/}"; STALE_COUNT="${STALE_COUNT:-0}"
+[ "$STALE_COUNT" -eq 0 ] && exit 0
+
+# Cooldown tracker
+TRACKER="$METRICS_DIR/stale-task-alerts-${PROJECT}.json"
+NOW=$(date +%s)
+ALERT_COUNT=0
+if [ -f "$TRACKER" ]; then
+    ALERT_COUNT=$(jq -r '.alert_count // 0' "$TRACKER" 2>/dev/null)
+    LAST_ALERT=$(jq -r '.last_alerted_at // ""' "$TRACKER" 2>/dev/null)
+    LAST_STALE_COUNT=$(jq -r '.last_stale_count // 0' "$TRACKER" 2>/dev/null)
+
+    if [ -n "$LAST_ALERT" ]; then
+        LAST_TS=$(date -d "$LAST_ALERT" +%s 2>/dev/null || echo 0)
+        AGO_MIN=$(( (NOW - LAST_TS) / 60 ))
+        # Cooldown applies UNLESS the stale_count grew (new zombies appeared)
+        if [ "$AGO_MIN" -lt "$COOLDOWN_MINUTES" ] && [ "$STALE_COUNT" -le "$LAST_STALE_COUNT" ]; then
+            [ "$DEBUG_STALE" == "true" ] && echo "[guard-stale-task] Cooldown active ($AGO_MIN min)" >&2
+            exit 0
+        fi
+    fi
+
+    if [ "$ALERT_COUNT" -ge "$MAX_ALERTS" ]; then
+        [ "$DEBUG_STALE" == "true" ] && echo "[guard-stale-task] Max alerts reached ($ALERT_COUNT)" >&2
+        exit 0
+    fi
+fi
+
+# Emit the nudge to stderr (matches V11 hook stderr convention)
+{
+    echo ""
+    echo "⚠ ZOMBIE-TASK CHECK: $STALE_COUNT in_progress task(s) in '$PROJECT' have recent file-edit"
+    echo "  activity but no completion event. Likely work-shipped-but-not-closed:"
+    jq -r '.nudges[] | "  - Task #\(.id) (\(.subject)): \(.evidence_count) edit(s) [\(.match_strength)]"' "$DISC_LOG" 2>/dev/null
+    echo ""
+    echo "  If shipped: TaskUpdate(taskId=\"<ID>\", status=\"completed\", metadata={artifacts:{files_changed:[...]}})"
+    echo "  If still active: ignore (this nudge respects a ${COOLDOWN_MINUTES}-min cooldown)"
+    echo "  To silence project-wide: export V11_GUARD_STALE_TASK=off"
+    echo ""
+} >&2
+
+# Update tracker
+mkdir -p "$METRICS_DIR"
+jq -n \
+    --arg project "$PROJECT" \
+    --argjson count "$((ALERT_COUNT + 1))" \
+    --argjson stale "$STALE_COUNT" \
+    --arg ts "$(date -Iseconds)" \
+    '{project: $project, alert_count: $count, last_stale_count: $stale, last_alerted_at: $ts}' \
+    > "$TRACKER"
+
+[ "$DEBUG_STALE" == "true" ] && echo "[guard-stale-task] Stale alert #$((ALERT_COUNT + 1)) emitted ($STALE_COUNT zombies)" >&2
+
+exit 0

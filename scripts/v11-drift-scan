@@ -1,0 +1,629 @@
+#!/bin/bash
+# V11 Drift Scan — lightweight drift detection without agent dispatch
+# Usage: ./scripts/v11-drift-scan PROJECT [--fix] [--category CATEGORY]
+#        ./scripts/v11-drift-scan --scan              Scan all projects
+#        ./scripts/v11-drift-scan --test              Self-test
+#
+# Checks 7 drift categories (lightweight):
+#   1. CLAUDE.md line count and structure
+#   2. Dead file references in docs
+#   3. .task-state.json staleness
+#   4. Temp file debris
+#   5. Archive directory existence
+#   6. Gitignore coverage
+#   7. Dark Code alignment (STR advisories + MODULE.md coverage/staleness)
+#
+# For full 5-agent deep analysis, use: /v11-drift (the skill)
+#
+# Exit codes: 0 = grade A/B, 1 = grade C/D/F, 2 = usage error
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+V11_HOME="$(dirname "$SCRIPT_DIR")"
+V11_WORKSPACE_ROOT="${V11_WORKSPACE_ROOT:-$HOME/.v11}"
+SESSIONS_ROOT="${SESSIONS_ROOT:-$V11_WORKSPACE_ROOT/sessions}"
+PORT_REGISTRY_FILE="$V11_WORKSPACE_ROOT/config/port-registry.json"
+
+# Colors
+RED='\033[0;31m'
+YELLOW='\033[0;33m'
+GREEN='\033[0;32m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+NC='\033[0m'
+
+# Self-test
+if [ "${1:-}" = "--test" ]; then
+    echo "v11-drift-scan v1.0.0"
+    exit 0
+fi
+
+PROJECT="${1:-}"
+FIX_MODE=false
+CATEGORY=""
+
+# Parse flags
+while [ $# -gt 1 ]; do
+    shift
+    case "${1:-}" in
+        --fix) FIX_MODE=true ;;
+        --category) shift; CATEGORY="${1:-}" ;;
+    esac
+done
+
+# Usage
+if [ -z "$PROJECT" ]; then
+    echo -e "${BOLD}V11 Drift Scan${NC} — Lightweight drift detection"
+    echo ""
+    echo "Usage: $0 PROJECT [--fix] [--category CATEGORY]"
+    echo "       $0 --scan              Scan all projects"
+    echo "       $0 --test              Self-test"
+    echo ""
+    echo "Categories: claude-md, docs, tracking, archive, prevention, all"
+    echo ""
+    echo "Checks:"
+    echo "  1. CLAUDE.md line count      4. Temp file debris"
+    echo "  2. Dead file references      5. Archive directory"
+    echo "  3. Task state staleness      6. Gitignore coverage"
+    echo "                               7. Dark Code alignment (STR + MODULE.md)"
+    echo ""
+    echo "For full 5-agent deep analysis: /v11-drift"
+    echo ""
+    echo "--fix: Auto-fix safe items (create dirs, add .gitignore entries)"
+    exit 2
+fi
+
+# --- Scoring ---
+SCORE=0
+FINDINGS=0
+CRITICAL=0
+HIGH=0
+MEDIUM=0
+LOW=0
+
+add_finding() {
+    local severity="$1"
+    local check="$2"
+    local message="$3"
+    ((FINDINGS++)) || true
+    case "$severity" in
+        CRITICAL) ((CRITICAL++)) || true; ((SCORE+=10)) || true; echo -e "  ${RED}[CRITICAL]${NC} $check: $message" ;;
+        HIGH)     ((HIGH++)) || true;     ((SCORE+=5))  || true; echo -e "  ${YELLOW}[HIGH]${NC}     $check: $message" ;;
+        MEDIUM)   ((MEDIUM++)) || true;   ((SCORE+=2))  || true; echo -e "  ${CYAN}[MEDIUM]${NC}   $check: $message" ;;
+        LOW)      ((LOW++)) || true;      ((SCORE+=1))  || true; echo -e "  [LOW]      $check: $message" ;;
+    esac
+}
+
+grade_from_score() {
+    local s=$1
+    if [ "$s" -le 5 ]; then echo "A"
+    elif [ "$s" -le 15 ]; then echo "B"
+    elif [ "$s" -le 30 ]; then echo "C"
+    elif [ "$s" -le 50 ]; then echo "D"
+    else echo "F"
+    fi
+}
+
+grade_color() {
+    case "$1" in
+        A) echo -e "${GREEN}$1${NC}" ;;
+        B) echo -e "${GREEN}$1${NC}" ;;
+        C) echo -e "${YELLOW}$1${NC}" ;;
+        D) echo -e "${RED}$1${NC}" ;;
+        F) echo -e "${RED}$1${NC}" ;;
+    esac
+}
+
+# --- Scan Mode ---
+if [ "$PROJECT" = "--scan" ]; then
+    echo -e "${BOLD}=== V11 Drift Scan ===${NC}"
+    echo ""
+
+    TOTAL=0
+    GRADE_A=0; GRADE_B=0; GRADE_C=0; GRADE_D=0; GRADE_F=0
+
+    printf "%-35s %-8s %-8s %-8s %-8s %-8s %-8s %s\n" \
+        "PROJECT" "CL.MD" "DOCS" "TRACK" "ARCHIV" "PREVENT" "SCORE" "GRADE"
+    printf "%-35s %-8s %-8s %-8s %-8s %-8s %-8s %s\n" \
+        "-------" "-----" "----" "-----" "------" "-------" "-----" "-----"
+
+    # Collect projects
+    PROJECTS=()
+    for d in "$V11_WORKSPACE_ROOT"/*/; do
+        name=$(basename "$d")
+        [[ "$name" =~ ^(v6_Ultra|v8|v9\.backup|v10|v11|node_modules|\.archive|scripts|system-apps-config|sessions)$ ]] && continue
+        [ -f "$d/CLAUDE.md" ] || continue
+        PROJECTS+=("$name")
+    done
+
+    for name in "${PROJECTS[@]}"; do
+        ((TOTAL++)) || true
+        PROJECT_DIR="$V11_WORKSPACE_ROOT/$name"
+        SESSION_DIR="$SESSIONS_ROOT/$name"
+
+        # Quick checks per category
+        # 1. CLAUDE.md
+        cl_score=0
+        if [ -f "$PROJECT_DIR/CLAUDE.md" ]; then
+            lines=$(wc -l < "$PROJECT_DIR/CLAUDE.md")
+            if [ "$lines" -gt 800 ]; then ((cl_score+=10)) || true
+            elif [ "$lines" -gt 400 ]; then ((cl_score+=5)) || true
+            elif [ "$lines" -gt 200 ]; then ((cl_score+=2)) || true
+            fi
+            # Check for modular docs
+            if [ "$lines" -gt 300 ] && ! grep -q '\.md)' "$PROJECT_DIR/CLAUDE.md" 2>/dev/null; then
+                ((cl_score+=5)) || true
+            fi
+        else
+            ((cl_score+=5)) || true  # No CLAUDE.md at all
+        fi
+        cl_grade=$(grade_from_score "$cl_score")
+
+        # 2. Docs (quick: check for dead refs in CLAUDE.md)
+        doc_score=0
+        if [ -f "$PROJECT_DIR/CLAUDE.md" ]; then
+            # Extract markdown links and check targets
+            while IFS= read -r ref; do
+                target=$(echo "$ref" | sed 's/.*](\(.*\))/\1/' | sed 's/).*//')
+                # Skip URLs and anchors
+                [[ "$target" =~ ^http ]] && continue
+                [[ "$target" =~ ^# ]] && continue
+                [[ -z "$target" ]] && continue
+                # Resolve relative to project dir
+                if [ ! -e "$PROJECT_DIR/$target" ] && [ ! -e "$target" ]; then
+                    ((doc_score+=2)) || true
+                fi
+            done < <(grep -oP '\[.*?\]\(.*?\)' "$PROJECT_DIR/CLAUDE.md" 2>/dev/null || true)
+        fi
+        doc_grade=$(grade_from_score "$doc_score")
+
+        # 3. Tracking
+        track_score=0
+        if [ -d "$SESSION_DIR" ]; then
+            # Stale task state
+            if [ -f "$SESSION_DIR/.task-state.json" ]; then
+                age_days=$(( ($(date +%s) - $(stat -c %Y "$SESSION_DIR/.task-state.json" 2>/dev/null || echo $(date +%s))) / 86400 ))
+                [ "$age_days" -gt 30 ] && ((track_score+=5)) || true
+                [ "$age_days" -gt 7 ] && ((track_score+=2)) || true
+            fi
+            # Stale handoff
+            if [ -f "$SESSION_DIR/handoff.md" ]; then
+                age_days=$(( ($(date +%s) - $(stat -c %Y "$SESSION_DIR/handoff.md" 2>/dev/null || echo $(date +%s))) / 86400 ))
+                [ "$age_days" -gt 14 ] && ((track_score+=2)) || true
+            fi
+            # Ghost formation
+            if [ -f "$SESSION_DIR/.formation-registry.json" ]; then
+                nulls=$(grep -c '"PLACEHOLDER"\|null' "$SESSION_DIR/.formation-registry.json" 2>/dev/null || echo 0)
+                [ "$nulls" -gt 2 ] && ((track_score+=5)) || true
+            fi
+        fi
+        track_grade=$(grade_from_score "$track_score")
+
+        # 4. Archive
+        arch_score=0
+        if [ -d "$SESSION_DIR" ]; then
+            [ ! -d "$SESSION_DIR/archive" ] && ((arch_score+=2)) || true
+            # Temp debris
+            debris=$(find "$PROJECT_DIR" -maxdepth 2 \( -name "*.tmp" -o -name "*.bak" -o -name "*.orig" -o -name "*.swp" -o -name ".DS_Store" \) 2>/dev/null | wc -l)
+            [ "$debris" -gt 5 ] && ((arch_score+=5)) || true
+            [ "$debris" -gt 0 ] && ((arch_score+=1)) || true
+            # Oversized session
+            if [ -d "$SESSION_DIR" ]; then
+                file_count=$(find "$SESSION_DIR" -type f 2>/dev/null | wc -l)
+                [ "$file_count" -gt 50 ] && ((arch_score+=5)) || true
+            fi
+        fi
+        arch_grade=$(grade_from_score "$arch_score")
+
+        # 5. Prevention
+        prev_score=0
+        # Gitignore
+        if [ -f "$PROJECT_DIR/.gitignore" ]; then
+            grep -q "\.tmp" "$PROJECT_DIR/.gitignore" 2>/dev/null || ((prev_score+=2)) || true
+            grep -q "\.bak" "$PROJECT_DIR/.gitignore" 2>/dev/null || ((prev_score+=1)) || true
+        else
+            ((prev_score+=5)) || true
+        fi
+        # Freshness signal
+        grep -q "Validated:" "$PROJECT_DIR/CLAUDE.md" 2>/dev/null || ((prev_score+=2)) || true
+        # V11 hooks
+        if [ -f "$PROJECT_DIR/.claude/settings.json" ]; then
+            grep -q "session-end" "$PROJECT_DIR/.claude/settings.json" 2>/dev/null || ((prev_score+=5)) || true
+        else
+            ((prev_score+=3)) || true
+        fi
+        prev_grade=$(grade_from_score "$prev_score")
+
+        # Overall
+        total_score=$((cl_score + doc_score + track_score + arch_score + prev_score))
+        overall_grade=$(grade_from_score "$total_score")
+
+        case "$overall_grade" in
+            A) ((GRADE_A++)) || true ;;
+            B) ((GRADE_B++)) || true ;;
+            C) ((GRADE_C++)) || true ;;
+            D) ((GRADE_D++)) || true ;;
+            F) ((GRADE_F++)) || true ;;
+        esac
+
+        printf "%-35s %-8s %-8s %-8s %-8s %-8s %-8s %s\n" \
+            "$name" "$cl_grade" "$doc_grade" "$track_grade" "$arch_grade" "$prev_grade" "$total_score" "$overall_grade"
+    done
+
+    echo ""
+    echo -e "${BOLD}Total: $TOTAL${NC} | A: $GRADE_A | B: $GRADE_B | C: $GRADE_C | D: $GRADE_D | F: $GRADE_F"
+    echo ""
+    if [ "$GRADE_F" -gt 0 ]; then
+        echo -e "${RED}$GRADE_F projects graded F — run /v11-drift on these for full analysis${NC}"
+    fi
+    if [ "$GRADE_D" -gt 0 ]; then
+        echo -e "${YELLOW}$GRADE_D projects graded D — consider running /v11-drift${NC}"
+    fi
+    exit 0
+fi
+
+# --- Single Project Mode ---
+
+# Resolve project paths
+PROJECT_DIR="$V11_WORKSPACE_ROOT/$PROJECT"
+SESSION_DIR="$SESSIONS_ROOT/$PROJECT"
+
+if [ ! -d "$PROJECT_DIR" ] && [ ! -d "$SESSION_DIR" ]; then
+    echo -e "${RED}Error: Project '$PROJECT' not found at $PROJECT_DIR or $SESSION_DIR${NC}"
+    exit 2
+fi
+
+echo -e "${BOLD}=== V11 Drift Scan: $PROJECT ===${NC}"
+echo ""
+
+# --- Check 1: CLAUDE.md Line Count & Structure ---
+echo -e "${BOLD}1. CLAUDE.md Optimization${NC}"
+if [ -f "$PROJECT_DIR/CLAUDE.md" ]; then
+    LINES=$(wc -l < "$PROJECT_DIR/CLAUDE.md")
+    CHARS=$(wc -c < "$PROJECT_DIR/CLAUDE.md")
+    EST_TOKENS=$((CHARS / 4))
+
+    if [ "$LINES" -gt 800 ]; then
+        add_finding "CRITICAL" "claude-md-lines" "CLAUDE.md is $LINES lines (~$EST_TOKENS tokens). Target: <200"
+    elif [ "$LINES" -gt 400 ]; then
+        add_finding "HIGH" "claude-md-lines" "CLAUDE.md is $LINES lines (~$EST_TOKENS tokens). Target: <200"
+    elif [ "$LINES" -gt 200 ]; then
+        add_finding "MEDIUM" "claude-md-lines" "CLAUDE.md is $LINES lines (~$EST_TOKENS tokens). Target: <200"
+    else
+        echo -e "  ${GREEN}PASS${NC} CLAUDE.md: $LINES lines (~$EST_TOKENS tokens)"
+    fi
+
+    # Monolith check
+    if [ "$LINES" -gt 300 ]; then
+        if ! grep -q '\.md)' "$PROJECT_DIR/CLAUDE.md" 2>/dev/null; then
+            add_finding "HIGH" "claude-md-monolith" "No modular .md references in $LINES-line file. Should split into .claude/docs/"
+        fi
+    fi
+
+    # Modular reference validation
+    while IFS= read -r ref; do
+        target=$(echo "$ref" | sed 's/.*](\(.*\.md\)).*/\1/')
+        [[ "$target" =~ ^http ]] && continue
+        [[ -z "$target" ]] && continue
+        if [ ! -f "$PROJECT_DIR/$target" ] && [ ! -f "$target" ]; then
+            add_finding "HIGH" "claude-md-dead-ref" "References $target which does not exist"
+        fi
+    done < <(grep -oP '\[.*?\]\([^)]*\.md[^)]*\)' "$PROJECT_DIR/CLAUDE.md" 2>/dev/null || true)
+
+    # Required sections
+    for section in "Purpose\|What\|About" "Quick Start\|Commands\|Development" "Critical Rules\|Rules\|Constraints" "Key Files\|Architecture\|Structure"; do
+        if ! grep -qiE "^##.*($section)" "$PROJECT_DIR/CLAUDE.md" 2>/dev/null; then
+            add_finding "LOW" "claude-md-section" "Missing recommended section: $section"
+        fi
+    done
+
+    # Freshness
+    if ! grep -q "Validated:" "$PROJECT_DIR/CLAUDE.md" 2>/dev/null; then
+        add_finding "MEDIUM" "claude-md-freshness" "No freshness timestamp (<!-- Validated: DATE -->)"
+    fi
+else
+    add_finding "HIGH" "claude-md-missing" "No CLAUDE.md found"
+fi
+echo ""
+
+# --- Check 2: Dead File References ---
+echo -e "${BOLD}2. Documentation References${NC}"
+if [ -f "$PROJECT_DIR/CLAUDE.md" ]; then
+    DEAD_REFS=0
+    while IFS= read -r line; do
+        # Extract path from markdown link [text](path)
+        path=$(echo "$line" | grep -oP '\]\(\K[^)]+' | head -1)
+        [[ -z "$path" ]] && continue
+        [[ "$path" =~ ^http ]] && continue
+        [[ "$path" =~ ^# ]] && continue
+        [[ "$path" =~ ^mailto ]] && continue
+
+        # Resolve relative to project dir
+        if [ ! -e "$PROJECT_DIR/$path" ] && [ ! -e "$path" ]; then
+            add_finding "MEDIUM" "dead-reference" "CLAUDE.md references '$path' which does not exist"
+            ((DEAD_REFS++)) || true
+        fi
+    done < <(grep -oP '\[.*?\]\([^)]+\)' "$PROJECT_DIR/CLAUDE.md" 2>/dev/null || true)
+
+    [ "$DEAD_REFS" -eq 0 ] && echo -e "  ${GREEN}PASS${NC} All references valid"
+fi
+echo ""
+
+# --- Check 3: Task State Staleness ---
+echo -e "${BOLD}3. Tracking State${NC}"
+if [ -d "$SESSION_DIR" ]; then
+    if [ -f "$SESSION_DIR/.task-state.json" ]; then
+        AGE_DAYS=$(( ($(date +%s) - $(stat -c %Y "$SESSION_DIR/.task-state.json")) / 86400 ))
+        if [ "$AGE_DAYS" -gt 30 ]; then
+            add_finding "HIGH" "task-state-stale" ".task-state.json is $AGE_DAYS days old"
+        elif [ "$AGE_DAYS" -gt 7 ]; then
+            add_finding "MEDIUM" "task-state-stale" ".task-state.json is $AGE_DAYS days old"
+        else
+            echo -e "  ${GREEN}PASS${NC} Task state: $AGE_DAYS days old"
+        fi
+    else
+        echo -e "  [INFO] No .task-state.json (task system not activated)"
+    fi
+
+    if [ -f "$SESSION_DIR/handoff.md" ]; then
+        AGE_DAYS=$(( ($(date +%s) - $(stat -c %Y "$SESSION_DIR/handoff.md")) / 86400 ))
+        if [ "$AGE_DAYS" -gt 14 ]; then
+            add_finding "MEDIUM" "handoff-stale" "handoff.md is $AGE_DAYS days old (stale context)"
+        fi
+    fi
+
+    if [ -f "$SESSION_DIR/.formation-registry.json" ]; then
+        NULLS=$(grep -c '"PLACEHOLDER"\|"null"\|: null' "$SESSION_DIR/.formation-registry.json" 2>/dev/null || echo 0)
+        if [ "$NULLS" -gt 2 ]; then
+            add_finding "MEDIUM" "formation-ghost" "Formation registry has $NULLS null/placeholder agent IDs"
+        fi
+    fi
+else
+    echo -e "  [INFO] No session directory"
+fi
+echo ""
+
+# --- Check 4: Temp File Debris ---
+echo -e "${BOLD}4. Temp File Debris${NC}"
+DEBRIS_COUNT=0
+DEBRIS_LIST=""
+for pattern in "*.tmp" "*.bak" "*.orig" "*.swp" "*.swo" "*~" ".DS_Store" "Thumbs.db"; do
+    found=$(find "$PROJECT_DIR" -maxdepth 3 -name "$pattern" 2>/dev/null | head -10)
+    if [ -n "$found" ]; then
+        count=$(echo "$found" | wc -l)
+        ((DEBRIS_COUNT+=count)) || true
+        DEBRIS_LIST+="$found"$'\n'
+    fi
+done
+
+# Check for cache dirs
+for dir_pattern in "__pycache__" ".pytest_cache" ".mypy_cache" ".ruff_cache"; do
+    found=$(find "$PROJECT_DIR" -maxdepth 3 -type d -name "$dir_pattern" 2>/dev/null | head -5)
+    if [ -n "$found" ]; then
+        count=$(echo "$found" | wc -l)
+        ((DEBRIS_COUNT+=count)) || true
+    fi
+done
+
+if [ "$DEBRIS_COUNT" -gt 10 ]; then
+    add_finding "HIGH" "temp-debris" "$DEBRIS_COUNT temp/cache items found"
+elif [ "$DEBRIS_COUNT" -gt 0 ]; then
+    add_finding "MEDIUM" "temp-debris" "$DEBRIS_COUNT temp/cache items found"
+else
+    echo -e "  ${GREEN}PASS${NC} No temp debris"
+fi
+
+# Structured temp system
+if [ ! -d "$PROJECT_DIR/.tmp" ] && [ ! -d "$PROJECT_DIR/tmp" ] && [ ! -d "$SESSION_DIR/.tmp" ] 2>/dev/null; then
+    add_finding "LOW" "no-temp-dir" "No structured .tmp/ directory"
+fi
+echo ""
+
+# --- Check 5: Archive System ---
+echo -e "${BOLD}5. Archive System${NC}"
+HAS_ARCHIVE=false
+[ -d "$SESSION_DIR/archive" ] 2>/dev/null && HAS_ARCHIVE=true
+[ -d "$PROJECT_DIR/archive" ] 2>/dev/null && HAS_ARCHIVE=true
+[ -d "$PROJECT_DIR/.archive" ] 2>/dev/null && HAS_ARCHIVE=true
+
+if $HAS_ARCHIVE; then
+    echo -e "  ${GREEN}PASS${NC} Archive directory exists"
+else
+    add_finding "MEDIUM" "no-archive" "No archive directory (sessions or project)"
+    if $FIX_MODE; then
+        mkdir -p "$SESSION_DIR/archive" 2>/dev/null || true
+        echo -e "  ${GREEN}FIXED${NC} Created $SESSION_DIR/archive/"
+    fi
+fi
+
+# Session size
+if [ -d "$SESSION_DIR" ]; then
+    FILE_COUNT=$(find "$SESSION_DIR" -type f 2>/dev/null | wc -l)
+    if [ "$FILE_COUNT" -gt 50 ]; then
+        SIZE=$(du -sh "$SESSION_DIR" 2>/dev/null | cut -f1)
+        add_finding "HIGH" "oversized-session" "Session has $FILE_COUNT files ($SIZE)"
+    fi
+fi
+
+# Backup accumulation
+BACKUP_COUNT=$(find "$PROJECT_DIR" -maxdepth 2 \( -name "*.backup*" -o -name "*-backup" -o -name "*.bak" \) 2>/dev/null | wc -l)
+if [ "$BACKUP_COUNT" -gt 5 ]; then
+    add_finding "MEDIUM" "backup-accumulation" "$BACKUP_COUNT backup files accumulated"
+fi
+echo ""
+
+# --- Check 6: Gitignore Coverage ---
+echo -e "${BOLD}6. Prevention Measures${NC}"
+if [ -f "$PROJECT_DIR/.gitignore" ]; then
+    MISSING_PATTERNS=()
+    grep -q "\.tmp" "$PROJECT_DIR/.gitignore" 2>/dev/null || MISSING_PATTERNS+=("*.tmp")
+    grep -q "\.bak" "$PROJECT_DIR/.gitignore" 2>/dev/null || MISSING_PATTERNS+=("*.bak")
+    grep -q "\.DS_Store" "$PROJECT_DIR/.gitignore" 2>/dev/null || MISSING_PATTERNS+=(".DS_Store")
+
+    # Stack-specific
+    if [ -f "$PROJECT_DIR/requirements.txt" ] || [ -f "$PROJECT_DIR/pyproject.toml" ]; then
+        grep -q "__pycache__" "$PROJECT_DIR/.gitignore" 2>/dev/null || MISSING_PATTERNS+=("__pycache__/")
+        grep -q "\.pyc" "$PROJECT_DIR/.gitignore" 2>/dev/null || MISSING_PATTERNS+=("*.pyc")
+    fi
+    if [ -f "$PROJECT_DIR/package.json" ]; then
+        grep -q "node_modules" "$PROJECT_DIR/.gitignore" 2>/dev/null || MISSING_PATTERNS+=("node_modules/")
+    fi
+
+    if [ ${#MISSING_PATTERNS[@]} -gt 3 ]; then
+        add_finding "HIGH" "gitignore-gaps" "Missing ${#MISSING_PATTERNS[@]} patterns: ${MISSING_PATTERNS[*]}"
+    elif [ ${#MISSING_PATTERNS[@]} -gt 0 ]; then
+        add_finding "MEDIUM" "gitignore-gaps" "Missing patterns: ${MISSING_PATTERNS[*]}"
+    else
+        echo -e "  ${GREEN}PASS${NC} Gitignore coverage adequate"
+    fi
+
+    if $FIX_MODE && [ ${#MISSING_PATTERNS[@]} -gt 0 ]; then
+        echo "" >> "$PROJECT_DIR/.gitignore"
+        echo "# Drift prevention (v11-drift)" >> "$PROJECT_DIR/.gitignore"
+        for p in "${MISSING_PATTERNS[@]}"; do
+            echo "$p" >> "$PROJECT_DIR/.gitignore"
+        done
+        echo -e "  ${GREEN}FIXED${NC} Added ${#MISSING_PATTERNS[@]} patterns to .gitignore"
+    fi
+else
+    add_finding "HIGH" "no-gitignore" "No .gitignore file"
+    if $FIX_MODE; then
+        cat > "$PROJECT_DIR/.gitignore" << 'GITIGNORE'
+# Drift prevention (v11-drift)
+*.tmp
+*.bak
+*.orig
+*.swp
+.DS_Store
+__pycache__/
+*.pyc
+node_modules/
+.drift-report.json
+GITIGNORE
+        echo -e "  ${GREEN}FIXED${NC} Created .gitignore with drift patterns"
+    fi
+fi
+
+# V11 hooks check
+if [ -f "$PROJECT_DIR/.claude/settings.json" ]; then
+    if grep -q "session-end" "$PROJECT_DIR/.claude/settings.json" 2>/dev/null; then
+        echo -e "  ${GREEN}PASS${NC} Session-end hook wired"
+    else
+        add_finding "HIGH" "no-session-end" "session-end hook not wired in settings.json"
+    fi
+else
+    add_finding "MEDIUM" "no-settings" "No .claude/settings.json"
+fi
+echo ""
+
+# ------------------------------------------------------------------------
+# 7. Dark Code Alignment (V11.7.2 — addresses Layer 1-3 gaps)
+# ------------------------------------------------------------------------
+echo -e "${BOLD}7. Dark Code Alignment${NC}"
+
+# 7a. Persisted STR advisories in task state
+TASK_STATE_FILE="$V11_WORKSPACE_ROOT/.agent-metrics/task-state/${PROJECT}.json"
+[ ! -f "$TASK_STATE_FILE" ] && [ -f "$SESSION_DIR/.task-state.json" ] && TASK_STATE_FILE="$SESSION_DIR/.task-state.json"
+if [ -f "$TASK_STATE_FILE" ]; then
+    STR_MISSING=$(jq -r '.dark_code_advisories.str_missing_count // 0' "$TASK_STATE_FILE" 2>/dev/null)
+    STR_MISSING=${STR_MISSING:-0}
+    if [ "$STR_MISSING" -eq 0 ]; then
+        echo -e "  ${GREEN}PASS${NC} No complex/novel tasks missing spec_test_requirements"
+    else
+        add_finding "MEDIUM" "layer1-str-missing" "$STR_MISSING complex/novel tasks without spec_test_requirements — run scripts/spec-requirements-extract"
+    fi
+fi
+
+# 7b. MODULE.md coverage on code modules
+# Walk PROJECT_DIR recursively to cover monorepo layouts.
+MOD_TOTAL=0
+MOD_MANIFEST=0
+MOD_STALE=0
+THIRTY_DAYS_AGO=$(date -d '30 days ago' +%s 2>/dev/null || echo 0)
+if [ -d "$PROJECT_DIR" ]; then
+    while IFS= read -r d; do
+        cc=$(find "$d" -maxdepth 1 -type f \( -name "*.py" -o -name "*.ts" -o -name "*.tsx" -o -name "*.js" -o -name "*.jsx" -o -name "*.go" -o -name "*.rs" \) 2>/dev/null | wc -l | tr -d ' ')
+        [ "$cc" -lt 3 ] && continue
+        MOD_TOTAL=$((MOD_TOTAL + 1))
+        if [ -f "$d/MODULE.md" ] || [ -f "$d/MODULE.json" ]; then
+            MOD_MANIFEST=$((MOD_MANIFEST + 1))
+            # Staleness: was any code file modified in the last 30 days AFTER the MODULE.md?
+            MANIFEST_FILE="$d/MODULE.md"
+            [ -f "$d/MODULE.json" ] && MANIFEST_FILE="$d/MODULE.json"
+            if [ -f "$MANIFEST_FILE" ]; then
+                MANIFEST_MTIME=$(stat -c %Y "$MANIFEST_FILE" 2>/dev/null || echo 0)
+                NEWEST_CODE=$(find "$d" -maxdepth 1 -type f \( -name "*.py" -o -name "*.ts" -o -name "*.tsx" -o -name "*.js" -o -name "*.go" -o -name "*.rs" \) -printf '%T@\n' 2>/dev/null | sort -nr | head -1 | cut -d. -f1)
+                if [ -n "$NEWEST_CODE" ] && [ "$NEWEST_CODE" -gt "$MANIFEST_MTIME" ] && [ "$NEWEST_CODE" -gt "$THIRTY_DAYS_AGO" ]; then
+                    MOD_STALE=$((MOD_STALE + 1))
+                fi
+            fi
+        fi
+    done < <(find "$PROJECT_DIR" \
+        \( -type d \( -name 'node_modules' -o -name '.git' -o -name '__pycache__' \
+                      -o -name 'target' -o -name 'dist' -o -name 'build' \
+                      -o -name '.venv' -o -name 'venv' -o -name '.next' \
+                      -o -name 'data' -o -name 'vendor' -o -name 'third_party' \
+                      -o -name 'fixtures' -o -name 'testdata' -o -name 'corpus' \
+                      -o -name 'tests' -o -name 'test' -o -name '__tests__' \
+                      -o -name 'results' -o -name 'coverage' -o -name 'out' \) -prune \) \
+        -o -type d -print 2>/dev/null)
+
+    if [ "$MOD_TOTAL" -eq 0 ]; then
+        echo -e "  ${CYAN}INFO${NC} No code modules detected"
+    else
+        MISSING=$((MOD_TOTAL - MOD_MANIFEST))
+        if [ "$MISSING" -eq 0 ]; then
+            echo -e "  ${GREEN}PASS${NC} MODULE.md coverage $MOD_MANIFEST/$MOD_TOTAL"
+        else
+            PCT=$((MOD_MANIFEST * 100 / MOD_TOTAL))
+            add_finding "MEDIUM" "module-md-gaps" "MODULE.md coverage ${MOD_MANIFEST}/${MOD_TOTAL} (${PCT}%) — $MISSING modules unmanifested"
+        fi
+        if [ "$MOD_STALE" -gt 0 ]; then
+            add_finding "LOW" "module-md-stale" "$MOD_STALE MODULE.md files older than recent code changes — review"
+        fi
+    fi
+fi
+echo ""
+
+# --- Summary ---
+GRADE=$(grade_from_score "$SCORE")
+GRADE_DISPLAY=$(grade_color "$GRADE")
+
+echo -e "${BOLD}=== Summary ===${NC}"
+echo -e "  Score: $SCORE | Grade: $GRADE_DISPLAY"
+echo -e "  Findings: $FINDINGS (${RED}$CRITICAL critical${NC}, ${YELLOW}$HIGH high${NC}, ${CYAN}$MEDIUM medium${NC}, $LOW low)"
+echo ""
+
+if [ "$SCORE" -gt 30 ]; then
+    echo -e "  ${YELLOW}Recommendation: Run /v11-drift $PROJECT for full 5-agent analysis${NC}"
+fi
+
+if [ "$FINDINGS" -gt 0 ] && ! $FIX_MODE; then
+    echo -e "  Run with --fix to auto-correct safe items"
+fi
+
+# Cache result
+if [ -d "$SESSION_DIR" ]; then
+    cat > "$SESSION_DIR/.drift-scan-result.json" 2>/dev/null << EOF || true
+{
+  "project": "$PROJECT",
+  "scan_date": "$(date +%Y-%m-%d)",
+  "scanner": "v11-drift-scan",
+  "score": $SCORE,
+  "grade": "$GRADE",
+  "findings": $FINDINGS,
+  "critical": $CRITICAL,
+  "high": $HIGH,
+  "medium": $MEDIUM,
+  "low": $LOW
+}
+EOF
+fi
+
+# Exit code based on grade
+if [ "$SCORE" -le 15 ]; then
+    exit 0  # A or B
+else
+    exit 1  # C, D, or F
+fi

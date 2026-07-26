@@ -1,0 +1,281 @@
+#!/usr/bin/env bash
+# Install/uninstall the V11 nightly review-daemon cadence as a user crontab entry.
+#
+# R3.2: the review-daemon (scripts/review-daemon) drains per-project review
+# queues but does NOT wire its own cron — that is a deliberate separation
+# (see review-daemon header). This script is the explicit installer the user
+# runs; nothing in V11 modifies the crontab implicitly.
+#
+# Usage:
+#   install-review-cadence [--time HH:MM] [--limit N]
+#   install-review-cadence --status
+#   install-review-cadence --uninstall
+#
+# Behavior:
+#   - install (default): adds/replaces a single marked crontab line that
+#     loops over every project with a pending review-queue file
+#     (~/.agent-metrics/review-queue/*.jsonl) and runs:
+#       V11_REVIEW_CADENCE=on <V11_HOME>/scripts/review-daemon $PROJECT --limit N \
+#         >> ~/.agent-metrics/review-daemon-cron.log 2>&1
+#     Default time: 03:30. Idempotent — re-running replaces the marked line,
+#     never duplicates it.
+#
+#     At install time, the absolute path of the `claude` CLI is resolved
+#     (`command -v claude`) and baked into a generated run wrapper
+#     (~/.agent-metrics/review-cadence-run.sh) as PATH — cron's minimal
+#     environment cannot otherwise resolve `claude` on $PATH or satisfy its
+#     auth lookup. The cron line itself just invokes the wrapper (keeping it
+#     short — vixie-cron rejects long inline commands with "command too
+#     long"). Install ABORTS with a clear message if `claude` cannot be
+#     found.
+#
+#     Every cron firing appends a heartbeat line to the log
+#     (`V11-HEARTBEAT <ISO8601> projects=<p1,p2,...|none> exit=<code>`) —
+#     including runs where the review-queue is empty — so silent no-ops
+#     are visible in the log rather than indistinguishable from "cron
+#     never fired."
+#
+#     The generated cron command also truncates the log to its last 5000
+#     lines whenever it exceeds 10000, via `tail` + `mv` (no logrotate
+#     dependency), to bound unattended log growth.
+#
+#     H4b (W2-2): once every review-daemon invocation above has completed, the
+#     wrapper runs review-queue-maintenance --normalize --gc --apply
+#     SEQUENTIALLY — never in a parallel cron slot, so it never contends with
+#     a live review-daemon run for the per-project queue flock (W2-1,
+#     V11_RQ_MAINT_LOCK_TIMEOUT). Output appends to the same cron log. Gated
+#     behind V11_RQ_MAINT_CADENCE (default on) as an independent rollback
+#     lever from V11_REVIEW_CADENCE.
+#
+#   - --status: prints the current marked crontab entry (if any), plus the
+#     timestamp of the last heartbeat line in the log and a warning if it
+#     is older than 48 hours (or absent).
+#   - --uninstall: removes the marked crontab line (and only that line).
+#
+# Marker (for idempotent replace / removal): "# v11-review-cadence"
+#
+# Rollback:
+#   install-review-cadence --uninstall   — removes the crontab line
+#   V11_REVIEW_CADENCE=off               — review-daemon itself exits 0 immediately
+#     (already respected by review-daemon; this installer never overrides it)
+#   V11_RQ_MAINT_CADENCE=off             — skips the review-queue-maintenance step only;
+#     the review-daemon loop still runs (independent lever, H4b/W2-2)
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+V11_HOME="${V11_HOME:-$(dirname "$SCRIPT_DIR")}"
+REVIEW_DAEMON="${V11_HOME}/scripts/review-daemon"
+REVIEW_QUEUE_MAINT="${V11_HOME}/scripts/review-queue-maintenance"
+METRICS_DIR="${HOME}/.agent-metrics"
+QUEUE_DIR="${METRICS_DIR}/review-queue"
+CRON_LOG="${METRICS_DIR}/review-daemon-cron.log"
+
+MARKER="# v11-review-cadence"
+HEARTBEAT_TAG="V11-HEARTBEAT"
+HEARTBEAT_STALE_SECONDS=$((48 * 3600))
+
+TIME="03:30"
+LIMIT=5
+MODE="install"
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --time)
+            TIME="${2:-}"
+            shift
+            ;;
+        --limit)
+            LIMIT="${2:-5}"
+            shift
+            ;;
+        --uninstall)
+            MODE="uninstall"
+            ;;
+        --status)
+            MODE="status"
+            ;;
+        -h|--help)
+            sed -n '2,62p' "$0" | sed 's/^# \{0,1\}//'
+            exit 0
+            ;;
+        *)
+            echo "install-review-cadence: unknown argument '$1'" >&2
+            exit 2
+            ;;
+    esac
+    shift
+done
+
+if ! printf '%s' "$TIME" | grep -qE '^([01][0-9]|2[0-3]):[0-5][0-9]$'; then
+    echo "install-review-cadence: --time must be HH:MM (24h), got '$TIME'" >&2
+    exit 1
+fi
+
+if ! printf '%s' "$LIMIT" | grep -qE '^[0-9]+$'; then
+    echo "install-review-cadence: --limit must be a positive integer, got '$LIMIT'" >&2
+    exit 1
+fi
+
+HOUR="${TIME%%:*}"
+MINUTE="${TIME##*:}"
+# Strip any leading zero so cron doesn't treat e.g. "08" as octal in some parsers.
+HOUR="$((10#$HOUR))"
+MINUTE="$((10#$MINUTE))"
+
+if [ ! -x "$REVIEW_DAEMON" ]; then
+    echo "install-review-cadence: WARNING — review-daemon not found/executable at $REVIEW_DAEMON" >&2
+fi
+
+if [ ! -x "$REVIEW_QUEUE_MAINT" ]; then
+    echo "install-review-cadence: WARNING — review-queue-maintenance not found/executable at $REVIEW_QUEUE_MAINT" >&2
+fi
+
+# ── Heartbeat inspection helper (used by --status) ─────────────────────────
+_print_heartbeat_status() {
+    if [ ! -f "$CRON_LOG" ]; then
+        echo "install-review-cadence: no heartbeat found (log does not exist yet: ${CRON_LOG})"
+        return
+    fi
+    _last_hb="$(grep "$HEARTBEAT_TAG" "$CRON_LOG" 2>/dev/null | tail -n 1 || true)"
+    if [ -z "$_last_hb" ]; then
+        echo "install-review-cadence: no heartbeat found in ${CRON_LOG} — cron may never have fired."
+        return
+    fi
+    _hb_ts="$(printf '%s\n' "$_last_hb" | awk '{print $2}')"
+    echo "Last heartbeat: ${_last_hb}"
+    _hb_epoch="$(date -d "$_hb_ts" +%s 2>/dev/null || true)"
+    _now_epoch="$(date +%s)"
+    if [ -z "$_hb_epoch" ]; then
+        echo "install-review-cadence: WARNING — could not parse heartbeat timestamp '${_hb_ts}'."
+        return
+    fi
+    _age=$(( _now_epoch - _hb_epoch ))
+    if [ "$_age" -gt "$HEARTBEAT_STALE_SECONDS" ]; then
+        _age_hours=$(( _age / 3600 ))
+        echo "install-review-cadence: WARNING — last heartbeat is ${_age_hours}h old (older than 48h). Cron may be silently failing."
+    else
+        echo "install-review-cadence: heartbeat is fresh (within 48h)."
+    fi
+}
+
+# ── Status ───────────────────────────────────────────────────────────────
+if [ "$MODE" = "status" ]; then
+    _current="$(crontab -l 2>/dev/null | grep -F "$MARKER" || true)"
+    if [ -z "$_current" ]; then
+        echo "install-review-cadence: no v11-review-cadence entry installed."
+        exit 0
+    fi
+    echo "install-review-cadence: current entry:"
+    echo "$_current"
+    echo ""
+    _print_heartbeat_status
+    exit 0
+fi
+
+# ── Uninstall ────────────────────────────────────────────────────────────
+if [ "$MODE" = "uninstall" ]; then
+    _existing="$(crontab -l 2>/dev/null || true)"
+    if ! printf '%s\n' "$_existing" | grep -qF "$MARKER"; then
+        echo "install-review-cadence: no v11-review-cadence entry found — nothing to remove."
+        exit 0
+    fi
+    printf '%s\n' "$_existing" | grep -vF "$MARKER" | crontab -
+    rm -f "${METRICS_DIR}/review-cadence-run.sh"
+    echo "install-review-cadence: removed v11-review-cadence crontab entry."
+    exit 0
+fi
+
+# ── Install ──────────────────────────────────────────────────────────────
+
+# R3.2-hardening: cron runs under a minimal environment. `claude` (invoked by
+# review-daemon) will fail to resolve on $PATH — and may fail auth lookups
+# that depend on locating its install dir — unless we bake an absolute path
+# and a sane PATH into the run wrapper. Resolve at INSTALL time, using the
+# same interactive-shell resolution the operator already trusts. Abort the
+# install with a clear message if `claude` cannot be found.
+CLAUDE_BIN="$(command -v claude || true)"
+if [ -z "$CLAUDE_BIN" ]; then
+    echo "install-review-cadence: ERROR — 'claude' CLI not found on PATH. Install/configure the claude CLI before installing this cron entry." >&2
+    exit 1
+fi
+CLAUDE_DIR="$(dirname "$CLAUDE_BIN")"
+CRON_PATH="${CLAUDE_DIR}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+# The cron line itself must stay short (vixie-cron enforces a max command
+# length and rejects long inline commands with "command too long"). Generate
+# a small wrapper script instead and have cron invoke that — this also keeps
+# the heartbeat/truncation logic readable and independently testable.
+RUN_SCRIPT="${METRICS_DIR}/review-cadence-run.sh"
+mkdir -p "$METRICS_DIR"
+cat > "$RUN_SCRIPT" <<EOF
+#!/bin/sh
+# Auto-generated by install-review-cadence — safe to regenerate, do not hand-edit.
+export PATH="${CRON_PATH}"
+
+QUEUE_DIR="${QUEUE_DIR}"
+CRON_LOG="${CRON_LOG}"
+REVIEW_DAEMON="${REVIEW_DAEMON}"
+REVIEW_QUEUE_MAINT="${REVIEW_QUEUE_MAINT}"
+LIMIT="${LIMIT}"
+HEARTBEAT_TAG="${HEARTBEAT_TAG}"
+
+# Bound unattended log growth: truncate to the last 5000 lines once the log
+# exceeds 10000 lines (tail + mv, no logrotate dependency).
+if [ -f "\$CRON_LOG" ]; then
+    lc=\$(wc -l < "\$CRON_LOG" 2>/dev/null || echo 0)
+    if [ "\$lc" -gt 10000 ]; then
+        tail -n 5000 "\$CRON_LOG" > "\${CRON_LOG}.tmp" && mv "\${CRON_LOG}.tmp" "\$CRON_LOG"
+    fi
+fi
+
+exitc=0
+projects=""
+for f in "\$QUEUE_DIR"/*.jsonl; do
+    [ -e "\$f" ] || continue
+    p=\$(basename "\$f" .jsonl)
+    projects="\${projects}\${p},"
+    V11_REVIEW_CADENCE=on "\$REVIEW_DAEMON" "\$p" --limit "\$LIMIT" >> "\$CRON_LOG" 2>&1
+    exitc=\$?
+done
+
+# H4b (W2-2): run review-queue-maintenance (normalize + gc) SEQUENTIALLY AFTER every
+# review-daemon invocation above has completed — never in a parallel cron slot, so it
+# never contends with a live review-daemon run for the per-project queue flock (W2-1,
+# V11_RQ_MAINT_LOCK_TIMEOUT). Gated behind V11_RQ_MAINT_CADENCE (default on) as an
+# independent rollback lever from V11_REVIEW_CADENCE (which gates the daemon itself).
+if [ "\${V11_RQ_MAINT_CADENCE:-on}" != "off" ]; then
+    "\$REVIEW_QUEUE_MAINT" --normalize --gc --apply >> "\$CRON_LOG" 2>&1
+fi
+
+# Heartbeat: written every run, even when the queue is empty, so a silently
+# non-firing (or silently failing) cron entry is visible in the log rather
+# than indistinguishable from "nothing to do."
+echo "\${HEARTBEAT_TAG} \$(date -Iseconds) projects=\${projects:-none} exit=\${exitc}" >> "\$CRON_LOG"
+EOF
+chmod +x "$RUN_SCRIPT"
+
+CRON_LINE="${MINUTE} ${HOUR} * * * ${RUN_SCRIPT} ${MARKER}"
+
+_existing="$(crontab -l 2>/dev/null || true)"
+if printf '%s\n' "$_existing" | grep -qF "$MARKER"; then
+    _new="$(printf '%s\n' "$_existing" | grep -vF "$MARKER")"
+    printf '%s\n%s\n' "$_new" "$CRON_LINE" | crontab -
+    echo "install-review-cadence: replaced existing v11-review-cadence entry."
+else
+    if [ -z "$_existing" ]; then
+        printf '%s\n' "$CRON_LINE" | crontab -
+    else
+        printf '%s\n%s\n' "$_existing" "$CRON_LINE" | crontab -
+    fi
+    echo "install-review-cadence: installed v11-review-cadence entry."
+fi
+
+echo ""
+echo "Schedule: daily at ${TIME} (limit=${LIMIT} per project)"
+echo "Run script: ${RUN_SCRIPT}"
+echo "Log:      ${CRON_LOG}"
+echo ""
+echo "Rollback:"
+echo "  install-review-cadence --uninstall   — remove this crontab entry"
+echo "  V11_REVIEW_CADENCE=off               — review-daemon no-ops even if cron fires"

@@ -1,0 +1,259 @@
+#!/bin/bash
+# V11 Script: ledger-verify (W3-2)
+# Cold-path verdict-hash verification across durable ledgers.
+#
+# OPERATOR-ON-DEMAND ONLY. This script is never wired into the ledger replay
+# fold, sync-tasks, or any hook — it exists purely for an operator to
+# spot-check that review-verdict files referenced from the durable ledger
+# (`verdict_ref`) still exist on disk and still match the hash recorded at
+# write time (`verdict_sha`, written by `_v11_review_queue_mark_done` in
+# hooks/lib/common.sh:3610 via `sha256sum "$verdict_ref"`).
+#
+# Every ledger row of shape {"ev":"review", ..., "verdict_ref": "...",
+# "verdict_sha": "..."} is re-hashed against the file on disk and classified:
+#
+#   OK        verdict_ref exists and sha256 matches verdict_sha
+#   MISMATCH  verdict_ref exists but sha256 does NOT match verdict_sha
+#   MISSING   verdict_ref does not exist on disk (or is unreadable)
+#
+# Rows missing either verdict_ref or verdict_sha are ignored silently — most
+# ledger rows are not review rows, and review rows written before V11.19's
+# B1/B2 verdict fold-back may have empty verdict fields. Malformed JSON lines
+# are skipped and counted, never fatal.
+#
+# USAGE:
+#   ledger-verify [PROJECT] [--json]
+#   ledger-verify --help
+#
+#   PROJECT   Limit to one project's ledger ($METRICS_DIR/ledger/PROJECT.jsonl).
+#             When omitted, every *.jsonl file directly under
+#             $METRICS_DIR/ledger/ is checked.
+#   --json    Emit a single machine-readable JSON summary instead of the
+#             human-readable report.
+#
+# EXIT CODES:
+#   0   All verdict rows checked were OK (including zero rows checked).
+#   1   At least one MISMATCH was found (takes priority over MISSING).
+#   2   No MISMATCH, but at least one MISSING was found.
+#   3   Usage error (invalid PROJECT name / bad arguments).
+#
+# This script never writes anything — read-only cold path.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+V11_HOME="${V11_HOME:-$(dirname "$SCRIPT_DIR")}"
+# shellcheck source=../hooks/lib/common.sh
+source "$V11_HOME/hooks/lib/common.sh"
+
+if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
+    sed -n '2,37p' "$0" | sed 's/^# \{0,1\}//'
+    exit 0
+fi
+
+PROJECT=""
+JSON_OUT=false
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --json) JSON_OUT=true ;;
+        --help|-h) sed -n '2,37p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -*) echo "ledger-verify: unknown option '$1'" >&2; exit 3 ;;
+        *)
+            if [ -n "$PROJECT" ]; then
+                echo "ledger-verify: unexpected extra argument '$1'" >&2
+                exit 3
+            fi
+            PROJECT="$1"
+            ;;
+    esac
+    shift
+done
+
+if [ -n "$PROJECT" ] && ! printf '%s' "$PROJECT" | grep -qE '^[a-zA-Z0-9._-]{1,64}$'; then
+    echo "ledger-verify: invalid PROJECT name '$PROJECT'" >&2
+    exit 3
+fi
+
+# Delegate parsing/hashing/aggregation to Python — jsonl parsing + sha256 file
+# hashing is far cleaner there, matching the v11_replay_ledger pattern already
+# used for the ledger fold (hooks/lib/common.sh).
+V11_LV_METRICS_DIR="$METRICS_DIR" \
+V11_LV_PROJECT="$PROJECT" \
+V11_LV_JSON="$JSON_OUT" \
+python3 - <<'PYEOF'
+import hashlib
+import json
+import os
+import sys
+from pathlib import Path
+
+METRICS_DIR = os.environ.get("V11_LV_METRICS_DIR", "")
+PROJECT = os.environ.get("V11_LV_PROJECT", "")
+JSON_OUT = os.environ.get("V11_LV_JSON", "false") == "true"
+
+LEDGER_DIR = Path(METRICS_DIR) / "ledger"
+
+
+def sha256_of_file(path):
+    """Return the sha256 hex digest of a file, or None if it can't be read."""
+    h = hashlib.sha256()
+    try:
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(65536), b""):
+                h.update(chunk)
+    except OSError:
+        return None
+    return h.hexdigest()
+
+
+def discover_ledger_files(project):
+    if project:
+        return [(project, LEDGER_DIR / f"{project}.jsonl")]
+    if not LEDGER_DIR.is_dir():
+        return []
+    files = sorted(p for p in LEDGER_DIR.glob("*.jsonl") if p.is_file())
+    return [(p.stem, p) for p in files]
+
+
+def verify_ledger(project, path):
+    result = {
+        "project": project,
+        "exists": path.exists(),
+        "malformed_lines": 0,
+        "rows_checked": 0,
+        "ok": 0,
+        "mismatch": [],
+        "missing": [],
+    }
+    if not result["exists"]:
+        return result
+
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        print(f"ledger-verify: cannot read {path}: {exc}", file=sys.stderr)
+        return result
+
+    for raw in text.splitlines():
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            rec = json.loads(raw)
+        except json.JSONDecodeError:
+            result["malformed_lines"] += 1
+            continue
+        if not isinstance(rec, dict):
+            result["malformed_lines"] += 1
+            continue
+
+        verdict_ref = rec.get("verdict_ref")
+        verdict_sha = rec.get("verdict_sha")
+        # Rows without BOTH fields aren't verifiable review rows — ignore
+        # silently (the common case: most ledger rows aren't reviews).
+        if not verdict_ref or not verdict_sha:
+            continue
+
+        result["rows_checked"] += 1
+        task_id = rec.get("task_id", "<unknown>")
+
+        if not os.path.exists(verdict_ref):
+            result["missing"].append({"task_id": task_id, "verdict_ref": verdict_ref})
+            continue
+
+        actual_sha = sha256_of_file(verdict_ref)
+        if actual_sha is None:
+            # Exists per os.path.exists but unreadable (permissions/race) —
+            # treat conservatively as missing rather than silently OK.
+            result["missing"].append({"task_id": task_id, "verdict_ref": verdict_ref})
+            continue
+
+        if actual_sha == verdict_sha:
+            result["ok"] += 1
+        else:
+            result["mismatch"].append({"task_id": task_id, "verdict_ref": verdict_ref})
+
+    return result
+
+
+def print_human(results):
+    total_checked = sum(r["rows_checked"] for r in results)
+    total_ok = sum(r["ok"] for r in results)
+    total_mismatch = sum(len(r["mismatch"]) for r in results)
+    total_missing = sum(len(r["missing"]) for r in results)
+    total_malformed = sum(r["malformed_lines"] for r in results)
+
+    print("Ledger Verdict-Hash Verification")
+    print("-" * 60)
+    if not results:
+        print(f"  (no ledgers found under {LEDGER_DIR})")
+    for r in results:
+        if not r["exists"]:
+            print(f"  {r['project']}: ledger not found — skipped")
+            continue
+        line = (
+            f"  {r['project']}: {r['rows_checked']} checked, "
+            f"{r['ok']} OK, {len(r['mismatch'])} MISMATCH, "
+            f"{len(r['missing'])} MISSING"
+        )
+        if r["malformed_lines"]:
+            line += f" ({r['malformed_lines']} malformed lines skipped)"
+        print(line)
+
+    print("-" * 60)
+    print(
+        f"Total: {total_checked} checked, {total_ok} OK, "
+        f"{total_mismatch} MISMATCH, {total_missing} MISSING, "
+        f"{total_malformed} malformed lines skipped"
+    )
+
+    if total_mismatch:
+        print()
+        print("MISMATCH rows:")
+        for r in results:
+            for row in r["mismatch"]:
+                print(f"  project={r['project']} task_id={row['task_id']} verdict_ref={row['verdict_ref']}")
+    if total_missing:
+        print()
+        print("MISSING rows:")
+        for r in results:
+            for row in r["missing"]:
+                print(f"  project={r['project']} task_id={row['task_id']} verdict_ref={row['verdict_ref']}")
+
+    print()
+    if total_mismatch:
+        print("Result: FAIL — hash mismatch(es) found")
+    elif total_missing:
+        print("Result: WARN — missing verdict file(s), no mismatches")
+    else:
+        print("Result: PASS — all verdict hashes verified")
+
+
+targets = discover_ledger_files(PROJECT)
+results = [verify_ledger(project, path) for project, path in targets]
+
+total_mismatch = sum(len(r["mismatch"]) for r in results)
+total_missing = sum(len(r["missing"]) for r in results)
+
+if JSON_OUT:
+    summary = {
+        "ledger_dir": str(LEDGER_DIR),
+        "projects": results,
+        "totals": {
+            "rows_checked": sum(r["rows_checked"] for r in results),
+            "ok": sum(r["ok"] for r in results),
+            "mismatch": total_mismatch,
+            "missing": total_missing,
+            "malformed_lines": sum(r["malformed_lines"] for r in results),
+        },
+    }
+    print(json.dumps(summary, separators=(",", ":")))
+else:
+    print_human(results)
+
+if total_mismatch:
+    sys.exit(1)
+if total_missing:
+    sys.exit(2)
+sys.exit(0)
+PYEOF

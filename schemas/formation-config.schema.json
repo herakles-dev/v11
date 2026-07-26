@@ -1,0 +1,80 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "formation-config.schema.json",
+  "title": "V11 Formation Configuration",
+  "description": "Schema for formation definitions in the agent registry",
+  "type": "object",
+  "properties": {
+    "formations": {
+      "type": "object",
+      "additionalProperties": { "$ref": "#/$defs/formation" }
+    }
+  },
+  "required": ["formations"],
+  "$defs": {
+    "formation": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "Human-readable formation name"
+        },
+        "description": {
+          "type": "string",
+          "description": "When to use this formation"
+        },
+        "teammates": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/formation_role" },
+          "minItems": 1,
+          "maxItems": 5
+        },
+        "task_flow": {
+          "type": "string",
+          "description": "Dependency diagram (human-readable)"
+        },
+        "cost_multiplier": {
+          "type": "string",
+          "pattern": "^[0-9]+(\\.[0-9]+)?-?[0-9]*(\\.[0-9]+)?x$",
+          "description": "Cost multiplier range (e.g., '3.5-5x')"
+        },
+        "tool_policies": {
+          "$ref": "formation-registry.schema.json#/$defs/tool_policies"
+        },
+        "heartbeat_interval_minutes": {
+          "type": "integer",
+          "minimum": 5,
+          "maximum": 30,
+          "default": 10
+        },
+        "difficulty_routing": {
+          "type": "object",
+          "properties": {
+            "min_complexity": {
+              "enum": ["routine", "medium", "complex", "novel"]
+            },
+            "min_scope": {
+              "enum": ["small", "medium", "large"]
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "required": ["name", "teammates"],
+      "additionalProperties": false
+    },
+    "formation_role": {
+      "type": "object",
+      "properties": {
+        "role": { "type": "string" },
+        "agent": { "type": "string" },
+        "file_ownership": {
+          "type": "string",
+          "description": "Description of owned files/directories"
+        }
+      },
+      "required": ["role", "agent"],
+      "additionalProperties": false
+    }
+  }
+}

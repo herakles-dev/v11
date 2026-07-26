@@ -1,0 +1,262 @@
+#!/bin/bash
+# V11.15 Task Review — Build the adversarial-lite-reviewer prompt for ONE task.
+# Deterministic prompt builder consumed by the orchestrator's post-task review
+# step (team-orchestrator Phase 4). Analog of scripts/wave-review, single-task.
+# Usage: ./scripts/task-review PROJECT TASK_ID [--save]
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+V11_HOME="${V11_HOME:-$(dirname "$SCRIPT_DIR")}"
+# shellcheck source=../hooks/lib/common.sh
+source "$V11_HOME/hooks/lib/common.sh"
+
+if [ "${1:-}" == "--help" ] || [ "${1:-}" == "-h" ]; then
+  cat << 'HELP'
+V11.15 Task Review — adversarial-lite-reviewer prompt for a single task
+
+USAGE:
+    ./scripts/task-review PROJECT TASK_ID [--save]
+    ./scripts/task-review TASK_ID [--save]   (auto-detect project)
+    ./scripts/task-review PROJECT TASK_ID --files a,b [--agent ID] [--save]
+
+OPTIONS:
+    --files L   Comma-separated (or repeatable) files_changed list. When given,
+                the task-state task_artifacts lookup is bypassed entirely —
+                this is how you build a reviewer prompt while the task is still
+                in_progress (sync-tasks only persists artifacts on `completed`,
+                but the V11.15 loop must review BEFORE completion). The caller
+                (orchestrator) already knows the changed files; pass them here.
+    --agent ID  Executing agent for attribution. Defaults to the
+                recommended_agents[TASK_ID] entry (persisted on TaskCreate),
+                else active_agent_id, else "unknown".
+    --subject S Task subject for the reviewer prompt (else task-state, else "").
+    --handoff H Handoff note for the reviewer prompt (else task-state, else "").
+    --save      Write prompt to sessions/PROJECT/reviews/task-TASKID.json
+    --help      Show this help
+
+OUTPUT:
+    The reviewer spawn prompt on stdout. The orchestrator spawns
+    adversarial-lite-reviewer with this prompt, captures the JSON verdict,
+    and folds it into the single terminal TaskUpdate(status=completed,
+    metadata.artifacts.review=…) — see playbook per-task-review.md.
+
+GATING:
+    This script is a deterministic prompt builder ONLY. It does NOT read
+    sessions/PROJECT/.review-config.json. The enabled/scope/sample_rate and
+    severity routing knobs documented in that file are enforced by the
+    orchestrator's Phase 4r step (see team-orchestrator playbook
+    per-task-review.md), not here. Calling this script always emits a prompt;
+    deciding *whether* a task should be reviewed is the caller's job.
+
+    Without --files, behavior is unchanged: files_changed is read from
+    task-state task_artifacts (only present after a `completed` transition).
+HELP
+  exit 0
+fi
+
+# --- Arg parsing ---
+PROJECT="" TASK_ID="" SAVE=false
+CLI_FILES="" CLI_AGENT="" CLI_SUBJECT="" CLI_HANDOFF=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --save) SAVE=true ;;
+    --help|-h) ;;
+    --files)   shift; [ $# -gt 0 ] || { echo "Error: --files needs a value" >&2; exit 1; }
+               CLI_FILES="${CLI_FILES:+$CLI_FILES,}$1" ;;
+    --files=*) CLI_FILES="${CLI_FILES:+$CLI_FILES,}${1#*=}" ;;
+    --agent)   shift; [ $# -gt 0 ] || { echo "Error: --agent needs a value" >&2; exit 1; }
+               CLI_AGENT="$1" ;;
+    --agent=*) CLI_AGENT="${1#*=}" ;;
+    --subject)   shift; [ $# -gt 0 ] || { echo "Error: --subject needs a value" >&2; exit 1; }
+                 CLI_SUBJECT="$1" ;;
+    --subject=*) CLI_SUBJECT="${1#*=}" ;;
+    --handoff)   shift; [ $# -gt 0 ] || { echo "Error: --handoff needs a value" >&2; exit 1; }
+                 CLI_HANDOFF="$1" ;;
+    --handoff=*) CLI_HANDOFF="${1#*=}" ;;
+    *)
+      if   [ -z "$PROJECT" ]; then PROJECT="$1"
+      elif [ -z "$TASK_ID" ]; then TASK_ID="$1"
+      fi ;;
+  esac
+  shift
+done
+
+# If only one positional given, treat it as TASK_ID and auto-detect project.
+if [ -n "$PROJECT" ] && [ -z "$TASK_ID" ]; then
+  TASK_ID="$PROJECT"; PROJECT=""
+fi
+
+if [ -z "$PROJECT" ]; then
+  PROJECT="$(v11_read_active_project)"
+fi
+if [[ -n "$PROJECT" ]] && [[ "$PROJECT" == *".."* || "$PROJECT" == *"/"* || "$PROJECT" =~ [^a-zA-Z0-9._-] ]]; then
+  echo "Error: Invalid project name: $PROJECT" >&2; exit 1
+fi
+[ -n "$PROJECT" ] || { echo "Error: PROJECT required (or set active-project)" >&2; exit 1; }
+[ -n "$TASK_ID" ] || { echo "Error: TASK_ID required" >&2; exit 1; }
+if [[ "$TASK_ID" =~ [^a-zA-Z0-9._-] ]]; then
+  echo "Error: Invalid task id: $TASK_ID" >&2; exit 1
+fi
+
+# --- Locate task-state ---
+# With --files, task-state is OPTIONAL (it may not exist yet for an
+# in_progress task). Without --files, it is required exactly as before.
+TASK_STATE_FILE="$TASK_STATE_DIR/${PROJECT}.json"
+if [ ! -f "$TASK_STATE_FILE" ]; then
+  if [ -z "$CLI_FILES" ]; then
+    echo "Error: No task-state for '$PROJECT' — expected: $TASK_STATE_FILE" >&2; exit 1
+  fi
+  TASK_STATE_FILE=""   # signal "no state file" to the Python block
+fi
+
+# --- Spec first line (intent context for the reviewer) ---
+SPEC_FILE="$SESSIONS_ROOT/$PROJECT/spec.md"
+SPEC_FIRST_LINE=""
+[ -f "$SPEC_FILE" ] && SPEC_FIRST_LINE="$(head -1 "$SPEC_FILE" | sed 's/^#* *//')"
+
+# --- Python: extract this task's artifacts, build the lite-reviewer prompt ---
+python3 - "$TASK_STATE_FILE" "$PROJECT" "$TASK_ID" "$SPEC_FIRST_LINE" \
+          "$SAVE" "$SESSIONS_ROOT" "$CLI_FILES" "$CLI_AGENT" \
+          "$CLI_SUBJECT" "$CLI_HANDOFF" << 'PY'
+import json, sys, os
+from datetime import datetime, timezone
+
+(state_file, project, task_id, spec_line, save_flag, sessions_root,
+ cli_files, cli_agent, cli_subject, cli_handoff) = sys.argv[1:]
+save_flag = save_flag.lower() == "true"
+
+# task-state is optional in --files mode (in_progress tasks have none yet).
+task_state = {}
+if state_file:
+    try:
+        with open(state_file) as f:
+            task_state = json.load(f)
+    except (json.JSONDecodeError, ValueError):
+        print(f"Error: task-state for '{project}' is empty or invalid.", file=sys.stderr)
+        sys.exit(1)
+
+artifacts = task_state.get("task_artifacts", {})
+art = artifacts.get(task_id)
+
+cli_file_list = [p.strip() for p in cli_files.split(",") if p.strip()]
+
+if cli_files and not cli_file_list:
+    print("Error: --files was given but resolved to an empty file list", file=sys.stderr)
+    sys.exit(1)
+
+if cli_file_list:
+    # --files mode: caller supplies scope directly; task_artifacts not required.
+    files = []
+    for p in cli_file_list:
+        if p not in files:
+            files.append(p)
+    # Non-fatal existence check: warn if a path is not visible from cwd.
+    # Advisory only — a worktree or reviewer host may legitimately lack access.
+    for p in files:
+        if not os.path.exists(p):
+            print(f"Warning: --files path does not exist on disk: {p}", file=sys.stderr)
+    art = art if isinstance(art, dict) else {}
+else:
+    # Legacy mode (byte-identical to pre-Bug-B behavior): scope from task-state.
+    if not isinstance(art, dict):
+        print(f"Error: no artifacts for task {task_id} in {project} — "
+              f"the task must complete with metadata.artifacts.files_changed "
+              f"(or pass --files for an in_progress task).",
+              file=sys.stderr)
+        sys.exit(2)
+    files = []
+    for k in ("files_changed", "files_created"):
+        for p in art.get(k, []) or []:
+            if p not in files:
+                files.append(p)
+
+subject = cli_subject or art.get("summary", art.get("subject", ""))
+handoff = cli_handoff or art.get("handoff_note", "")
+
+def _san(s):
+    """Sanitize user-supplied strings before embedding in the prompt template."""
+    import re
+    s = re.sub(r'[\r\n\x00-\x1f\x7f]', ' ', s)  # collapse control chars / newlines
+    s = s.replace('`', "'")                        # backticks → apostrophe
+    s = s.replace('{', '(').replace('}', ')')      # braces → parens
+    return s
+
+subject = _san(subject)
+handoff = _san(handoff)
+# agent_id: explicit --agent wins, then recommended_agents map, then
+# active_agent_id, then unknown.
+agent_id = cli_agent \
+           or (task_state.get("recommended_agents", {}) or {}).get(task_id) \
+           or task_state.get("active_agent_id") or "unknown"
+
+if not files:
+    print(f"Error: task {task_id} carries no files to review "
+          f"(empty --files and no files_changed/files_created in task-state).",
+          file=sys.stderr)
+    sys.exit(2)
+
+files_block = "\n".join(f"- {p}" for p in files)
+
+prompt = f"""## Adversarial-Lite Review — Task #{task_id}
+Project: {project}  |  Spec: {spec_line}
+Executing agent (review subject): {agent_id}
+
+### Task
+{subject}
+{("Handoff note: " + handoff) if handoff else ""}
+
+### SCOPE — review ONLY these files. Do NOT read the wider repo.
+{files_block}
+
+### Instructions
+Single fast pass, 3 lenses:
+1. Correctness vs the task description above.
+2. Completeness / edge-cases / error paths.
+3. Integration / contract breakage against callers of changed symbols.
+
+Rate task difficulty 1-5 (1=trivial, 5=very hard). Count every error.
+Exclusions: do NOT flag intentional design, backward-compat shims, or
+pre-existing issues outside these files.
+
+### Output — emit EXACTLY this JSON, nothing else
+{{
+  "reviewer": "adversarial-lite-reviewer",
+  "task_id": "{task_id}",
+  "agent_id": "{agent_id}",
+  "difficulty": <1-5 int>,
+  "error_count": <int>,
+  "errors": [
+    {{"id":"E1","severity":"CRITICAL|HIGH|MEDIUM|LOW","file":"<path>",
+      "line":<int|null>,"type":"compilation|test_failure|contract_violation|security|logic|completeness|integration",
+      "detail":"<=500 chars","fix_hint":"<=300 chars","confidence":"HIGH|MEDIUM|LOW"}}
+  ],
+  "verdict": "PASS|ISSUES_FOUND|BLOCKED",
+  "stats": {{"files_reviewed": <int>, "lines_reviewed": <int>}}
+}}
+Do NOT emit `reviewed_at` — sync-tasks stamps the persist timestamp.
+
+Verdict rules: PASS = 0 CRITICAL & 0 HIGH & <=3 MEDIUM;
+ISSUES_FOUND = any HIGH or >3 MEDIUM; BLOCKED = any CRITICAL.
+"""
+
+print(prompt)
+
+if not save_flag:
+    sys.exit(0)
+
+try:
+    reviews_dir = os.path.join(sessions_root, project, "reviews")
+    os.makedirs(reviews_dir, exist_ok=True)
+    out_path = os.path.join(reviews_dir, f"task-{task_id}.json")
+    with open(out_path, "w") as f:
+        json.dump({
+            "task_id": task_id, "project": project, "agent_id": agent_id,
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "files_reviewed": files, "prompt": prompt, "verdict": None,
+        }, f, indent=2)
+    print(f"[saved] {out_path}", file=sys.stderr)
+except OSError as e:
+    print(f"ERROR: Cannot write task-review file: {e}", file=sys.stderr)
+    sys.exit(1)
+PY

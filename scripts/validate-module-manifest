@@ -1,0 +1,248 @@
+#!/usr/bin/env python3
+"""
+V11 Validate Module Manifest — schema validation for MODULE.md / MODULE.json files.
+
+Usage:
+    ./scripts/validate-module-manifest PROJECT [--strict] [--json]
+    ./scripts/validate-module-manifest --scan  (all projects)
+
+Finds MODULE.md and MODULE.json files under a project and validates each
+against schemas/module-manifest.schema.json.
+
+MODULE.md files are scanned for a fenced ```json block containing the
+manifest body (a common pattern for keeping human docs + machine schema
+in one file). MODULE.json files are parsed directly.
+
+Exit codes:
+    0   all manifests valid (or no manifests found, non-strict)
+    1   validation failures detected
+    2   usage error or schema missing
+    3   --strict + no manifests found
+
+Addresses Dark Code Layer 2 gap: module manifests need a validator like
+every other V11 artifact (task-state, formation-registry, autonomy-state).
+"""
+import json
+import os
+import re
+import sys
+from pathlib import Path
+
+V11_HOME = Path(os.environ.get("V11_HOME", os.path.expanduser("~/v11")))
+V11_WORKSPACE_ROOT = Path(os.environ.get("V11_WORKSPACE_ROOT", os.path.expanduser("~")))
+SESSIONS_ROOT = Path(os.environ.get("SESSIONS_ROOT", V11_WORKSPACE_ROOT / "sessions"))
+SCHEMA_PATH = V11_HOME / "schemas" / "module-manifest.schema.json"
+
+
+def load_schema():
+    if not SCHEMA_PATH.exists():
+        print(f"ERROR: Schema not found at {SCHEMA_PATH}", file=sys.stderr)
+        sys.exit(2)
+    with SCHEMA_PATH.open() as f:
+        return json.load(f)
+
+
+def extract_json_from_md(md_path):
+    """Extract first ```json fenced block from a markdown file."""
+    text = md_path.read_text(errors="replace")
+    match = re.search(r"```json\s*\n(.*?)\n```", text, re.DOTALL)
+    if not match:
+        return None
+    try:
+        return json.loads(match.group(1))
+    except json.JSONDecodeError as e:
+        return {"__parse_error__": str(e)}
+
+
+def find_manifests(project_dir):
+    """Walk project dir, return (path, kind, data_or_error) tuples."""
+    results = []
+    skip_dirs = {"node_modules", ".git", "__pycache__", "target", "dist", "build", ".venv", "venv", ".next"}
+    for root, dirs, files in os.walk(project_dir):
+        dirs[:] = [d for d in dirs if d not in skip_dirs]
+        for fname in files:
+            path = Path(root) / fname
+            if fname == "MODULE.json":
+                try:
+                    with path.open() as f:
+                        results.append((path, "json", json.load(f)))
+                except (json.JSONDecodeError, OSError) as e:
+                    results.append((path, "json", {"__parse_error__": str(e)}))
+            elif fname == "MODULE.md":
+                data = extract_json_from_md(path)
+                if data is not None:
+                    results.append((path, "md-embedded", data))
+                else:
+                    results.append((path, "md-plain", None))
+    return results
+
+
+def validate_one(data, schema):
+    """Return list of error strings (empty if valid)."""
+    try:
+        import jsonschema
+    except ImportError:
+        return ["jsonschema module not installed"]
+
+    if isinstance(data, dict) and "__parse_error__" in data:
+        return [f"JSON parse error: {data['__parse_error__']}"]
+
+    validator = jsonschema.Draft202012Validator(schema)
+    errors = []
+    for err in sorted(validator.iter_errors(data), key=lambda e: e.path):
+        path = ".".join(str(p) for p in err.path) or "(root)"
+        errors.append(f"{path}: {err.message}")
+    return errors
+
+
+def validate_project(project, schema, strict=False, json_output=False):
+    """Validate one project. Returns (pass_count, fail_count, report)."""
+    # Resolve project dir
+    candidates = [
+        V11_WORKSPACE_ROOT / project,
+        SESSIONS_ROOT / project,
+    ]
+    project_dir = next((c for c in candidates if c.is_dir()), None)
+    if not project_dir:
+        return 0, 0, {"error": f"Project '{project}' not found"}
+
+    manifests = find_manifests(project_dir)
+    pass_count = 0
+    fail_count = 0
+    report = {
+        "project": project,
+        "project_dir": str(project_dir),
+        "manifests": [],
+    }
+
+    for path, kind, data in manifests:
+        entry = {
+            "path": str(path.relative_to(project_dir)),
+            "kind": kind,
+        }
+        if kind == "md-plain":
+            # No embedded JSON — UNVALIDATED. This is a Dark Code Layer 2 gap:
+            # the manifest exists but its machine-readable contract was never
+            # checked. Previously this was silently reported as [INFO] with a
+            # count that read as "nothing wrong." That masked the fact that
+            # no schema validation had run. Now surfaced as a WARN by default;
+            # --strict escalates to a failure.
+            entry["status"] = "unvalidated"
+            entry["errors"] = ["no fenced ```json block found — schema validation skipped"]
+            if strict:
+                fail_count += 1
+            report["manifests"].append(entry)
+            continue
+
+        errors = validate_one(data, schema)
+        if errors:
+            entry["status"] = "invalid"
+            entry["errors"] = errors
+            fail_count += 1
+        else:
+            entry["status"] = "valid"
+            entry["errors"] = []
+            pass_count += 1
+        report["manifests"].append(entry)
+
+    if not manifests:
+        report["note"] = "No MODULE.md or MODULE.json files found"
+        # Don't inflate fail_count — strict-empty is a distinct exit code (3)
+        # handled in main().
+
+    return pass_count, fail_count, report
+
+
+def print_report(report, strict=False):
+    if "error" in report:
+        print(f"ERROR: {report['error']}", file=sys.stderr)
+        return
+    project = report["project"]
+    manifests = report.get("manifests", [])
+    print(f"=== Module Manifest Validation: {project} ===")
+    print(f"Project dir: {report['project_dir']}")
+    print()
+    if not manifests:
+        note = report.get("note", "")
+        if strict:
+            print(f"  [FAIL] {note} (--strict)")
+        else:
+            print(f"  [INFO] {note}")
+        return
+    for m in manifests:
+        status = m["status"]
+        tag = {"valid": "[PASS]", "invalid": "[FAIL]", "unvalidated": "[WARN]"}.get(status, "[????]")
+        print(f"  {tag} {m['path']}  ({m['kind']})")
+        for err in m.get("errors", []):
+            print(f"         {err}")
+    print()
+    pass_n = sum(1 for m in manifests if m["status"] == "valid")
+    fail_n = sum(1 for m in manifests if m["status"] == "invalid")
+    warn_n = sum(1 for m in manifests if m["status"] == "unvalidated")
+    print(f"  Summary: {pass_n} valid | {fail_n} invalid | {warn_n} unvalidated (no ```json block)")
+    if warn_n:
+        print(f"  NOTE: {warn_n} manifest(s) have no embedded JSON — schema NOT checked. Add a ```json block or MODULE.json sibling.")
+
+
+def main():
+    args = sys.argv[1:]
+    if not args or args[0] in ("-h", "--help"):
+        print(__doc__.strip())
+        sys.exit(0)
+    if args[0] == "--test":
+        print("validate-module-manifest v1.0")
+        sys.exit(0)
+
+    strict = "--strict" in args
+    json_output = "--json" in args
+
+    schema = load_schema()
+
+    if args[0] == "--scan":
+        # Scan every project that exists in sessions/ or the workspace root
+        projects = set()
+        for d in SESSIONS_ROOT.iterdir() if SESSIONS_ROOT.is_dir() else []:
+            if d.is_dir():
+                projects.add(d.name)
+        total_pass = total_fail = 0
+        all_reports = []
+        for p in sorted(projects):
+            pc, fc, r = validate_project(p, schema, strict=strict)
+            total_pass += pc
+            total_fail += fc
+            if r.get("manifests") or "error" in r:
+                all_reports.append(r)
+        if json_output:
+            json.dump({"total_pass": total_pass, "total_fail": total_fail, "projects": all_reports}, sys.stdout, indent=2)
+            print()
+        else:
+            print(f"=== Scan Results ===\n")
+            for r in all_reports:
+                if r.get("manifests"):
+                    v = sum(1 for m in r['manifests'] if m['status']=='valid')
+                    f = sum(1 for m in r['manifests'] if m['status']=='invalid')
+                    u = sum(1 for m in r['manifests'] if m['status']=='unvalidated')
+                    suffix = f", {u} unvalidated" if u else ""
+                    print(f"  {r['project']}: {v} valid, {f} invalid{suffix}")
+            print(f"\nTotal: {total_pass} valid, {total_fail} invalid across {len(all_reports)} projects")
+        sys.exit(1 if total_fail else 0)
+
+    project = args[0]
+    pass_count, fail_count, report = validate_project(project, schema, strict=strict)
+    if json_output:
+        json.dump(report, sys.stdout, indent=2)
+        print()
+    else:
+        print_report(report, strict=strict)
+
+    if "error" in report:
+        sys.exit(2)
+    if fail_count:
+        sys.exit(1)
+    if strict and not report.get("manifests"):
+        sys.exit(3)
+    sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()

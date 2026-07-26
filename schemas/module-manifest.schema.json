@@ -1,0 +1,155 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "module-manifest.schema.json",
+  "title": "V11 Module Manifest",
+  "description": "Self-describing manifest for a source code module. Addresses Dark Code Layer 2 (Structural Context): every module must declare its responsibility, dependencies, and consumers so that code is legible without re-reading it. Lives as sidecar MODULE.md or embedded JSON in module docstring.",
+  "type": "object",
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "1.0",
+      "description": "Manifest schema version"
+    },
+    "name": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Module name, typically matching the directory or file basename"
+    },
+    "path": {
+      "type": "string",
+      "description": "Relative path from project root (e.g., src/api/auth/)"
+    },
+    "responsibility": {
+      "type": "string",
+      "minLength": 10,
+      "maxLength": 300,
+      "description": "One-paragraph statement of what this module owns. Should answer: 'What problem does this module solve that no other module solves?'"
+    },
+    "stability": {
+      "enum": ["experimental", "beta", "stable", "frozen", "deprecated"],
+      "description": "Stability tier. experimental: expect changes. stable: public API locked. frozen: no changes without migration plan. deprecated: do not extend."
+    },
+    "owner_agent": {
+      "type": "string",
+      "description": "Agent ID or role responsible for this module (e.g., backend-architect, spec-implementer-v11)"
+    },
+    "public_interface": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/interface_member" },
+      "description": "Publicly exported symbols that other modules may depend on. Internal symbols are NOT listed here."
+    },
+    "upstream_dependencies": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/dependency" },
+      "description": "Modules and libraries THIS module depends on. Direct imports only, not transitive."
+    },
+    "downstream_consumers": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Modules/services that depend on this module. Maintained during refactoring. Glob patterns allowed (e.g., 'src/routes/**/')."
+    },
+    "invariants": {
+      "type": "array",
+      "items": { "type": "string", "maxLength": 200 },
+      "description": "Conditions this module GUARANTEES to its callers. Violating an invariant is a contract breach. Example: 'User IDs are never reused after account deletion.'"
+    },
+    "performance_envelope": {
+      "type": "object",
+      "properties": {
+        "p99_latency_ms": { "type": "number", "minimum": 0 },
+        "max_throughput_rps": { "type": "number", "minimum": 0 },
+        "memory_budget_mb": { "type": "number", "minimum": 0 },
+        "notes": { "type": "string", "maxLength": 300 }
+      },
+      "additionalProperties": false,
+      "description": "Performance expectations. Absence means 'not performance-critical' — which is itself a statement."
+    },
+    "failure_modes": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/failure_mode" },
+      "description": "Known failure modes and how this module handles them. Addresses Dark Code Layer 3 (Resilience Protocols)."
+    },
+    "test_coverage": {
+      "type": "object",
+      "properties": {
+        "unit_tests": { "type": "string", "description": "Glob to unit test files" },
+        "integration_tests": { "type": "string", "description": "Glob to integration tests" },
+        "coverage_pct": { "type": "number", "minimum": 0, "maximum": 100 }
+      },
+      "additionalProperties": false
+    },
+    "related_spec": {
+      "type": "string",
+      "description": "Relative path to spec.md section governing this module"
+    },
+    "last_reviewed": {
+      "type": "string",
+      "format": "date",
+      "description": "Last date a human or adversarial-reviewer validated this manifest against actual code"
+    }
+  },
+  "required": ["schema_version", "name", "responsibility", "stability"],
+  "additionalProperties": false,
+  "$defs": {
+    "interface_member": {
+      "type": "object",
+      "properties": {
+        "symbol": { "type": "string", "description": "Function, class, type, or constant name" },
+        "kind": { "enum": ["function", "class", "type", "constant", "endpoint", "event", "component"] },
+        "signature": { "type": "string", "description": "Human-readable signature (language-appropriate)" },
+        "purpose": { "type": "string", "maxLength": 200 },
+        "idempotent": { "type": "boolean", "description": "Safe to call multiple times with same args?" },
+        "side_effects": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Observable effects beyond return value (DB writes, network calls, file I/O)"
+        }
+      },
+      "required": ["symbol", "kind", "purpose"],
+      "additionalProperties": false
+    },
+    "dependency": {
+      "type": "object",
+      "properties": {
+        "target": { "type": "string", "description": "Module path or package name" },
+        "kind": { "enum": ["internal-module", "package", "service", "database", "filesystem", "env"] },
+        "why": {
+          "type": "string",
+          "maxLength": 200,
+          "description": "Why THIS dependency was chosen. Addresses Dark Code Layer 4 'architectural probing' at the module level."
+        },
+        "substitutable": {
+          "type": "boolean",
+          "description": "Can this dependency be swapped without changing the module's public interface?"
+        }
+      },
+      "required": ["target", "kind", "why"],
+      "additionalProperties": false
+    },
+    "failure_mode": {
+      "type": "object",
+      "properties": {
+        "trigger": { "type": "string", "maxLength": 200, "description": "What condition causes this failure" },
+        "handling": {
+          "enum": ["retry", "circuit-break", "fallback", "fail-fast", "degrade", "propagate", "log-and-continue"],
+          "description": "How this module responds"
+        },
+        "retry_policy": {
+          "type": "object",
+          "properties": {
+            "max_attempts": { "type": "integer", "minimum": 1 },
+            "backoff": { "enum": ["none", "fixed", "linear", "exponential", "jittered"] },
+            "timeout_ms": { "type": "integer", "minimum": 0 }
+          },
+          "additionalProperties": false
+        },
+        "user_visible": {
+          "type": "boolean",
+          "description": "Does the user see this failure, or is it absorbed internally?"
+        }
+      },
+      "required": ["trigger", "handling"],
+      "additionalProperties": false
+    }
+  }
+}

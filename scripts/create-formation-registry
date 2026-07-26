@@ -1,0 +1,182 @@
+#!/bin/bash
+# V11 Script: create-formation-registry
+# Creates .formation-registry.json for active agent team
+#
+# Usage:
+#   create-formation-registry FORMATION PROJECT
+#
+# Example:
+#   create-formation-registry feature-impl audio-suite
+#
+# Output: $SESSIONS_ROOT/PROJECT/.formation-registry.json
+
+set -euo pipefail
+
+FORMATION=""
+PROJECT=""
+declare -A SPECIALIST_OVERRIDES
+
+# Parse arguments — support --specialist role=agent overrides
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --specialist)
+            # Format: --specialist backend-impl=backend-architect
+            if [ -n "${2:-}" ]; then
+                ROLE="${2%%=*}"
+                AGENT="${2#*=}"
+                SPECIALIST_OVERRIDES["$ROLE"]="$AGENT"
+                shift 2
+            else
+                echo "ERROR: --specialist requires role=agent argument" >&2
+                exit 1
+            fi
+            ;;
+        --help|-h)
+            cat << 'USAGE'
+Usage: create-formation-registry FORMATION PROJECT [--specialist ROLE=AGENT ...]
+
+Creates .formation-registry.json for an active agent team.
+
+Options:
+  --specialist ROLE=AGENT   Override default agent for a role with a specialist
+                            Example: --specialist backend-impl=backend-architect
+
+Examples:
+  create-formation-registry feature-impl audio-suite
+  create-formation-registry feature-impl audio-suite --specialist backend-impl=backend-architect --specialist tester=testing-engineer
+USAGE
+            exit 0
+            ;;
+        *)
+            if [ -z "$FORMATION" ]; then
+                FORMATION="$1"
+            elif [ -z "$PROJECT" ]; then
+                PROJECT="$1"
+            else
+                echo "ERROR: Unexpected argument: $1" >&2
+                exit 1
+            fi
+            shift
+            ;;
+    esac
+done
+
+if [ -z "$FORMATION" ] || [ -z "$PROJECT" ]; then
+    echo "Usage: create-formation-registry FORMATION PROJECT [--specialist ROLE=AGENT ...]" >&2
+    echo "Example: create-formation-registry feature-impl audio-suite" >&2
+    exit 1
+fi
+
+# Registry location
+SESSIONS_ROOT="${SESSIONS_ROOT:-$HOME/sessions}"
+REGISTRY_FILE="$SESSIONS_ROOT/$PROJECT/.formation-registry.json"
+
+# Ensure project session exists
+if [ ! -d "$SESSIONS_ROOT/$PROJECT" ]; then
+    echo "ERROR: Project session not found: $SESSIONS_ROOT/$PROJECT" >&2
+    echo "Create the project directory first, or verify the project name." >&2
+    exit 1
+fi
+
+# Read formation definition from V11 agent registry
+V11_WORKSPACE_ROOT="${V11_WORKSPACE_ROOT:-$HOME/.v11}"
+V11_REGISTRY="$V11_WORKSPACE_ROOT/v11/agents/V11_AGENT_REGISTRY.json"
+
+if [ ! -f "$V11_REGISTRY" ]; then
+    echo "ERROR: V11 agent registry not found: $V11_REGISTRY" >&2
+    exit 1
+fi
+
+# Extract formation teammates structure
+FORMATION_SPEC=$(jq -r --arg formation "$FORMATION" '.formations[$formation] // empty' "$V11_REGISTRY")
+
+if [ -z "$FORMATION_SPEC" ] || [ "$FORMATION_SPEC" == "null" ]; then
+    echo "ERROR: Formation '$FORMATION' not found in $V11_REGISTRY" >&2
+    echo "Available formations:" >&2
+    jq -r '.formations | keys[]' "$V11_REGISTRY" >&2
+    exit 1
+fi
+
+# Build teammates object from formation roles + agents arrays
+# V11.4: Apply specialist overrides from CLI args
+TEAMMATES_JSON=$(jq -n \
+  --argjson spec "$FORMATION_SPEC" '
+  $spec.roles as $roles |
+  $spec.teammates as $agents |
+  reduce range($roles | length) as $i (
+    {};
+    . + {
+      ($roles[$i]): {
+        "agent": $agents[$i],
+        "agent_id": "PLACEHOLDER",
+        "ownership": {
+          "directories": [],
+          "files": [],
+          "patterns": []
+        }
+      }
+    }
+  )
+')
+
+# Apply specialist overrides from --specialist arguments
+for ROLE in "${!SPECIALIST_OVERRIDES[@]}"; do
+    AGENT="${SPECIALIST_OVERRIDES[$ROLE]}"
+    # Verify role exists in formation
+    ROLE_EXISTS=$(printf '%s' "$TEAMMATES_JSON" | jq -r --arg r "$ROLE" 'has($r)')
+    if [ "$ROLE_EXISTS" != "true" ]; then
+        echo "WARNING: Role '$ROLE' not found in formation '$FORMATION'. Skipping override." >&2
+        continue
+    fi
+    TEAMMATES_JSON=$(printf '%s' "$TEAMMATES_JSON" | jq --arg r "$ROLE" --arg a "$AGENT" \
+        '.[$r].agent = $a')
+    echo "Specialist override: $ROLE -> $AGENT"
+done
+
+# Extract formation tool_policies (use formation default if present, else sensible default)
+FORMATION_POLICIES=$(jq -r '.tool_policies // {"defaults":{"profile":"coding"},"per_role":{}}' <<< "$FORMATION_SPEC")
+
+# Create registry structure (aligned with formation-registry.schema.json)
+# Atomic write: write to a temp file, validate, then mv into place.
+# This prevents guard-write-gates from seeing a 0-byte or partial file
+# if the process is killed or the disk fills mid-write.
+TMP="${REGISTRY_FILE}.tmp.$$"
+(
+  flock -w 5 200 || { echo "create-formation-registry: could not acquire registry lock" >&2; exit 3; }
+  if jq -n \
+    --arg formation "$FORMATION" \
+    --arg project "$PROJECT" \
+    --arg ts "$(date -Iseconds)" \
+    --argjson policies "$FORMATION_POLICIES" \
+    --argjson teammates "$TEAMMATES_JSON" '
+    {
+      "formation": $formation,
+      "project": $project,
+      "created_at": $ts,
+      "heartbeat_interval_minutes": 10,
+      "tool_policies": $policies,
+      "teammates": $teammates
+    }
+  ' > "$TMP" && [ -s "$TMP" ] && jq empty "$TMP" 2>/dev/null; then
+      mv "$TMP" "$REGISTRY_FILE"
+  else
+      rm -f "$TMP"
+      echo "create-formation-registry: write validation failed, preserving existing registry" >&2
+      exit 3
+  fi
+) 200>"${REGISTRY_FILE}.lock"
+
+ROLE_COUNT=$(jq -r '.teammates | keys | length' "$REGISTRY_FILE")
+
+echo "Formation registry created: $REGISTRY_FILE"
+echo "Formation: $FORMATION ($ROLE_COUNT roles pre-populated)"
+echo "Project: $PROJECT"
+echo ""
+echo "Roles created:"
+jq -r '.teammates | to_entries[] | "  \(.key): \(.value.agent)"' "$REGISTRY_FILE"
+echo ""
+echo "Next steps:"
+echo "  1. Edit $REGISTRY_FILE to define file ownership per role"
+echo "  2. Set ownership.directories, ownership.files, ownership.patterns for each role"
+echo "  3. Replace PLACEHOLDER agent_id before spawning each teammate"
+echo "  4. export V11_AGENT_ID=<id> before spawning each teammate"

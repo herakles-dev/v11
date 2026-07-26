@@ -1,0 +1,13 @@
+#!/bin/bash
+# V11 post-commit hook shim — git surface for auto-closing tasks.
+# Install per-repo with:
+#   git config core.hooksPath /path/to/v11/hooks/git-hooks
+# Or install directly with:
+#   /path/to/v11/scripts/install-postcommit-hook [PROJECT_PATH]
+#
+# Rollback:
+#   V11_POSTCOMMIT_AUTOCLOSE=off  — disable auto-close
+#   V11_POSTCOMMIT_DRYRUN=on      — dry-run mode
+
+V11_HOME="${V11_HOME:-$(cd "$(dirname "$(dirname "$(realpath "${BASH_SOURCE[0]}")")")" && pwd)}"
+exec "${V11_HOME}/hooks/post-commit-close-tasks" "$@"

@@ -1,0 +1,111 @@
+#!/usr/bin/env python3
+"""
+V11 Benchmark — system-level quality tracking with composite scoring.
+
+Usage:
+    scripts/v11-benchmark                     # Tier 0 (free, ~15s)
+    scripts/v11-benchmark --tier 1            # Tier 0+1 (~$0.30)
+    scripts/v11-benchmark --tier 2            # All tiers (~$15)
+    scripts/v11-benchmark --compare           # Trend from ledger
+    scripts/v11-benchmark --compare --last 10 # Last 10 runs
+    scripts/v11-benchmark --report            # Markdown report to stdout
+    scripts/v11-benchmark --baseline          # Set current as baseline
+    scripts/v11-benchmark --regression        # Check for regressions vs baseline
+    scripts/v11-benchmark --json              # JSON output only
+"""
+import argparse
+import json
+import os
+import sys
+from pathlib import Path
+
+# Add V11 root to path
+V11_ROOT = Path(__file__).parent.parent
+sys.path.insert(0, str(V11_ROOT))
+
+from benchmarks.runner import run_benchmark
+from benchmarks.ledger import (
+    load_baseline, save_baseline, get_last_result, get_trend,
+    LEDGER_PATH, BASELINE_PATH,
+)
+from benchmarks.regression import has_blocking_regressions
+from benchmarks.report import (
+    print_terminal_report, format_json, format_markdown, print_trend,
+    NO_COLOR,
+)
+import benchmarks.report as report_module
+
+
+def main():
+    parser = argparse.ArgumentParser(description="V11 Benchmark System")
+    parser.add_argument("--tier", type=int, default=0, choices=[0, 1, 2],
+                        help="Maximum tier to run (0=smoke, 1=integration, 2=full)")
+    parser.add_argument("--compare", action="store_true",
+                        help="Show trend comparison from ledger")
+    parser.add_argument("--last", type=int, default=5,
+                        help="Number of recent runs to compare (default: 5)")
+    parser.add_argument("--report", action="store_true",
+                        help="Output markdown report")
+    parser.add_argument("--baseline", action="store_true",
+                        help="Set current run as baseline")
+    parser.add_argument("--regression", action="store_true",
+                        help="Check for regressions against baseline")
+    parser.add_argument("--json", action="store_true",
+                        help="JSON output only")
+    parser.add_argument("--verbose", "-v", action="store_true",
+                        help="Show individual test results")
+    parser.add_argument("--ledger", type=str, default=None,
+                        help="Custom ledger path")
+    args = parser.parse_args()
+
+    # Honor NO_COLOR env
+    if os.environ.get("NO_COLOR"):
+        report_module.NO_COLOR = True
+
+    ledger_path = Path(args.ledger) if args.ledger else None
+
+    # ── Compare mode ───────────────────────────────────────────────────────
+    if args.compare:
+        trend = get_trend(ledger_path, last_n=args.last)
+        if args.json:
+            print(json.dumps(trend, indent=2))
+        else:
+            print_trend(trend)
+        return 0
+
+    # ── Run benchmark ──────────────────────────────────────────────────────
+    baseline = load_baseline() if args.regression else None
+    previous = get_last_result(ledger_path, tier=args.tier)
+
+    result = run_benchmark(
+        tier=args.tier,
+        baseline=baseline,
+        previous=previous,
+        ledger_path=ledger_path,
+        verbose=args.verbose,
+    )
+
+    # ── Output ─────────────────────────────────────────────────────────────
+    if args.json:
+        print(format_json(result))
+    elif args.report:
+        print(format_markdown(result))
+    else:
+        print_terminal_report(result, verbose=args.verbose)
+
+    # ── Baseline mode ──────────────────────────────────────────────────────
+    if args.baseline:
+        save_baseline(result)
+        if not args.json:
+            print(f"  Baseline saved to {BASELINE_PATH}")
+
+    # ── Exit code ──────────────────────────────────────────────────────────
+    regressions = result.get("regressions", [])
+    if any(r.get("severity") in ("HIGH", "CRITICAL") for r in regressions):
+        return 1
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

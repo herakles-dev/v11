@@ -1,0 +1,140 @@
+#!/bin/bash
+# V11.20 — backfill-wave-findings
+#
+# Scan sessions/*/reviews/wave-*.json (existing wave-review output) and
+# sessions/*/wave-reports/wave-*-review.json (V11.20 spec convention) across
+# all projects (or a single project with --project), invoke
+# scripts/wave-review-attribute on each. Idempotent: T5's attribution_key
+# dedup naturally skips already-attributed findings.
+#
+# Usage:
+#   ./scripts/backfill-wave-findings                     # all projects
+#   ./scripts/backfill-wave-findings --project P         # one project
+#   ./scripts/backfill-wave-findings --dry-run           # report what would happen
+#   ./scripts/backfill-wave-findings --since 2026-05-01  # ISO date (file mtime gate)
+#   ./scripts/backfill-wave-findings --quiet             # only summary
+#
+# Honors V11_WAVE_ATTRIBUTE=off (delegated via T5).
+#
+# Exit codes:
+#   0    Success (including no reports found)
+#   1    Invalid arguments
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+V11_HOME="${V11_HOME:-$(dirname "$SCRIPT_DIR")}"
+# shellcheck source=../hooks/lib/common.sh
+source "$V11_HOME/hooks/lib/common.sh"
+
+usage() {
+    sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//'
+}
+
+if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
+    usage; exit 0
+fi
+
+PROJECT_FILTER=""
+DRY_RUN=false
+SINCE=""
+QUIET=false
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --project)  PROJECT_FILTER="${2:-}"; shift 2 ;;
+        --dry-run)  DRY_RUN=true; shift ;;
+        --since)    SINCE="${2:-}"; shift 2 ;;
+        --quiet)    QUIET=true; shift ;;
+        --help|-h)  usage; exit 0 ;;
+        *) echo "backfill-wave-findings: unknown arg '$1'" >&2; exit 1 ;;
+    esac
+done
+
+ATTR_SCRIPT="$SCRIPT_DIR/wave-review-attribute"
+if [ ! -x "$ATTR_SCRIPT" ]; then
+    echo "backfill-wave-findings: missing $ATTR_SCRIPT" >&2
+    exit 1
+fi
+
+SESSIONS_ROOT="${SESSIONS_ROOT:-$V11_WORKSPACE_ROOT/sessions}"
+if [ ! -d "$SESSIONS_ROOT" ]; then
+    echo "backfill-wave-findings: no sessions dir at $SESSIONS_ROOT" >&2
+    exit 0
+fi
+
+SINCE_EPOCH=""
+if [ -n "$SINCE" ]; then
+    SINCE_EPOCH=$(date -d "$SINCE" +%s 2>/dev/null || true)
+    if [ -z "$SINCE_EPOCH" ]; then
+        echo "backfill-wave-findings: bad --since '$SINCE' (use ISO date)" >&2
+        exit 1
+    fi
+fi
+
+# --- Build the project list ---
+PROJECTS=()
+if [ -n "$PROJECT_FILTER" ]; then
+    PROJECTS+=("$PROJECT_FILTER")
+else
+    while IFS= read -r d; do
+        [ -d "$d" ] || continue
+        PROJECTS+=("$(basename "$d")")
+    done < <(find "$SESSIONS_ROOT" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort)
+fi
+
+# --- Walk projects, find candidate report files, dispatch to T5 ---
+TOTAL_REPORTS=0
+TOTAL_ATTEMPTED=0
+TOTAL_WARNINGS=0
+
+for project in "${PROJECTS[@]}"; do
+    # Find candidate files. Both possible conventions:
+    #   sessions/$project/reviews/wave-N.json
+    #   sessions/$project/wave-reports/wave-N-review.json
+    SEEN_REPORTS=()
+    for dir in "$SESSIONS_ROOT/$project/reviews" "$SESSIONS_ROOT/$project/wave-reports"; do
+        [ -d "$dir" ] || continue
+        while IFS= read -r f; do
+            [ -f "$f" ] || continue
+            if [ -n "$SINCE_EPOCH" ]; then
+                MTIME=$(stat -c%Y "$f" 2>/dev/null || echo 0)
+                [ "$MTIME" -ge "$SINCE_EPOCH" ] || continue
+            fi
+            SEEN_REPORTS+=("$f")
+        done < <(find "$dir" -maxdepth 1 -name "wave-*.json" -type f 2>/dev/null | sort)
+    done
+
+    [ "${#SEEN_REPORTS[@]}" -eq 0 ] && continue
+    TOTAL_REPORTS=$((TOTAL_REPORTS + ${#SEEN_REPORTS[@]}))
+
+    if ! $QUIET; then
+        echo "[backfill] $project: ${#SEEN_REPORTS[@]} report(s)" >&2
+    fi
+
+    for report in "${SEEN_REPORTS[@]}"; do
+        TOTAL_ATTEMPTED=$((TOTAL_ATTEMPTED + 1))
+        ARGS=("$project" "--report-file" "$report")
+        $DRY_RUN && ARGS+=("--dry-run")
+        $QUIET && ARGS+=("--quiet")
+        # Best-effort: a single bad report should not abort the whole scan.
+        set +e
+        "$ATTR_SCRIPT" "${ARGS[@]}" 2>&1 | (
+            if $QUIET; then grep -E "^\[(applied|DRY-RUN|skip|unattributed)\]" || true
+            else cat
+            fi
+        )
+        ATTR_EXIT=${PIPESTATUS[0]}
+        set -e
+        if [ "$ATTR_EXIT" -ne 0 ]; then
+            echo "[backfill-wave-findings] WARNING: wave-review-attribute exited $ATTR_EXIT for $project $report" >&2
+            TOTAL_WARNINGS=$((TOTAL_WARNINGS + 1))
+        fi
+    done
+done
+
+MODE="[applied]"
+$DRY_RUN && MODE="[DRY-RUN]"
+WARN_MSG=""
+[ "$TOTAL_WARNINGS" -gt 0 ] && WARN_MSG=", $TOTAL_WARNINGS warning(s)"
+echo "$MODE backfill-wave-findings: ${#PROJECTS[@]} project(s) scanned, $TOTAL_REPORTS report(s) found, $TOTAL_ATTEMPTED attribution call(s) dispatched${WARN_MSG}" >&2

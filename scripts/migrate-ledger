@@ -1,0 +1,1114 @@
+#!/usr/bin/env bash
+# scripts/migrate-ledger — Idempotent ledger migration seed (ADR-LEDGER §5)
+#
+# Usage:
+#   migrate-ledger PROJECT [--dry-run]
+#   migrate-ledger --all [--dry-run]
+#   migrate-ledger --test
+#   migrate-ledger --pin   PROJECT
+#   migrate-ledger --unpin PROJECT
+#
+# DO NOT run --all without explicit orchestrator + user approval.
+# --all is gated: this script exits 2 when --all is passed without the env
+# guard V11_MIGRATE_LEDGER_ALL_APPROVED=1 set by the operator.
+#
+# Exit codes:
+#   0  success (including idempotent no-op via marker)
+#   1  migration failed (project → .rejected; loud error)
+#   2  usage error / missing approval guard for --all
+
+set -euo pipefail
+
+# ---------------------------------------------------------------------------
+# Resolve V11_HOME (script lives in $V11_HOME/scripts/)
+# ---------------------------------------------------------------------------
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+V11_HOME="${V11_HOME:-$(dirname "$SCRIPT_DIR")}"
+export V11_HOME
+
+# Source common.sh to get v11_* functions
+# shellcheck source=hooks/lib/common.sh
+source "${V11_HOME}/hooks/lib/common.sh" 2>/dev/null || {
+    echo "migrate-ledger: FATAL — cannot source common.sh at ${V11_HOME}/hooks/lib/common.sh" >&2
+    exit 1
+}
+
+# ---------------------------------------------------------------------------
+# Env / constants
+# ---------------------------------------------------------------------------
+: "${METRICS_DIR:=$V11_WORKSPACE_ROOT/.agent-metrics}"
+: "${TASK_STATE_DIR:=$METRICS_DIR/task-state}"
+: "${SESSIONS_ROOT:=$V11_WORKSPACE_ROOT/sessions}"
+
+LEDGER_DIR="${METRICS_DIR}/ledger"
+MIGRATED_DIR="${LEDGER_DIR}/.migrated"
+LEGACY_PINNED_DIR="${LEDGER_DIR}/.legacy-pinned"
+
+# Tolerance for transient bucket skew (§5.2c)
+PENDING_TOL=2
+IN_PROGRESS_TOL=2
+
+# ---------------------------------------------------------------------------
+# Argument parsing
+# ---------------------------------------------------------------------------
+DRY_RUN=0
+DO_ALL=0
+DO_TEST=0
+DO_PIN=0
+DO_UNPIN=0
+PROJECT=""
+
+usage() {
+    cat >&2 <<'EOF'
+Usage:
+  migrate-ledger PROJECT [--dry-run]
+  migrate-ledger --all   [--dry-run]   # requires V11_MIGRATE_LEDGER_ALL_APPROVED=1
+  migrate-ledger --test
+  migrate-ledger --pin   PROJECT
+  migrate-ledger --unpin PROJECT
+EOF
+    exit 2
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --dry-run) DRY_RUN=1 ;;
+        --all)     DO_ALL=1 ;;
+        --test)    DO_TEST=1 ;;
+        --pin)
+            DO_PIN=1
+            shift
+            [[ $# -gt 0 ]] || usage
+            PROJECT="$1"
+            ;;
+        --unpin)
+            DO_UNPIN=1
+            shift
+            [[ $# -gt 0 ]] || usage
+            PROJECT="$1"
+            ;;
+        -*)
+            echo "migrate-ledger: unknown flag '$1'" >&2
+            usage
+            ;;
+        *)
+            [[ -z "$PROJECT" ]] || usage
+            PROJECT="$1"
+            ;;
+    esac
+    shift
+done
+
+# ---------------------------------------------------------------------------
+# --pin / --unpin management for the legacy-pinned lever
+# ---------------------------------------------------------------------------
+_handle_pin_unpin() {
+    local action="$1" project="$2"
+    if [ -z "$project" ] || ! printf '%s' "$project" | grep -qE '^[a-zA-Z0-9._-]{1,64}$'; then
+        echo "migrate-ledger: invalid project name for --${action}: '$project'" >&2
+        exit 2
+    fi
+    mkdir -p "$LEGACY_PINNED_DIR" 2>/dev/null || true
+    local pin_file="${LEGACY_PINNED_DIR}/${project}"
+    if [ "$action" = "pin" ]; then
+        printf '{"pinned_at":"%s","project":"%s"}\n' "$(date -Iseconds)" "$project" > "$pin_file"
+        echo "migrate-ledger: LEGACY-PINNED '$project' — cutover gate will force legacy for this project" >&2
+    else
+        rm -f "$pin_file"
+        echo "migrate-ledger: UNPIN '$project' — removed legacy-pinned marker" >&2
+    fi
+    exit 0
+}
+
+if [ "$DO_PIN" -eq 1 ];   then _handle_pin_unpin "pin"   "$PROJECT"; fi
+if [ "$DO_UNPIN" -eq 1 ]; then _handle_pin_unpin "unpin" "$PROJECT"; fi
+
+# ---------------------------------------------------------------------------
+# --test: minimal self-test (runs in a temp dir, no real state touched)
+# ---------------------------------------------------------------------------
+if [ "$DO_TEST" -eq 1 ]; then
+    _self_test() {
+        local td=""
+        td=$(mktemp -d)
+        trap 'rm -rf "${td:-}"' EXIT
+
+        local fake_root="$td/v11-root"
+        local fake_metrics="$fake_root/.agent-metrics"
+        local fake_sessions="$fake_root/sessions"
+        local fake_task_state="$fake_metrics/task-state"
+        mkdir -p "$fake_metrics/ledger/.migrated" "$fake_metrics/sessions" \
+                 "$fake_task_state" "$fake_sessions"
+
+        export V11_WORKSPACE_ROOT="$fake_root"
+        export METRICS_DIR="$fake_metrics"
+        export TASK_STATE_DIR="$fake_task_state"
+        export SESSIONS_ROOT="$fake_sessions"
+
+        local proj="selftest-$$"
+
+        # Fake aggregate: one completed task, one pending
+        local agg_file="$fake_task_state/${proj}.json"
+        local now
+        now=$(date -Iseconds)
+        cat > "$agg_file" <<JSON
+{
+  "project":"${proj}",
+  "total":2, "completed":1, "pending":1, "in_progress":0, "blocked":0,
+  "phase":"discovery",
+  "active_task":null,"active_task_ids":[],"active_task_ids_by_session":{},
+  "open_tasks_by_session":{},
+  "recent_completed":[{"id":"1","subject":"Done task","at":"${now}","session_uuid":"s1"}],
+  "blocked_tasks":[],"recommended_agents":{},"task_artifacts":{},
+  "aggregated_from":[],"last_updated":"${now}","aggregate_built_at":"${now}"
+}
+JSON
+
+        echo "migrate-ledger --test: running self-test migration for project '$proj'..." >&2
+
+        # First run
+        if V11_LEDGER_CUTOVER=off \
+           V11_WORKSPACE_ROOT="$fake_root" METRICS_DIR="$fake_metrics" \
+           TASK_STATE_DIR="$fake_task_state" SESSIONS_ROOT="$fake_sessions" \
+           bash "${BASH_SOURCE[0]}" "$proj" 2>&1 | grep -v "^migrate-ledger:.*self-test"; then
+            true
+        fi
+
+        local marker_path="$fake_metrics/ledger/.migrated/${proj}"
+        if [ -f "$marker_path" ]; then
+            echo "migrate-ledger --test: PASS — marker written" >&2
+        else
+            echo "migrate-ledger --test: FAIL — marker not written" >&2
+            return 1
+        fi
+
+        # Idempotency: second run must be a no-op
+        local ledger="$fake_metrics/ledger/${proj}.jsonl"
+        local line_count_before
+        line_count_before=$(wc -l < "$ledger" 2>/dev/null || echo 0)
+
+        if V11_LEDGER_CUTOVER=off \
+           V11_WORKSPACE_ROOT="$fake_root" METRICS_DIR="$fake_metrics" \
+           TASK_STATE_DIR="$fake_task_state" SESSIONS_ROOT="$fake_sessions" \
+           bash "${BASH_SOURCE[0]}" "$proj" 2>&1 | grep -v "^migrate-ledger:.*self-test"; then
+            true
+        fi
+
+        local line_count_after
+        line_count_after=$(wc -l < "$ledger" 2>/dev/null || echo 0)
+
+        if [ "$line_count_before" -eq "$line_count_after" ]; then
+            echo "migrate-ledger --test: PASS — idempotent (lines unchanged: $line_count_before)" >&2
+        else
+            echo "migrate-ledger --test: FAIL — re-run changed ledger ($line_count_before → $line_count_after lines)" >&2
+            return 1
+        fi
+
+        echo "migrate-ledger --test: ALL PASS" >&2
+    }
+    _self_test
+    exit $?
+fi
+
+# ---------------------------------------------------------------------------
+# --all guard
+# ---------------------------------------------------------------------------
+if [ "$DO_ALL" -eq 1 ]; then
+    if [ "${V11_MIGRATE_LEDGER_ALL_APPROVED:-0}" != "1" ]; then
+        cat >&2 <<'EOF'
+migrate-ledger: --all requires explicit operator approval.
+Set V11_MIGRATE_LEDGER_ALL_APPROVED=1 to confirm.
+DO NOT run --all without orchestrator + user approval.
+This script touches durable state for ALL live projects.
+EOF
+        exit 2
+    fi
+    # Enumerate all projects from task-state dir
+    declare -a ALL_PROJECTS=()
+    while IFS= read -r f; do
+        local_proj=$(basename "$f" .json)
+        if printf '%s' "$local_proj" | grep -qE '^[a-zA-Z0-9._-]{1,64}$'; then
+            ALL_PROJECTS+=("$local_proj")
+        fi
+    done < <(find "$TASK_STATE_DIR" -maxdepth 1 -name '*.json' ! -name '*.lock' ! -name '*.bak' 2>/dev/null | sort)
+
+    echo "migrate-ledger: --all migrating ${#ALL_PROJECTS[@]} projects (DRY_RUN=$DRY_RUN)..." >&2
+    overall_rc=0
+    # BUGFIX (2026-05-18): ${DRY_RUN:+--dry-run} expands whenever DRY_RUN is
+    # non-empty — and DRY_RUN=0 IS non-empty, so the child ALWAYS got
+    # --dry-run and --all could never actually execute. Gate on the value.
+    _child_dry=()
+    [ "$DRY_RUN" -eq 1 ] 2>/dev/null && _child_dry=(--dry-run)
+    for p in "${ALL_PROJECTS[@]}"; do
+        if V11_MIGRATE_LEDGER_ALL_APPROVED=1 bash "${BASH_SOURCE[0]}" "$p" "${_child_dry[@]}"; then
+            true
+        else
+            overall_rc=1
+        fi
+    done
+    exit $overall_rc
+fi
+
+# ---------------------------------------------------------------------------
+# Validate single-project argument
+# ---------------------------------------------------------------------------
+if [ -z "$PROJECT" ]; then
+    echo "migrate-ledger: PROJECT argument required" >&2
+    usage
+fi
+if ! printf '%s' "$PROJECT" | grep -qE '^[a-zA-Z0-9._-]{1,64}$'; then
+    echo "migrate-ledger: invalid project name '$PROJECT' (SEC-C-02 whitelist)" >&2
+    exit 2
+fi
+
+# ---------------------------------------------------------------------------
+# Core migration function
+# ---------------------------------------------------------------------------
+migrate_project() {
+    local project="$1"
+    local dry_run="${2:-0}"
+
+    # Temp-file leak guard: declare the temps up front and clean every one on
+    # process exit (--all spawns a fresh `bash script <p>` per project, so an
+    # EXIT trap is process-scoped and fires on success, _reject_project+return,
+    # gate failure, OR a `set -euo pipefail` abort — including the rare case
+    # where a later `mktemp -d` fails after an earlier temp was created).
+    local idk_map_file="" idk_tmp_dir="" gate_tmp_dir="" gate4a_tmp_dir=""
+    trap 'rm -f "${idk_map_file:-}" 2>/dev/null; rm -rf "${idk_tmp_dir:-}" "${gate_tmp_dir:-}" "${gate4a_tmp_dir:-}" 2>/dev/null; true' EXIT
+
+    local ledger_file
+    ledger_file=$(v11_ledger_path "$project" jsonl) || return 1
+    local marker_file
+    marker_file=$(v11_ledger_path "$project" migrated) || return 1
+    local aggregate_file="${TASK_STATE_DIR}/${project}.json"
+
+    # -----------------------------------------------------------------------
+    # Step 1: Marker gate — idempotent (ADR §5 step 1)
+    # -----------------------------------------------------------------------
+    if [ -f "$marker_file" ]; then
+        echo "migrate-ledger: '$project' already migrated (marker exists) — no-op" >&2
+        return 0
+    fi
+
+    echo "migrate-ledger: starting migration for project '$project' (dry_run=$dry_run)..." >&2
+
+    # -----------------------------------------------------------------------
+    # Step 2: De-poisoned baseline (ADR §5 step 2, HIGH-1)
+    # -----------------------------------------------------------------------
+
+    # 2a: Rebuild aggregate fresh with Bug-H quarantine.
+    # V11_LEDGER_CUTOVER=off: migration OWNS this ledger; the cutover guard
+    # must not run mid-migration (a prior partial/empty ledger could log a
+    # spurious zeroed 'cutover' decision before the real seed lands).
+    echo "migrate-ledger: [$project] rebuilding aggregate (Bug-H quarantine)..." >&2
+    if [ "$dry_run" -eq 0 ]; then
+        V11_LEDGER_CUTOVER=off v11_rebuild_project_aggregate "$project" 2>/dev/null || true
+    fi
+
+    # Read the (possibly just-rebuilt) aggregate
+    local agg_json=""
+    if [ -f "$aggregate_file" ] && [ -s "$aggregate_file" ] && jq empty "$aggregate_file" 2>/dev/null; then
+        agg_json=$(cat "$aggregate_file")
+    fi
+
+    # Legacy pre-ledger projects (no aggregate at all): emit zeroed reconcile + marker only
+    if [ -z "$agg_json" ]; then
+        echo "migrate-ledger: [$project] no aggregate found — legacy pre-ledger project; emitting zeroed baseline" >&2
+        if [ "$dry_run" -eq 0 ]; then
+            _seed_legacy_only "$project" "$marker_file" "$ledger_file"
+        else
+            echo "migrate-ledger: [DRY-RUN] [$project] would seed zeroed legacy baseline" >&2
+        fi
+        return 0
+    fi
+
+    # 2b: Build the de-poisoned enumerated task set from the aggregate
+    # Collect open_tasks_by_session ∪ recent_completed ∪ blocked_tasks, deduped by subject_norm
+    # Note: recent_completed entries have no per-task metadata.project (MED-A accepted residual)
+
+    # We use Python for this complex enumeration to avoid awk/bash fragility
+    local enumeration_json
+    enumeration_json=$(
+        python3 - "$aggregate_file" "$project" <<'PYEOF'
+import json, sys, os
+
+agg_file = sys.argv[1]
+project  = sys.argv[2]
+
+try:
+    agg = json.load(open(agg_file))
+except Exception as e:
+    print(f"ENUM_ERROR: {e}", file=sys.stderr); sys.exit(1)
+
+# ---------------------------------------------------------------------------
+# Build the enumerated task set (de-poisoned — ADR §5.2b)
+# ---------------------------------------------------------------------------
+# Key: subject_norm (for dedup).  Value: task record with final_status, subject,
+# at (timestamp), session_uuid, task_id, metadata.
+# open_tasks_by_session tasks are project-filterable (per-task metadata.project).
+# recent_completed / blocked_tasks are NOT filterable (no per-task project field).
+
+sys.path.insert(0, os.environ.get("V11_HOME", "") + "/scripts/lib")
+try:
+    from normalize_subject import normalize_subject
+except ImportError:
+    def normalize_subject(s):
+        import unicodedata, re as re_
+        s = unicodedata.normalize("NFC", s).casefold()
+        s = re_.sub(r'\s+', ' ', s).strip()
+        return s or "__empty__"
+
+# Dedupe registry: subject_norm -> record (last-write-wins; open beats completed)
+registry = {}
+
+last_updated = agg.get("last_updated") or agg.get("aggregate_built_at") or ""
+
+# --- open_tasks_by_session (project-filterable) ---
+# Defensive: legacy/foreign aggregates can carry malformed shapes (a string
+# where a dict is expected). Skip non-conforming entries — never crash
+# (same skip-malformed discipline as v11_replay_ledger's parse_ledger).
+_obs = agg.get("open_tasks_by_session")
+if not isinstance(_obs, dict):
+    _obs = {}
+for sess_uuid, open_tasks in _obs.items():
+    if not isinstance(open_tasks, dict):
+        continue
+    for task_id, task in open_tasks.items():
+        if not isinstance(task, dict):
+            continue
+        subj = task.get("subject") or ""
+        sn = normalize_subject(subj)
+        status = task.get("status") or "pending"
+        meta = task.get("metadata")
+        if not isinstance(meta, dict):
+            meta = {}
+        # Project filter: if per-task metadata.project is explicitly set and
+        # is NOT this project, skip (Bug-H per-task corroboration, §5.2b)
+        task_proj = meta.get("project") or ""
+        if task_proj and task_proj != project:
+            continue
+        registry[sn] = {
+            "subject_norm": sn,
+            "subject": subj,
+            "final_status": status,
+            "at": last_updated,
+            "session_uuid": sess_uuid,
+            "task_id": str(task_id),
+            "metadata": meta,
+            "source": "open_tasks",
+        }
+
+# --- recent_completed (no per-task project filter — MED-A accepted residual) ---
+_rcl = agg.get("recent_completed")
+if not isinstance(_rcl, list):
+    _rcl = []
+for rc in _rcl:
+    if not isinstance(rc, dict):
+        continue
+    subj = rc.get("subject") or ""
+    sn = normalize_subject(subj)
+    at = rc.get("at") or last_updated
+    sess = rc.get("session_uuid") or ""
+    tid = str(rc.get("id") or "")
+    # Only add if not already present as an open task (open beats completed)
+    if sn not in registry:
+        registry[sn] = {
+            "subject_norm": sn,
+            "subject": subj,
+            "final_status": "completed",
+            "at": at,
+            "session_uuid": sess,
+            "task_id": tid,
+            "metadata": {},
+            "source": "recent_completed",
+        }
+
+# --- blocked_tasks (no per-task project filter — same rationale as recent_completed) ---
+_btl = agg.get("blocked_tasks")
+if not isinstance(_btl, list):
+    _btl = []
+for bt in _btl:
+    if not isinstance(bt, dict):
+        continue
+    subj = bt.get("subject") or ""
+    sn = normalize_subject(subj)
+    at = bt.get("at") or last_updated
+    sess = bt.get("session_uuid") or ""
+    tid = str(bt.get("id") or "")
+    if sn not in registry:
+        registry[sn] = {
+            "subject_norm": sn,
+            "subject": subj,
+            "final_status": "blocked",
+            "at": at,
+            "session_uuid": sess,
+            "task_id": tid,
+            "metadata": {},
+            "source": "blocked_tasks",
+        }
+
+# --- Derive counters from enumerated set (§5.2b derived_counters) ---
+tasks = list(registry.values())
+derived_counters = {
+    "total": len(tasks),
+    "pending":     sum(1 for t in tasks if t["final_status"] == "pending"),
+    "in_progress": sum(1 for t in tasks if t["final_status"] == "in_progress"),
+    "completed":   sum(1 for t in tasks if t["final_status"] == "completed"),
+    "blocked":     sum(1 for t in tasks if t["final_status"] == "blocked"),
+}
+
+# --- Scalar counters from the aggregate ---
+scalar_counters = {
+    "total":       int(agg.get("total", 0)),
+    "pending":     int(agg.get("pending", 0)),
+    "in_progress": int(agg.get("in_progress", 0)),
+    "completed":   int(agg.get("completed", 0)),
+    "blocked":     int(agg.get("blocked", 0)),
+}
+
+result = {
+    "tasks": tasks,
+    "derived_counters": derived_counters,
+    "scalar_counters": scalar_counters,
+    "agg_last_updated": last_updated,
+    "recommended_agents": agg.get("recommended_agents") or {},
+    "review_summary": agg.get("review_summary"),
+    "blocked_tasks_list": agg.get("blocked_tasks") or [],
+    "recent_completed_list": agg.get("recent_completed") or [],
+}
+print(json.dumps(result))
+PYEOF
+    ) || {
+        echo "migrate-ledger: [$project] enumeration failed — aborting" >&2
+        return 1
+    }
+
+    # Parse the enumeration result
+    local derived_total scalar_total derived_pending scalar_pending
+    local derived_in_progress scalar_in_progress derived_completed scalar_completed
+    local derived_blocked scalar_blocked counters_diverged
+    derived_total=$(printf '%s' "$enumeration_json" | jq -r '.derived_counters.total')
+    scalar_total=$(printf '%s' "$enumeration_json" | jq -r '.scalar_counters.total')
+    derived_pending=$(printf '%s' "$enumeration_json" | jq -r '.derived_counters.pending')
+    scalar_pending=$(printf '%s' "$enumeration_json" | jq -r '.scalar_counters.pending')
+    derived_in_progress=$(printf '%s' "$enumeration_json" | jq -r '.derived_counters.in_progress')
+    scalar_in_progress=$(printf '%s' "$enumeration_json" | jq -r '.scalar_counters.in_progress')
+    derived_completed=$(printf '%s' "$enumeration_json" | jq -r '.derived_counters.completed')
+    scalar_completed=$(printf '%s' "$enumeration_json" | jq -r '.scalar_counters.completed')
+    derived_blocked=$(printf '%s' "$enumeration_json" | jq -r '.derived_counters.blocked')
+    scalar_blocked=$(printf '%s' "$enumeration_json" | jq -r '.scalar_counters.blocked')
+
+    # 2c: Compare derived vs scalar with tolerance (§5.2c)
+    counters_diverged=0
+
+    # Terminal buckets: exact match required
+    if [ "${derived_completed}" != "${scalar_completed}" ] || \
+       [ "${derived_blocked}" != "${scalar_blocked}" ]; then
+        counters_diverged=1
+    fi
+
+    # Transient buckets: ±2 tolerance
+    local p_diff ip_diff
+    p_diff=$(( derived_pending - scalar_pending ))
+    ip_diff=$(( derived_in_progress - scalar_in_progress ))
+    [ $p_diff -lt 0 ] && p_diff=$(( -p_diff ))
+    [ $ip_diff -lt 0 ] && ip_diff=$(( -ip_diff ))
+    if [ "$p_diff" -gt "$PENDING_TOL" ] || [ "$ip_diff" -gt "$IN_PROGRESS_TOL" ]; then
+        counters_diverged=1
+    fi
+
+    if [ "$counters_diverged" -eq 1 ]; then
+        echo "migrate-ledger: WARNING [$project] scalar counters disagree with enumerated set beyond tolerance — seeding from ENUMERATED set, scalar counters DISCARDED as likely Bug-H/drift poisoned" >&2
+        echo "  scalar:  total=$scalar_total completed=$scalar_completed pending=$scalar_pending in_progress=$scalar_in_progress blocked=$scalar_blocked" >&2
+        echo "  derived: total=$derived_total completed=$derived_completed pending=$derived_pending in_progress=$derived_in_progress blocked=$derived_blocked" >&2
+    fi
+
+    if [ "$dry_run" -eq 1 ]; then
+        echo "migrate-ledger: [DRY-RUN] [$project] would seed ledger:" >&2
+        echo "  enumerated tasks: $derived_total (completed=$derived_completed pending=$derived_pending in_progress=$derived_in_progress blocked=$derived_blocked)" >&2
+        echo "  counters_diverged: $counters_diverged" >&2
+        return 0
+    fi
+
+    # -----------------------------------------------------------------------
+    # Step 3: Synthetic baseline — HIGH-4 _idk backfill FIRST, then truncate-seed
+    # -----------------------------------------------------------------------
+
+    # 3a: HIGH-4 _idk open-task backfill — SEQUENCING RATIONALE.
+    # ADR §5 step 3 says _idk backfill is the "first action of step 3", but the
+    # AUTHORITATIVE create_seq is only known after v11_ledger_append returns it
+    # (FD-207-confirmed). So the real sequence is: truncate-seed → emit `created`
+    # (captures the confirmed create_seq per identity) → patch `_idk` back into
+    # the surviving per-session STATE (step 3d). This is equivalent to and safe
+    # under the ADR ordering: the truncate happens before ANY by_id-keyed
+    # emission, and `_idk` is written with the confirmed values, never a guess.
+    # `_terminal_idk` is NOT seeded (Addendum A §A.5 removed it). There is
+    # deliberately NO pre-truncate session loop here — it would only duplicate
+    # the Bug-H quarantine that step 3d already applies, doing no work.
+    local sessions_dir="${METRICS_DIR}/sessions"   # used by step 3d + gate-4a
+
+    # 3b: Truncate-seed — the ONLY sanctioned ledger truncation (ADR §4.4 Bug-1 exception)
+    # Open O_WRONLY|O_TRUNC|O_CREAT under FD-207
+    echo "migrate-ledger: [$project] truncate-seed (discards any prior partial run)..." >&2
+    mkdir -p "${LEDGER_DIR}" "${MIGRATED_DIR}" 2>/dev/null || true
+    local lock_file
+    lock_file=$(v11_ledger_path "$project" lock) || return 1
+
+    # Truncate the ledger under FD-207 to discard any partial prior run
+    (
+        exec 207>"$lock_file"
+        flock -w 10 207 || {
+            echo "migrate-ledger: [$project] FD-207 flock timeout for truncate-seed" >&2
+            exit 1
+        }
+        # Truncate: open with O_TRUNC via bash redirection into the file
+        : > "$ledger_file"
+    ) || {
+        echo "migrate-ledger: [$project] truncate-seed failed — aborting" >&2
+        return 1
+    }
+
+    # 3c: Emit synthetic baseline events using v11_ledger_append
+    # For each enumerated task: emit created → terminal status event
+    # Capture the returned create_seq from each created event to patch _idk.
+
+    local now_ts
+    now_ts=$(date -Iseconds)
+
+    # We build a session UUID for migration (not a real session)
+    local migration_session_uuid="migration-$(date +%s)-$$"
+
+    # Track (subject_norm -> create_seq) assignments for _idk backfill.
+    # Use a JSON temp file to avoid bash associative array pitfalls under set -euo pipefail.
+    local idk_map_file
+    idk_map_file=$(mktemp)
+    printf '{}' > "$idk_map_file"
+
+    # Read the tasks array from enumeration_json
+    local tasks_count
+    tasks_count=$(printf '%s' "$enumeration_json" | jq '.tasks | length')
+    echo "migrate-ledger: [$project] emitting synthetic baseline for $tasks_count tasks..." >&2
+
+    local i=0
+    while [ "$i" -lt "$tasks_count" ]; do
+        local task_json
+        task_json=$(printf '%s' "$enumeration_json" | jq -c ".tasks[$i]")
+        local subject subject_norm final_status task_id sess_uuid at_ts meta_json
+
+        subject=$(printf '%s' "$task_json" | jq -r '.subject // ""')
+        subject_norm=$(printf '%s' "$task_json" | jq -r '.subject_norm // "__empty__"')
+        final_status=$(printf '%s' "$task_json" | jq -r '.final_status // "pending"')
+        task_id=$(printf '%s' "$task_json" | jq -r '.task_id // "0"')
+        sess_uuid=$(printf '%s' "$task_json" | jq -r '.session_uuid // ""')
+        at_ts=$(printf '%s' "$task_json" | jq -r '.at // ""')
+        meta_json=$(printf '%s' "$task_json" | jq -c '.metadata // {}')
+        [ -z "$at_ts" ] && at_ts="$now_ts"
+        [ -z "$sess_uuid" ] && sess_uuid="$migration_session_uuid"
+
+        # Emit 'created' event — v11_ledger_append returns the FD-207-confirmed create_seq on stdout
+        local created_event
+        created_event=$(jq -n \
+            --argjson v 1 \
+            --arg ev "created" \
+            --arg ts "$at_ts" \
+            --arg project "$project" \
+            --arg subject_norm "$subject_norm" \
+            --arg task_id "$task_id" \
+            --arg session_uuid "$migration_session_uuid" \
+            --arg subject "$subject" \
+            --arg source "migration" \
+            --argjson meta "$meta_json" \
+            --argjson cd '{"total":1,"pending":1}' \
+            '{v:$v, ev:$ev, ts:$ts, project:$project, subject_norm:$subject_norm,
+              task_id:$task_id, session_uuid:$session_uuid,
+              subject:$subject, source:$source, metadata:$meta,
+              counters_delta:$cd}')
+
+        local confirmed_cs
+        confirmed_cs=$(v11_ledger_append "$project" "$created_event" 2>/dev/null || echo "")
+        if [ -z "$confirmed_cs" ]; then
+            # Do NOT guess a create_seq. A guessed value (e.g. "1") can collide
+            # with another failed-append task's guess → two distinct identities
+            # share (subject_norm, create_seq); the acceptance gate checks
+            # replay counters, NOT idk-map create_seq uniqueness, so it would
+            # NOT catch this. An empty return means a real FD-207/IO failure
+            # (LEDGER-SEQ-WRITE-FAIL) — reject the whole project so the operator
+            # triages the underlying IO issue and re-runs cleanly (the marker
+            # is not written; truncate-seed discards this partial on re-run).
+            echo "migrate-ledger: [$project] FATAL — v11_ledger_append returned no create_seq for task '$subject' (FD-207/IO failure). Rejecting project; investigate and re-run." >&2
+            _reject_project "$project" "$ledger_file"
+            return 1
+        fi
+
+        # Record create_seq for _idk backfill via JSON temp file
+        jq --arg k "$subject_norm" --argjson v "$confirmed_cs" '. + {($k): $v}' \
+            "$idk_map_file" > "${idk_map_file}.tmp" 2>/dev/null && \
+            mv "${idk_map_file}.tmp" "$idk_map_file" 2>/dev/null || true
+
+        # Emit exactly ONE terminal status event (no intermediate transitions — §5 step 3)
+        # final_status can be: pending, in_progress, completed, blocked
+        # For pending: no terminal event (created already sets pending)
+        # For in_progress: emit in_progress with net delta {pending:-1, in_progress:+1}
+        # For completed: emit completed with net delta {pending:-1, completed:+1}
+        # For blocked: emit blocked with net delta {pending:-1, blocked:+1}
+        if [ "$final_status" != "pending" ]; then
+            local terminal_event terminal_cd
+            case "$final_status" in
+                in_progress)
+                    terminal_cd='{"pending":-1,"in_progress":1}'
+                    terminal_event=$(jq -n \
+                        --argjson v 1 \
+                        --arg ev "in_progress" \
+                        --arg ts "$at_ts" \
+                        --arg project "$project" \
+                        --arg subject_norm "$subject_norm" \
+                        --argjson create_seq "$confirmed_cs" \
+                        --arg task_id "$task_id" \
+                        --arg session_uuid "$migration_session_uuid" \
+                        --arg source "migration" \
+                        --argjson cd "$terminal_cd" \
+                        '{v:$v, ev:$ev, ts:$ts, project:$project,
+                          subject_norm:$subject_norm, create_seq:$create_seq,
+                          task_id:$task_id, session_uuid:$session_uuid,
+                          source:$source, counters_delta:$cd}')
+                    ;;
+                completed)
+                    terminal_cd='{"pending":-1,"completed":1}'
+                    terminal_event=$(jq -n \
+                        --argjson v 1 \
+                        --arg ev "completed" \
+                        --arg ts "$at_ts" \
+                        --arg at "$at_ts" \
+                        --arg project "$project" \
+                        --arg subject_norm "$subject_norm" \
+                        --argjson create_seq "$confirmed_cs" \
+                        --arg task_id "$task_id" \
+                        --arg session_uuid "$migration_session_uuid" \
+                        --arg source "migration" \
+                        --arg subject "$subject" \
+                        --argjson cd "$terminal_cd" \
+                        '{v:$v, ev:$ev, ts:$ts, at:$at, project:$project,
+                          subject_norm:$subject_norm, create_seq:$create_seq,
+                          task_id:$task_id, session_uuid:$session_uuid,
+                          source:$source, subject:$subject, counters_delta:$cd}')
+                    ;;
+                blocked)
+                    terminal_cd='{"pending":-1,"blocked":1}'
+                    terminal_event=$(jq -n \
+                        --argjson v 1 \
+                        --arg ev "blocked" \
+                        --arg ts "$at_ts" \
+                        --arg at "$at_ts" \
+                        --arg project "$project" \
+                        --arg subject_norm "$subject_norm" \
+                        --argjson create_seq "$confirmed_cs" \
+                        --arg task_id "$task_id" \
+                        --arg session_uuid "$migration_session_uuid" \
+                        --arg source "migration" \
+                        --argjson cd "$terminal_cd" \
+                        '{v:$v, ev:$ev, ts:$ts, at:$at, project:$project,
+                          subject_norm:$subject_norm, create_seq:$create_seq,
+                          task_id:$task_id, session_uuid:$session_uuid,
+                          source:$source, counters_delta:$cd}')
+                    ;;
+            esac
+            # stdout discarded (confirmed create_seq not needed for a terminal
+            # event), but stderr is NOT suppressed — a LEDGER-SEQ-WRITE-FAIL
+            # advisory must remain visible (the || true keeps side-effect-
+            # never-fails; a lost terminal event is caught by the step-4
+            # acceptance gate as a status mismatch).
+            v11_ledger_append "$project" "$terminal_event" > /dev/null || true
+        fi
+
+        i=$(( i + 1 ))
+    done
+
+    # Emit the reconcile event (absolute pin — derived_counters, NOT scalar — HIGH-1)
+    local reconcile_event
+    local derived_abs
+    derived_abs=$(printf '%s' "$enumeration_json" | jq -c '.derived_counters')
+    reconcile_event=$(jq -n \
+        --argjson v 1 \
+        --arg ev "reconcile" \
+        --arg ts "$now_ts" \
+        --arg project "$project" \
+        --arg subject_norm "" \
+        --argjson create_seq -1 \
+        --arg task_id "migration" \
+        --arg session_uuid "$migration_session_uuid" \
+        --arg scope "project" \
+        --argjson counters_abs "$derived_abs" \
+        --arg reason "migration-baseline" \
+        --arg source "migration" \
+        '{v:$v, ev:$ev, ts:$ts, project:$project, subject_norm:$subject_norm,
+          create_seq:$create_seq, task_id:$task_id, session_uuid:$session_uuid,
+          scope:$scope, counters_abs:$counters_abs, reason:$reason, source:$source}')
+    v11_ledger_append "$project" "$reconcile_event" > /dev/null 2>/dev/null || true
+
+    # 3d: HIGH-4 _idk open-task backfill into surviving per-session STATE
+    # Now we have the FD-207-confirmed create_seq values in idk_map_file.
+    # Write _idk into each open task in surviving per-session STATE files.
+    echo "migrate-ledger: [$project] HIGH-4 _idk backfill with confirmed create_seq values..." >&2
+
+    # idk_map_file is already a JSON file; just use it directly.
+    # Write the patcher script to a temp dir (avoids heredoc variable expansion)
+    local idk_tmp_dir
+    idk_tmp_dir=$(mktemp -d)
+    # Move the idk_map JSON file into the temp dir
+    cp "$idk_map_file" "${idk_tmp_dir}/idk_map.json" 2>/dev/null || printf '{}' > "${idk_tmp_dir}/idk_map.json"
+    rm -f "$idk_map_file" 2>/dev/null || true
+    cat > "${idk_tmp_dir}/idk_patcher.py" <<'IDK_PATCHER_SCRIPT'
+import json, sys, os
+
+sess_file = sys.argv[1]
+project   = sys.argv[2]
+idk_file  = sys.argv[3]
+
+v11_home = os.environ.get("V11_HOME", "")
+sys.path.insert(0, v11_home + "/scripts/lib")
+try:
+    from normalize_subject import normalize_subject
+except ImportError:
+    def normalize_subject(s):
+        import unicodedata, re as re_
+        s = unicodedata.normalize("NFC", s).casefold()
+        return re_.sub(r'\s+', ' ', s).strip() or "__empty__"
+
+try:
+    idk_map = json.load(open(idk_file))
+except Exception:
+    idk_map = {}
+
+try:
+    state = json.load(open(sess_file))
+except Exception as e:
+    # Output empty string on error — caller will detect and skip
+    sys.exit(0)
+
+open_tasks = state.get("open_tasks") or {}
+modified = False
+for tid, task in open_tasks.items():
+    if task.get("_idk"):
+        continue  # already has _idk
+    subj = task.get("subject") or ""
+    sn = normalize_subject(subj)
+    cs = idk_map.get(sn)
+    if cs is not None:
+        task["_idk"] = {"subject_norm": sn, "create_seq": int(cs)}
+        modified = True
+
+if modified:
+    state["open_tasks"] = open_tasks
+    print(json.dumps(state))
+IDK_PATCHER_SCRIPT
+
+    if [ -d "$sessions_dir" ]; then
+        local sess_f
+        for sess_f in "${sessions_dir}"/*/task-state.json; do
+            [ -f "$sess_f" ] || continue
+            [ -s "$sess_f" ] || continue
+            jq empty "$sess_f" 2>/dev/null || continue
+            local sess_proj
+            sess_proj=$(jq -r '.project // empty' "$sess_f" 2>/dev/null)
+            [ "$sess_proj" = "$project" ] || continue
+            # Bug-H quarantine
+            local ownership2
+            ownership2=$(jq -r --arg P "$project" '
+                [ (.open_tasks // {}) | to_entries[] | .value.metadata.project? ]
+                | map(select(. != null and . != ""))
+                | if length == 0 then "trust"
+                  elif (index($P) != null) then "include"
+                  else "exclude" end
+            ' "$sess_f" 2>/dev/null || echo "trust")
+            [ "$ownership2" = "exclude" ] && continue
+
+            local patched
+            patched=$(python3 "${idk_tmp_dir}/idk_patcher.py" \
+                        "$sess_f" "$project" "${idk_tmp_dir}/idk_map.json" 2>/dev/null) || patched=""
+
+            if [ -n "$patched" ] && printf '%s' "$patched" | jq empty 2>/dev/null; then
+                local sess_tmp="${sess_f}.migrate.tmp.$$"
+                printf '%s' "$patched" | jq '.' > "$sess_tmp" 2>/dev/null && \
+                    mv "$sess_tmp" "$sess_f" 2>/dev/null || \
+                    rm -f "$sess_tmp" 2>/dev/null || true
+            fi
+        done
+    fi
+    rm -rf "$idk_tmp_dir" 2>/dev/null || true
+
+    # -----------------------------------------------------------------------
+    # Step 4: Acceptance gate (ADR §5 step 4)
+    # -----------------------------------------------------------------------
+    echo "migrate-ledger: [$project] running acceptance gate (v11_replay_ledger)..." >&2
+
+    local replay_json
+    replay_json=$(V11_LEDGER_CUTOVER=off \
+                  V11_WORKSPACE_ROOT="$V11_WORKSPACE_ROOT" \
+                  METRICS_DIR="$METRICS_DIR" \
+                  V11_HOME="$V11_HOME" \
+                  v11_replay_ledger "$project" 2>/dev/null) || {
+        echo "migrate-ledger: [$project] GATE FAIL — v11_replay_ledger returned non-zero" >&2
+        _reject_project "$project" "$ledger_file"
+        return 1
+    }
+
+    if [ -z "$replay_json" ] || ! printf '%s' "$replay_json" | jq empty 2>/dev/null; then
+        echo "migrate-ledger: [$project] GATE FAIL — replay produced invalid/empty JSON" >&2
+        _reject_project "$project" "$ledger_file"
+        return 1
+    fi
+
+    # Compare replay counters against derived_counters (NOT the possibly-poisoned scalars)
+    local gate_failed=0
+    local derived_json
+    derived_json=$(printf '%s' "$enumeration_json" | jq -c '.derived_counters')
+
+    # Write replay and derived to temp files to avoid bash heredoc variable expansion conflicts
+    local gate_tmp_dir
+    gate_tmp_dir=$(mktemp -d)
+    printf '%s' "$replay_json" > "${gate_tmp_dir}/replay.json"
+    printf '%s' "$derived_json" > "${gate_tmp_dir}/derived.json"
+    local gate3_py="${gate_tmp_dir}/gate3.py"
+    cat > "$gate3_py" <<'PYEOF3_SCRIPT'
+import json, sys
+replay_file  = sys.argv[1]
+derived_file = sys.argv[2]
+try:
+    replay  = json.load(open(replay_file))
+    derived = json.load(open(derived_file))
+except Exception as e:
+    print(f"GATE_PARSE_ERROR: {e}", file=sys.stderr); sys.exit(1)
+load_bearing = ["total", "completed", "pending", "in_progress", "blocked"]
+failures = []
+for k in load_bearing:
+    rv = replay.get(k, 0)
+    dv = derived.get(k, 0)
+    if rv != dv:
+        failures.append(f"  {k}: replay={rv} derived={dv}")
+if failures:
+    print("GATE_COUNTER_FAIL", file=sys.stderr)
+    for f in failures:
+        print(f, file=sys.stderr)
+    sys.exit(1)
+print("GATE_COUNTERS_OK")
+PYEOF3_SCRIPT
+
+    if ! python3 "$gate3_py" "${gate_tmp_dir}/replay.json" "${gate_tmp_dir}/derived.json" \
+            >/dev/null; then
+        gate_failed=1
+    fi
+    rm -rf "$gate_tmp_dir" 2>/dev/null || true
+
+    if [ "$gate_failed" -eq 1 ]; then
+        echo "migrate-ledger: [$project] GATE FAIL — replay counters != derived_counters" >&2
+        _reject_project "$project" "$ledger_file"
+        return 1
+    fi
+
+    # §5 step 4a: HIGH-4 verification — every enumerable open task has _idk,
+    # AND every enumerable task (open + terminal) has a created line in the ledger
+    local gate4a_tmp_dir
+    gate4a_tmp_dir=$(mktemp -d)
+    printf '%s' "$enumeration_json" > "${gate4a_tmp_dir}/enum.json"
+    local gate4a_py="${gate4a_tmp_dir}/gate4a.py"
+    cat > "$gate4a_py" <<'PYEOF4_SCRIPT'
+import json, sys, os
+
+project      = sys.argv[1]
+sessions_dir = sys.argv[2]
+ledger_file  = sys.argv[3]
+enum_file    = sys.argv[4]
+
+v11_home = os.environ.get("V11_HOME", "")
+sys.path.insert(0, v11_home + "/scripts/lib")
+try:
+    from normalize_subject import normalize_subject
+except ImportError:
+    def normalize_subject(s):
+        import unicodedata, re as re_
+        s = unicodedata.normalize("NFC", s).casefold()
+        return re_.sub(r'\s+', ' ', s).strip() or "__empty__"
+
+try:
+    enumeration = json.load(open(enum_file))
+except Exception as e:
+    print(f"GATE4A_PARSE_ERROR: {e}", file=sys.stderr); sys.exit(1)
+
+tasks = enumeration.get("tasks", [])
+
+# (i) Every enumerable OPEN task in surviving per-session STATE must carry _idk
+open_task_norms = {t["subject_norm"] for t in tasks if t["final_status"] not in ("completed", "blocked")}
+idk_missing = []
+if os.path.isdir(sessions_dir):
+    for sess_dir in os.listdir(sessions_dir):
+        state_file = os.path.join(sessions_dir, sess_dir, "task-state.json")
+        if not os.path.isfile(state_file):
+            continue
+        try:
+            state = json.load(open(state_file))
+        except Exception:
+            continue
+        if state.get("project") != project:
+            continue
+        open_tasks = state.get("open_tasks") or {}
+        for tid, task in open_tasks.items():
+            subj = task.get("subject") or ""
+            sn = normalize_subject(subj)
+            if sn in open_task_norms and not task.get("_idk"):
+                idk_missing.append(f"session={sess_dir} task_id={tid} subject_norm={sn}")
+
+# (ii) Every enumerable task (open AND terminal) must have a created line in the ledger
+all_task_norms = {t["subject_norm"] for t in tasks}
+try:
+    with open(ledger_file, "r", encoding="utf-8", errors="replace") as fh:
+        ledger_text = fh.read()
+except OSError as e:
+    print(f"GATE4A_LEDGER_READ_ERROR: {e}", file=sys.stderr); sys.exit(1)
+
+created_norms = set()
+for line in ledger_text.split("\n"):
+    if not line:
+        continue
+    try:
+        ev = json.loads(line)
+    except Exception:
+        continue
+    if ev.get("ev") == "created" and ev.get("project") == project:
+        created_norms.add(ev.get("subject_norm", ""))
+
+missing_created = all_task_norms - created_norms
+
+if idk_missing:
+    print("GATE4A_IDK_MISSING", file=sys.stderr)
+    for m in idk_missing:
+        print(f"  {m}", file=sys.stderr)
+    sys.exit(1)
+
+if missing_created:
+    print("GATE4A_CREATED_MISSING", file=sys.stderr)
+    for sn in missing_created:
+        print(f"  subject_norm={sn}", file=sys.stderr)
+    sys.exit(1)
+
+print("GATE4A_OK")
+PYEOF4_SCRIPT
+
+    if ! python3 "$gate4a_py" "$project" "$sessions_dir" "$ledger_file" \
+            "${gate4a_tmp_dir}/enum.json" >/dev/null; then
+        gate_failed=1
+    fi
+    rm -rf "$gate4a_tmp_dir" 2>/dev/null || true
+
+    if [ "$gate_failed" -eq 1 ]; then
+        echo "migrate-ledger: [$project] GATE FAIL — HIGH-4 step 4a verification failed" >&2
+        _reject_project "$project" "$ledger_file"
+        return 1
+    fi
+
+    # -----------------------------------------------------------------------
+    # Step 5: Write migration marker (ADR §5 step 5)
+    # -----------------------------------------------------------------------
+    echo "migrate-ledger: [$project] all gates PASSED — writing migration marker" >&2
+
+    local ledger_lines
+    ledger_lines=$(wc -l < "$ledger_file" 2>/dev/null || echo 0)
+    local from_aggregate_sha256
+    from_aggregate_sha256=$(sha256sum "$aggregate_file" 2>/dev/null | cut -d' ' -f1 || echo "unknown")
+
+    mkdir -p "$MIGRATED_DIR" 2>/dev/null || true
+    # Serialize counters_diverged as a proper JSON boolean
+    local _diverged_bool="false"
+    [ "$counters_diverged" -eq 1 ] 2>/dev/null && _diverged_bool="true"
+    jq -n \
+        --arg migrated_at "$now_ts" \
+        --arg from_aggregate_sha256 "$from_aggregate_sha256" \
+        --argjson derived_counters "$(printf '%s' "$enumeration_json" | jq '.derived_counters')" \
+        --argjson scalar_counters "$(printf '%s' "$enumeration_json" | jq '.scalar_counters')" \
+        --argjson counters_diverged "$_diverged_bool" \
+        --argjson ledger_lines "$ledger_lines" \
+        '{migrated_at: $migrated_at,
+          from_aggregate_sha256: $from_aggregate_sha256,
+          derived_counters: $derived_counters,
+          scalar_counters: $scalar_counters,
+          counters_diverged: $counters_diverged,
+          ledger_lines: $ledger_lines}' > "$marker_file" 2>/dev/null || {
+        echo "migrate-ledger: [$project] WARNING — failed to write marker file (migration still valid)" >&2
+    }
+
+    echo "migrate-ledger: [$project] migration COMPLETE (lines=$ledger_lines, counters_diverged=$counters_diverged)" >&2
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# Helper: emit zeroed baseline for a legacy pre-ledger project (no aggregate)
+# ---------------------------------------------------------------------------
+_seed_legacy_only() {
+    local project="$1" marker_file="$2" ledger_file="$3"
+    local now_ts
+    now_ts=$(date -Iseconds)
+    local migration_session="migration-$(date +%s)-$$"
+    mkdir -p "${LEDGER_DIR}" "${MIGRATED_DIR}" 2>/dev/null || true
+    local lock_file
+    lock_file=$(v11_ledger_path "$project" lock) || return 1
+    # Truncate-seed
+    (
+        exec 207>"$lock_file"
+        flock -w 10 207 || { echo "migrate-ledger: [$project] flock timeout for legacy seed" >&2; exit 1; }
+        : > "$ledger_file"
+    ) || return 1
+
+    # Emit zeroed reconcile
+    local reconcile_event
+    reconcile_event=$(jq -n \
+        --argjson v 1 \
+        --arg ev "reconcile" \
+        --arg ts "$now_ts" \
+        --arg project "$project" \
+        --arg subject_norm "" \
+        --argjson create_seq -1 \
+        --arg task_id "migration" \
+        --arg session_uuid "$migration_session" \
+        --arg scope "project" \
+        --argjson counters_abs '{"total":0,"pending":0,"in_progress":0,"completed":0,"blocked":0}' \
+        --arg reason "migration-baseline" \
+        --arg source "migration" \
+        '{v:$v, ev:$ev, ts:$ts, project:$project, subject_norm:$subject_norm,
+          create_seq:$create_seq, task_id:$task_id, session_uuid:$session_uuid,
+          scope:$scope, counters_abs:$counters_abs, reason:$reason, source:$source}')
+    v11_ledger_append "$project" "$reconcile_event" > /dev/null 2>/dev/null || true
+
+    # Write marker
+    jq -n \
+        --arg migrated_at "$now_ts" \
+        --arg from_aggregate_sha256 "none" \
+        --argjson derived_counters '{"total":0,"pending":0,"in_progress":0,"completed":0,"blocked":0}' \
+        --argjson scalar_counters '{"total":0,"pending":0,"in_progress":0,"completed":0,"blocked":0}' \
+        --argjson counters_diverged false \
+        --argjson ledger_lines 1 \
+        '{migrated_at: $migrated_at,
+          from_aggregate_sha256: $from_aggregate_sha256,
+          derived_counters: $derived_counters,
+          scalar_counters: $scalar_counters,
+          counters_diverged: $counters_diverged,
+          ledger_lines: $ledger_lines}' > "$marker_file" 2>/dev/null || true
+
+    echo "migrate-ledger: [$project] legacy pre-ledger project seeded (zeroed baseline)" >&2
+}
+
+# ---------------------------------------------------------------------------
+# Helper: reject a project (rename ledger to .rejected, emit loud error)
+# ---------------------------------------------------------------------------
+_reject_project() {
+    local project="$1" ledger_file="$2"
+    local rejected="${ledger_file}.rejected"
+    mv "$ledger_file" "$rejected" 2>/dev/null || true
+    echo "migrate-ledger: [$project] REJECTED — ledger renamed to $(basename "$rejected"); project stays LEGACY until investigated" >&2
+    echo "migrate-ledger: [$project] do NOT force-mark; triage the rejection first" >&2
+}
+
+# ---------------------------------------------------------------------------
+# Main: run single-project migration
+# ---------------------------------------------------------------------------
+if ! migrate_project "$PROJECT" "$DRY_RUN"; then
+    exit 1
+fi
+exit 0

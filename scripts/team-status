@@ -1,0 +1,156 @@
+#!/bin/bash
+# V11 Team Status - Show active Agent Teams, formation health, and diagnostics
+# Usage: ./scripts/team-status
+
+V11_WORKSPACE_ROOT="${V11_WORKSPACE_ROOT:-$HOME/.v11}"
+SESSIONS_ROOT="${SESSIONS_ROOT:-$V11_WORKSPACE_ROOT/sessions}"
+METRICS_DIR="$V11_WORKSPACE_ROOT/.agent-metrics"
+TASK_STATE_DIR="$METRICS_DIR/task-state"
+ACTIVE_PROJECT_FILE="$METRICS_DIR/active-project"
+
+# SEC-C-02: safe read of the active-project signal file.
+_v11_read_active_project_safe() {
+    local raw
+    [ -f "$ACTIVE_PROJECT_FILE" ] || return 0
+    [ -s "$ACTIVE_PROJECT_FILE" ] || return 0
+    raw=$(head -n 1 "$ACTIVE_PROJECT_FILE" 2>/dev/null | tr -d '[:space:]')
+    if printf '%s' "$raw" | grep -qE '^[a-zA-Z0-9._-]{1,64}$'; then
+        printf '%s' "$raw"
+    else
+        echo "team-status: rejected invalid content in $ACTIVE_PROJECT_FILE" >&2
+        return 0
+    fi
+}
+TEAMS_DIR="$HOME/.claude/teams"
+
+# Self-test
+if [ "${1:-}" == "--test" ]; then
+    echo "team-status v2.0 (V11.4)"
+    exit 0
+fi
+
+echo "=== V11 Agent Teams Status ==="
+echo "Generated: $(date -Iseconds)"
+echo ""
+
+# Check for active project (SEC-C-02: sanitized)
+PROJECT="$(_v11_read_active_project_safe)"
+if [ -n "$PROJECT" ]; then
+    echo "Active Project: $PROJECT"
+else
+    echo "Active Project: (none)"
+fi
+echo ""
+
+# Check for active teams
+if [ -d "$TEAMS_DIR" ] && [ "$(ls -A "$TEAMS_DIR" 2>/dev/null)" ]; then
+    echo "## Active Teams"
+    echo ""
+    for team_dir in "$TEAMS_DIR"/*/; do
+        [ -d "$team_dir" ] || continue
+        team_name=$(basename "$team_dir")
+        echo "### Team: $team_name"
+
+        # Check for config
+        if [ -f "$team_dir/config.json" ]; then
+            member_count=$(jq -r '.members | length // 0' "$team_dir/config.json" 2>/dev/null)
+            echo "  Members: $member_count"
+            jq -r '.members[]? | "  - \(.name // "unknown") (\(.role // "member")) [\(.model // "?")]"' "$team_dir/config.json" 2>/dev/null
+        else
+            file_count=$(ls "$team_dir" 2>/dev/null | wc -l)
+            echo "  Files: $file_count"
+        fi
+        echo ""
+    done
+else
+    echo "## Active Teams"
+    echo "  (no active teams)"
+    echo ""
+fi
+
+# Show task state for active project
+if [ -n "$PROJECT" ]; then
+    STATE_FILE="$TASK_STATE_DIR/${PROJECT}.json"
+    if [ -f "$STATE_FILE" ]; then
+        echo "## Task State: $PROJECT"
+        TOTAL=$(jq -r '.total // 0' "$STATE_FILE")
+        COMPLETED=$(jq -r '.completed // 0' "$STATE_FILE")
+        PENDING=$(jq -r '.pending // 0' "$STATE_FILE")
+        IN_PROGRESS=$(jq -r '.in_progress // 0' "$STATE_FILE")
+        PHASE=$(jq -r '.phase // "unknown"' "$STATE_FILE")
+
+        echo "  Phase: $PHASE"
+        echo "  Total: $TOTAL | Completed: $COMPLETED | Pending: $PENDING | In Progress: $IN_PROGRESS"
+
+        if [ "$TOTAL" -gt 0 ]; then
+            PCT=$((COMPLETED * 100 / TOTAL))
+            echo "  Progress: $PCT%"
+        fi
+
+        # Show recent completed
+        RECENT=$(jq -r '.recent_completed[:5][]? // empty' "$STATE_FILE" 2>/dev/null)
+        if [ -n "$RECENT" ]; then
+            echo ""
+            echo "  Recent:"
+            echo "$RECENT" | while read -r task; do
+                echo "    - $task"
+            done
+        fi
+    else
+        echo "## Task State: $PROJECT"
+        echo "  WARNING: No task state file found (tasks not activated)"
+    fi
+fi
+
+# V11.4: Formation registry diagnostics
+echo ""
+echo "## Formation Diagnostics"
+
+ZOMBIE_COUNT=0
+for session_dir in "$SESSIONS_ROOT"/*/; do
+    [ -d "$session_dir" ] || continue
+    proj_name=$(basename "$session_dir")
+
+    FORMATION_REG="$session_dir/.formation-registry.json"
+    [ -f "$FORMATION_REG" ] || continue
+
+    FORMATION_NAME=$(jq -r '.formation // "unknown"' "$FORMATION_REG" 2>/dev/null)
+
+    # Check for null agent_ids (formation defined but never spawned)
+    NULL_AGENTS=$(jq -r '[.teammates | to_entries[] | select(.value.agent_id == null or .value.agent_id == "PLACEHOLDER" or .value.agent_id == "null")] | length' "$FORMATION_REG" 2>/dev/null)
+    TOTAL_AGENTS=$(jq -r '.teammates | keys | length' "$FORMATION_REG" 2>/dev/null)
+
+    STATUS="active"
+    if [ "$NULL_AGENTS" -eq "$TOTAL_AGENTS" ] 2>/dev/null; then
+        STATUS="ZOMBIE (never spawned)"
+        ZOMBIE_COUNT=$((ZOMBIE_COUNT + 1))
+    elif [ "$NULL_AGENTS" -gt 0 ] 2>/dev/null; then
+        STATUS="PARTIAL ($NULL_AGENTS/$TOTAL_AGENTS unspawned)"
+    fi
+
+    echo ""
+    echo "  Project: $proj_name"
+    echo "    Formation: $FORMATION_NAME"
+    echo "    Status: $STATUS"
+    jq -r '.teammates | to_entries[] | "    \(.key): \(.value.agent) [id: \(.value.agent_id // "null")]"' "$FORMATION_REG" 2>/dev/null
+
+    # Check task state for this project
+    PROJ_STATE="$TASK_STATE_DIR/${proj_name}.json"
+    if [ -f "$PROJ_STATE" ]; then
+        PROJ_TOTAL=$(jq -r '.total // 0' "$PROJ_STATE")
+        PROJ_COMPLETED=$(jq -r '.completed // 0' "$PROJ_STATE")
+        echo "    Tasks: $PROJ_COMPLETED/$PROJ_TOTAL"
+    else
+        echo "    Tasks: (no task state — system not activated)"
+    fi
+done
+
+if [ "$ZOMBIE_COUNT" -gt 0 ]; then
+    echo ""
+    echo "  WARNING: $ZOMBIE_COUNT zombie formation(s) detected (defined but never spawned)"
+    echo "  Recommend: Archive or activate. Use /v11 diagnose for details."
+fi
+
+echo ""
+echo "---"
+echo "Usage: ./scripts/team-status"

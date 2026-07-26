@@ -1,0 +1,191 @@
+# Gates: ${PROJECT_NAME}
+
+> Gates are critical checkpoints that block downstream work until criteria are met.
+
+## Overview
+
+| Gate | Name | Status | Unlocks |
+|------|------|--------|---------|
+| Gate 0 | ${GATE_0_NAME} | ${GATE_0_STATUS} | ${GATE_0_UNLOCKS} |
+| Gate 1 | ${GATE_1_NAME} | ${GATE_1_STATUS} | ${GATE_1_UNLOCKS} |
+| Gate 2 | ${GATE_2_NAME} | ${GATE_2_STATUS} | ${GATE_2_UNLOCKS} |
+
+---
+
+## Gate ${GATE_NUMBER}: ${GATE_NAME}
+
+**Purpose**: ${GATE_PURPOSE}
+**Type**: [technical | milestone | dependency]
+
+### Criteria
+
+All must pass:
+- [ ] ${CRITERION_1}
+- [ ] ${CRITERION_2}
+- [ ] ${CRITERION_3}
+- [ ] ${CRITERION_4}
+
+**Current**: ${CURRENT_STATUS} (${PASSED_COUNT}/${TOTAL_COUNT} met)
+
+### Validation Method
+
+Prefer probe-query commands (curl the app's runtime verification surface — `/health`,
+`/__introspect`, `window.__debug`, `--json`) over screenshots; reserve screenshots for
+the final human gate.
+
+```bash
+${VALIDATION_COMMAND_1}
+${VALIDATION_COMMAND_2}
+${VALIDATION_COMMAND_3}
+```
+
+**Expected results**:
+- ${EXPECTED_RESULT_1}
+- ${EXPECTED_RESULT_2}
+- ${EXPECTED_RESULT_3}
+
+### Dependencies
+
+**Unlocks**: ${UNLOCKED_SPRINT_1}, ${UNLOCKED_SPRINT_2}
+**Blocks**: ${BLOCKED_SPRINT_1}, ${BLOCKED_SPRINT_2}
+
+### Status
+
+- **Current state**: ${CURRENT_STATE}
+- **Pass date**: ${PASS_DATE}
+- **Blocker**: ${BLOCKER_DESCRIPTION}
+
+### Notes
+${GATE_NOTES}
+
+---
+
+## Gate Pass Protocol
+
+To pass a gate:
+1. ✅ Complete all criteria checkboxes
+2. ✅ Run validation commands successfully
+3. ✅ Document evidence in Notes section
+4. ✅ Update status to "passed"
+5. ✅ Record pass date
+6. ✅ Update state.md with gate pass
+7. ✅ Unblock dependent sprints
+
+---
+
+## Gate Status Definitions
+
+| Status | Meaning | Next Action |
+|--------|---------|-------------|
+| **pending** | Criteria not met | Continue work |
+| **validating** | Testing in progress | Wait for results |
+| **passed** | All criteria passed | Proceed to next phase |
+| **failed** | Validation failed | Fix blockers, retry |
+| **blocked** | External dependency | Wait for unblock |
+
+---
+
+## Example Gate (Reference)
+
+## Gate 0: Database Foundation
+
+**Purpose**: Ensure database production-ready before API layer
+**Type**: technical
+
+### Criteria
+
+All must pass:
+- [x] PostgreSQL 15 running in docker
+- [x] Schema migrations configured (Alembic)
+- [x] Connection pooling (pg_bouncer)
+- [ ] Backup/restore tested
+
+**Current**: validating (3/4 met)
+
+### Validation Method
+
+```bash
+docker ps | grep postgres
+docker exec postgres psql -U app -c "SELECT version();"
+alembic upgrade head
+alembic downgrade -1
+alembic upgrade head
+./scripts/test-db-connection
+pg_isready -h localhost -p 5432
+```
+
+**Expected results**:
+- PostgreSQL container running and healthy
+- Version output: "PostgreSQL 15.x"
+- Migrations apply cleanly (no errors)
+- Connection pool accepts connections
+- Backup script creates valid dump file
+
+### Dependencies
+
+**Unlocks**: Sprint 1 (API Development), Sprint 2 (User Management)
+**Blocks**: Sprint 3 (Advanced Features), Sprint 4 (Data Analytics)
+
+### Status
+
+- **Current state**: validating
+- **Pass date**: TBD
+- **Blocker**: Backup script needs S3 credentials
+
+### Notes
+- Using pg_bouncer with max_client_conn=100
+- Migration files in /migrations/versions/
+- Backup strategy: daily snapshots to S3, 30-day retention
+
+---
+
+## Task Dependency Mapping (V8)
+
+> Gates map to Claude Code 2026 Tasks system for automated dependency enforcement.
+
+### Gate → Task Mapping
+
+Gates translate to Task dependencies:
+- **Gate criteria** → Individual tasks with `TaskCreate`
+- **Gate unlock** → `TaskUpdate(addBlocks=[...])`
+- **Gate block** → `TaskUpdate(addBlockedBy=[...])`
+
+| Gate | Blocking Tasks | Unlocked Tasks | Task IDs |
+|------|----------------|----------------|----------|
+| Gate ${GATE_NUMBER} | Sprint ${BLOCKING_SPRINT} all tasks | Sprint ${UNLOCKED_SPRINT} all tasks | gate-${GATE_NUMBER}-* |
+
+### Creating Gate Tasks
+
+```bash
+# Gate criteria as individual tasks
+TaskCreate(subject="Gate ${GATE_NUMBER}: ${CRITERION_1}", description="...")
+TaskCreate(subject="Gate ${GATE_NUMBER}: ${CRITERION_2}", description="...")
+
+# Gate pass task (blocked by all criteria)
+TaskCreate(subject="Gate ${GATE_NUMBER} Pass", description="All criteria met")
+TaskUpdate(taskId="gate-${GATE_NUMBER}-pass", addBlockedBy=["gate-${GATE_NUMBER}-1", "gate-${GATE_NUMBER}-2"])
+
+# Unlock downstream sprints when gate passes
+TaskUpdate(taskId="sprint-${UNLOCKED_SPRINT}-01", addBlockedBy=["gate-${GATE_NUMBER}-pass"])
+```
+
+### Gate Status via TaskList
+
+Instead of manual status tracking, query Tasks:
+```bash
+TaskList  # Shows gate tasks with status (pending/in_progress/completed)
+TaskGet(taskId="gate-${GATE_NUMBER}-pass")  # Check if gate passed
+```
+
+### Auto-Unblock Pattern
+
+When gate passes, downstream sprints auto-unblock:
+```
+Gate ${GATE_NUMBER} criteria tasks (all complete)
+    └── Gate ${GATE_NUMBER} Pass (completes)
+        └── Sprint ${UNLOCKED_SPRINT} tasks (unblocked)
+```
+
+---
+
+Created: ${DATE}

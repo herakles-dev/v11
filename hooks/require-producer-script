@@ -1,0 +1,154 @@
+#!/bin/bash
+# V11 Hook: require-producer-script (PreToolUse — Bash)
+# Blocks `git commit` when staged paths include empirical-artifact files
+# (*_validation.json, *_results.csv) that lack a sibling producer script.
+#
+# Doctrine: S54-T1 review (commit example-project/74ed933) caught `arrival_order_validation.json`
+# shipped without a producer script, making the `Validation: LIVE` tag unverifiable.
+# This hook codifies that discipline so future commits are caught automatically.
+# See: feedback_validation_artifact_producer.md, spec-sprint-55.md §T1.
+#
+# Exit codes:
+#   0 - Allow operation (no validation artifacts, or all have producers, or gate is off)
+#   2 - Block operation (validation artifact staged without sibling producer)
+#
+# Rollback lever: V11_PRODUCER_SCRIPT_REQUIRED=off  (exits 0 unconditionally with warning)
+#
+# Sibling producer patterns (in artifact's directory OR in staged set):
+#   produce_*.py, produce_*.sh, run_*.py
+#
+# Artifact globs:
+#   *_validation.json, *_results.csv, *_results.log, *_results.json
+#   Accepted separators before the keyword: `_`, `.`, `-`  (e.g. `foo_results.log`,
+#   `seed-bisect-results.log`, `bench.results.json`).
+#   Bare filenames like `results.json` at repo root are INTENTIONALLY excluded
+#   (the separator anchor avoids over-matching incidental files); validation
+#   artifacts are expected to carry a project prefix.
+#   (Widened in S57-T0a after retro 2026-06-04 rec #3: S55-T3 seed-bisect-results.log
+#    slipped through the original *_results.csv-only filter.)
+#
+# V11 spec: S55-T1 (2026-06-02)
+
+# Rollback lever check — must be first
+if [ "${V11_PRODUCER_SCRIPT_REQUIRED:-on}" = "off" ]; then
+    echo "[require-producer-script] Gate is OFF (V11_PRODUCER_SCRIPT_REQUIRED=off) — skipping check." >&2
+    exit 0
+fi
+
+# Self-test mode
+if [ "$1" = "--test" ]; then
+    echo "require-producer-script v1 (S55-T1, blocks missing producer on validation artifacts)"
+    exit 0
+fi
+
+# Read JSON input from stdin
+INPUT=$(cat)
+
+# Only fire on Bash tool invocations
+TOOL_NAME=$(printf '%s' "$INPUT" | jq -r '.tool_name // "unknown"' 2>/dev/null)
+if [ "$TOOL_NAME" != "Bash" ]; then
+    exit 0
+fi
+
+# Only fire when the command is a git commit
+COMMAND=$(printf '%s' "$INPUT" | jq -r '.tool_input.command // ""' 2>/dev/null)
+if ! printf '%s' "$COMMAND" | grep -qE '(^|[[:space:]])git[[:space:]]+commit([[:space:]]|$)'; then
+    exit 0
+fi
+
+# Resolve the working directory for git operations
+CWD=$(printf '%s' "$INPUT" | jq -r '.working_directory // ""' 2>/dev/null)
+if [ -z "$CWD" ]; then
+    CWD="$(pwd)"
+fi
+
+# Collect staged paths
+STAGED_PATHS=$(git -C "$CWD" diff --cached --name-only 2>/dev/null)
+if [ -z "$STAGED_PATHS" ]; then
+    exit 0
+fi
+
+# Identify staged full paths matching the artifact globs
+ARTIFACT_PATTERNS='[._-]validation\.json$|[._-]results\.(csv|log|json)$'
+MATCHED_ARTIFACTS=()
+while IFS= read -r rel_path; do
+    if printf '%s' "$rel_path" | grep -qE "$ARTIFACT_PATTERNS"; then
+        MATCHED_ARTIFACTS+=("$rel_path")
+    fi
+done <<< "$STAGED_PATHS"
+
+# No matching artifacts — nothing to enforce
+if [ "${#MATCHED_ARTIFACTS[@]}" -eq 0 ]; then
+    exit 0
+fi
+
+# Producer patterns to look for
+PRODUCER_PATTERNS='^produce_.*\.(py|sh)$|^run_.*\.py$'
+
+# Build set of staged filenames (basename only) for staged-set check
+STAGED_BASENAMES=()
+while IFS= read -r rel_path; do
+    STAGED_BASENAMES+=("$(basename "$rel_path")")
+done <<< "$STAGED_PATHS"
+
+VIOLATIONS=()
+
+for artifact_rel in "${MATCHED_ARTIFACTS[@]}"; do
+    artifact_abs="$CWD/$artifact_rel"
+    artifact_dir=$(dirname "$artifact_abs")
+    artifact_base=$(basename "$artifact_rel")
+    found_producer=0
+
+    # Check 1: sibling file on disk in the same directory
+    if [ -d "$artifact_dir" ]; then
+        while IFS= read -r -d '' candidate; do
+            candidate_base=$(basename "$candidate")
+            if printf '%s' "$candidate_base" | grep -qE "$PRODUCER_PATTERNS"; then
+                found_producer=1
+                break
+            fi
+        done < <(find "$artifact_dir" -maxdepth 1 -type f -print0 2>/dev/null)
+    fi
+
+    # Check 2: producer in the staged set (same directory prefix)
+    if [ "$found_producer" -eq 0 ]; then
+        artifact_dir_rel=$(dirname "$artifact_rel")
+        while IFS= read -r staged_rel; do
+            staged_dir_rel=$(dirname "$staged_rel")
+            if [ "$staged_dir_rel" = "$artifact_dir_rel" ]; then
+                staged_base=$(basename "$staged_rel")
+                if printf '%s' "$staged_base" | grep -qE "$PRODUCER_PATTERNS"; then
+                    found_producer=1
+                    break
+                fi
+            fi
+        done <<< "$STAGED_PATHS"
+    fi
+
+    if [ "$found_producer" -eq 0 ]; then
+        VIOLATIONS+=("$artifact_base")
+    fi
+done
+
+if [ "${#VIOLATIONS[@]}" -eq 0 ]; then
+    exit 0
+fi
+
+# Block the commit with a clear error
+echo "" >&2
+echo "[require-producer-script] BLOCKED: Validation artifact(s) staged without a sibling producer script." >&2
+echo "" >&2
+echo "  Affected artifact(s):" >&2
+for v in "${VIOLATIONS[@]}"; do
+    echo "    - $v" >&2
+done
+echo "" >&2
+echo "  A producer script (produce_*.py, produce_*.sh, or run_*.py) must exist" >&2
+echo "  in the same directory as each validation artifact, OR be staged in the same commit." >&2
+echo "" >&2
+echo "  This ensures the Validation: LIVE tag can be independently verified." >&2
+echo "  Doctrine: feedback_validation_artifact_producer.md (S54-T1 review, commit example-project/74ed933)" >&2
+echo "" >&2
+echo "  Rollback lever: V11_PRODUCER_SCRIPT_REQUIRED=off git commit ..." >&2
+echo "" >&2
+exit 2

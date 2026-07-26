@@ -1,0 +1,214 @@
+#!/bin/bash
+# V11 Script: v11-bootstrap-session
+#
+# Initializes V11 state files for a session where hooks weren't loaded at boot.
+# Claude Code reads settings.json once at session start — mid-session hook
+# installations are no-ops. This script creates the state that hooks would have
+# created, so the NEXT hook-aware session finds valid state (and so scripts
+# like status/handoff work in the current session).
+#
+# Usage:
+#   v11-bootstrap-session PROJECT         # Bootstrap named project
+#   v11-bootstrap-session                  # Detect from CWD
+#   v11-bootstrap-session --check          # Check if bootstrap is needed
+#   v11-bootstrap-session --help           # Show this help
+
+set -euo pipefail
+
+V11_WORKSPACE_ROOT="${V11_WORKSPACE_ROOT:-$HOME/.v11}"
+SESSIONS_ROOT="${SESSIONS_ROOT:-$V11_WORKSPACE_ROOT/sessions}"
+METRICS_DIR="$V11_WORKSPACE_ROOT/.agent-metrics"
+ACTIVE_PROJECT_FILE="$METRICS_DIR/active-project"
+NOW=$(date -Iseconds)
+
+# --- arg parsing ---
+PROJECT=""
+CHECK_ONLY=false
+
+for arg in "$@"; do
+    case "$arg" in
+        --help|-h)
+            sed -n '3,16p' "$0" | sed 's/^# \{0,1\}//'
+            exit 0
+            ;;
+        --check) CHECK_ONLY=true ;;
+        --test) echo "v11-bootstrap-session OK"; exit 0 ;;
+        -*) echo "Unknown flag: $arg" >&2; exit 1 ;;
+        *)
+            [ -n "$PROJECT" ] && { echo "Multiple project names given" >&2; exit 1; }
+            PROJECT="$arg"
+            ;;
+    esac
+done
+
+# --- resolve project ---
+if [ -z "$PROJECT" ]; then
+    # Try CWD-based detection (same logic as detect-project)
+    CWD="$PWD"
+    if [[ "$CWD" =~ ^$SESSIONS_ROOT/([^/]+) ]]; then
+        PROJECT="${BASH_REMATCH[1]}"
+    elif [[ "$CWD" =~ ^$V11_WORKSPACE_ROOT/([^/]+) ]]; then
+        candidate="${BASH_REMATCH[1]}"
+        # Exclude infra dirs
+        case "$candidate" in
+            .agent-metrics|.claude|.config|.local|.cache|scripts|node_modules) ;;
+            *) PROJECT="$candidate" ;;
+        esac
+    fi
+fi
+
+if [ -z "$PROJECT" ]; then
+    echo "ERROR: Could not detect project. Usage: v11-bootstrap-session PROJECT" >&2
+    exit 1
+fi
+
+# Sanitize (same regex as common.sh v11_read_active_project)
+if ! [[ "$PROJECT" =~ ^[a-zA-Z0-9._-]+$ ]]; then
+    echo "ERROR: Invalid project name: $PROJECT" >&2
+    exit 1
+fi
+
+SESSION_DIR="$SESSIONS_ROOT/$PROJECT"
+AUTONOMY_FILE="$SESSION_DIR/.autonomy-state"
+TASK_STATE_FILE="$METRICS_DIR/task-state/$PROJECT.json"  # aggregate
+START_FILE="$SESSION_DIR/.session-start"
+
+# V11.13: per-session state path. When V11_SESSION_ID is set (real Claude session),
+# bootstrap writes a per-session file there. When unset (CLI invocation), use a
+# stable "legacy-bootstrap" namespace so migration can tell it apart from real
+# sessions.
+if [ -n "${V11_SESSION_ID:-}" ] && [[ "$V11_SESSION_ID" =~ ^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$ ]]; then
+    SESSION_UUID="$V11_SESSION_ID"
+else
+    SESSION_UUID="legacy-bootstrap-$PROJECT"
+fi
+PER_SESSION_STATE_FILE="$METRICS_DIR/sessions/$SESSION_UUID/task-state.json"
+
+# --- check mode ---
+if $CHECK_ONLY; then
+    needs=0
+    [ ! -f "$ACTIVE_PROJECT_FILE" ] || [ "$(tr -d '[:space:]' < "$ACTIVE_PROJECT_FILE" 2>/dev/null)" != "$PROJECT" ] && {
+        echo "NEEDS BOOTSTRAP: active-project is '$(cat "$ACTIVE_PROJECT_FILE" 2>/dev/null || echo "(missing)")' not '$PROJECT'"
+        needs=1
+    }
+    [ ! -d "$SESSION_DIR" ] && { echo "NEEDS BOOTSTRAP: session dir missing"; needs=1; }
+    [ ! -f "$AUTONOMY_FILE" ] || [ ! -s "$AUTONOMY_FILE" ] && { echo "NEEDS BOOTSTRAP: autonomy-state missing/empty"; needs=1; }
+    [ ! -f "$PER_SESSION_STATE_FILE" ] || [ ! -s "$PER_SESSION_STATE_FILE" ] && { echo "NEEDS BOOTSTRAP: per-session task-state missing/empty ($PER_SESSION_STATE_FILE)"; needs=1; }
+    [ "$needs" -eq 0 ] && echo "OK: $PROJECT state looks initialized"
+    exit $needs
+fi
+
+# --- bootstrap ---
+echo "Bootstrapping V11 state for: $PROJECT"
+changes=0
+
+# 1. active-project
+mkdir -p "$METRICS_DIR"
+current_active=""
+[ -f "$ACTIVE_PROJECT_FILE" ] && current_active=$(tr -d '[:space:]' < "$ACTIVE_PROJECT_FILE" 2>/dev/null || true)
+if [ "$current_active" != "$PROJECT" ]; then
+    printf '%s\n' "$PROJECT" > "$ACTIVE_PROJECT_FILE"
+    echo "  [+] active-project → $PROJECT (was: ${current_active:-<empty>})"
+    changes=$((changes + 1))
+else
+    echo "  [=] active-project already $PROJECT"
+fi
+
+# 2. session dir
+if [ ! -d "$SESSION_DIR" ]; then
+    mkdir -p "$SESSION_DIR"
+    echo "  [+] created $SESSION_DIR"
+    changes=$((changes + 1))
+else
+    echo "  [=] session dir exists"
+fi
+
+# 3. session-start
+if [ ! -f "$START_FILE" ]; then
+    printf '%s\n' "$NOW" > "$START_FILE"
+    echo "  [+] .session-start → $NOW"
+    changes=$((changes + 1))
+else
+    echo "  [=] .session-start exists ($(cat "$START_FILE"))"
+fi
+
+# 4. autonomy-state
+if [ ! -f "$AUTONOMY_FILE" ] || [ ! -s "$AUTONOMY_FILE" ]; then
+    cat > "$AUTONOMY_FILE" << 'AUTONOMY'
+{"level": "A0", "name": "Manual", "successes": 0, "rollbacks": 0, "grants": [], "history": []}
+AUTONOMY
+    echo "  [+] .autonomy-state → A0 (Manual)"
+    changes=$((changes + 1))
+else
+    level=$(jq -r '.level // "unknown"' "$AUTONOMY_FILE" 2>/dev/null || echo "unknown")
+    echo "  [=] .autonomy-state exists ($level)"
+fi
+
+# 5. task-state — V11.13 per-session ownership.
+# Writing directly to the aggregate path is wrong post-V11.13 — the aggregate
+# is derived from per-session files. Instead write the per-session file for
+# this Claude session (or "legacy-bootstrap-{project}" if invoked from CLI)
+# and trigger an aggregate rebuild.
+mkdir -p "$(dirname "$PER_SESSION_STATE_FILE")"
+mkdir -p "$METRICS_DIR/task-state"
+if [ ! -f "$PER_SESSION_STATE_FILE" ] || [ ! -s "$PER_SESSION_STATE_FILE" ]; then
+    jq -nc \
+        --arg sid "$SESSION_UUID" \
+        --arg project "$PROJECT" \
+        --arg ts "$NOW" \
+        '{
+            session_uuid: $sid,
+            project: $project,
+            total: 0,
+            completed: 0,
+            pending: 0,
+            in_progress: 0,
+            blocked: 0,
+            phase: "discovery",
+            active_task: null,
+            active_task_ids: [],
+            active_agent_id: null,
+            recent_completed: [],
+            open_tasks: {},
+            recommended_agents: {},
+            last_updated: $ts,
+            bootstrapped: true
+        }' > "$PER_SESSION_STATE_FILE"
+    echo "  [+] per-session state → $PER_SESSION_STATE_FILE (bootstrapped=true, session=$SESSION_UUID)"
+    changes=$((changes + 1))
+
+    # Rebuild aggregate so legacy readers see the bootstrapped state too.
+    # Source common.sh inside a subshell to keep this script's set -euo pipefail clean.
+    V11_WORKSPACE_ROOT="$V11_WORKSPACE_ROOT" \
+    SESSIONS_ROOT="$SESSIONS_ROOT" \
+    METRICS_DIR="$METRICS_DIR" \
+    V11_SESSION_ID="$SESSION_UUID" \
+        bash -c "source '$(dirname "$(readlink -f "$0")")/../hooks/lib/common.sh'; v11_rebuild_project_aggregate '$PROJECT'" \
+        >/dev/null 2>&1 || true
+else
+    total=$(jq -r '.total // 0' "$PER_SESSION_STATE_FILE" 2>/dev/null || echo "?")
+    echo "  [=] per-session state exists ($total tasks, session=$SESSION_UUID)"
+fi
+
+echo ""
+if [ "$changes" -gt 0 ]; then
+    echo "Bootstrap complete: $changes changes."
+else
+    echo "No changes needed — state was already initialized."
+fi
+echo ""
+echo "NOTE: Hooks still won't fire in the current session (settings.json is"
+echo "cached at boot). State files are now valid for scripts and the next"
+echo "hook-aware session. To get full hook support: restart Claude Code."
+
+# V11.13: surface handoff-tasks.json if present
+HANDOFF_TASKS="$SESSION_DIR/handoff-tasks.json"
+if [ -f "$HANDOFF_TASKS" ]; then
+    open_count=$(jq -r '.open_tasks | length' "$HANDOFF_TASKS" 2>/dev/null || echo "?")
+    if [ "${open_count:-0}" != "0" ] && [ -n "${open_count:-}" ]; then
+        echo ""
+        echo "REHYDRATE: ${open_count} open task(s) from prior session — run:"
+        echo "  ./scripts/v11-resume-tasks $PROJECT"
+        echo "…then Claude issues TaskCreate per the emitted <v11-resume> block."
+    fi
+fi

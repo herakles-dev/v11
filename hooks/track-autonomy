@@ -1,0 +1,351 @@
+#!/bin/bash
+# V11 Hook: track-autonomy (PostToolUse — Write|Edit|Bash)
+# Updates trust metrics AND writes audit log in a single pass.
+# Replaces V8 track-autonomy-score (193L) + audit-autonomy-action (191L).
+# Never blocks (exit 0 always).
+source "$(dirname "${BASH_SOURCE[0]}")/lib/common.sh"
+
+# --- CLI flags ---
+if [ "$1" == "--test" ]; then echo "track-autonomy v1 (merged score+audit)"; exit 0; fi
+
+if [ "$1" == "--recent" ]; then
+    AUDIT_LOG="$METRICS_DIR/autonomy-audit.jsonl"
+    if [ -f "$AUDIT_LOG" ]; then tail -n "${2:-20}" "$AUDIT_LOG" | jq -s '.'; else echo "[]"; fi
+    exit 0
+fi
+
+if [ "$1" == "--stats" ]; then
+    AUDIT_LOG="$METRICS_DIR/autonomy-audit.jsonl"
+    if [ -f "$AUDIT_LOG" ]; then
+        echo "=== Autonomy Audit Statistics ==="
+        echo "Total entries: $(wc -l < "$AUDIT_LOG")"
+        echo ""; echo "By outcome:"
+        jq -s 'group_by(.outcome) | map({outcome: .[0].outcome, count: length})' "$AUDIT_LOG"
+        echo ""; echo "By risk level:"
+        jq -s 'group_by(.risk_level) | map({risk_level: .[0].risk_level, count: length})' "$AUDIT_LOG"
+        echo ""; echo "By approval method:"
+        jq -s 'group_by(.approval_method) | map({method: .[0].approval_method, count: length})' "$AUDIT_LOG"
+    else echo "No audit log found"; fi
+    exit 0
+fi
+
+# --- Main hook logic ---
+v11_parse_input
+case "$V11_TOOL_NAME" in Write|Edit|Bash) ;; *) exit 0 ;; esac
+
+RISK_LEVEL=$(v11_risk_level)
+[ "$RISK_LEVEL" == "low" ] && exit 0
+
+mkdir -p "$METRICS_DIR"
+
+# Outcome
+OUTCOME="success"
+[ -n "$V11_ERROR" ] && [ "$V11_ERROR" != "null" ] && OUTCOME="error"
+
+# Category from file extension or command
+CATEGORY="other"
+if [ -n "$V11_FILE_PATH" ]; then
+    case "${V11_FILE_PATH##*.}" in
+        ts|tsx|js|jsx) CATEGORY="typescript" ;;
+        py)            CATEGORY="python" ;;
+        sh|bash)       CATEGORY="shell" ;;
+        md)            CATEGORY="markdown" ;;
+        json|yaml|yml) CATEGORY="config" ;;
+    esac
+elif [ -n "$V11_COMMAND" ]; then
+    case "$V11_COMMAND" in
+        git\ *)                  CATEGORY="git" ;;
+        docker\ *)               CATEGORY="docker" ;;
+        npm\ *|yarn\ *|pnpm\ *) CATEGORY="npm" ;;
+        *)                       CATEGORY="shell" ;;
+    esac
+fi
+
+NOW=$(date -Iseconds)
+
+# Detect project from file path or command (moved before state file determination)
+v11_detect_project "$V11_FILE_PATH"
+if [ -z "$V11_PROJECT" ] && [ -n "$V11_COMMAND" ]; then
+    CMD_PATH=$(printf '%s' "$V11_COMMAND" | grep -oE "$V11_WORKSPACE_ROOT/[^ ]+" | head -1)
+    [ -n "$CMD_PATH" ] && v11_detect_project "$CMD_PATH"
+fi
+
+# Write to project-local state if project detected, else NOOP (don't track)
+if [ -n "$V11_PROJECT" ]; then
+    STATE_FILE="$SESSIONS_ROOT/$V11_PROJECT/.autonomy-state"
+    mkdir -p "$(dirname "$STATE_FILE")"
+else
+    # No project context — skip state update (safety fallback)
+    STATE_FILE=""
+fi
+
+# ==== PART A: Update Trust Score ====
+
+if [ -n "$STATE_FILE" ] && [ -f "$STATE_FILE" ] && [ -s "$STATE_FILE" ] && jq empty "$STATE_FILE" 2>/dev/null; then
+    STATE=$(cat "$STATE_FILE")
+else
+    # File missing, empty, or invalid JSON — initialize fresh state
+    [ -n "$STATE_FILE" ] && [ -f "$STATE_FILE" ] && ! [ -s "$STATE_FILE" ] && \
+        echo "track-autonomy: autonomy-state empty/invalid, reinitializing ($STATE_FILE)" >&2
+    # FH-007 (Wave 3c): rollbacks field removed — never incremented, dead tracking.
+    # If rollback tracking is wired in the future, reinstate as a new field.
+    STATE=$(jq -n --arg t "$NOW" '{
+        level:0, successful:0, errors:0,
+        approved_categories:[], grants:[],
+        high_risk_history:[], recent_errors:[], last_updated:$t}')
+fi
+
+CURRENT_LEVEL=$(printf '%s' "$STATE" | jq -r '.level // 0')
+SUCCESSFUL=$(printf '%s' "$STATE" | jq -r '.successful // 0')
+ERRORS=$(printf '%s' "$STATE" | jq -r '.errors // 0')
+
+if [ "$OUTCOME" == "success" ]; then
+    SUCCESSFUL=$((SUCCESSFUL + 1))
+    # Add category to approved_categories if not present
+    if [ -n "$CATEGORY" ] && [ "$CATEGORY" != "other" ]; then
+        STATE=$(printf '%s' "$STATE" | jq --arg c "$CATEGORY" \
+            'if (.approved_categories | index($c)) then . else .approved_categories += [$c] end')
+    fi
+    # Escalation thresholds (A3→A4 and A4→A5 require explicit user grant via scripts/autonomy-grant).
+    NEW_LEVEL=$CURRENT_LEVEL
+    if   [ "$CURRENT_LEVEL" -eq 0 ] && [ "$SUCCESSFUL" -ge 5 ]; then NEW_LEVEL=1
+    elif [ "$CURRENT_LEVEL" -eq 1 ] && [ "$SUCCESSFUL" -ge 10 ]; then NEW_LEVEL=2
+    elif [ "$CURRENT_LEVEL" -eq 2 ] && [ "$SUCCESSFUL" -ge 25 ]; then NEW_LEVEL=3; fi
+    if [ "$NEW_LEVEL" -gt "$CURRENT_LEVEL" ]; then
+        CURRENT_LEVEL=$NEW_LEVEL
+        echo "[$NOW] [${V11_PROJECT:-unknown}] Autonomy escalated to A$CURRENT_LEVEL (successful=$SUCCESSFUL)" \
+            >> "$METRICS_DIR/autonomy-changes.log"
+    fi
+else
+    ERRORS=$((ERRORS + 1))
+    # Record in recent_errors (keep last 10)
+    STATE=$(printf '%s' "$STATE" | jq --arg t "$NOW" --arg e "${V11_ERROR:0:200}" \
+        '.recent_errors = ([{timestamp:$t, error:$e}] + .recent_errors)[:10]')
+    if [ "$CURRENT_LEVEL" -gt 0 ]; then
+        NEW_LEVEL=$((CURRENT_LEVEL - 1))
+        # 2+ errors in 10 min → drop to A0
+        # Compute cutoff timestamp in shell (portable — no jq todate dependency)
+        _CUTOFF=$(date -d '10 minutes ago' -Iseconds 2>/dev/null || date -v-10M -Iseconds 2>/dev/null || echo "1970-01-01T00:00:00")
+        RECENT_COUNT=$(printf '%s' "$STATE" | jq --arg cutoff "$_CUTOFF" \
+            '[.recent_errors[] | select(.timestamp > $cutoff)] | length' 2>/dev/null)
+        [ "${RECENT_COUNT:-0}" -ge 2 ] && NEW_LEVEL=0
+        CURRENT_LEVEL=$NEW_LEVEL
+        echo "[$NOW] [${V11_PROJECT:-unknown}] Autonomy de-escalated to A$CURRENT_LEVEL (errors=$ERRORS)" \
+            >> "$METRICS_DIR/autonomy-changes.log"
+    fi
+fi
+
+# Persist updated state (only if project-local) — atomic write via PID-suffixed tmp
+# to avoid truncating the target when jq produces no output
+if [ -n "$STATE_FILE" ]; then
+    (
+        flock -w 5 200 || exit 0
+        _TMP="$STATE_FILE.tmp.$$"
+        printf '%s' "$STATE" | jq \
+            --argjson level "$CURRENT_LEVEL" --argjson successful "$SUCCESSFUL" \
+            --argjson errors "$ERRORS" --arg t "$NOW" \
+            '.level=$level|.successful=$successful|.errors=$errors|.last_updated=$t|del(.rollbacks)' \
+            > "$_TMP"
+        if [ -s "$_TMP" ] && jq empty "$_TMP" 2>/dev/null; then
+            mv "$_TMP" "$STATE_FILE"
+        else
+            rm -f "$_TMP"
+            echo "track-autonomy: jq produced empty/invalid output; existing state preserved ($STATE_FILE)" >&2
+        fi
+    ) 200>"$STATE_FILE.lock"
+fi
+
+# V11.27 T3: A4 high_risk_history dead-gate legibility (F5 inert-instrumentation).
+# At level>=4 the high-risk gate (common.sh:1056-1075) auto-approves ONLY when the
+# command matches an entry in high_risk_history — but NO code path appends to that
+# array anywhere, so an A4 project with an empty history blocks EVERY high-risk op
+# (any([])==false → return 2). A silent always-block masquerading as "autonomous."
+# Surface it. Read-only, zero behavior change. Honors V11_A4_DEADGATE_WARN=off.
+if [ "${V11_A4_DEADGATE_WARN:-on}" != "off" ] && [ "${CURRENT_LEVEL:-0}" -ge 4 ] 2>/dev/null; then
+    _HRH_COUNT=$(printf '%s' "$STATE" | jq -r '.high_risk_history // [] | length' 2>/dev/null || echo 0)
+    if [ "${_HRH_COUNT:-0}" -eq 0 ] 2>/dev/null; then
+        echo "⚠ high_risk_history never populated — A4 high-risk gate is effectively always-block (no auto-approve path exists; see common.sh:1056)" >&2
+    fi
+fi
+
+# ==== PART B: Write Audit Entry ====
+
+# Approval method based on autonomy level
+APPROVAL_METHOD="explicit"; GRANT_MATCHED=""
+case "$CURRENT_LEVEL" in
+    1) APPROVAL_METHOD="category_repeat" ;;
+    2) # Check grants for matching file pattern
+       if [ -n "$V11_FILE_PATH" ]; then
+           while IFS= read -r grant; do
+               [ -z "$grant" ] || [ "$grant" == "null" ] && continue
+               PATTERN=$(printf '%s' "$grant" | jq -r '.pattern // empty')
+               [ -z "$PATTERN" ] && continue
+               # shellcheck disable=SC2053
+               if [[ "$V11_FILE_PATH" == $PATTERN ]]; then
+                   APPROVAL_METHOD="grant_scope"; GRANT_MATCHED="$PATTERN"; break
+               fi
+           done < <(printf '%s' "$STATE" | jq -c '.grants // [] | .[]' 2>/dev/null)
+       fi
+       [ -z "$GRANT_MATCHED" ] && APPROVAL_METHOD="explicit" ;;
+    3) APPROVAL_METHOD="trusted_medium" ;;
+    4) APPROVAL_METHOD="autonomous" ;;
+esac
+
+# === V11.4: Enriched audit fields ===
+
+# Fallback project detection: if v11_detect_project missed (e.g. NON_PROJECTS dir),
+# use the active-project file set by detect-project hook.
+# SEC-C-02: sanitized read — rejects path-traversal / metacharacter payloads.
+if [ -z "$V11_PROJECT" ]; then
+    V11_PROJECT="$(v11_read_active_project)"
+fi
+
+# Task ID from active task state — V11.34.2 (improvement 14 F2): read the
+# CURRENT SESSION's own task-state file, not the project aggregate. The
+# aggregate (TASK_STATE_DIR/$V11_PROJECT.json) is the union of ALL sessions
+# working the same project — reading it let a sibling session's in-flight
+# task_id/agent_id get stamped onto THIS session's edit, misattributing the
+# audit row (and any scorecard built on it) to another agent entirely.
+# v11_session_state_path() is project-independent (the session file
+# self-identifies via its own .project field), so attribution now works even
+# when V11_PROJECT resolution comes up empty — the old V11_PROJECT guard is
+# dropped rather than relaxed, since it no longer gates anything meaningful.
+AUDIT_TASK_ID=""
+TASK_STATE_F="$(v11_session_state_path)"
+if [ -f "$TASK_STATE_F" ]; then
+    AUDIT_TASK_ID=$(jq -r '(.active_task_ids // [])[0] // ""' "$TASK_STATE_F" 2>/dev/null)
+fi
+
+# Agent ID: prefer environment, fall back to (this session's own) task-state active_agent_id
+AUDIT_AGENT_ID="${V11_AGENT_ID:-}"
+if [ -z "$AUDIT_AGENT_ID" ] && [ -f "$TASK_STATE_F" ]; then
+    AUDIT_AGENT_ID=$(jq -r '.active_agent_id // ""' "$TASK_STATE_F" 2>/dev/null)
+fi
+
+# Diff summary and hash for git-tracked files
+AUDIT_DIFF_SUMMARY=""
+AUDIT_DIFF_HASH=""
+AUDIT_FILE="${V11_FILE_PATH:-$V11_COMMAND}"
+if [ -n "$V11_FILE_PATH" ] && [ -f "$V11_FILE_PATH" ]; then
+    FILE_DIR=$(dirname "$V11_FILE_PATH")
+    if [ -d "$FILE_DIR/.git" ] || git -C "$FILE_DIR" rev-parse --git-dir &>/dev/null; then
+        AUDIT_DIFF_SUMMARY=$(cd "$FILE_DIR" && git diff --stat -- "$(basename "$V11_FILE_PATH")" 2>/dev/null | tail -1 || echo "")
+        AUDIT_DIFF_HASH=$(cd "$FILE_DIR" && git diff -- "$(basename "$V11_FILE_PATH")" 2>/dev/null | md5sum 2>/dev/null | cut -c1-8 || echo "")
+    fi
+fi
+
+# R1: verify-edit-landed gate (V11.28 W1-T1).
+# A Write/Edit reported success but produced an empty git diff — either the edit was a
+# true no-op (harmless) or external tooling (formatter/watcher/pre-commit hook) reverted
+# it after landing. Warn loudly so the executor notices; skip untracked/new files where
+# an empty diff is expected (nothing to compare against). Advisory only — PostToolUse
+# cannot undo the tool call, so this always still exits 0.
+if [ "${V11_EDIT_LANDED_CHECK:-on}" != "off" ] \
+    && [ "$OUTCOME" == "success" ] \
+    && { [ "$V11_TOOL_NAME" == "Write" ] || [ "$V11_TOOL_NAME" == "Edit" ]; } \
+    && [ -n "$V11_FILE_PATH" ] && [ -f "$V11_FILE_PATH" ]; then
+    FILE_DIR=$(dirname "$V11_FILE_PATH")
+    if git -C "$FILE_DIR" rev-parse --git-dir &>/dev/null; then
+        BASENAME="$(basename "$V11_FILE_PATH")"
+        IS_TRACKED=$(cd "$FILE_DIR" && git ls-files --error-unmatch -- "$BASENAME" >/dev/null 2>&1 && echo yes || echo no)
+        if [ "$IS_TRACKED" == "yes" ] && [ -z "$AUDIT_DIFF_SUMMARY" ]; then
+            echo "[V11 EDIT-NO-OP] $V11_FILE_PATH: edit reported success but git diff is empty — external tooling (formatter/watcher) may have reverted it. Verify with: git diff --stat -- $V11_FILE_PATH" >&2
+        fi
+    fi
+fi
+
+# V11.4: Full diff storage (opt-in per project)
+if [ -n "$V11_PROJECT" ] && [ -n "$AUDIT_DIFF_HASH" ] && [ "$AUDIT_DIFF_HASH" != "d41d8cd9" ]; then
+    AUDIT_CONFIG="$SESSIONS_ROOT/$V11_PROJECT/.audit-config.json"
+    if [ -f "$AUDIT_CONFIG" ]; then
+        CAPTURE_DIFFS=$(jq -r '.capture_diffs // false' "$AUDIT_CONFIG" 2>/dev/null)
+        MAX_DIFF_KB=$(jq -r '.max_diff_size_kb // 50' "$AUDIT_CONFIG" 2>/dev/null)
+        if [ "$CAPTURE_DIFFS" = "true" ] && [ -n "$V11_FILE_PATH" ]; then
+            DIFF_DIR="$SESSIONS_ROOT/$V11_PROJECT/audit-diffs"
+            mkdir -p "$DIFF_DIR"
+            DIFF_CONTENT=$(cd "$(dirname "$V11_FILE_PATH")" && git diff -- "$(basename "$V11_FILE_PATH")" 2>/dev/null || echo "")
+            DIFF_SIZE=$(printf '%s' "$DIFF_CONTENT" | wc -c)
+            MAX_BYTES=$((MAX_DIFF_KB * 1024))
+            if [ "$DIFF_SIZE" -gt 0 ] && [ "$DIFF_SIZE" -le "$MAX_BYTES" ]; then
+                PATCH_FILE="$DIFF_DIR/$(date +%Y%m%d-%H%M%S)-${AUDIT_DIFF_HASH}.patch"
+                printf '%s\n' "$DIFF_CONTENT" > "$PATCH_FILE"
+            fi
+        fi
+    fi
+fi
+
+# V11.20: caller_kind — orchestrator vs subagent distinction for cross-layer scorecard.
+# Helper echoes empty under V11_CALLER_KIND=off (rollback), in which case the field is
+# OMITTED entirely (not written as null) to preserve legacy schema shape.
+AUDIT_CALLER_KIND=$(v11_caller_kind 2>/dev/null || true)
+
+# Append JSONL audit entry (V11.4: enriched with task_id, agent_id, diff fields;
+# V11.20: optional caller_kind merged in iff non-empty)
+AUDIT_LOG="$METRICS_DIR/autonomy-audit.jsonl"
+jq -nc \
+    --arg ts "$NOW" --arg sid "${V11_SESSION_ID:-unknown}" \
+    --arg proj "${V11_PROJECT:-}" --arg action "$V11_TOOL_NAME" \
+    --arg file "$AUDIT_FILE" --arg risk "$RISK_LEVEL" \
+    --argjson alevel "$CURRENT_LEVEL" --arg method "$APPROVAL_METHOD" \
+    --arg grant "$GRANT_MATCHED" --arg outcome "$OUTCOME" \
+    --arg err "${V11_ERROR:-}" \
+    --arg task_id "$AUDIT_TASK_ID" --arg agent_id "$AUDIT_AGENT_ID" \
+    --arg diff_summary "$AUDIT_DIFF_SUMMARY" --arg diff_hash "$AUDIT_DIFF_HASH" \
+    --arg caller_kind "$AUDIT_CALLER_KIND" \
+    '({timestamp:$ts, session_id:$sid,
+       project:(if $proj=="" then null else $proj end),
+       action:$action, file:$file, risk_level:$risk,
+       autonomy_level:$alevel, approval_method:$method,
+       grant_matched:(if $grant=="" then null else $grant end),
+       outcome:$outcome,
+       error:(if $err=="" then null else $err end),
+       task_id:(if $task_id=="" then null else $task_id end),
+       agent_id:(if $agent_id=="" then null else $agent_id end),
+       diff_summary:(if $diff_summary=="" then null else $diff_summary end),
+       diff_hash:(if $diff_hash=="" then null else $diff_hash end)})
+     + (if $caller_kind=="" then {} else {caller_kind:$caller_kind} end)' >> "$AUDIT_LOG"
+
+# Rotate if >10MB: archive old entries, keep a byte-consistent tail.
+# HS-007 (Wave 3c): wrap in flock to prevent concurrent rotation under parallel agent load.
+# track-autonomy fires on every Write/Edit/Bash; two agents passing the threshold
+# simultaneously would race on tail+mv, corrupting both archive and active log.
+# B2 (2026-07-17): retention was a fixed 50000-line tail, which exceeds the 10MB
+# trigger once avg line size passes ~210B (observed ~550B/line → 27MB tail). The
+# post-rotation file then never drops below the trigger, so rotation fired on
+# EVERY hook call — 13k+ micro-archives and a full-log rewrite per call. Derive
+# keep-count from bytes so the post-rotation file settles at ~70% of the trigger.
+if [ -f "$AUDIT_LOG" ]; then
+    LOG_SIZE=$(stat -c%s "$AUDIT_LOG" 2>/dev/null || echo 0)
+    if [ "$LOG_SIZE" -gt 10485760 ]; then
+        (
+            flock -w 5 200 || exit 0
+            # Re-check size under lock — another instance may have rotated while we waited
+            LOG_SIZE=$(stat -c%s "$AUDIT_LOG" 2>/dev/null || echo 0)
+            [ "$LOG_SIZE" -le 10485760 ] && exit 0
+            # POSIX-compatible rotation (head -n -N is GNU-only)
+            _TOTAL_LINES=$(wc -l < "$AUDIT_LOG")
+            _KEEP_LINES=50000
+            if [ "$_TOTAL_LINES" -gt 0 ]; then
+                _AVG_LINE=$((LOG_SIZE / _TOTAL_LINES))
+                [ "$_AVG_LINE" -lt 1 ] && _AVG_LINE=1
+                _KEEP_LINES=$((7340032 / _AVG_LINE))   # target: 70% of 10MB trigger
+                [ "$_KEEP_LINES" -gt 50000 ] && _KEEP_LINES=50000
+                [ "$_KEEP_LINES" -lt 100 ] && _KEEP_LINES=100
+            fi
+            _ARCHIVE_COUNT=$((_TOTAL_LINES - _KEEP_LINES))
+            if [ "$_ARCHIVE_COUNT" -gt 0 ]; then
+                head -n "$_ARCHIVE_COUNT" "$AUDIT_LOG" | gzip > "$METRICS_DIR/autonomy-audit.$(date +%Y%m%d-%H%M%S)-$$.jsonl.gz"
+            fi
+            _ROT_TMP="$AUDIT_LOG.tmp.$$"
+            tail -n "$_KEEP_LINES" "$AUDIT_LOG" > "$_ROT_TMP"
+            if [ -s "$_ROT_TMP" ]; then
+                mv "$_ROT_TMP" "$AUDIT_LOG"
+            else
+                rm -f "$_ROT_TMP"
+                echo "track-autonomy: rotation produced empty log — preserved original" >&2
+            fi
+        ) 200>"$AUDIT_LOG.lock"
+    fi
+fi
+
+exit 0

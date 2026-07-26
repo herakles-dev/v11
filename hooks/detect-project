@@ -1,0 +1,187 @@
+#!/bin/bash
+# V11 Hook: detect-project
+# PreToolUse hook that detects project context from file paths during Read operations.
+# Sets active project file for session tracking.
+
+source "$(dirname "${BASH_SOURCE[0]}")/lib/common.sh"
+
+if [ "$1" == "--test" ]; then
+    echo "detect-project v1"
+    exit 0
+fi
+
+# Parse stdin into V11_* globals (file_path, tool_name, etc.)
+v11_parse_input
+
+# Skip if no file path detected
+[ -z "$V11_FILE_PATH" ] && exit 0
+
+# Detect project from file path
+v11_detect_project
+
+# Skip if metadata/infrastructure file
+v11_is_metadata_file "$V11_FILE_PATH" && exit 0
+
+# Write active project if detected (P4: dual-write to global + session-scoped)
+# B1 (2026-05-14): sticky-first-touch. Once THIS session has been bound to a
+# project (session-scoped active-project is non-empty), subsequent Reads in
+# another project's CWD must NOT silently re-bind the session.
+#
+# CRITICAL: check the session-scoped file *directly*, not via
+# v11_read_active_project. The latter falls back to the global file, which
+# may carry a stale value from a prior session — using it as the sticky
+# signal would leave fresh sessions unable to bind when the global is stale
+# and disagrees with the current CWD-derived project.
+#
+# Explicit project switches go through scripts/v11-bootstrap-session which
+# calls v11_write_active_project directly, bypassing this gate.
+if [ -n "$V11_PROJECT" ]; then
+    _SCOPED_FILE=""
+    _SESSION_BOUND_PROJECT=""
+    if [ -n "${V11_SESSION_ID:-}" ]; then
+        _SCOPED_FILE="$METRICS_DIR/sessions/$V11_SESSION_ID/active-project"
+        if [ -f "$_SCOPED_FILE" ] && [ -s "$_SCOPED_FILE" ]; then
+            _SESSION_BOUND_PROJECT=$(head -n 1 "$_SCOPED_FILE" 2>/dev/null | tr -d '[:space:]')
+        fi
+    fi
+
+    # Allow write when: (a) no session UUID (CLI/test fallback to global semantics),
+    # (b) this session has never been bound, or (c) re-touching the same project.
+    if [ -z "$_SESSION_BOUND_PROJECT" ] || [ "$_SESSION_BOUND_PROJECT" = "$V11_PROJECT" ]; then
+        v11_write_active_project "$V11_PROJECT"
+
+        # Stamp session-start on first touch — write-once, never overwrite
+        _START_FILE="$SESSIONS_ROOT/$V11_PROJECT/.session-start"
+        if [ -d "$SESSIONS_ROOT/$V11_PROJECT" ] && [ ! -f "$_START_FILE" ]; then
+            printf '%s\n' "$(date -Iseconds)" > "$_START_FILE" 2>/dev/null || true
+        fi
+
+        # V11.17 Fix 4: Surface pending handoff once per session.
+        # Goal: if a prior session left a handoff-tasks.json with open tasks,
+        # the receiving session learns about it on first Read instead of
+        # waiting for the user to type /v11. Rate-limited per V11_SESSION_ID
+        # via marker file. Opt-out: V11_HANDOFF_NUDGE=off.
+        if [ "${V11_HANDOFF_NUDGE:-}" != "off" ] && [ -n "${V11_SESSION_ID:-}" ]; then
+            _HO_TASKS="$SESSIONS_ROOT/$V11_PROJECT/handoff-tasks.json"
+            _NUDGE_MARKER="$METRICS_DIR/sessions/$V11_SESSION_ID/.handoff-surfaced"
+            if [ -f "$_HO_TASKS" ] && [ -s "$_HO_TASKS" ] && [ ! -f "$_NUDGE_MARKER" ]; then
+                _OPEN_COUNT=$(jq -r '(.open_tasks // []) | length' "$_HO_TASKS" 2>/dev/null || echo 0)
+                [[ "$_OPEN_COUNT" =~ ^[0-9]+$ ]] || _OPEN_COUNT=0
+                if [ "$_OPEN_COUNT" -gt 0 ]; then
+                    echo "[V11] $_OPEN_COUNT open task(s) in handoff for $V11_PROJECT. Run /v11 to auto-rehydrate." >&2
+                    mkdir -p "$(dirname "$_NUDGE_MARKER")" 2>/dev/null || true
+                    : > "$_NUDGE_MARKER" 2>/dev/null || true
+                fi
+            fi
+        fi
+        # V11.19 Fix: Surface pending review-queue count once per session.
+        # Companion to the V11.17 handoff nudge. The orchestrator now has a
+        # durable signal that completed-without-review work exists; without
+        # this nudge the queue is silent until /v11 is typed.
+        # Opt-out: V11_REVIEW_NUDGE=off.
+        if [ "${V11_REVIEW_NUDGE:-}" != "off" ] && [ -n "${V11_SESSION_ID:-}" ]; then
+            _RQ_NUDGE_MARKER="$METRICS_DIR/sessions/$V11_SESSION_ID/.review-surfaced-$V11_PROJECT"
+            if [ ! -f "$_RQ_NUDGE_MARKER" ]; then
+                # Source common.sh once if helpers aren't available.
+                # In the normal hook path, hooks/lib/common.sh has NOT been
+                # sourced into detect-project yet (this hook doesn't use other
+                # common.sh helpers), so we source here.
+                if ! declare -f v11_review_queue_pending_count >/dev/null 2>&1; then
+                    # shellcheck source=lib/common.sh
+                    source "$(dirname "${BASH_SOURCE[0]}")/lib/common.sh" 2>/dev/null || true
+                fi
+                if declare -f v11_review_queue_pending_count >/dev/null 2>&1; then
+                    _RQ_PENDING=$(v11_review_queue_pending_count "$V11_PROJECT" 2>/dev/null || echo "0")
+                    [[ "$_RQ_PENDING" =~ ^[0-9]+$ ]] || _RQ_PENDING=0
+                    if [ "$_RQ_PENDING" -gt 0 ]; then
+                        echo "[V11] $_RQ_PENDING pending review(s) for $V11_PROJECT — run scripts/review-queue pending $V11_PROJECT (or spawn adversarial-lite-reviewer)." >&2
+                        mkdir -p "$(dirname "$_RQ_NUDGE_MARKER")" 2>/dev/null || true
+                        : > "$_RQ_NUDGE_MARKER" 2>/dev/null || true
+                    fi
+                fi
+            fi
+        fi
+        # V11 S1 (v11-ledger-integrity): DETECT reconciliation surface.
+        # Consolidates four half-wired control-loop signals into one JSON block
+        # on stderr. Default off — opt-in by setting V11_DETECT_RECONCILE to
+        # any non-"off" value (e.g. "on"). Mutates nothing: no writes, no
+        # TaskUpdate, no enqueue. Hook count stays 17 (no new hook).
+        # Rollback: unset V11_DETECT_RECONCILE or set to "off".
+        if [ "${V11_DETECT_RECONCILE:-off}" != "off" ] && [ -n "${V11_PROJECT:-}" ]; then
+            # Guard: ensure common.sh helpers are loaded (mirrors review-nudge pattern)
+            if ! declare -f v11_fold_manifest_read >/dev/null 2>&1; then
+                source "$(dirname "${BASH_SOURCE[0]}")/lib/common.sh" 2>/dev/null || true
+            fi
+
+            # Signal 1: zombie/discipline — READ the existing discipline log only.
+            # V11.27 review M1: invoking handoff-discipline-check here would WRITE
+            # .handoff-discipline-log.json on every Read, breaking S1's read-only
+            # contract (and amplifying disk writes on the hot path). The log is
+            # refreshed at session-end by the V11.18 discipline detector; we accept
+            # stale-by-one-session to keep DETECT strictly non-mutating.
+            _DISC_LOG="$SESSIONS_ROOT/$V11_PROJECT/.handoff-discipline-log.json"
+            _DC_JSON='{}'
+            [ -f "$_DISC_LOG" ] && _DC_JSON=$(cat "$_DISC_LOG" 2>/dev/null || echo '{}')
+            _DC_COUNT=$(printf '%s' "$_DC_JSON" | jq -r '.stale_in_progress_count // 0' 2>/dev/null || echo 0)
+            [[ "${_DC_COUNT:-}" =~ ^[0-9]+$ ]] || _DC_COUNT=0
+            _DC_IDS=$(printf '%s' "$_DC_JSON" | jq -c '[.nudges[]? | .id] // []' 2>/dev/null || echo '[]')
+
+            # Signal 2: review queue — invoke pending list fresh
+            _RQ_JSON=$("$V11_HOME/scripts/review-queue" pending "$V11_PROJECT" --json 2>/dev/null || echo '[]')
+            _RQ_PENDING=$(printf '%s' "$_RQ_JSON" | jq 'length' 2>/dev/null || echo 0)
+            [[ "${_RQ_PENDING:-}" =~ ^[0-9]+$ ]] || _RQ_PENDING=0
+            _RQ_UNKNOWN=$(printf '%s' "$_RQ_JSON" | \
+                jq '[.[] | select(.agent_id == "unknown")] | length' 2>/dev/null || echo 0)
+            [[ "${_RQ_UNKNOWN:-}" =~ ^[0-9]+$ ]] || _RQ_UNKNOWN=0
+
+            # Signal 3: fold families — read manifest from disk via helper
+            _FM_JSON=$(v11_fold_manifest_read "$V11_PROJECT" 2>/dev/null || echo '{}')
+            _FM_COUNT=$(printf '%s' "$_FM_JSON" | jq -r '.output_count // 0' 2>/dev/null || echo 0)
+            [[ "${_FM_COUNT:-}" =~ ^[0-9]+$ ]] || _FM_COUNT=0
+            _FM_MERGE=$(printf '%s' "$_FM_JSON" | \
+                jq -r '((.input_count // 0) - (.output_count // 0)) | if . < 0 then 0 else . end' \
+                2>/dev/null || echo 0)
+            [[ "${_FM_MERGE:-}" =~ ^[0-9]+$ ]] || _FM_MERGE=0
+
+            # Signal 4: retro counter — read from disk via helper
+            _RC_VAL=$(v11_retro_counter_read "$V11_PROJECT" 2>/dev/null || echo 0)
+            [[ "${_RC_VAL:-}" =~ ^[0-9]+$ ]] || _RC_VAL=0
+            _RC_THR="${V11_RETRO_THRESHOLD:-5}"
+            [[ "${_RC_THR:-}" =~ ^[0-9]+$ ]] || _RC_THR=5
+            _RC_FLY="false"
+            [ "$_RC_VAL" -gt $(( _RC_THR * 10 )) ] && _RC_FLY="true"
+
+            # Emit one compact JSON object to stderr — capture first so a jq error emits nothing
+            _RECONCILE_OUT=$(jq -cn \
+                --argjson zombie_count "${_DC_COUNT}" \
+                --argjson zombie_ids "${_DC_IDS}" \
+                --argjson rq_pending "${_RQ_PENDING}" \
+                --argjson rq_unknown "${_RQ_UNKNOWN}" \
+                --argjson fm_count "${_FM_COUNT}" \
+                --argjson fm_merge "${_FM_MERGE}" \
+                --argjson rc_val "${_RC_VAL}" \
+                --argjson rc_thr "${_RC_THR}" \
+                --argjson rc_fly "${_RC_FLY}" \
+                '{"v11_detect_reconcile": {
+                    "zombie_tasks":  {"count": $zombie_count, "ids": $zombie_ids},
+                    "review_queue":  {"pending": $rq_pending, "unknown_attribution": $rq_unknown},
+                    "fold_families": {"count": $fm_count, "mergeable_candidates": $fm_merge},
+                    "retro_counter": {"value": $rc_val, "threshold": $rc_thr, "flywheel_suspect": $rc_fly}
+                }}' 2>/dev/null) && printf '%s\n' "$_RECONCILE_OUT" >&2 || true
+        fi
+    fi
+    # else: this session is already bound to $_SESSION_BOUND_PROJECT; drift to
+    # $V11_PROJECT is suppressed. Use v11-bootstrap-session to switch.
+fi
+
+# Time injection — cache Chicago timezone for skills/agents
+# HS-011 (Wave 3c): defensive check that source succeeded; disown to prevent zombies
+if [ -f "$(dirname "${BASH_SOURCE[0]}")/lib/get-chicago-time.sh" ]; then
+  source "$(dirname "${BASH_SOURCE[0]}")/lib/get-chicago-time.sh"
+  if declare -f inject_chicago_time >/dev/null 2>&1; then
+    inject_chicago_time &  # Background — don't slow down hook
+    disown $! 2>/dev/null || true
+  fi
+fi
+
+exit 0

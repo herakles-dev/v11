@@ -1,0 +1,356 @@
+#!/usr/bin/env bash
+# V11 fold-reconcile — propose-only reconcile for folded task families.
+#
+# OPERATOR-ON-DEMAND ONLY — never invoked from a hook or DETECT path.
+# This script reads the project ledger, runs the family-fold algorithm,
+# and proposes merges for families that are safe to consolidate: same sprint,
+# same normalized subject, family_size > 1.
+#
+# Dry-run is the default. --apply --confirm (+ V11_FOLD_RECONCILE != off)
+# is required before any ledger event is written.
+#
+# Usage:
+#   fold-reconcile [--dry-run] <project>
+#   fold-reconcile --apply --confirm <project>
+#   fold-reconcile --json [--dry-run] <project>
+#
+# Rollback levers:
+#   --dry-run              always safe (default)
+#   V11_FOLD_RECONCILE=off disables --apply (exit 2)
+#
+# V11 ledger-integrity spec T6.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+V11_HOME="${V11_HOME:-$(dirname "$SCRIPT_DIR")}"
+V11_WORKSPACE_ROOT="${V11_WORKSPACE_ROOT:-$HOME/.v11}"
+# shellcheck source=../hooks/lib/common.sh
+source "$V11_HOME/hooks/lib/common.sh"
+
+MODE="dry-run"
+DO_APPLY=0
+DO_CONFIRM=0
+PROJECT=""
+JSON_OUT=0
+
+usage() {
+    cat <<EOF
+Usage: fold-reconcile [--dry-run] <project>
+       fold-reconcile --apply --confirm <project>
+       fold-reconcile --json [--dry-run] <project>
+
+Propose merges for task families where all members share the same sprint and
+normalize-equal subjects. Dry-run by default — proposes merges but writes
+nothing to the ledger.
+
+Options:
+  --dry-run       (default) Print proposals only. No ledger writes.
+  --apply         Apply proposals by appending reconcile scope=identity events.
+                  Requires --confirm and V11_FOLD_RECONCILE != off.
+  --confirm       Required safety guard with --apply.
+  --json          Emit proposals as JSON (compatible with --dry-run).
+  -h, --help      Show this help.
+
+Rollback: default --dry-run; V11_FOLD_RECONCILE=off disables --apply.
+
+OPERATOR-ON-DEMAND ONLY — never invoked from a hook or DETECT path.
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --dry-run)  MODE="dry-run"; shift ;;
+        --apply)    DO_APPLY=1; MODE="apply"; shift ;;
+        --confirm)  DO_CONFIRM=1; shift ;;
+        --json)     JSON_OUT=1; shift ;;
+        -h|--help)  usage; exit 0 ;;
+        -*)
+            echo "fold-reconcile: unknown option: $1" >&2
+            usage >&2
+            exit 1
+            ;;
+        *)
+            if [ -z "$PROJECT" ]; then
+                PROJECT="$1"
+            else
+                echo "fold-reconcile: unexpected argument: $1" >&2
+                exit 1
+            fi
+            shift
+            ;;
+    esac
+done
+
+if [ -z "$PROJECT" ]; then
+    echo "fold-reconcile: project name required" >&2
+    usage >&2
+    exit 1
+fi
+
+# Validate: --apply requires --confirm
+if [ "$DO_APPLY" = "1" ] && [ "$DO_CONFIRM" = "0" ]; then
+    echo "fold-reconcile: --apply requires --confirm" >&2
+    exit 1
+fi
+
+# Rollback lever: V11_FOLD_RECONCILE=off disables --apply
+if [ "$DO_APPLY" = "1" ] && [ "${V11_FOLD_RECONCILE:-on}" = "off" ]; then
+    echo "fold-reconcile: --apply refused — V11_FOLD_RECONCILE=off" >&2
+    exit 2
+fi
+
+LEDGER_DIR="${METRICS_DIR}/ledger"
+LEDGER_FILE="${LEDGER_DIR}/${PROJECT}.jsonl"
+
+if [ ! -f "$LEDGER_FILE" ]; then
+    echo "fold-reconcile: no ledger found for project '$PROJECT' at $LEDGER_FILE" >&2
+    exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# Step 1: Build tasks + proposals via Python.
+# Reads the ledger, reconstructs task state, runs fold_families + propose_merge,
+# and emits a JSON object with:
+#   { proposals: [...], create_seq_lookup: {task_id: {create_seq, subject_norm,
+#     session_uuid}}, task_count: N }
+#
+# create_seq_lookup is needed by the --apply path (v11_ledger_append requires
+# create_seq on non-created events to key the identity in the ledger replay).
+# ---------------------------------------------------------------------------
+_PROPOSALS_JSON=$(
+    V11_FOLD_PROJECT="$PROJECT" \
+    V11_FOLD_LEDGER="$LEDGER_FILE" \
+    V11_FOLD_V11HOME="$V11_HOME" \
+    python3 - <<'PYEOF'
+import os, sys, json
+
+project     = os.environ["V11_FOLD_PROJECT"]
+ledger_path = os.environ["V11_FOLD_LEDGER"]
+v11_home    = os.environ["V11_FOLD_V11HOME"]
+
+if v11_home:
+    sys.path.insert(0, v11_home + "/scripts/lib")
+
+from family_fold import fold_families, propose_merge
+
+# ---------------------------------------------------------------------------
+# Parse ledger: reconstruct per-identity task state and build a create_seq
+# lookup keyed by task_id.  Only the last-write-wins state per identity is
+# needed for fold/propose; for the apply path we also track create_seq so
+# the caller can emit valid identity-scope reconcile events.
+# ---------------------------------------------------------------------------
+try:
+    with open(ledger_path, "r", encoding="utf-8", errors="replace") as fh:
+        raw = fh.read()
+except OSError as exc:
+    print(f"fold-reconcile: cannot read ledger: {exc}", file=sys.stderr)
+    sys.exit(1)
+
+# idk key -> task dict (mutable, last-write-wins)
+tasks_by_idk = {}   # "<subject_norm>\x00<create_seq>" -> {...}
+
+for line in raw.split("\n"):
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        ev = json.loads(line)
+    except json.JSONDecodeError:
+        continue
+    if not isinstance(ev, dict) or ev.get("project") != project:
+        continue
+
+    ev_type     = ev.get("ev", "")
+    task_id     = ev.get("task_id") or ""
+    session_uuid = ev.get("session_uuid") or ""
+    subject_norm = ev.get("subject_norm") or ""
+    create_seq  = ev.get("create_seq")
+
+    if create_seq is None or ev_type == "reconcile":
+        # Reconcile events and malformed lines do not define new identities
+        continue
+
+    idk = f"{subject_norm}\x00{create_seq}"
+
+    if idk not in tasks_by_idk:
+        tasks_by_idk[idk] = {
+            "id": task_id,
+            "subject": ev.get("subject") or "",
+            "subject_norm": subject_norm,
+            "status": "pending",
+            "source_session_uuid": session_uuid,
+            "create_seq": create_seq,
+            "metadata": ev.get("metadata") or {},
+        }
+    else:
+        rec = tasks_by_idk[idk]
+        # Update status from well-known event types
+        if ev_type in ("in_progress", "completed", "pending", "blocked"):
+            rec["status"] = ev_type
+        # Merge metadata deltas (later events win on overlapping keys)
+        md = ev.get("metadata")
+        if isinstance(md, dict) and md:
+            merged = dict(rec.get("metadata") or {})
+            merged.update(md)
+            rec["metadata"] = merged
+        # Keep the most recent task_id and session_uuid (handles task reassignment)
+        if task_id:
+            rec["id"] = task_id
+        if session_uuid:
+            rec["source_session_uuid"] = session_uuid
+
+# Build the task list for fold_families (exclude completed tasks — they are
+# already done and not candidates for merge).
+tasks_for_fold = [
+    t for t in tasks_by_idk.values()
+    if t.get("status") not in ("completed",)
+]
+
+fold_result = fold_families(tasks_for_fold)
+proposals   = propose_merge(fold_result["families"], tasks_for_fold)
+
+# create_seq lookup keyed by task_id — used by the --apply bash path to
+# build the identity-scope reconcile event (v11_ledger_append requires it).
+create_seq_lookup = {
+    t["id"]: {
+        "create_seq":   t["create_seq"],
+        "subject_norm": t["subject_norm"],
+        "session_uuid": t["source_session_uuid"],
+    }
+    for t in tasks_for_fold
+    if t.get("create_seq") is not None and t.get("id")
+}
+
+print(json.dumps({
+    "proposals":        proposals,
+    "create_seq_lookup": create_seq_lookup,
+    "task_count":       len(tasks_for_fold),
+}, indent=2))
+PYEOF
+) || {
+    echo "fold-reconcile: Python step failed — cannot compute proposals" >&2
+    exit 1
+}
+
+# ---------------------------------------------------------------------------
+# Step 2: Report / apply
+# ---------------------------------------------------------------------------
+_PROPOSAL_COUNT=$(printf '%s' "$_PROPOSALS_JSON" \
+    | jq '.proposals | length' 2>/dev/null || echo 0)
+_TASK_COUNT=$(printf '%s' "$_PROPOSALS_JSON" \
+    | jq '.task_count' 2>/dev/null || echo 0)
+
+if [ "$JSON_OUT" = "1" ] && [ "$MODE" = "dry-run" ]; then
+    printf '%s' "$_PROPOSALS_JSON" | jq '.proposals'
+    exit 0
+fi
+
+echo "fold-reconcile: project=${PROJECT} tasks=${_TASK_COUNT} proposals=${_PROPOSAL_COUNT} mode=${MODE}"
+
+if [ "$_PROPOSAL_COUNT" = "0" ]; then
+    echo "fold-reconcile: no mergeable families found"
+    exit 0
+fi
+
+if [ "$MODE" = "dry-run" ]; then
+    echo ""
+    echo "--- PROPOSALS (dry-run — 0 ledger writes) ---"
+    printf '%s' "$_PROPOSALS_JSON" | jq -r '
+        .proposals[] |
+        "  Family: \(.family_id)  sprint=\(.sprint)  size=\(.family_size)\n" +
+        "    Canonical : [\(.canonical.id)] \(.canonical.subject)\n" +
+        "    Merge into canonical:\n" +
+        (.non_canonical[] | "      - [\(.id)] \(.subject)")
+    ' 2>/dev/null || printf '%s' "$_PROPOSALS_JSON" | jq '.proposals'
+    echo ""
+    echo "fold-reconcile: dry-run complete — 0 ledger writes"
+    exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# Apply mode: append reconcile scope=identity event for each non-canonical
+# member using the existing v11_ledger_append tombstone pattern.
+# Append-only — the ledger is never rewritten.
+# ---------------------------------------------------------------------------
+NOW=$(date -Iseconds 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%S+00:00)
+FOLD_SESSION_ID="fold-reconcile-$(date +%s)-$$"
+APPLIED=0
+SKIPPED=0
+
+while IFS= read -r _PROPOSAL; do
+    _NC_COUNT=$(printf '%s' "$_PROPOSAL" | jq '.non_canonical | length' 2>/dev/null || echo 0)
+    _SPRINT=$(printf '%s' "$_PROPOSAL" | jq -r '.sprint // ""' 2>/dev/null || echo "")
+
+    _i=0
+    while [ "$_i" -lt "$_NC_COUNT" ]; do
+        _NC_ID=$(printf '%s' "$_PROPOSAL" \
+            | jq -r ".non_canonical[$_i].id // \"\"" 2>/dev/null)
+        _NC_SUBJ=$(printf '%s' "$_PROPOSAL" \
+            | jq -r ".non_canonical[$_i].subject // \"\"" 2>/dev/null)
+
+        # Retrieve create_seq + session_uuid from the Python-computed lookup
+        _CSEQ_INFO=$(printf '%s' "$_PROPOSALS_JSON" \
+            | jq -r --arg id "$_NC_ID" '.create_seq_lookup[$id] // empty' 2>/dev/null)
+        if [ -z "$_CSEQ_INFO" ]; then
+            echo "fold-reconcile: WARN no create_seq for task_id=${_NC_ID} — skipping" >&2
+            SKIPPED=$((SKIPPED + 1))
+            _i=$((_i + 1))
+            continue
+        fi
+
+        _CREATE_SEQ=$(printf '%s' "$_CSEQ_INFO" | jq -r '.create_seq' 2>/dev/null)
+        _SUBJ_NORM=$(printf '%s' "$_CSEQ_INFO"  | jq -r '.subject_norm // ""' 2>/dev/null)
+        _SESSION=$(printf '%s' "$_CSEQ_INFO"    | jq -r '.session_uuid // ""' 2>/dev/null)
+
+        # Build the reconcile scope=identity event JSON.
+        # Shape matches the tombstone pattern in hooks/lib/common.sh ~:2425.
+        _EVENT_JSON=$(jq -cn \
+            --arg  project     "$PROJECT" \
+            --arg  sid         "$_SESSION" \
+            --arg  fold_sid    "$FOLD_SESSION_ID" \
+            --arg  ts          "$NOW" \
+            --arg  subject_norm "$_SUBJ_NORM" \
+            --arg  task_id     "$_NC_ID" \
+            --argjson create_seq "$_CREATE_SEQ" \
+            --arg  sprint      "$_SPRINT" '
+            {
+                v:            1,
+                ev:           "reconcile",
+                ts:           $ts,
+                project:      $project,
+                subject_norm: $subject_norm,
+                task_id:      $task_id,
+                session_uuid: $sid,
+                create_seq:   $create_seq,
+                scope:        "identity",
+                source:       "fold-reconcile",
+                fold_session: $fold_sid,
+                sprint:       $sprint,
+                reason:       "same_sprint_same_norm"
+            }
+        ' 2>/dev/null)
+
+        if [ -z "$_EVENT_JSON" ]; then
+            echo "fold-reconcile: WARN failed to build event JSON for task_id=${_NC_ID} — skipping" >&2
+            SKIPPED=$((SKIPPED + 1))
+            _i=$((_i + 1))
+            continue
+        fi
+
+        # V11.27 review M2: a swallowed append failure (|| true) would inflate
+        # APPLIED and report a reconcile that never reached the ledger. Branch on
+        # the append result — same SKIPPED+WARN pattern as the guards above.
+        if v11_ledger_append "$PROJECT" "$_EVENT_JSON"; then
+            echo "fold-reconcile: reconciled task_id=${_NC_ID} subject='${_NC_SUBJ}'"
+            APPLIED=$((APPLIED + 1))
+        else
+            echo "fold-reconcile: WARN ledger append failed for task_id=${_NC_ID} — NOT reconciled (counted as skipped)" >&2
+            SKIPPED=$((SKIPPED + 1))
+        fi
+        _i=$((_i + 1))
+    done
+done < <(printf '%s' "$_PROPOSALS_JSON" | jq -c '.proposals[]' 2>/dev/null)
+
+echo ""
+echo "fold-reconcile: done — applied=${APPLIED} skipped=${SKIPPED}"

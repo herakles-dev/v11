@@ -1,0 +1,133 @@
+#!/bin/bash
+# V11 Script: validate-config
+# Validates all project configuration files against their JSON Schemas.
+#
+# Usage: ./scripts/validate-config [PROJECT]
+#   PROJECT: Optional project name. If omitted, validates all projects.
+#
+# Exit codes:
+#   0 - All validations passed (or advisory warnings only)
+#   1 - Validation errors found
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/../hooks/lib/common.sh"
+
+PROJECT="${1:-}"
+ERRORS=0
+WARNINGS=0
+CHECKED=0
+
+validate_file() {
+    local file="$1" schema="$2" label="$3"
+    CHECKED=$((CHECKED + 1))
+
+    if [ ! -f "$file" ]; then
+        return 0
+    fi
+
+    local content
+    content=$(cat "$file" 2>/dev/null)
+
+    if [ -z "$content" ]; then
+        echo "  SKIP  $label (empty file)"
+        return 0
+    fi
+
+    if ! printf '%s' "$content" | jq empty 2>/dev/null; then
+        echo "  FAIL  $label — invalid JSON"
+        ERRORS=$((ERRORS + 1))
+        return 1
+    fi
+
+    local errfile
+    errfile=$(mktemp -t v11-validate-XXXXXX)
+    if v11_validate_json "$content" "$schema" 2>"$errfile"; then
+        echo "  PASS  $label"
+    else
+        echo "  WARN  $label"
+        sed 's/^/         /' "$errfile"
+        WARNINGS=$((WARNINGS + 1))
+    fi
+    rm -f "$errfile"
+}
+
+validate_project() {
+    local project="$1"
+    local session_dir="$SESSIONS_ROOT/$project"
+
+    echo ""
+    echo "Project: $project"
+    echo "─────────────────────────────"
+
+    # Task state
+    if [ -f "$TASK_STATE_DIR/${project}.json" ]; then
+        validate_file "$TASK_STATE_DIR/${project}.json" "task-state.schema.json" "task-state (metrics)"
+    fi
+    if [ -f "$session_dir/.task-state.json" ]; then
+        validate_file "$session_dir/.task-state.json" "task-state.schema.json" "task-state (session)"
+    fi
+
+    # Formation registry
+    validate_file "$session_dir/.formation-registry.json" "formation-registry.schema.json" "formation-registry"
+
+    # Autonomy state
+    validate_file "$session_dir/.autonomy-state" "autonomy-state.schema.json" "autonomy-state"
+
+    echo ""
+}
+
+echo "V11 Configuration Validator"
+echo "==========================="
+echo "Schema dir: $V11_SCHEMA_DIR"
+
+# Validate schemas exist
+SCHEMA_COUNT=$(ls "$V11_SCHEMA_DIR"/*.schema.json 2>/dev/null | wc -l)
+echo "Schemas available: $SCHEMA_COUNT"
+
+if [ "$SCHEMA_COUNT" -eq 0 ]; then
+    echo "ERROR: No schemas found in $V11_SCHEMA_DIR"
+    exit 1
+fi
+
+if [ -n "$PROJECT" ]; then
+    # Validate single project
+    validate_project "$PROJECT"
+else
+    # Validate all projects in sessions/
+    if [ -d "$SESSIONS_ROOT" ]; then
+        for dir in "$SESSIONS_ROOT"/*/; do
+            [ -d "$dir" ] || continue
+            project=$(basename "$dir")
+            validate_project "$project"
+        done
+    fi
+
+    # Also check metrics task state
+    if [ -d "$TASK_STATE_DIR" ]; then
+        for state_file in "$TASK_STATE_DIR"/*.json; do
+            [ -f "$state_file" ] || continue
+            project=$(basename "$state_file" .json)
+            # Skip if already checked via sessions
+            [ -d "$SESSIONS_ROOT/$project" ] && continue
+            validate_project "$project"
+        done
+    fi
+fi
+
+echo "─────────────────────────────"
+echo "Results: $CHECKED checked, $ERRORS errors, $WARNINGS warnings"
+
+if [ "$ERRORS" -gt 0 ]; then
+    echo "FAILED: $ERRORS validation errors found"
+    exit 1
+fi
+
+if [ "$WARNINGS" -gt 0 ]; then
+    echo "PASSED with $WARNINGS advisory warnings"
+else
+    echo "PASSED: All configurations valid"
+fi
+
+exit 0

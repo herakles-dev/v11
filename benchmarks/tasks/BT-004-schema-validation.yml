@@ -1,0 +1,36 @@
+id: BT-004
+title: "JSON schemas accept valid, reject invalid inputs"
+tier: 0
+type: schema-validation
+category: schema-validation
+description: |
+  Validates task-metadata and task-state schemas against known good and bad inputs.
+cases:
+  - schema: task-metadata.schema.json
+    valid: true
+    input:
+      project: "test-project"
+      sprint: "sprint-01-foundation"
+      risk: "medium"
+  - schema: task-metadata.schema.json
+    valid: false
+    input:
+      project: "test-project"
+      # missing required: sprint, risk
+  - schema: task-state.schema.json
+    valid: true
+    input:
+      project: "test-project"
+      total: 5
+      completed: 2
+      in_progress: 1
+      pending: 2
+      blocked: 0
+      active_task_ids: ["1"]
+      last_updated: "2026-03-16T00:00:00Z"
+  - schema: task-state.schema.json
+    valid: false
+    input:
+      project: "test-project"
+      total: "five"
+      # total should be integer

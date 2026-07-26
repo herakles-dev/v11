@@ -1,0 +1,118 @@
+#!/bin/bash
+# V11 Script: plan-resume
+# Scans ~/.claude/plans/ for V11 plan files and outputs resume instructions.
+#
+# Usage:
+#   plan-resume                   # Auto-detect from active project
+#   plan-resume PROJECT           # Resume specific project
+#   plan-resume --list            # List all V11 plan files
+#   plan-resume --test            # Self-test
+
+set -euo pipefail
+
+V11_WORKSPACE_ROOT="${V11_WORKSPACE_ROOT:-$HOME/.v11}"
+SESSIONS_ROOT="${SESSIONS_ROOT:-$V11_WORKSPACE_ROOT/sessions}"
+METRICS_DIR="$V11_WORKSPACE_ROOT/.agent-metrics"
+ACTIVE_PROJECT_FILE="$METRICS_DIR/active-project"
+
+# SEC-C-02: safe read of the active-project signal file.
+# Inline sanitizer (script uses `set -euo pipefail`; avoid sourcing common.sh).
+_v11_read_active_project_safe() {
+    local raw
+    [ -f "$ACTIVE_PROJECT_FILE" ] || return 0
+    [ -s "$ACTIVE_PROJECT_FILE" ] || return 0
+    raw=$(head -n 1 "$ACTIVE_PROJECT_FILE" 2>/dev/null | tr -d '[:space:]')
+    if printf '%s' "$raw" | grep -qE '^[a-zA-Z0-9._-]{1,64}$'; then
+        printf '%s' "$raw"
+    else
+        echo "plan-resume: rejected invalid content in $ACTIVE_PROJECT_FILE" >&2
+        return 0
+    fi
+}
+PLANS_DIR="$HOME/.claude/plans"
+
+# --- CLI flags ---
+if [ "${1:-}" == "--test" ]; then
+    echo "plan-resume v1.0 (V11.4)"
+    exit 0
+fi
+
+if [ "${1:-}" == "--list" ]; then
+    if [ ! -d "$PLANS_DIR" ]; then
+        echo "No plans directory found."
+        exit 0
+    fi
+    echo "V11 Plan Files:"
+    { grep -rl '<!-- v11-plan:' "$PLANS_DIR" 2>/dev/null || true; } | while read -r f; do
+        PROJECT=$(grep -oP '<!-- v11-plan: \K[^ ]+' "$f" 2>/dev/null || echo "unknown")
+        UPDATED=$(grep -oP 'Updated: \K.*' "$f" 2>/dev/null | tail -1 || echo "unknown")
+        TASKS=$(grep -oP 'Tasks: \K[^\n]+' "$f" 2>/dev/null | head -1 || echo "?")
+        echo "  $PROJECT — Tasks: $TASKS — Updated: $UPDATED"
+        echo "    File: $f"
+    done
+    exit 0
+fi
+
+# --- Detect project ---
+PROJECT="${1:-}"
+
+if [ -z "$PROJECT" ]; then
+    PROJECT="$(_v11_read_active_project_safe)"
+fi
+
+# --- Find plan file ---
+if [ ! -d "$PLANS_DIR" ]; then
+    echo "No plans directory found. Run plan-sync first." >&2
+    exit 1
+fi
+
+PLAN_FILE=""
+if [ -n "$PROJECT" ]; then
+    MARKER="<!-- v11-plan: $PROJECT -->"
+    PLAN_FILE=$(grep -rl "$MARKER" "$PLANS_DIR" 2>/dev/null | head -1 || echo "")
+fi
+
+# If no specific project, try to find the most recently updated V11 plan
+if [ -z "$PLAN_FILE" ]; then
+    PLAN_FILE=$(grep -rl '<!-- v11-plan:' "$PLANS_DIR" 2>/dev/null \
+        | xargs -r ls -t 2>/dev/null | head -1 || echo "")
+    if [ -n "$PLAN_FILE" ]; then
+        PROJECT=$(grep -oP '<!-- v11-plan: \K[^ ]+' "$PLAN_FILE" 2>/dev/null || echo "unknown")
+    fi
+fi
+
+if [ -z "$PLAN_FILE" ] || [ ! -f "$PLAN_FILE" ]; then
+    echo "No V11 plan file found." >&2
+    [ -n "$PROJECT" ] && echo "Run: plan-sync $PROJECT" >&2
+    exit 1
+fi
+
+# --- Output resume prompt ---
+echo "=== V11 Session Resume: $PROJECT ==="
+echo ""
+
+# Extract and display State Snapshot
+sed -n '/^## State Snapshot/,/^## /p' "$PLAN_FILE" | head -n -1
+
+echo ""
+
+# Extract and display Agents section if present
+AGENTS=$(sed -n '/^## Agents/,/^## /p' "$PLAN_FILE" 2>/dev/null | head -n -1)
+if [ -n "$AGENTS" ]; then
+    echo "$AGENTS"
+    echo ""
+fi
+
+# Extract and display Resume Instructions
+sed -n '/^## Resume Instructions/,/^---/p' "$PLAN_FILE" | head -n -1
+
+echo ""
+echo "Plan file: $PLAN_FILE"
+echo ""
+echo "To continue, run:"
+echo "  1. Read $V11_WORKSPACE_ROOT/v11/CLAUDE.md"
+if [ -f "$SESSIONS_ROOT/$PROJECT/spec.md" ]; then
+    echo "  2. Read $SESSIONS_ROOT/$PROJECT/spec.md"
+fi
+echo "  3. TaskList"
+echo "  4. Pick up where you left off"

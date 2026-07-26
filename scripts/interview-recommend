@@ -1,0 +1,159 @@
+#!/usr/bin/env bash
+# V11 Interview Recommend — evidence-backed architectural recommendations
+# Usage: ./scripts/interview-recommend --stack STACK --scope SCOPE [--domain DOMAIN] [--json]
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+V11_HOME="${V11_HOME:-$(dirname "$SCRIPT_DIR")}"
+[[ -f "$V11_HOME/hooks/lib/common.sh" ]] && source "$V11_HOME/hooks/lib/common.sh" 2>/dev/null || true
+
+ATHENAEUM="$SCRIPT_DIR/athenaeum-search"
+STACK="" SCOPE="" DOMAIN="" JSON_MODE=false
+
+usage() { cat <<'EOF'
+Usage: interview-recommend --stack STACK --scope SCOPE [--domain DOMAIN] [--json]
+  --stack STACK    e.g. fastapi-react, nextjs, flask, express-vue
+  --scope SCOPE    small (1-3 files), medium (4-8), large (9+)
+  --domain DOMAIN  override Athenaeum search domain
+  --json           output JSON
+EOF
+exit 1; }
+
+[[ $# -eq 0 ]] && usage
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --stack)  STACK="$2";  shift 2 ;;
+    --scope)  SCOPE="$2";  shift 2 ;;
+    --domain) DOMAIN="$2"; shift 2 ;;
+    --json)   JSON_MODE=true; shift ;;
+    -h|--help) usage ;;
+    *) echo "ERROR: Unknown option: $1" >&2; exit 1 ;;
+  esac
+done
+[[ -z "$STACK" ]] && { echo "ERROR: --stack is required" >&2; exit 1; }
+[[ -z "$SCOPE" ]] && { echo "ERROR: --scope is required" >&2; exit 1; }
+STACK_LOWER="${STACK,,}"
+
+# ── Domain mapping ────────────────────────────────────────────────────────────
+if [[ -n "$DOMAIN" ]]; then
+  DOMAINS=("$DOMAIN")
+else
+  DOMAINS=()
+  echo "$STACK_LOWER" | grep -qiE 'fastapi|flask|express|django' && DOMAINS+=("backend")
+  echo "$STACK_LOWER" | grep -qiE 'react|nextjs|next\.js|vue'    && DOMAINS+=("frontend")
+  [[ ${#DOMAINS[@]} -eq 0 ]] && DOMAINS+=("backend")
+fi
+
+# ── Athenaeum search (with fallback) ─────────────────────────────────────────
+ATHENAEUM_UP=false
+ATHENAEUM_PORT="${ATHENAEUM_PORT:-8000}"
+if [[ -x "$ATHENAEUM" ]] && curl -sf --max-time 3 "http://localhost:${ATHENAEUM_PORT}/api/libraries" >/dev/null 2>&1; then
+  ATHENAEUM_UP=true
+fi
+
+normalize() { echo "$1" | jq -c 'if type=="array" then . elif .results then .results else [] end' 2>/dev/null || echo "[]"; }
+
+ARCH_ITEMS="[]" METH_ITEMS="[]"
+if $ATHENAEUM_UP; then
+  DOMAIN_FLAGS=(); for d in "${DOMAINS[@]}"; do DOMAIN_FLAGS+=(--domain "$d"); done
+  ARCH_ITEMS=$(normalize "$("$ATHENAEUM" "$STACK_LOWER patterns best practices" "${DOMAIN_FLAGS[@]}" --limit 3 --json 2>/dev/null || echo "[]")")
+  METH_ITEMS=$(normalize "$("$ATHENAEUM" "project planning $SCOPE scope" --library problem-solving --limit 2 --json 2>/dev/null || echo "[]")")
+fi
+
+# ── Scope-based methodology ───────────────────────────────────────────────────
+cynefin()    { case "${SCOPE,,}" in small) echo "Simple (known solution, direct application)";;  medium) echo "Complicated (known solution patterns exist for this stack)";; *) echo "Complicated→Complex (multi-layer coordination required)";; esac; }
+decomp()     { case "${SCOPE,,}" in small) echo "File-based (identify affected files, implement top-down)";;  medium) echo "Concern-based (data model → service → API → UI)";; *) echo "Layer-based (Frontend → API → Service → Database)";; esac; }
+formation()  { case "${SCOPE,,}" in small) echo "single-file or lightweight-feature (1-3 tasks)";;  medium) echo "lightweight-feature (4-8 tasks, 1-2 layers)";; *) echo "feature-impl (multi-layer, 9+ tasks)";; esac; }
+
+# ── Agent recommendations ─────────────────────────────────────────────────────
+has_backend=false; has_frontend=false
+echo "$STACK_LOWER" | grep -qiE 'fastapi|flask|express|django' && has_backend=true
+echo "$STACK_LOWER" | grep -qiE 'react|nextjs|next\.js|vue'    && has_frontend=true
+! $has_backend && ! $has_frontend && has_backend=true
+
+AGENTS_JSON="["
+add_agent() { [[ "$AGENTS_JSON" != "[" ]] && AGENTS_JSON+=","; AGENTS_JSON+=$(jq -n --arg r "$1" --arg a "$2" --arg rat "$3" '{role:$r,recommended:$a,rationale:$rat}'); }
+
+case "${SCOPE,,}" in
+  small)
+    $has_backend  && add_agent "Backend"   "spec-implementer-v11"  "Small scope → standard implementer"
+    $has_frontend && add_agent "Frontend"  "spec-implementer-v11"  "Small scope → standard implementer"
+    add_agent "Tester" "spec-tester-v11" "Standard validation"
+    ;;
+  medium)
+    if $has_backend; then
+      if echo "$STACK_LOWER" | grep -qiE 'auth|jwt|oauth|postgres|redis'; then
+        add_agent "Backend" "backend-architect"    "Complex patterns → specialist"
+      else
+        add_agent "Backend" "spec-implementer-v11" "Routine backend → spec agent"
+      fi
+    fi
+    $has_frontend && add_agent "Frontend"   "spec-implementer-v11" "Medium scope → spec agent"
+    add_agent "Tester" "spec-tester-v11" "Standard validation"
+    add_agent "Integrator" "spec-integrator-v11" "API contract alignment"
+    ;;
+  *)
+    $has_backend  && add_agent "Backend"   "backend-architect"    "Large scope → specialist"
+    $has_frontend && add_agent "Frontend"  "frontend-specialist"  "React/Vue SPA → specialist"
+    add_agent "Tester" "spec-tester-v11" "Standard validation"
+    add_agent "Integrator" "spec-integrator-v11" "API contract alignment"
+    ;;
+esac
+AGENTS_JSON+="]"
+
+STACK_DISPLAY=$(echo "$STACK_LOWER" | sed 's/-/ + /g')
+DOMAINS_DISPLAY=$(printf '%s' "${DOMAINS[*]}" | tr ' ' '+')
+
+# ── JSON output ───────────────────────────────────────────────────────────────
+if $JSON_MODE; then
+  jq -n \
+    --arg stack "$STACK_DISPLAY" --arg scope "$SCOPE" --arg domains "$DOMAINS_DISPLAY" \
+    --arg cynefin "$(cynefin)" --arg decomp "$(decomp)" --arg formation "$(formation)" \
+    --argjson arch "$ARCH_ITEMS" --argjson meth "$METH_ITEMS" --argjson agents "$AGENTS_JSON" \
+    --argjson up "$( $ATHENAEUM_UP && echo true || echo false )" \
+    '{stack:$stack,scope:$scope,domains:$domains,athenaeum_up:$up,
+      architecture_patterns:$arch,
+      methodology:{cynefin_domain:$cynefin,decomposition:$decomp,formation:$formation,problem_solving_refs:$meth},
+      agent_recommendations:$agents,
+      risk_assessment:{stack_complexity:"Medium (well-documented patterns)",auth_presence:"[ask user]",data_sensitivity:"[ask user]"}}'
+  exit 0
+fi
+
+# ── Human-readable output ─────────────────────────────────────────────────────
+echo "V11 Interview Recommendations"
+echo "Stack: $STACK_DISPLAY | Scope: $SCOPE"
+echo ""
+echo "## Architecture Patterns (from Athenaeum)"
+if ! $ATHENAEUM_UP; then
+  echo "  (Athenaeum offline — hardcoded guidance)"
+  echo "  - \"REST API Design\" (architecture): Resource-oriented endpoints, versioned routes"
+  echo "  - \"Database Layer Patterns\" (architecture): Repository pattern with connection pooling"
+  echo "  - \"Component Architecture\" (frontend): Feature-based folder structure, shared hooks"
+else
+  count=$(echo "$ARCH_ITEMS" | jq 'length')
+  [[ "$count" -eq 0 ]] && echo "  (No results from Athenaeum)" || \
+  while IFS= read -r item; do
+    title=$(echo "$item" | jq -r '.title // .document_title // "Untitled"')
+    score=$(echo "$item" | jq -r '.score // .similarity // ""')
+    lib=$(echo "$item"   | jq -r '.library_slug // .library // ""')
+    excerpt=$(echo "$item" | jq -r '(.excerpt // .chunk_text // .text // "") | gsub("\n+";" ") | if length>80 then .[:80]+"…" else . end')
+    printf '  - "%s" (%s%s): %s\n' "$title" "$lib" "$([ -n "$score" ] && echo ", score $score")" "$excerpt"
+  done < <(echo "$ARCH_ITEMS" | jq -c '.[]')
+fi
+echo ""
+echo "## Methodology"
+echo "  - Cynefin domain: $(cynefin)"
+echo "  - Recommended decomposition: $(decomp)"
+echo "  - Formation: $(formation)"
+echo ""
+echo "## Agent Recommendations"
+printf '| %-12s | %-26s | %-40s |\n' "Role" "Recommended" "Rationale"
+printf '|%s|%s|%s|\n' "--------------" "----------------------------" "------------------------------------------"
+while IFS= read -r a; do
+  printf '| %-12s | %-26s | %-40s |\n' "$(echo "$a"|jq -r .role)" "$(echo "$a"|jq -r .recommended)" "$(echo "$a"|jq -r .rationale)"
+done < <(echo "$AGENTS_JSON" | jq -c '.[]')
+echo ""
+echo "## Risk Assessment"
+echo "  - Stack complexity: Medium (well-documented patterns)"
+echo "  - Auth presence: [ask user]"
+echo "  - Data sensitivity: [ask user]"

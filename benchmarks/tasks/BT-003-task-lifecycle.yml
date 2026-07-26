@@ -1,0 +1,9 @@
+id: BT-003
+title: "Task lifecycle: create, claim, complete"
+tier: 0
+type: task-lifecycle
+category: task-lifecycle
+description: |
+  Full task state machine: TaskCreate -> TaskUpdate(in_progress) with owner
+  -> TaskUpdate(completed). Validates active_task_ids tracking and agent_id
+  propagation through sync-tasks hook.

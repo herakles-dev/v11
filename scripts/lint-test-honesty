@@ -1,0 +1,261 @@
+#!/usr/bin/env python3
+"""V11.26 — Test-honesty lint pass.
+
+Detects false-green test patterns that allowed bugs to ship in V11.18,
+V11.25.1, and V11.25.2. Each pattern is anchored to the commit where it
+was first fixed; this script prevents recurrence.
+
+Patterns:
+
+  P1 stderr-subtraction — `.stderr.replace(...)` in a test assertion.
+     Shipped in V11.18 (sprint-v11.18 sessions/v11-handoff-hygiene),
+     fixed V11.25.2 (commit 5d3492d, T7-E1).
+     Failure mode: if the second stderr is empty or differently shaped,
+     the subtraction silently false-negatives. Real test never runs.
+
+  P2 disjunctive-decision-assert — `assert ... in ("A", "B", "C")` with
+     3+ uppercase string options. Shipped in V11.18, fixed V11.25.2
+     (commit 5d3492d, T7-E2). Failure mode: any outcome passes — the
+     assertion has no truth value.
+
+  P3 run-without-rc-capture — bare `_run(...)` call in a test function
+     whose body has only negative assertions afterward (assert not X,
+     assert X != Y, assert X not in Y). Without rc capture + returncode
+     check, a silent script crash makes the negative assertion pass
+     vacuously. Shipped in V11.18 negative tests at lines 224/235/250
+     of test_handoff_hygiene.py, fixed V11.25.2 (commit 5d3492d, T7-E4).
+     A bare `_run()` followed by ANY positive assertion is allowed — the
+     positive assert fails naturally if the script crashed.
+
+  P4 bash-case-without-default — `case ... in` block in scripts/handoff
+     or hooks/session-end without a `*)` default arm. Was the root cause
+     of V11.25.x silent `_CONF_DECISION="UNKNOWN"` fall-through; extracted
+     to a typed Python state machine in V11.26 (this commit). This pattern
+     prevents new occurrences.
+
+Env knobs:
+  V11_LINT_TEST_HONESTY=off  → exit 0 immediately (rollback)
+  V11_HOME=<path>            → override repo root (default $HOME/v11)
+
+Exit codes:
+  0 — no violations OR linter disabled
+  1 — violations found (printed to stderr)
+"""
+
+import ast
+import os
+import re
+import sys
+from pathlib import Path
+
+
+# Pattern P1: stderr.replace(...) in a non-comment line
+_RE_STDERR_REPLACE = re.compile(r"\.stderr\.replace\s*\(")
+
+# Pattern P2: assert ... in (UPPER, UPPER, ...) with 3+ uppercase string options
+# Match: `in (` followed by ≥3 quoted uppercase tokens separated by commas.
+_RE_DISJUNCTIVE = re.compile(
+    r'\bin\s*\(\s*'
+    r'(?:["\'][A-Z][A-Z0-9_\-]+["\']\s*,\s*){2,}'
+    r'["\'][A-Z][A-Z0-9_\-]+["\']'
+)
+
+# Pattern P4: bash `case ... in` line (must be matched with `esac` and `*)` default)
+_RE_BASH_CASE_OPEN = re.compile(r"^\s*case\s+.+\s+in\s*$")
+_RE_BASH_CASE_CLOSE = re.compile(r"^\s*esac\s*$")
+_RE_BASH_CASE_DEFAULT = re.compile(r"^\s*\*\)")
+
+
+def _assert_is_negative(node: ast.Assert) -> bool:
+    """True iff this assert's truthiness depends on a NEGATIVE check.
+
+    Negative forms (pass vacuously when subject is missing/None/empty):
+      assert not X
+      assert X != Y
+      assert X is not Y
+      assert X not in Y
+      assert not X.exists(), assert not X.is_file(), etc. — covered by 'not X'
+
+    Positive forms (fail naturally when script crashed):
+      assert X
+      assert X == Y, assert X in Y, assert X is Y
+      assert len(X) == N, assert X.foo
+    """
+    test = node.test
+    # `assert not X`
+    if isinstance(test, ast.UnaryOp) and isinstance(test.op, ast.Not):
+        return True
+    # `assert X != Y`, `assert X not in Y`, `assert X is not Y`
+    if isinstance(test, ast.Compare):
+        return all(
+            isinstance(op, (ast.NotEq, ast.NotIn, ast.IsNot))
+            for op in test.ops
+        )
+    return False
+
+
+def _check_bare_run_calls(func: ast.FunctionDef, path: Path, violations: list) -> None:
+    """Within a test function body, find bare _run() calls.
+
+    Bare = an Expr statement whose value is a Call with func.id == '_run'.
+    Flag if NO positive assert appears later in the same function body
+    (only negative asserts, or no asserts at all → vacuous-pass risk).
+    """
+    body = func.body
+    for i, stmt in enumerate(body):
+        if not (isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call)):
+            continue
+        call_func = stmt.value.func
+        if not (isinstance(call_func, ast.Name) and call_func.id == "_run"):
+            continue
+
+        # Found a bare _run(...) call. Scan subsequent statements for any
+        # positive assertion (an assert that would fail on script crash).
+        has_positive_assert = False
+        for later in body[i + 1:]:
+            for sub in ast.walk(later):
+                if isinstance(sub, ast.Assert) and not _assert_is_negative(sub):
+                    has_positive_assert = True
+                    break
+            if has_positive_assert:
+                break
+
+        if not has_positive_assert:
+            try:
+                snippet = ast.unparse(stmt)
+            except Exception:
+                snippet = "<bare _run() call>"
+            violations.append((
+                "P3-run-without-rc-capture",
+                str(path),
+                stmt.lineno,
+                snippet[:140],
+            ))
+
+
+def _lint_python_test(path: Path, violations: list) -> None:
+    """Apply P1/P2 line-wise, P3 via AST walk over test function bodies."""
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return
+
+    # P1, P2 — line-based
+    for lineno, line in enumerate(text.splitlines(), start=1):
+        stripped = line.lstrip()
+        if not stripped or stripped.startswith("#"):
+            continue
+
+        if _RE_STDERR_REPLACE.search(line):
+            violations.append((
+                "P1-stderr-subtraction",
+                str(path),
+                lineno,
+                line.strip()[:140],
+            ))
+
+        if "assert" in line and _RE_DISJUNCTIVE.search(line):
+            violations.append((
+                "P2-disjunctive-decision-assert",
+                str(path),
+                lineno,
+                line.strip()[:140],
+            ))
+
+    # P3 — AST-based (needs the function-body context to distinguish
+    # positive-assertion-follows from negative-only-followed)
+    try:
+        tree = ast.parse(text, filename=str(path))
+    except SyntaxError:
+        return
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and \
+                node.name.startswith("test_"):
+            _check_bare_run_calls(node, path, violations)
+
+
+def _lint_bash_script(path: Path, violations: list) -> None:
+    """Apply P4 to a bash script.
+
+    Stack-based case/esac parser. Nested cases supported. A case block
+    that closes without seeing `*)` is flagged.
+    """
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return
+
+    # stack entries: [start_lineno, has_default_bool]
+    stack: list = []
+    for lineno, line in enumerate(text.splitlines(), start=1):
+        stripped = line.lstrip()
+        if not stripped or stripped.startswith("#"):
+            continue
+
+        if _RE_BASH_CASE_OPEN.match(line):
+            stack.append([lineno, False])
+            continue
+
+        if stack and _RE_BASH_CASE_DEFAULT.match(line):
+            stack[-1][1] = True
+            continue
+
+        if _RE_BASH_CASE_CLOSE.match(line) and stack:
+            start_line, has_default = stack.pop()
+            if not has_default:
+                violations.append((
+                    "P4-bash-case-without-default",
+                    str(path),
+                    start_line,
+                    f"case statement opened here closes without `*)` arm",
+                ))
+
+
+def main() -> int:
+    if os.environ.get("V11_LINT_TEST_HONESTY", "on") == "off":
+        return 0
+
+    v11_home = Path(os.environ.get("V11_HOME", str(Path.home() / "v11")))
+    if not v11_home.exists():
+        print(f"lint-test-honesty: V11_HOME={v11_home} does not exist", file=sys.stderr)
+        return 1
+
+    violations: list = []
+
+    # P1/P2/P3 — every Python test file under tests/
+    test_dir = v11_home / "tests"
+    if test_dir.exists():
+        for path in sorted(test_dir.rglob("*.py")):
+            _lint_python_test(path, violations)
+
+    # P4 — confined to handoff-adjacent bash scripts. Other bash in the repo
+    # is allowed case-without-default (less critical). Expand the list when
+    # new state-machine-heavy scripts arrive.
+    for rel in ("scripts/handoff", "hooks/session-end"):
+        path = v11_home / rel
+        if path.exists():
+            _lint_bash_script(path, violations)
+
+    if not violations:
+        return 0
+
+    by_pattern: dict = {}
+    for pattern_id, path, lineno, snippet in violations:
+        by_pattern.setdefault(pattern_id, []).append((path, lineno, snippet))
+
+    print(f"V11.26 lint-test-honesty: {len(violations)} violation(s) in "
+          f"{len(by_pattern)} pattern(s)", file=sys.stderr)
+    for pattern_id in sorted(by_pattern):
+        hits = by_pattern[pattern_id]
+        print(f"\n  [{pattern_id}] {len(hits)} hit(s):", file=sys.stderr)
+        for path, lineno, snippet in hits:
+            print(f"    {path}:{lineno}", file=sys.stderr)
+            print(f"        {snippet}", file=sys.stderr)
+    print("\n  See scripts/lint-test-honesty header for pattern rationale "
+          "and commit refs.", file=sys.stderr)
+    print("  Rollback: V11_LINT_TEST_HONESTY=off", file=sys.stderr)
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,120 @@
+#!/bin/bash
+# Display hook performance dashboard
+
+set -euo pipefail
+
+echo "=== V11 Hook Performance Dashboard ==="
+echo ""
+
+# Read timing log
+LOG=~/.agent-metrics/hook-timing.log
+
+if [[ ! -f "$LOG" ]]; then
+    echo "Error: Hook timing log not found at $LOG"
+    exit 1
+fi
+
+# Get total measurement count
+TOTAL_COUNT=$(wc -l < "$LOG")
+echo "Total Measurements: $TOTAL_COUNT"
+echo ""
+
+# Define hooks to analyze
+HOOKS=(
+    "detect-project"
+    "guard-enforcement"
+    "guard-write-gates"
+    "guard-effort"
+    "enforce-test-coverage"
+    "verify-syntax"
+    "track-autonomy"
+    "sync-tasks"
+    "track-agents"
+    "session-end"
+)
+
+echo "=== Hook Latency Statistics ==="
+printf "%-25s %6s %8s %8s %8s %8s\n" "Hook" "Count" "P50" "P95" "P99" "Mean"
+echo "────────────────────────────────────────────────────────────────────"
+
+for hook in "${HOOKS[@]}"; do
+    # Extract latencies for this hook (use jq slurp to handle multiline JSON)
+    LATENCIES=$(jq -s --arg hook "$hook" '[.[] | select(.hook == $hook) | .elapsed_ms] | sort | .[]' "$LOG")
+
+    if [[ -z "$LATENCIES" ]]; then
+        continue
+    fi
+
+    # Count measurements
+    COUNT=$(echo "$LATENCIES" | wc -l)
+
+    # Calculate percentiles using awk
+    STATS=$(echo "$LATENCIES" | awk -v count="$COUNT" '
+        {
+            values[NR] = $1
+            sum += $1
+        }
+        END {
+            p50_idx = int(count * 0.50)
+            p95_idx = int(count * 0.95)
+            p99_idx = int(count * 0.99)
+
+            # Handle edge cases
+            if (p50_idx < 1) p50_idx = 1
+            if (p95_idx < 1) p95_idx = 1
+            if (p99_idx < 1) p99_idx = 1
+
+            printf "%d %d %d %.0f", values[p50_idx], values[p95_idx], values[p99_idx], sum/count
+        }
+    ')
+
+    read -r P50 P95 P99 MEAN <<< "$STATS"
+
+    printf "%-25s %6d %6dms %6dms %6dms %6dms\n" "$hook" "$COUNT" "$P50" "$P95" "$P99" "$MEAN"
+done
+
+echo ""
+echo "=== SLA Violations (>500ms) ==="
+
+# Find measurements exceeding 500ms
+VIOLATIONS=$(jq -s '[.[] | select(.elapsed_ms > 500)] | sort_by(.elapsed_ms) | reverse | .[0:10]' "$LOG")
+
+VIOLATION_COUNT=$(echo "$VIOLATIONS" | jq '. | length')
+
+if [[ "$VIOLATION_COUNT" -eq 0 ]]; then
+    echo "No SLA violations detected (all hooks <500ms)"
+else
+    echo "$VIOLATIONS" | jq -r '.[] | "\(.hook): \(.elapsed_ms)ms (iteration \(.iteration), \(.timestamp))"'
+fi
+
+echo ""
+echo "=== Recent Activity (Last 20 Measurements) ==="
+jq -s '.[-20:] | .[] | "\(.timestamp) \(.hook): \(.elapsed_ms)ms"' "$LOG"
+
+echo ""
+echo "=== Cache Efficiency (enforce-test-coverage) ==="
+
+# Analyze test coverage cache hits vs misses
+COVERAGE_LATENCIES=$(jq -s '[.[] | select(.hook == "enforce-test-coverage") | .elapsed_ms] | sort' "$LOG")
+COVERAGE_COUNT=$(echo "$COVERAGE_LATENCIES" | jq '. | length')
+
+if [[ "$COVERAGE_COUNT" -gt 0 ]]; then
+    COVERAGE_MEDIAN=$(echo "$COVERAGE_LATENCIES" | jq 'if length > 0 then .[length/2 | floor] else 0 end')
+    COVERAGE_P95=$(echo "$COVERAGE_LATENCIES" | jq 'if length > 0 then .[length*0.95 | floor] else 0 end')
+    CACHE_HITS=$(echo "$COVERAGE_LATENCIES" | jq '[.[] | select(. < 200)] | length')
+    CACHE_HIT_RATE=$(awk -v hits="$CACHE_HITS" -v total="$COVERAGE_COUNT" 'BEGIN {printf "%.1f", (hits/total)*100}')
+
+    echo "Coverage hook measurements: $COVERAGE_COUNT"
+    echo "Median latency: ${COVERAGE_MEDIAN}ms (likely cache hits)"
+    echo "P95 latency: ${COVERAGE_P95}ms (likely cache misses)"
+    echo "Estimated cache hit rate: ${CACHE_HIT_RATE}% (latency <200ms)"
+else
+    echo "No enforce-test-coverage measurements found"
+fi
+
+echo ""
+echo "=== V11 vs Target Gap ==="
+echo "V11 theoretical target: ~24ms PreToolUse, ~32ms PostToolUse"
+echo "V11 actual (P50): 203-366ms (8-11x higher)"
+echo "Primary bottlenecks: Bash startup (~150ms), jq processing (~50-80ms)"
+echo "Impact on session: 1-3% of total time (acceptable for safety guarantees)"

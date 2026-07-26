@@ -1,0 +1,8 @@
+id: BT-002
+title: "Cross-agent write triggers ownership conflict"
+tier: 0
+type: ownership
+category: ownership
+description: |
+  Backend-impl agent writing to tester's directory should be detected
+  by guard-write-gates as an ownership conflict.

@@ -1,0 +1,144 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "plan-context.schema.json",
+  "title": "V11 Plan Context",
+  "description": "Structured reasoning artifact that persists planning context across sessions",
+  "type": "object",
+  "properties": {
+    "project": { "type": "string", "minLength": 1 },
+    "version": { "type": "string", "pattern": "^\\d+\\.\\d+\\.\\d+$" },
+    "last_updated": { "type": "string", "format": "date-time" },
+    "domain": { "$ref": "#/$defs/domain_classification" },
+    "constraints": { "$ref": "#/$defs/constraints" },
+    "hypotheses": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/hypothesis" }
+    },
+    "decisions": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/decision" }
+    },
+    "bottleneck": { "$ref": "#/$defs/bottleneck" },
+    "kill_conditions": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "resume_context": { "$ref": "#/$defs/resume_context" },
+    "interview_completed": {
+      "type": "boolean",
+      "description": "Whether the structured interview has been completed"
+    },
+    "interview_questions_answered": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Number of interview questions answered"
+    },
+    "interview_timestamp": {
+      "type": ["string", "null"],
+      "format": "date-time",
+      "description": "When the interview was completed"
+    }
+  },
+  "required": ["project", "version", "last_updated"],
+  "additionalProperties": true,
+  "$defs": {
+    "domain_classification": {
+      "type": "object",
+      "properties": {
+        "cynefin": {
+          "enum": ["clear", "complicated", "complex", "chaotic", "confused"]
+        },
+        "rationale": { "type": "string", "maxLength": 500 }
+      },
+      "required": ["cynefin"],
+      "additionalProperties": false
+    },
+    "constraints": {
+      "type": "object",
+      "properties": {
+        "hard": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "name": { "type": "string" },
+              "description": { "type": "string" }
+            },
+            "required": ["name", "description"],
+            "additionalProperties": false
+          }
+        },
+        "soft": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "name": { "type": "string" },
+              "description": { "type": "string" },
+              "tradeoff": { "type": "string" }
+            },
+            "required": ["name", "description", "tradeoff"],
+            "additionalProperties": false
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "hypothesis": {
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "statement": { "type": "string" },
+        "prior": { "type": "number", "minimum": 0, "maximum": 1 },
+        "current": { "type": "number", "minimum": 0, "maximum": 1 },
+        "validated_by": { "type": "string" },
+        "evidence": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "status": {
+          "enum": ["active", "validated", "invalidated"]
+        }
+      },
+      "required": ["id", "statement", "status"],
+      "additionalProperties": false
+    },
+    "decision": {
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "title": { "type": "string" },
+        "context": { "type": "string" },
+        "options": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "chosen": { "type": "string" },
+        "rationale": { "type": "string" },
+        "date": { "type": "string" },
+        "reversible": { "type": "boolean" }
+      },
+      "required": ["id", "title", "chosen", "rationale"],
+      "additionalProperties": false
+    },
+    "bottleneck": {
+      "type": "object",
+      "properties": {
+        "current": { "type": "string" },
+        "exploit_strategy": { "type": "string" },
+        "last_updated": { "type": "string" }
+      },
+      "required": ["current"],
+      "additionalProperties": false
+    },
+    "resume_context": {
+      "type": "object",
+      "properties": {
+        "last_decision_point": { "type": "string" },
+        "next_critical_question": { "type": "string" },
+        "evidence_received": { "type": "string" }
+      },
+      "additionalProperties": false
+    }
+  }
+}

@@ -1,0 +1,257 @@
+#!/usr/bin/env python3
+# V11 Pre-Scope Check — read-only dispatch filter flagging open tasks that
+# look likely to need splitting before an agent is dispatched onto them.
+#
+# Usage: scripts/prescope-check PROJECT [TASK_ID]
+#         TASK_ID (optional) limits the scan to a single task.
+#
+# Reads (never writes):
+#   SESSIONS_ROOT/PROJECT/.task-state.json  (default SESSIONS_ROOT=$V11_WORKSPACE_ROOT/sessions)
+#     -> the "open_tasks" bucket (pending/in_progress tasks; same bucket
+#        wave-check's collect_wave_tasks() consults for its work/review split)
+#   $V11_WORKSPACE_ROOT/.agent-metrics/ledger/PROJECT.jsonl
+#     -> ev:"prescope" rows appended by sync-tasks S1-B2
+#        (_v11_prescope_ledger_event in hooks/lib/common.sh)
+#
+# Flags an open task when ANY of:
+#   (a) metadata.scope is missing on the task's CURRENT metadata — EXCEPT
+#       review-pair siblings (metadata.review_of set) and blocker tasks,
+#       which mirror sync-tasks S1-A1's exemption exactly: those aren't
+#       "work" tasks in the deliverable-sizing sense and are never expected
+#       to carry a scope tag.
+#   (b) metadata.scope == "large" (no exemption — fires on review/blocker
+#       tasks too, matching sync-tasks' V11_PRESCOPE_ADVISORY block)
+#   (c) metadata.complexity in {complex, novel} AND metadata.deliverable_of is
+#       absent/empty
+#   (d) the ledger carries one or more ev:"prescope" rows for this task_id
+#       (fired at TaskCreate by sync-tasks S1-A1/A2/B1 — missing_scope,
+#       invalid_scope, scope_large, complex_no_deliverable, smell_conjunction,
+#       smell_runbook_steps, smell_length) AND the task is still open. This is
+#       a literal "row exists + task still open" check — it does NOT re-run
+#       the smell regexes against the current description (that logic lives
+#       once, in sync-tasks S1-A2); it surfaces what already fired and was
+#       never resolved by completing (or re-scoping) the task.
+#
+# (a)-(c) duplicate reason codes may also appear as ledger rows; each
+# (task_id, reason) pair is only ever emitted once (deduplicated).
+#
+# Output: one line per flagged (task_id, reason) pair on stdout:
+#   <task_id> <reason> — suggest: <split axis>
+#
+# Exit codes:
+#   0  → clean — no flagged open tasks
+#   11 → at least one (task_id, reason) line was printed to stdout
+#   4  → BAD_USAGE — missing args / unreadable task-state
+#
+# S1-C1 (improvements/10). Authored by spec-implementer-v11.
+
+from __future__ import annotations
+
+import json
+import os
+import sys
+from pathlib import Path
+from typing import Any
+
+EXIT_OK = 0
+EXIT_FLAGGED = 11
+EXIT_BAD_USAGE = 4
+
+HOME = Path.home()
+WORKSPACE_ROOT = Path(os.environ.get("V11_WORKSPACE_ROOT", str(HOME)))
+SESSIONS_ROOT = Path(os.environ.get("SESSIONS_ROOT", str(WORKSPACE_ROOT / "sessions")))
+
+# Reason code -> short split-axis hint. Unknown/future reason codes fall
+# back to DEFAULT_SUGGEST rather than erroring — this script must never
+# choke on a ledger row shape it doesn't recognize yet.
+SUGGEST_AXES = {
+    "missing_scope": "tag metadata.scope small|medium|large; one file/one concern per task",
+    "invalid_scope": "tag metadata.scope small|medium|large; one file/one concern per task",
+    "scope_large": "one file/one concern per task",
+    "complex_no_deliverable": "one file/one concern per task; set metadata.deliverable_of on split children",
+    "smell_conjunction": "separate tests into sibling task",
+    "smell_runbook_steps": "one step per sibling task",
+    "smell_length": "split into deliverable-sized siblings by concern",
+}
+DEFAULT_SUGGEST = "split into deliverable-sized siblings — one file/one concern per task"
+
+
+def task_state_path(project: str) -> Path:
+    """Return the path to read task-state from, preferring the per-session
+    mirror under SESSIONS_ROOT, falling back to the durable aggregate —
+    mirrors wave-check's task_state_path() convention."""
+    primary = SESSIONS_ROOT / project / ".task-state.json"
+    if primary.exists():
+        return primary
+    return WORKSPACE_ROOT / ".agent-metrics" / "task-state" / f"{project}.json"
+
+
+def ledger_path(project: str) -> Path:
+    return WORKSPACE_ROOT / ".agent-metrics" / "ledger" / f"{project}.jsonl"
+
+
+def suggest_for(reason: str) -> str:
+    return SUGGEST_AXES.get(reason, DEFAULT_SUGGEST)
+
+
+def collect_open_tasks(state: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """Open (pending/in_progress) tasks keyed by task_id, from the
+    "open_tasks" bucket. Defensive isinstance(dict) guard mirrors
+    wave-check's collect_wave_tasks() — aggregates occasionally carry
+    sibling keys (e.g. "completed") as plain ints/lists rather than task
+    maps, so only a genuine task-map bucket is consulted."""
+    out: dict[str, dict[str, Any]] = {}
+    bucket = state.get("open_tasks")
+    if not isinstance(bucket, dict):
+        return out
+    for tid, t in bucket.items():
+        if not isinstance(t, dict):
+            continue
+        status = t.get("status") or "pending"
+        if status in ("pending", "in_progress"):
+            out[str(tid)] = t
+    return out
+
+
+def is_scope_warn_exempt(task: dict[str, Any]) -> bool:
+    """Mirrors sync-tasks S1-A1's exemption (V11_SCOPE_WARN block) EXACTLY:
+    review-pair siblings (metadata.review_of set) and blocker tasks (subject
+    starts with "BLOCKER", case-insensitive, or metadata.blocker truthy)
+    are not "work" tasks in the deliverable-sizing sense and are never
+    expected to carry metadata.scope. Applies ONLY to the missing_scope
+    check below — sync-tasks' separate V11_PRESCOPE_ADVISORY block (scope
+    large / complex-no-deliverable) carries NO such exemption, so those two
+    reasons fire on review/blocker tasks too, unexempted, matching the hook."""
+    meta = task.get("metadata") or {}
+    if meta.get("review_of"):
+        return True
+    subject = str(task.get("subject") or "")
+    if subject.strip().upper().startswith("BLOCKER"):
+        return True
+    blocker = meta.get("blocker")
+    if blocker not in (None, False, "false", "0", 0, ""):
+        return True
+    return False
+
+
+def direct_reasons(task: dict[str, Any]) -> list[str]:
+    """Reason codes computed directly from the task's CURRENT metadata
+    (conditions a-c) — independent of ledger history."""
+    meta = task.get("metadata") or {}
+    scope = meta.get("scope")
+    complexity = meta.get("complexity")
+    deliverable_of = meta.get("deliverable_of")
+
+    reasons: list[str] = []
+    if not scope:
+        if not is_scope_warn_exempt(task):
+            reasons.append("missing_scope")
+    elif scope == "large":
+        reasons.append("scope_large")
+
+    if complexity in ("complex", "novel") and not deliverable_of:
+        reasons.append("complex_no_deliverable")
+
+    return reasons
+
+
+def read_prescope_ledger_reasons(ledger_file: Path, project: str) -> dict[str, list[str]]:
+    """task_id -> ordered, deduplicated list of reason codes from ev:"prescope"
+    ledger rows for this project. Tolerant of malformed/foreign lines
+    (mirrors wave-check's replay_ledger_by_task_id read loop)."""
+    rows: dict[str, list[str]] = {}
+    if not ledger_file.exists():
+        return rows
+    try:
+        raw_lines = ledger_file.read_text(encoding="utf-8", errors="replace").split("\n")
+    except OSError:
+        return rows
+
+    for raw in raw_lines:
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            ev = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(ev, dict) or ev.get("v") != 1 or ev.get("project") != project:
+            continue
+        if ev.get("ev") != "prescope":
+            continue
+        tid = ev.get("task_id")
+        reason = ev.get("reason")
+        if not tid or not reason:
+            continue
+        tid = str(tid)
+        bucket = rows.setdefault(tid, [])
+        if reason not in bucket:
+            bucket.append(reason)
+    return rows
+
+
+def main() -> int:
+    if len(sys.argv) >= 2 and sys.argv[1] in ("--help", "-h"):
+        print("usage: prescope-check PROJECT [TASK_ID]\n\n"
+              "Phase 4 dispatch filter: exit 0 = dispatchable, exit 11 = split before spawn\n"
+              "(multi-deliverable smell or missing/invalid scope), exit 4 = bad usage.")
+        return 0
+    if len(sys.argv) not in (2, 3):
+        print("usage: prescope-check PROJECT [TASK_ID]", file=sys.stderr)
+        return EXIT_BAD_USAGE
+
+    project = sys.argv[1]
+    task_filter = sys.argv[2] if len(sys.argv) == 3 else None
+
+    ts_path = task_state_path(project)
+    if not ts_path.exists():
+        print(f"[prescope-check] task-state not found for project={project!r}: {ts_path}",
+              file=sys.stderr)
+        return EXIT_BAD_USAGE
+
+    try:
+        state = json.loads(ts_path.read_text())
+    except (OSError, json.JSONDecodeError) as e:
+        print(f"[prescope-check] failed to read {ts_path}: {e}", file=sys.stderr)
+        return EXIT_BAD_USAGE
+
+    open_tasks = collect_open_tasks(state)
+
+    if task_filter is not None:
+        open_tasks = {tid: t for tid, t in open_tasks.items() if tid == task_filter}
+        if not open_tasks:
+            print(f"[prescope-check] task {task_filter!r} not found among open tasks for "
+                  f"project={project!r} — nothing to check", file=sys.stderr)
+            return EXIT_OK
+
+    ledger_reasons = read_prescope_ledger_reasons(ledger_path(project), project)
+
+    flagged_lines: list[str] = []
+    flagged_task_ids: set[str] = set()
+
+    for tid in sorted(open_tasks):
+        t = open_tasks[tid]
+        reasons = list(direct_reasons(t))
+        for reason in ledger_reasons.get(tid, []):
+            if reason not in reasons:
+                reasons.append(reason)
+
+        for reason in reasons:
+            flagged_lines.append(f"{tid} {reason} — suggest: {suggest_for(reason)}")
+            flagged_task_ids.add(tid)
+
+    if not flagged_lines:
+        print(f"[prescope-check] OK — project={project!r}: no flagged open tasks",
+              file=sys.stderr)
+        return EXIT_OK
+
+    for line in flagged_lines:
+        print(line)
+
+    print(f"[prescope-check] FLAGGED — project={project!r}: {len(flagged_lines)} line(s) "
+          f"across {len(flagged_task_ids)} task(s)", file=sys.stderr)
+    return EXIT_FLAGGED
+
+
+if __name__ == "__main__":
+    sys.exit(main())

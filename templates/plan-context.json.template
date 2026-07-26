@@ -1,0 +1,29 @@
+{
+  "project": "{{PROJECT}}",
+  "version": "1.0.0",
+  "last_updated": "{{TIMESTAMP}}",
+  "domain": {
+    "cynefin": "confused",
+    "rationale": ""
+  },
+  "constraints": {
+    "hard": [],
+    "soft": []
+  },
+  "hypotheses": [],
+  "decisions": [],
+  "bottleneck": {
+    "current": "",
+    "exploit_strategy": "",
+    "last_updated": "{{TIMESTAMP}}"
+  },
+  "kill_conditions": [],
+  "resume_context": {
+    "last_decision_point": "",
+    "next_critical_question": "",
+    "evidence_received": ""
+  },
+  "interview_completed": false,
+  "interview_questions_answered": 0,
+  "interview_timestamp": null
+}

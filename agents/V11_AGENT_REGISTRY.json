@@ -1,0 +1,1661 @@
+{
+  "metadata": {
+    "version": "11.34.0",
+    "protocol": "V11",
+    "description": "V11 Spec Agents - Per-Task Agent Assignment, Artifact Handoffs, Adversarial Verification, Semantic Memory, Tracker System",
+    "created": "2026-02-11",
+    "agent_count": 13,
+    "formations_count": 14,
+    "system_prompt_root": "~/v11",
+    "deprecation_note": "V11.11+: per-task `metadata.agent` (recorded in the task-state recommended_agents map) is the primary dispatch mechanism. Per-agent `teammate_messaging` and `handoff_to` graphs below are LEGACY backward-compat \u2014 retained so existing TeamCreate-based projects keep working; they are NOT the recommended coordination model and should not be used for new work.",
+    "deprecated_v8_agents": [
+      "spec-conductor-v8"
+    ],
+    "deprecated_v5_agents": [
+      "spec-builder-agent",
+      "spec-validator-agent",
+      "spec-file-operator-agent",
+      "spec-react-component-agent",
+      "spec-project-launcher-agent",
+      "spec-template-applier-agent",
+      "spec-update-applier-agent",
+      "spec-logic-implementer-agent",
+      "spec-integration-coordinator-agent",
+      "spec-test-engineer-agent",
+      "spec-security-architect-agent",
+      "spec-security-validator-agent",
+      "spec-optimization-agent",
+      "spec-rollback-executor-agent",
+      "spec-architect-agent"
+    ]
+  },
+  "agents": [
+    {
+      "version": "11.34.0",
+      "category": "spec-v11",
+      "description": "Session planning and initialization for V11 spec-driven development",
+      "model": "opus",
+      "model_tier": "reasoning",
+      "default_mode": "direct",
+      "effort_level": "high",
+      "tool_profile": "full",
+      "triggers": [
+        "I want to build",
+        "I need to",
+        "Can you help me",
+        "Start new project",
+        "Plan session",
+        "Create spec"
+      ],
+      "capabilities": [
+        "goal_extraction",
+        "adaptive_interview",
+        "spec_md_generation",
+        "task_creation",
+        "sprint_planning",
+        "gate_definition"
+      ],
+      "tools": [
+        "*"
+      ],
+      "handoff_to": [
+        "spec-architect-v11"
+      ],
+      "handoff_from": [],
+      "teammate_messaging": {
+        "to": [
+          "spec-architect-v11",
+          "spec-implementer-v11"
+        ],
+        "from": [
+          "spec-recovery-v11"
+        ]
+      },
+      "color": "cyan",
+      "system_prompt": "agents/spec-planner-v11.md",
+      "v11_native": true
+    },
+    {
+      "version": "11.34.0",
+      "category": "spec-v11",
+      "description": "Architecture design for complex, novel problems",
+      "model": "opus",
+      "model_tier": "reasoning",
+      "default_mode": "teammate",
+      "effort_level": "high",
+      "tool_profile": "full",
+      "triggers": [
+        "design architecture",
+        "novel problem",
+        "multi-service design",
+        "technology evaluation",
+        "scalability planning"
+      ],
+      "capabilities": [
+        "system_architecture",
+        "technology_selection",
+        "trade_off_analysis",
+        "scalability_planning",
+        "formation_structure_design",
+        "container_network_design"
+      ],
+      "tools": [
+        "*"
+      ],
+      "handoff_to": [
+        "spec-implementer-v11"
+      ],
+      "handoff_from": [
+        "spec-planner-v11",
+        "spec-implementer-v11"
+      ],
+      "teammate_messaging": {
+        "to": [
+          "spec-implementer-v11",
+          "spec-integrator-v11",
+          "spec-security-v11"
+        ],
+        "from": [
+          "spec-planner-v11",
+          "spec-implementer-v11"
+        ]
+      },
+      "color": "purple",
+      "system_prompt": "agents/spec-architect-v11.md",
+      "v11_native": true
+    },
+    {
+      "version": "11.34.0",
+      "category": "spec-v11",
+      "description": "Code implementation and business logic",
+      "model": "sonnet",
+      "model_tier": "intelligence",
+      "default_mode": "teammate",
+      "effort_level": null,
+      "tool_profile": "coding",
+      "triggers": [
+        "implement",
+        "write code",
+        "create feature",
+        "build",
+        "code"
+      ],
+      "capabilities": [
+        "feature_implementation",
+        "business_logic",
+        "api_endpoints",
+        "database_models",
+        "hot_reload_verification"
+      ],
+      "tools": [
+        "Read",
+        "Write",
+        "Edit",
+        "Grep",
+        "Glob",
+        "Bash",
+        "TaskCreate",
+        "TaskUpdate",
+        "TaskList",
+        "TaskGet"
+      ],
+      "handoff_to": [
+        "spec-tester-v11",
+        "spec-integrator-v11",
+        "spec-reviewer-v11"
+      ],
+      "handoff_from": [
+        "spec-architect-v11",
+        "spec-integrator-v11",
+        "spec-tester-v11",
+        "spec-reviewer-v11",
+        "spec-recovery-v11"
+      ],
+      "teammate_messaging": {
+        "to": [
+          "spec-tester-v11",
+          "spec-integrator-v11",
+          "spec-reviewer-v11",
+          "spec-architect-v11",
+          "spec-security-v11"
+        ],
+        "from": [
+          "spec-architect-v11",
+          "spec-integrator-v11",
+          "spec-tester-v11",
+          "spec-reviewer-v11",
+          "spec-recovery-v11"
+        ]
+      },
+      "color": "green",
+      "system_prompt": "agents/spec-implementer-v11.md",
+      "v11_native": true,
+      "most_frequent": true
+    },
+    {
+      "version": "11.34.0",
+      "category": "spec-v11",
+      "description": "Multi-service coordination and API contracts",
+      "model": "sonnet",
+      "model_tier": "intelligence",
+      "default_mode": "teammate",
+      "effort_level": null,
+      "tool_profile": "coding",
+      "triggers": [
+        "integrate services",
+        "API contract",
+        "docker network",
+        "service communication",
+        "multi-service"
+      ],
+      "capabilities": [
+        "api_contract_definition",
+        "docker_network_config",
+        "service_dependency_management",
+        "health_check_coordination",
+        "nginx_integration"
+      ],
+      "tools": [
+        "Read",
+        "Write",
+        "Edit",
+        "Grep",
+        "Glob",
+        "Bash",
+        "TaskCreate",
+        "TaskUpdate",
+        "TaskList",
+        "TaskGet"
+      ],
+      "handoff_to": [
+        "spec-tester-v11",
+        "spec-implementer-v11",
+        "spec-reviewer-v11"
+      ],
+      "handoff_from": [
+        "spec-implementer-v11",
+        "spec-architect-v11",
+        "spec-tester-v11"
+      ],
+      "teammate_messaging": {
+        "to": [
+          "spec-tester-v11",
+          "spec-implementer-v11",
+          "spec-reviewer-v11"
+        ],
+        "from": [
+          "spec-implementer-v11",
+          "spec-architect-v11",
+          "spec-tester-v11"
+        ]
+      },
+      "color": "blue",
+      "system_prompt": "agents/spec-integrator-v11.md",
+      "v11_native": true
+    },
+    {
+      "version": "11.34.0",
+      "category": "spec-v11",
+      "description": "L1-L4 testing and validation",
+      "model": "sonnet",
+      "model_tier": "intelligence",
+      "default_mode": "teammate",
+      "effort_level": null,
+      "tool_profile": "testing",
+      "triggers": [
+        "run tests",
+        "test coverage",
+        "integration tests",
+        "validate",
+        "check gate"
+      ],
+      "capabilities": [
+        "l1_syntax_validation",
+        "l2_functional_tests",
+        "l3_integration_tests",
+        "l4_regression_tests",
+        "gate_validation",
+        "task_verification"
+      ],
+      "tools": [
+        "Read",
+        "Grep",
+        "Glob",
+        "Bash",
+        "TaskCreate",
+        "TaskUpdate",
+        "TaskList",
+        "TaskGet"
+      ],
+      "handoff_to": [
+        "spec-implementer-v11",
+        "spec-integrator-v11",
+        "spec-recovery-v11"
+      ],
+      "handoff_from": [
+        "spec-implementer-v11",
+        "spec-integrator-v11",
+        "spec-optimizer-v11",
+        "spec-reviewer-v11"
+      ],
+      "teammate_messaging": {
+        "to": [
+          "spec-implementer-v11",
+          "spec-integrator-v11",
+          "spec-recovery-v11"
+        ],
+        "from": [
+          "spec-implementer-v11",
+          "spec-integrator-v11",
+          "spec-optimizer-v11",
+          "spec-reviewer-v11"
+        ]
+      },
+      "color": "lime",
+      "system_prompt": "agents/spec-tester-v11.md",
+      "v11_native": true
+    },
+    {
+      "version": "11.34.0",
+      "category": "spec-v11",
+      "description": "Security architecture and validation (merged)",
+      "model": "opus",
+      "model_tier": "reasoning",
+      "model_for_scanning": "sonnet",
+      "default_mode": "teammate",
+      "effort_level": "high",
+      "tool_profile": "coding",
+      "triggers": [
+        "security review",
+        "threat model",
+        "OWASP",
+        "vulnerability scan",
+        "secret detection"
+      ],
+      "capabilities": [
+        "threat_modeling_stride",
+        "owasp_top10_validation",
+        "secret_detection",
+        "dependency_audit",
+        "container_security",
+        "auth_review"
+      ],
+      "tools": [
+        "Read",
+        "Write",
+        "Edit",
+        "Grep",
+        "Glob",
+        "Bash",
+        "TaskCreate",
+        "TaskUpdate",
+        "TaskList",
+        "TaskGet"
+      ],
+      "handoff_to": [
+        "spec-implementer-v11",
+        "spec-tester-v11"
+      ],
+      "handoff_from": [
+        "spec-architect-v11",
+        "spec-implementer-v11"
+      ],
+      "teammate_messaging": {
+        "to": [
+          "spec-implementer-v11",
+          "spec-tester-v11"
+        ],
+        "from": [
+          "spec-architect-v11",
+          "spec-implementer-v11"
+        ]
+      },
+      "color": "red",
+      "system_prompt": "agents/spec-security-v11.md",
+      "v11_native": true,
+      "merged_from": [
+        "spec-security-architect-agent",
+        "spec-security-validator-agent"
+      ]
+    },
+    {
+      "version": "11.34.0",
+      "category": "spec-v11",
+      "description": "Performance optimization",
+      "model": "opus",
+      "model_tier": "reasoning",
+      "default_mode": "subagent",
+      "effort_level": "high",
+      "tool_profile": "full",
+      "triggers": [
+        "optimize",
+        "performance",
+        "slow",
+        "bottleneck",
+        "profiling"
+      ],
+      "capabilities": [
+        "profiling_analysis",
+        "query_optimization",
+        "caching_strategy",
+        "container_tuning",
+        "frontend_optimization",
+        "bottleneck_identification"
+      ],
+      "tools": [
+        "*"
+      ],
+      "handoff_to": [
+        "spec-tester-v11"
+      ],
+      "handoff_from": [
+        "spec-tester-v11"
+      ],
+      "teammate_messaging": {
+        "to": [
+          "spec-tester-v11"
+        ],
+        "from": [
+          "spec-tester-v11"
+        ]
+      },
+      "color": "orange",
+      "system_prompt": "agents/spec-optimizer-v11.md",
+      "v11_native": true
+    },
+    {
+      "version": "11.34.0",
+      "category": "spec-v11",
+      "description": "Rollback and failure recovery",
+      "model": "sonnet",
+      "model_tier": "intelligence",
+      "default_mode": "direct",
+      "effort_level": "high",
+      "tool_profile": "full",
+      "triggers": [
+        "rollback",
+        "recovery",
+        "restore",
+        "revert",
+        "failure",
+        "incident"
+      ],
+      "capabilities": [
+        "failure_analysis",
+        "file_restoration",
+        "container_rollback",
+        "database_rollback",
+        "task_state_recovery",
+        "incident_documentation"
+      ],
+      "tools": [
+        "*"
+      ],
+      "handoff_to": [
+        "spec-planner-v11",
+        "spec-implementer-v11"
+      ],
+      "handoff_from": [
+        "spec-tester-v11",
+        "spec-security-v11"
+      ],
+      "teammate_messaging": {
+        "to": [
+          "spec-planner-v11",
+          "spec-implementer-v11"
+        ],
+        "from": [
+          "spec-tester-v11",
+          "spec-security-v11"
+        ]
+      },
+      "color": "maroon",
+      "system_prompt": "agents/spec-recovery-v11.md",
+      "v11_native": true,
+      "safety_critical": true,
+      "success_rate_required": "100%"
+    },
+    {
+      "version": "11.34.0",
+      "category": "spec-v11",
+      "description": "Code review, PR review, and design critique",
+      "model": "opus",
+      "model_tier": "reasoning",
+      "default_mode": "teammate",
+      "effort_level": "high",
+      "tool_profile": "readonly",
+      "triggers": [
+        "review code",
+        "check PR",
+        "code quality",
+        "design review"
+      ],
+      "capabilities": [
+        "correctness_review",
+        "maintainability_review",
+        "security_review",
+        "design_critique"
+      ],
+      "tools": [
+        "Read",
+        "Grep",
+        "Glob",
+        "TaskCreate",
+        "TaskUpdate",
+        "TaskList",
+        "TaskGet"
+      ],
+      "handoff_to": [
+        "spec-implementer-v11"
+      ],
+      "handoff_from": [
+        "spec-implementer-v11",
+        "spec-integrator-v11"
+      ],
+      "teammate_messaging": {
+        "to": [
+          "spec-implementer-v11"
+        ],
+        "from": [
+          "spec-implementer-v11",
+          "spec-integrator-v11"
+        ]
+      },
+      "color": "teal",
+      "system_prompt": "agents/spec-reviewer-v11.md",
+      "v11_native": true,
+      "read_only": true
+    },
+    {
+      "version": "11.34.0",
+      "category": "spec-v11",
+      "description": "Adversarial wave review \u2014 5-lens audit (quality, completeness, integration, security, rationale \u2014 Dark Code Layer 4 'why' lens)",
+      "model": "sonnet",
+      "model_tier": "intelligence",
+      "default_mode": "subagent",
+      "effort_level": "high",
+      "tool_profile": "readonly",
+      "triggers": [
+        "wave review",
+        "adversarial review",
+        "audit wave",
+        "review output"
+      ],
+      "capabilities": [
+        "code_quality_audit",
+        "completeness_verification",
+        "integration_review",
+        "security_scan",
+        "verdict_generation"
+      ],
+      "tools": [
+        "Read",
+        "Grep",
+        "Glob",
+        "TaskCreate",
+        "TaskUpdate",
+        "TaskList",
+        "TaskGet"
+      ],
+      "handoff_to": [
+        "spec-implementer-v11"
+      ],
+      "handoff_from": [
+        "spec-implementer-v11",
+        "spec-integrator-v11"
+      ],
+      "color": "yellow",
+      "system_prompt": "agents/adversarial-reviewer.md",
+      "v11_native": true,
+      "read_only": true
+    },
+    {
+      "version": "11.34.0",
+      "category": "spec-v11",
+      "description": "Routing strategist: reviews a plan and recommends V11 formations, specialist agents per role, and skills per task. READ-ONLY advisory.",
+      "model": "opus",
+      "model_tier": "reasoning",
+      "default_mode": "subagent",
+      "effort_level": "high",
+      "tool_profile": "readonly",
+      "triggers": [
+        "who should handle",
+        "assign agents",
+        "agent assignment",
+        "recommend formation",
+        "route this plan",
+        "which formation",
+        "which agents"
+      ],
+      "capabilities": [
+        "plan_classification",
+        "formation_recommendation",
+        "specialist_pool_override",
+        "per_task_agent_assignment",
+        "skill_recommendation",
+        "wave_sequencing",
+        "risk_flagging"
+      ],
+      "tools": [
+        "Read",
+        "Grep",
+        "Glob",
+        "Task",
+        "AskUserQuestion"
+      ],
+      "handoff_to": [
+        "spec-planner-v11",
+        "spec-architect-v11",
+        "spec-implementer-v11"
+      ],
+      "handoff_from": [
+        "spec-planner-v11",
+        "spec-architect-v11"
+      ],
+      "teammate_messaging": {
+        "to": [
+          "spec-planner-v11"
+        ],
+        "from": [
+          "spec-planner-v11"
+        ]
+      },
+      "color": "violet",
+      "system_prompt": "~/.claude/agents/agent-assignment.md",
+      "v11_native": true
+    },
+    {
+      "version": "11.34.0",
+      "category": "spec-v11",
+      "description": "Adversarial-lite post-task review \u2014 fast 3-lens pass (correctness, completeness, integration) scoped strictly to a task's files_changed; emits difficulty 1-5 + per-error JSON verdict for agent-effectiveness attribution",
+      "model": "sonnet",
+      "model_tier": "intelligence",
+      "default_mode": "subagent",
+      "effort_level": "medium",
+      "tool_profile": "readonly",
+      "triggers": [
+        "lite review",
+        "post-task review",
+        "adversarial lite",
+        "review task output"
+      ],
+      "capabilities": [
+        "per_task_review",
+        "error_attribution",
+        "difficulty_rating",
+        "verdict_generation"
+      ],
+      "tools": [
+        "Read",
+        "Grep",
+        "Glob",
+        "TaskGet"
+      ],
+      "handoff_to": [
+        "adversarial-lite-fixer",
+        "spec-implementer-v11"
+      ],
+      "handoff_from": [
+        "spec-implementer-v11",
+        "spec-integrator-v11",
+        "spec-tester-v11"
+      ],
+      "color": "red",
+      "system_prompt": "agents/adversarial-lite-reviewer.md",
+      "v11_native": true,
+      "read_only": true
+    },
+    {
+      "version": "11.34.0",
+      "category": "spec-v11",
+      "description": "Minimal-scope auto-fixer for adversarial-lite-reviewer errors (LOW/MEDIUM/HIGH only \u2014 CRITICAL refused/escalated). Smallest change per error + scoped re-verify. Dedicated agent: never the implementer under measurement",
+      "model": "sonnet",
+      "model_tier": "intelligence",
+      "default_mode": "subagent",
+      "effort_level": "medium",
+      "tool_profile": "coding",
+      "triggers": [
+        "apply lite fixes",
+        "auto-fix review errors",
+        "fix reviewer findings"
+      ],
+      "capabilities": [
+        "minimal_fix",
+        "scoped_reverify",
+        "severity_gating"
+      ],
+      "tools": [
+        "Read",
+        "Write",
+        "Edit",
+        "Bash",
+        "Grep",
+        "Glob",
+        "TaskGet"
+      ],
+      "handoff_to": [
+        "spec-tester-v11"
+      ],
+      "handoff_from": [
+        "adversarial-lite-reviewer"
+      ],
+      "color": "orange",
+      "system_prompt": "agents/adversarial-lite-fixer.md",
+      "v11_native": true,
+      "read_only": false
+    }
+  ],
+  "formations": {
+    "new-project": {
+      "teammates": [
+        "spec-architect-v11",
+        "spec-implementer-v11",
+        "spec-implementer-v11"
+      ],
+      "roles": [
+        "architect",
+        "scaffolder",
+        "db-designer"
+      ],
+      "when": "New project setup, greenfield",
+      "specialist_pool": {
+        "architect": [
+          "backend-architect",
+          "spec-architect-v11"
+        ],
+        "scaffolder": [
+          "ci-cd-architect",
+          "frontend-specialist"
+        ],
+        "db-designer": [
+          "database-engineer",
+          "migration-strategist"
+        ],
+        "subagents": [
+          "performance-optimizer",
+          "security-engineer",
+          "docs-engineer"
+        ]
+      },
+      "tool_policies": {
+        "defaults": {
+          "profile": "coding",
+          "deny": [
+            "group:deploy"
+          ]
+        },
+        "per_role": {
+          "architect": {
+            "profile": "full",
+            "deny": [
+              "group:deploy"
+            ]
+          }
+        }
+      },
+      "agents": []
+    },
+    "feature-impl": {
+      "teammates": [
+        "spec-implementer-v11",
+        "spec-implementer-v11",
+        "spec-integrator-v11",
+        "spec-tester-v11"
+      ],
+      "roles": [
+        "backend-impl",
+        "frontend-impl",
+        "integrator",
+        "tester"
+      ],
+      "when": "Feature building, existing project",
+      "specialist_pool": {
+        "backend-impl": [
+          "backend-architect",
+          "database-engineer",
+          "api-security-expert"
+        ],
+        "frontend-impl": [
+          "frontend-specialist",
+          "App-Design",
+          "mobile-dev-expert"
+        ],
+        "integrator": [
+          "ci-cd-architect",
+          "nginx-manager",
+          "real-time-engineer"
+        ],
+        "tester": [
+          "testing-engineer",
+          "security-engineer"
+        ],
+        "subagents": [
+          "performance-optimizer",
+          "log-analyst",
+          "migration-strategist"
+        ]
+      },
+      "tool_policies": {
+        "defaults": {
+          "profile": "coding",
+          "deny": [
+            "group:deploy"
+          ]
+        },
+        "per_role": {
+          "backend-impl": {
+            "profile": "full",
+            "deny": [
+              "group:deploy"
+            ]
+          },
+          "frontend-impl": {
+            "profile": "full",
+            "deny": [
+              "group:deploy"
+            ]
+          },
+          "integrator": {
+            "profile": "coding",
+            "allow": [
+              "Bash:docker-compose"
+            ],
+            "deny": [
+              "group:deploy"
+            ]
+          },
+          "tester": {
+            "profile": "testing",
+            "deny": [
+              "Write",
+              "Edit",
+              "group:deploy"
+            ]
+          }
+        }
+      },
+      "agents": []
+    },
+    "bug-investigation": {
+      "teammates": [
+        "spec-implementer-v11",
+        "spec-implementer-v11",
+        "spec-implementer-v11"
+      ],
+      "roles": [
+        "hypothesis-1",
+        "hypothesis-2",
+        "hypothesis-3"
+      ],
+      "when": "Unknown root cause, parallel investigation",
+      "specialist_pool": {
+        "hypothesis-1": [
+          "backend-architect",
+          "frontend-specialist",
+          "database-engineer"
+        ],
+        "hypothesis-2": [
+          "sre-specialist",
+          "log-analyst",
+          "monitoring-specialist"
+        ],
+        "hypothesis-3": [
+          "security-engineer",
+          "performance-optimizer"
+        ],
+        "subagents": [
+          "system-apps-manager",
+          "container-manager"
+        ]
+      },
+      "tool_policies": {
+        "defaults": {
+          "profile": "coding",
+          "deny": [
+            "group:deploy"
+          ]
+        }
+      },
+      "agents": []
+    },
+    "security-review": {
+      "teammates": [
+        "spec-security-v11",
+        "spec-security-v11",
+        "spec-implementer-v11"
+      ],
+      "roles": [
+        "threat-modeler",
+        "scanner",
+        "fixer"
+      ],
+      "when": "Security audit",
+      "specialist_pool": {
+        "threat-modeler": [
+          "auth-specialist",
+          "api-security-expert",
+          "data-privacy-engineer"
+        ],
+        "scanner": [
+          "security-engineer",
+          "secure-coding-advisor"
+        ],
+        "fixer": [
+          "backend-architect",
+          "frontend-specialist"
+        ],
+        "subagents": [
+          "code-quality-engineer"
+        ]
+      },
+      "tool_policies": {
+        "defaults": {
+          "profile": "coding",
+          "deny": [
+            "group:deploy"
+          ]
+        },
+        "per_role": {
+          "threat-modeler": {
+            "profile": "readonly"
+          },
+          "scanner": {
+            "profile": "testing"
+          },
+          "fixer": {
+            "profile": "coding",
+            "deny": [
+              "group:deploy"
+            ]
+          }
+        }
+      },
+      "agents": []
+    },
+    "perf-optimization": {
+      "mode": "sequential-subagents",
+      "agents": [
+        "spec-optimizer-v11",
+        "spec-tester-v11"
+      ],
+      "when": "Performance work",
+      "tool_policies": {
+        "defaults": {
+          "profile": "full",
+          "deny": [
+            "group:deploy"
+          ]
+        }
+      },
+      "teammates": []
+    },
+    "code-review": {
+      "teammates": [
+        "spec-reviewer-v11",
+        "spec-reviewer-v11",
+        "spec-reviewer-v11"
+      ],
+      "roles": [
+        "security-reviewer",
+        "perf-reviewer",
+        "coverage-reviewer"
+      ],
+      "when": "PR or code review",
+      "tool_policies": {
+        "defaults": {
+          "profile": "readonly"
+        }
+      },
+      "agents": []
+    },
+    "single-file": {
+      "teammates": [
+        "spec-implementer-v11"
+      ],
+      "roles": [
+        "implementer"
+      ],
+      "when": "1-3 tasks, single file, <2 hour scope",
+      "task_count_range": [
+        1,
+        3
+      ],
+      "parallelization": "none",
+      "tool_policies": {
+        "defaults": {
+          "profile": "coding",
+          "deny": [
+            "group:deploy"
+          ]
+        }
+      },
+      "agents": []
+    },
+    "lightweight-feature": {
+      "teammates": [
+        "spec-implementer-v11",
+        "spec-tester-v11"
+      ],
+      "roles": [
+        "implementer",
+        "tester"
+      ],
+      "when": "Frontend-only or backend-only, 4-8 tasks, <4 hour scope",
+      "specialist_pool": {
+        "implementer": [
+          "frontend-specialist",
+          "backend-architect",
+          "database-engineer",
+          "mobile-dev-expert"
+        ],
+        "tester": [
+          "testing-engineer",
+          "security-engineer"
+        ],
+        "subagents": [
+          "performance-optimizer",
+          "code-quality-engineer"
+        ]
+      },
+      "task_count_range": [
+        4,
+        8
+      ],
+      "parallelization": "sequential",
+      "tool_policies": {
+        "defaults": {
+          "profile": "coding",
+          "deny": [
+            "group:deploy"
+          ]
+        },
+        "per_role": {
+          "tester": {
+            "profile": "testing",
+            "deny": [
+              "Write",
+              "Edit",
+              "group:deploy"
+            ]
+          }
+        }
+      },
+      "agents": []
+    },
+    "swebench-solver": {
+      "teammates": [
+        "spec-architect-v11",
+        "spec-implementer-v11",
+        "spec-tester-v11"
+      ],
+      "roles": [
+        "investigator",
+        "implementer",
+        "validator"
+      ],
+      "when": "SWE-bench Lite instance resolution \u2014 3-wave pipeline with feedback loop",
+      "mode": "sequential-waves",
+      "wave_structure": [
+        {
+          "wave": 0,
+          "role": "investigator",
+          "output": "hypothesis + target_files + files_explored",
+          "type": "agentic",
+          "max_steps": 10
+        },
+        {
+          "wave": 1,
+          "role": "implementer",
+          "output": "FIND/REPLACE patch"
+        },
+        {
+          "wave": 2,
+          "role": "validator",
+          "output": "test pass/fail + error_log"
+        }
+      ],
+      "max_iterations": 3,
+      "feedback_loop": "validator \u2192 implementer (on test failure, up to max_iterations)",
+      "cost_estimate": {
+        "per_instance_tokens": 56000,
+        "per_instance_usd": 0.17,
+        "five_instance_usd": 0.4,
+        "fifty_instance_usd": 4,
+        "three_hundred_instance_usd": 25,
+        "note": "Wave 0 agentic: ~10 tool calls x 2K tokens each; Wave 1+2: ~3 x 12K tokens"
+      },
+      "artifact_schema": {
+        "investigator": [
+          "hypothesis",
+          "target_files",
+          "complexity",
+          "reasoning",
+          "steps_used",
+          "files_explored"
+        ],
+        "implementer": [
+          "patch",
+          "confidence",
+          "reasoning"
+        ],
+        "validator": [
+          "resolved",
+          "f2p_tested",
+          "f2p_passed",
+          "error_log",
+          "final_patch"
+        ]
+      },
+      "tool_policies": {
+        "defaults": {
+          "profile": "coding",
+          "deny": [
+            "group:deploy"
+          ]
+        },
+        "per_role": {
+          "investigator": {
+            "profile": "readonly"
+          },
+          "implementer": {
+            "profile": "coding",
+            "deny": [
+              "group:deploy"
+            ]
+          },
+          "validator": {
+            "profile": "testing",
+            "deny": [
+              "Write",
+              "Edit",
+              "group:deploy"
+            ]
+          }
+        }
+      },
+      "agents": [],
+      "benchmark_script": "scripts/swe_v11.py",
+      "baseline_script": "scripts/swe_claude_baseline.py",
+      "output_dir": "swebench-predictions/v11-formation",
+      "traces_dir": "swebench-predictions/v11-formation/trajs"
+    },
+    "business-launch": {
+      "teammates": [
+        "spec-planner-v11",
+        "spec-implementer-v11",
+        "spec-implementer-v11",
+        "spec-reviewer-v11",
+        "spec-implementer-v11"
+      ],
+      "roles": [
+        "project-manager",
+        "operations",
+        "growth",
+        "legal-finance",
+        "business-dev"
+      ],
+      "when": "New business launch \u2014 multi-function planning across ops, legal, finance, marketing, BD. Use when project needs business strategy alongside engineering.",
+      "mode": "parallel-with-synthesis",
+      "wave_structure": [
+        {
+          "wave": 0,
+          "roles": [
+            "project-manager"
+          ],
+          "output": "team_charter + sprint_plan + task_breakdown",
+          "type": "planning"
+        },
+        {
+          "wave": 1,
+          "roles": [
+            "operations",
+            "growth",
+            "legal-finance",
+            "business-dev"
+          ],
+          "output": "specialist_reports",
+          "type": "parallel-research"
+        },
+        {
+          "wave": 2,
+          "roles": [
+            "project-manager"
+          ],
+          "output": "synthesis + roadmap + spec_updates",
+          "type": "synthesis"
+        }
+      ],
+      "specialist_pool": {
+        "project-manager": [
+          "technical-pm",
+          "spec-planner-v11"
+        ],
+        "operations": [
+          "spec-implementer-v11",
+          "sre-specialist"
+        ],
+        "growth": [
+          "spec-implementer-v11",
+          "App-Design"
+        ],
+        "legal-finance": [
+          "spec-reviewer-v11",
+          "data-privacy-engineer"
+        ],
+        "business-dev": [
+          "spec-integrator-v11",
+          "ai-integration-specialist"
+        ],
+        "subagents": [
+          "Excel-AI",
+          "Explore",
+          "docs-engineer"
+        ]
+      },
+      "tool_policies": {
+        "defaults": {
+          "profile": "coding",
+          "deny": [
+            "group:deploy"
+          ]
+        },
+        "per_role": {
+          "project-manager": {
+            "profile": "full"
+          },
+          "operations": {
+            "profile": "coding",
+            "deny": [
+              "group:deploy"
+            ]
+          },
+          "growth": {
+            "profile": "coding",
+            "deny": [
+              "group:deploy"
+            ]
+          },
+          "legal-finance": {
+            "profile": "readonly"
+          },
+          "business-dev": {
+            "profile": "coding",
+            "deny": [
+              "group:deploy"
+            ]
+          }
+        }
+      },
+      "artifact_schema": {
+        "project-manager": [
+          "team_charter",
+          "sprint_plan",
+          "task_list",
+          "roadmap",
+          "synthesis_report"
+        ],
+        "operations": [
+          "fulfillment_plan",
+          "sops",
+          "partner_pipeline",
+          "inventory_plan"
+        ],
+        "growth": [
+          "gtm_strategy",
+          "ad_campaigns",
+          "seo_plan",
+          "launch_playbook"
+        ],
+        "legal-finance": [
+          "legal_checklist",
+          "financial_model",
+          "entity_plan",
+          "compliance_report"
+        ],
+        "business-dev": [
+          "partner_list",
+          "outreach_templates",
+          "b2b_strategy",
+          "competitive_intel"
+        ]
+      },
+      "agents": []
+    },
+    "all-hands-planning": {
+      "mode": "parallel-background-agents",
+      "when": "Spec refinement requiring multiple specialist reviews in parallel. Use when a spec exists but needs cross-functional validation before build begins.",
+      "agents": [],
+      "roles": [
+        "architecture-reviewer",
+        "security-reviewer",
+        "frontend-reviewer",
+        "business-reviewer"
+      ],
+      "specialist_pool": {
+        "architecture-reviewer": [
+          "backend-architect",
+          "database-engineer"
+        ],
+        "security-reviewer": [
+          "security-engineer",
+          "auth-specialist",
+          "data-privacy-engineer"
+        ],
+        "frontend-reviewer": [
+          "frontend-specialist",
+          "App-Design",
+          "mobile-dev-expert"
+        ],
+        "business-reviewer": [
+          "Excel-AI",
+          "Explore",
+          "technical-pm"
+        ],
+        "subagents": [
+          "ai-integration-specialist",
+          "performance-optimizer"
+        ]
+      },
+      "wave_structure": [
+        {
+          "wave": 0,
+          "roles": [
+            "architecture-reviewer",
+            "security-reviewer",
+            "frontend-reviewer",
+            "business-reviewer"
+          ],
+          "output": "specialist_reports",
+          "type": "parallel-review"
+        },
+        {
+          "wave": 1,
+          "roles": [
+            "orchestrator"
+          ],
+          "output": "spec_v_next + roadmap + updated_docs",
+          "type": "synthesis"
+        }
+      ],
+      "tool_policies": {
+        "defaults": {
+          "profile": "readonly"
+        },
+        "per_role": {
+          "architecture-reviewer": {
+            "profile": "readonly"
+          },
+          "security-reviewer": {
+            "profile": "readonly"
+          },
+          "frontend-reviewer": {
+            "profile": "readonly"
+          },
+          "business-reviewer": {
+            "profile": "readonly"
+          }
+        }
+      },
+      "artifact_schema": {
+        "architecture-reviewer": [
+          "endpoint_count",
+          "table_count",
+          "docker_services",
+          "pipeline_steps",
+          "blockers_found",
+          "spec_additions"
+        ],
+        "security-reviewer": [
+          "threat_model",
+          "p0_findings",
+          "encryption_specs",
+          "compliance_requirements",
+          "spec_additions"
+        ],
+        "frontend-reviewer": [
+          "route_map",
+          "component_tree",
+          "ux_flow",
+          "performance_targets",
+          "spec_additions"
+        ],
+        "business-reviewer": [
+          "business_roadmap",
+          "financial_model",
+          "legal_checklist",
+          "kpi_dashboard",
+          "sops",
+          "spec_additions"
+        ]
+      }
+    },
+    "codebase-audit": {
+      "mode": "parallel-background-agents",
+      "when": "Full codebase review from multiple angles \u2014 security, performance, code quality, database, test coverage. Pre-build assessment, quarterly audit, post-incident review.",
+      "teammates": [
+        "spec-security-v11",
+        "spec-reviewer-v11",
+        "spec-optimizer-v11",
+        "spec-implementer-v11",
+        "spec-tester-v11"
+      ],
+      "roles": [
+        "security-auditor",
+        "code-quality-reviewer",
+        "performance-profiler",
+        "database-inspector",
+        "test-coverage-analyst"
+      ],
+      "specialist_pool": {
+        "security-auditor": [
+          "security-engineer",
+          "auth-specialist",
+          "api-security-expert"
+        ],
+        "code-quality-reviewer": [
+          "code-quality-engineer",
+          "refactoring-consultant"
+        ],
+        "performance-profiler": [
+          "performance-optimizer",
+          "frontend-specialist"
+        ],
+        "database-inspector": [
+          "database-engineer",
+          "migration-strategist"
+        ],
+        "test-coverage-analyst": [
+          "testing-engineer"
+        ],
+        "subagents": [
+          "spec-architect-v11",
+          "log-analyst",
+          "sre-specialist"
+        ]
+      },
+      "wave_structure": [
+        {
+          "wave": 0,
+          "roles": [
+            "orchestrator"
+          ],
+          "output": "scope + roster + finding_template",
+          "type": "planning"
+        },
+        {
+          "wave": 1,
+          "roles": [
+            "security-auditor",
+            "code-quality-reviewer",
+            "performance-profiler",
+            "database-inspector",
+            "test-coverage-analyst"
+          ],
+          "output": "finding_tasks",
+          "type": "parallel-audit"
+        },
+        {
+          "wave": 2,
+          "roles": [
+            "orchestrator"
+          ],
+          "output": "issues_md + issues_json",
+          "type": "synthesis"
+        }
+      ],
+      "tool_policies": {
+        "defaults": {
+          "profile": "readonly"
+        },
+        "per_role": {
+          "security-auditor": {
+            "profile": "readonly"
+          },
+          "code-quality-reviewer": {
+            "profile": "readonly"
+          },
+          "performance-profiler": {
+            "profile": "readonly"
+          },
+          "database-inspector": {
+            "profile": "readonly"
+          },
+          "test-coverage-analyst": {
+            "profile": "readonly"
+          }
+        }
+      },
+      "artifact_schema": {
+        "security-auditor": [
+          "owasp_findings",
+          "secret_scan",
+          "auth_review",
+          "injection_risks"
+        ],
+        "code-quality-reviewer": [
+          "solid_violations",
+          "tech_debt_score",
+          "code_smells",
+          "duplication"
+        ],
+        "performance-profiler": [
+          "n_plus_1_queries",
+          "bundle_analysis",
+          "caching_gaps",
+          "bottlenecks"
+        ],
+        "database-inspector": [
+          "missing_indexes",
+          "schema_issues",
+          "migration_health",
+          "query_complexity"
+        ],
+        "test-coverage-analyst": [
+          "coverage_gaps",
+          "untested_paths",
+          "e2e_deficits",
+          "test_quality"
+        ]
+      },
+      "agents": []
+    },
+    "deep-research": {
+      "mode": "parallel-background-agents",
+      "when": "Complex/novel projects requiring parallel research before implementation. Used in deep-plan Phase 3 (RESEARCH). Spawns 3-4 independent research agents.",
+      "teammates": [
+        "spec-architect-v11",
+        "spec-architect-v11",
+        "spec-architect-v11"
+      ],
+      "roles": [
+        "research-lead",
+        "landscape-researcher",
+        "technical-researcher"
+      ],
+      "specialist_pool": {
+        "research-lead": [
+          "spec-architect-v11",
+          "backend-architect"
+        ],
+        "landscape-researcher": [
+          "ai-integration-specialist",
+          "Explore"
+        ],
+        "technical-researcher": [
+          "spec-implementer-v11",
+          "database-engineer"
+        ],
+        "subagents": [
+          "performance-optimizer",
+          "security-engineer"
+        ]
+      },
+      "tool_policies": {
+        "defaults": {
+          "profile": "readonly"
+        }
+      },
+      "artifact_schema": {
+        "research-lead": [
+          "hypothesis_matrix",
+          "research_synthesis",
+          "key_findings"
+        ],
+        "landscape-researcher": [
+          "competitive_analysis",
+          "pattern_catalog",
+          "technology_comparison"
+        ],
+        "technical-researcher": [
+          "proof_of_concept",
+          "architecture_options",
+          "risk_assessment"
+        ]
+      },
+      "agents": []
+    },
+    "pm-audit": {
+      "mode": "parallel-background-agents",
+      "when": "Audit deep-plan research output for gaps, contradictions, and scope issues. Used in deep-plan Phase 4 (AUDIT). 3 parallel auditors with different lenses.",
+      "teammates": [
+        "spec-reviewer-v11",
+        "spec-reviewer-v11",
+        "spec-reviewer-v11"
+      ],
+      "roles": [
+        "research-auditor",
+        "landscape-auditor",
+        "spec-auditor"
+      ],
+      "specialist_pool": {
+        "research-auditor": [
+          "code-quality-engineer",
+          "spec-reviewer-v11"
+        ],
+        "landscape-auditor": [
+          "Explore",
+          "ai-integration-specialist"
+        ],
+        "spec-auditor": [
+          "technical-pm",
+          "spec-planner-v11"
+        ]
+      },
+      "tool_policies": {
+        "defaults": {
+          "profile": "readonly"
+        }
+      },
+      "artifact_schema": {
+        "research-auditor": [
+          "gap_list",
+          "contradiction_flags",
+          "evidence_quality"
+        ],
+        "landscape-auditor": [
+          "missing_alternatives",
+          "market_gaps",
+          "trend_alignment"
+        ],
+        "spec-auditor": [
+          "scope_assessment",
+          "risk_register",
+          "readiness_score"
+        ]
+      },
+      "agents": []
+    }
+  },
+  "effort_selection": {
+    "high_triggers": [
+      "architecture",
+      "security",
+      "threat",
+      "novel",
+      "complex",
+      "implement",
+      "fix",
+      "build",
+      "review"
+    ],
+    "high_default": true,
+    "medium_for": [
+      "testing",
+      "validation",
+      "coordination"
+    ],
+    "low_for": [
+      "formatting",
+      "linting",
+      "scanning"
+    ]
+  },
+  "integration": {
+    "tasks_system": "required",
+    "docker_network": "required",
+    "port_registry": "~/config/port-registry.json",
+    "observability": "~/scripts/observability-cli/"
+  },
+  "protocol": "V11",
+  "description": "V11 Spec Agents - Artifact Handoffs, Adversarial Verification, Tool Policies, Semantic Memory"
+}

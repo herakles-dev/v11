@@ -1,0 +1,222 @@
+#!/bin/bash
+# V11 Script: v11-migrate-task-state
+#
+# One-shot migration for V11.13: re-attribute pre-V11.13 project-keyed task-state
+# files to per-session ownership.
+#
+# Before V11.13: ~/.agent-metrics/task-state/{project}.json was authoritative
+# and updated in-place by every session touching the project. After V11.13:
+# the per-session file at ~/.agent-metrics/sessions/{uuid}/task-state.json is
+# authoritative; the project file is a derived aggregate rebuilt on every write.
+#
+# This script bridges the two by creating a synthetic "legacy" session for each
+# pre-V11.13 project file, so the aggregate continues to reflect that prior
+# state until naturally aged out by real new-session writes.
+#
+# Strategy per project:
+#   - Detect: project file at TASK_STATE_DIR/{project}.json exists, but no per-session
+#     file under sessions/*/task-state.json references it as .project
+#   - Migrate: write legacy session-state to sessions/legacy-{project}/task-state.json
+#     with session_uuid="legacy-{project}", carrying every field forward; stamp
+#     migrated_at + migrated_from_legacy=true so it's diagnostically distinct
+#   - Aggregate rebuild: trigger v11_rebuild_project_aggregate so the project file
+#     gets V11.13 fields (aggregated_from, aggregate_built_at)
+#
+# Usage:
+#   v11-migrate-task-state                       # migrate all detected projects
+#   v11-migrate-task-state --project NAME        # single project
+#   v11-migrate-task-state --scan                # list what would be migrated
+#   v11-migrate-task-state --dry-run             # show actions without doing them
+#   v11-migrate-task-state --help
+
+set -euo pipefail
+
+V11_WORKSPACE_ROOT="${V11_WORKSPACE_ROOT:-$HOME/.v11}"
+SESSIONS_ROOT="${SESSIONS_ROOT:-$V11_WORKSPACE_ROOT/sessions}"
+METRICS_DIR="${METRICS_DIR:-$V11_WORKSPACE_ROOT/.agent-metrics}"
+TASK_STATE_DIR="${TASK_STATE_DIR:-$METRICS_DIR/task-state}"
+SESSIONS_METRICS_DIR="$METRICS_DIR/sessions"
+
+# Derive V11_HOME from this script's own location so tests can override
+# V11_WORKSPACE_ROOT without breaking common.sh resolution.
+_SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+V11_HOME="${V11_HOME:-$(cd "$_SCRIPT_DIR/.." && pwd)}"
+
+# Source common.sh for v11_rebuild_project_aggregate
+# shellcheck disable=SC1091
+source "$V11_HOME/hooks/lib/common.sh"
+
+# --- arg parsing ---
+TARGET_PROJECT=""
+SCAN_ONLY=false
+DRY_RUN=false
+
+for arg in "$@"; do
+    case "$arg" in
+        --help|-h)
+            sed -n '3,30p' "$0" | sed 's/^# \{0,1\}//'
+            exit 0
+            ;;
+        --test)
+            echo "v11-migrate-task-state OK"
+            exit 0
+            ;;
+        --scan)    SCAN_ONLY=true ;;
+        --dry-run) DRY_RUN=true ;;
+        --project)
+            # next arg is the project name
+            TARGET_PROJECT="__NEXT__"
+            ;;
+        --project=*)
+            TARGET_PROJECT="${arg#--project=}"
+            ;;
+        -*)
+            echo "Unknown flag: $arg" >&2
+            exit 1
+            ;;
+        *)
+            if [ "$TARGET_PROJECT" = "__NEXT__" ]; then
+                TARGET_PROJECT="$arg"
+            else
+                echo "Unexpected positional arg: $arg" >&2
+                exit 1
+            fi
+            ;;
+    esac
+done
+
+[ "$TARGET_PROJECT" = "__NEXT__" ] && { echo "--project requires a name" >&2; exit 1; }
+
+if [ ! -d "$TASK_STATE_DIR" ]; then
+    echo "v11-migrate-task-state: nothing to migrate ($TASK_STATE_DIR doesn't exist)"
+    exit 0
+fi
+
+# --- detect candidates ---
+# A project file is "pre-V11.13" if:
+#   - it exists in $TASK_STATE_DIR
+#   - no session under $SESSIONS_METRICS_DIR has matching .project
+#   - it doesn't already have aggregated_from / aggregate_built_at fields
+# This is a heuristic — false positives just re-stamp aggregate metadata (idempotent).
+_is_pre_v11_13() {
+    local file="$1"
+    # Already aggregated?
+    local has_meta
+    has_meta=$(jq -r 'has("aggregate_built_at")' "$file" 2>/dev/null)
+    [ "$has_meta" = "true" ] && return 1
+    return 0
+}
+
+_has_any_session_for_project() {
+    local project="$1"
+    [ -d "$SESSIONS_METRICS_DIR" ] || return 1
+    local f p
+    for f in "$SESSIONS_METRICS_DIR"/*/task-state.json; do
+        [ -f "$f" ] || continue
+        p=$(jq -r '.project // empty' "$f" 2>/dev/null)
+        if [ "$p" = "$project" ]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Collect candidate projects
+CANDIDATES=()
+for state_file in "$TASK_STATE_DIR"/*.json; do
+    [ -f "$state_file" ] || continue
+    [ -s "$state_file" ] || continue
+    jq empty "$state_file" 2>/dev/null || continue
+
+    project=$(basename "$state_file" .json)
+    # If a specific project was requested, only consider that one
+    if [ -n "$TARGET_PROJECT" ] && [ "$TARGET_PROJECT" != "$project" ]; then
+        continue
+    fi
+    # Skip already-migrated files
+    if ! _is_pre_v11_13 "$state_file"; then
+        continue
+    fi
+    CANDIDATES+=("$project")
+done
+
+if [ ${#CANDIDATES[@]} -eq 0 ]; then
+    if [ -n "$TARGET_PROJECT" ]; then
+        echo "v11-migrate-task-state: $TARGET_PROJECT — nothing to migrate (no project file or already V11.13)"
+    else
+        echo "v11-migrate-task-state: no projects need migration."
+    fi
+    exit 0
+fi
+
+# --- scan mode ---
+if $SCAN_ONLY; then
+    echo "v11-migrate-task-state: ${#CANDIDATES[@]} project(s) need migration:"
+    for project in "${CANDIDATES[@]}"; do
+        state_file="$TASK_STATE_DIR/${project}.json"
+        total=$(jq -r '.total // 0' "$state_file" 2>/dev/null)
+        completed=$(jq -r '.completed // 0' "$state_file" 2>/dev/null)
+        if _has_any_session_for_project "$project"; then
+            existing_marker=" (some sessions exist; legacy will coexist)"
+        else
+            existing_marker=""
+        fi
+        echo "  - $project  ($completed/$total complete)$existing_marker"
+    done
+    exit 0
+fi
+
+# --- migrate ---
+MIGRATED=0
+SKIPPED=0
+NOW=$(date -Iseconds)
+
+for project in "${CANDIDATES[@]}"; do
+    state_file="$TASK_STATE_DIR/${project}.json"
+    legacy_uuid="legacy-${project}"
+    legacy_dir="$SESSIONS_METRICS_DIR/$legacy_uuid"
+    legacy_file="$legacy_dir/task-state.json"
+
+    if [ -f "$legacy_file" ]; then
+        echo "  [=] $project — legacy session file already exists, skipping"
+        SKIPPED=$((SKIPPED + 1))
+        continue
+    fi
+
+    if $DRY_RUN; then
+        echo "  [dry-run] would migrate $project → $legacy_file"
+        continue
+    fi
+
+    mkdir -p "$legacy_dir"
+    # Copy project state, stamp session_uuid and migration marker
+    jq --arg uuid "$legacy_uuid" --arg project "$project" --arg now "$NOW" '
+        . + {
+            session_uuid: $uuid,
+            project: ($project),
+            migrated_at: $now,
+            migrated_from_legacy: true
+        }
+    ' "$state_file" > "$legacy_file.tmp.$$"
+
+    if [ -s "$legacy_file.tmp.$$" ] && jq empty "$legacy_file.tmp.$$" 2>/dev/null; then
+        mv "$legacy_file.tmp.$$" "$legacy_file"
+        echo "  [+] $project → $legacy_file"
+        MIGRATED=$((MIGRATED + 1))
+
+        # Rebuild aggregate so the project file gains V11.13 metadata
+        v11_rebuild_project_aggregate "$project" 2>/dev/null || true
+    else
+        rm -f "$legacy_file.tmp.$$"
+        echo "  [!] $project — jq failed, skipped" >&2
+        SKIPPED=$((SKIPPED + 1))
+    fi
+done
+
+echo ""
+if $DRY_RUN; then
+    echo "Dry run complete: ${#CANDIDATES[@]} project(s) would be migrated."
+else
+    echo "Migration complete: $MIGRATED migrated, $SKIPPED skipped."
+fi
+exit 0

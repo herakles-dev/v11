@@ -1,0 +1,447 @@
+#!/bin/bash
+# V11 Script: worktree-sweep
+# Classify and clean up stale git worktrees under .claude/worktrees/.
+#
+# Agent worktrees can end up dirty ONLY with generated test artifacts
+# (tests/.reports/results.json, tests/.last-run-metrics.json), which defeats
+# the harness's "unchanged -> auto-remove" cleanup and leaves them stuck.
+#
+# CLASSIFICATION (per worktree, in order):
+#   LOCKED       -> `git worktree list` reports a lock (active/in-use agent).
+#                   Always KEEP, regardless of merge/dirty status.
+#   SAFE_REMOVE  -> branch merged into base branch AND (clean OR dirty with
+#                   only generated-artifact paths).
+#   KEEP (dirty) -> uncommitted changes outside the generated-artifact allow-
+#                   list. Loud warning — potential silent edit loss.
+#   KEEP (unmerged) -> branch has commits not yet merged into base. Warning
+#                   to merge before cleanup.
+#
+# USAGE:
+#   worktree-sweep [--apply] [--base BRANCH]
+#     (default) dry-run report only.
+#     --apply   remove SAFE_REMOVE worktrees (`git worktree remove --force`)
+#               and delete their branch (only if merged).
+#     --base    base branch to check merge status against (default: current
+#               branch of the main worktree).
+#
+#   worktree-sweep verify [WORKTREE_PATH|--all] [--base BRANCH] [--json]
+#     Commit-verify guard: classify one worktree (or all, with --all) and
+#     report whether it is safe to accept/merge/remove WITHOUT mutating
+#     anything (no removal, no branch deletion). Documented failure mode:
+#     a worktree agent edits but never commits -> its worktree can be
+#     removed as "unchanged" -> silent edit loss. `verify` gives callers
+#     (e.g. a pre-merge check) a scriptable exit-code contract:
+#       0  -> clean and merged into base           (safe to accept + remove)
+#       10 -> UNCOMMITTED non-generated edits       (commit before merge —
+#             potential silent edit loss)
+#       11 -> committed but UNMERGED to base branch (merge before cleanup)
+#       12 -> only generated artifacts dirty         (safe to accept + remove)
+#       2  -> cannot determine (detached HEAD)
+#     With --all, the exit code is the highest-severity code seen across all
+#     worktrees (severity order: 10 > 11 > 2 > 12 > 0); 0 only if every
+#     worktree is clean-and-merged or generated-only-dirty.
+#     --json emits a single JSON object (or array under --all) instead of
+#     the human-readable one-line verdict.
+#
+# ENV:
+#   V11_WORKTREE_GENERATED_GLOBS  space-separated glob list of paths treated
+#                                 as "generated, safe to ignore when dirty".
+#                                 Default: "tests/.reports/* tests/.last-run-metrics.json"
+#
+# Never touches the main worktree (the repo root itself).
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+V11_HOME="${V11_HOME:-$(dirname "$SCRIPT_DIR")}"
+REPO_ROOT="$(cd "$V11_HOME" && git rev-parse --show-toplevel)"
+
+DEFAULT_GENERATED_GLOBS="tests/.reports/* tests/.last-run-metrics.json"
+GENERATED_GLOBS="${V11_WORKTREE_GENERATED_GLOBS:-$DEFAULT_GENERATED_GLOBS}"
+
+if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
+    sed -n '2,47p' "$0" | sed 's/^# \{0,1\}//'
+    exit 0
+fi
+
+if [ "${1:-}" = "--test" ]; then
+    echo "worktree-sweep v1.1"
+    exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# Shared classification internals (used by both the sweep report/apply path
+# and the `verify` subcommand).
+# ---------------------------------------------------------------------------
+
+# Returns 0 (match) if $1 (relative path) matches any glob in GENERATED_GLOBS.
+_is_generated_path() {
+    local path="$1" glob
+    for glob in $GENERATED_GLOBS; do
+        # shellcheck disable=SC2254
+        case "$path" in
+            $glob) return 0 ;;
+        esac
+    done
+    return 1
+}
+
+# Returns 0 if every dirty path in worktree $1 matches the generated allowlist.
+_dirty_is_generated_only() {
+    local wt_path="$1" line path
+    while IFS= read -r line; do
+        [ -z "$line" ] && continue
+        # porcelain format: "XY path" (path may be quoted; generated globs
+        # here don't need rename/quote handling)
+        path="${line:3}"
+        if ! _is_generated_path "$path"; then
+            return 1
+        fi
+    done < <(git -C "$wt_path" status --porcelain --untracked-files=all)
+    return 0
+}
+
+# Classify a single worktree against $BASE_BRANCH. Sets globals:
+#   _WT_CODE    numeric exit-code contract value (0/2/10/11/12)
+#   _WT_LABEL   short machine label
+#   _WT_VERDICT human-readable one-line reason
+# Never mutates git state — read-only (status/merge-base only).
+_classify_worktree() {
+    local wt_path="$1" branch="$2"
+
+    if [ -z "$branch" ]; then
+        _WT_CODE=2
+        _WT_LABEL="UNKNOWN"
+        _WT_VERDICT="detached HEAD -- cannot determine merge status"
+        return 0
+    fi
+
+    local dirty_files
+    dirty_files=$(git -C "$wt_path" status --porcelain --untracked-files=all || true)
+
+    if [ -n "$dirty_files" ] && ! _dirty_is_generated_only "$wt_path"; then
+        _WT_CODE=10
+        _WT_LABEL="UNCOMMITTED"
+        _WT_VERDICT="uncommitted non-generated edits -- potential silent edit loss, commit before merge"
+        return 0
+    fi
+
+    local merged=false
+    if git -C "$REPO_ROOT" merge-base --is-ancestor "$branch" "$BASE_BRANCH" 2>/dev/null; then
+        merged=true
+    fi
+
+    if [ "$merged" != "true" ]; then
+        _WT_CODE=11
+        _WT_LABEL="UNMERGED"
+        _WT_VERDICT="committed but not merged into $BASE_BRANCH -- merge before cleanup"
+        return 0
+    fi
+
+    if [ -z "$dirty_files" ]; then
+        _WT_CODE=0
+        _WT_LABEL="CLEAN_MERGED"
+        _WT_VERDICT="clean and merged into $BASE_BRANCH -- safe to accept and remove"
+        return 0
+    fi
+
+    _WT_CODE=12
+    _WT_LABEL="GENERATED_ONLY"
+    _WT_VERDICT="merged, dirty with only generated artifacts -- safe to accept and remove"
+    return 0
+}
+
+# Emit one `worktree PATH\nbranch BRANCH\n[locked ...]` porcelain block per
+# worktree via stdin, NUL-separated. Callers iterate with:
+#   while IFS= read -r -d '' block; do ... done < <(_worktree_blocks)
+_worktree_blocks() {
+    git -C "$REPO_ROOT" worktree list --porcelain | awk -v RS= -v ORS='\0' '1'
+}
+
+# ---------------------------------------------------------------------------
+# `verify` subcommand
+# ---------------------------------------------------------------------------
+
+if [ "${1:-}" = "verify" ]; then
+    shift
+    VERIFY_TARGET=""
+    VERIFY_ALL=false
+    VERIFY_JSON=false
+    BASE_BRANCH=""
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --all) VERIFY_ALL=true; shift ;;
+            --base) BASE_BRANCH="${2:-}"; shift 2 ;;
+            --json) VERIFY_JSON=true; shift ;;
+            --help|-h)
+                sed -n '2,47p' "$0" | sed 's/^# \{0,1\}//'
+                exit 0
+                ;;
+            -*)
+                echo "worktree-sweep verify: unknown flag: $1" >&2
+                exit 1
+                ;;
+            *)
+                if [ -n "$VERIFY_TARGET" ]; then
+                    echo "worktree-sweep verify: unexpected extra argument: $1" >&2
+                    exit 1
+                fi
+                VERIFY_TARGET="$1"
+                shift
+                ;;
+        esac
+    done
+
+    if [ "$VERIFY_ALL" != "true" ] && [ -z "$VERIFY_TARGET" ]; then
+        echo "worktree-sweep verify: requires WORKTREE_PATH or --all" >&2
+        exit 1
+    fi
+    if [ "$VERIFY_ALL" = "true" ] && [ -n "$VERIFY_TARGET" ]; then
+        echo "worktree-sweep verify: pass either WORKTREE_PATH or --all, not both" >&2
+        exit 1
+    fi
+
+    if [ -z "$BASE_BRANCH" ]; then
+        BASE_BRANCH="$(git -C "$REPO_ROOT" rev-parse --abbrev-ref HEAD)"
+    fi
+
+    # Severity ranking for --all aggregate exit code (higher = worse).
+    _severity() {
+        case "$1" in
+            10) echo 4 ;;
+            11) echo 3 ;;
+            2)  echo 2 ;;
+            12) echo 1 ;;
+            0)  echo 0 ;;
+            *)  echo 0 ;;
+        esac
+    }
+
+    if [ "$VERIFY_ALL" = "true" ]; then
+        RESULTS_JSON="["
+        FIRST=true
+        WORST_SEV=-1
+        WORST_CODE=0
+        FOUND_ANY=false
+
+        while IFS= read -r -d '' block; do
+            [ -z "$block" ] && continue
+            wt_path=$(printf '%s\n' "$block" | awk '/^worktree /{print $2}')
+            branch=$(printf '%s\n' "$block" | awk '/^branch /{print $2}' | sed 's#^refs/heads/##')
+
+            [ "$wt_path" = "$REPO_ROOT" ] && continue   # never touch the main worktree
+
+            FOUND_ANY=true
+            _classify_worktree "$wt_path" "$branch"
+
+            sev=$(_severity "$_WT_CODE")
+            if [ "$sev" -gt "$WORST_SEV" ]; then
+                WORST_SEV="$sev"
+                WORST_CODE="$_WT_CODE"
+            fi
+
+            if [ "$VERIFY_JSON" = "true" ]; then
+                [ "$FIRST" = "true" ] || RESULTS_JSON="${RESULTS_JSON},"
+                FIRST=false
+                RESULTS_JSON="${RESULTS_JSON}$(V11_WT_PATH="$wt_path" V11_WT_BRANCH="${branch:-}" \
+                    V11_WT_CODE="$_WT_CODE" V11_WT_LABEL="$_WT_LABEL" V11_WT_VERDICT="$_WT_VERDICT" \
+                    V11_WT_BASE="$BASE_BRANCH" python3 -c '
+import json, os
+print(json.dumps({
+    "path": os.environ["V11_WT_PATH"],
+    "branch": os.environ.get("V11_WT_BRANCH") or None,
+    "base_branch": os.environ["V11_WT_BASE"],
+    "code": int(os.environ["V11_WT_CODE"]),
+    "label": os.environ["V11_WT_LABEL"],
+    "verdict": os.environ["V11_WT_VERDICT"],
+}, separators=(",", ":")))
+')"
+            else
+                echo "$wt_path [${branch:-<detached>}]: $_WT_LABEL ($_WT_CODE) - $_WT_VERDICT"
+            fi
+        done < <(_worktree_blocks)
+
+        if [ "$VERIFY_JSON" = "true" ]; then
+            RESULTS_JSON="${RESULTS_JSON}]"
+            echo "$RESULTS_JSON"
+        fi
+
+        if [ "$FOUND_ANY" != "true" ]; then
+            [ "$VERIFY_JSON" = "true" ] || echo "worktree-sweep verify: no worktrees to check."
+            exit 0
+        fi
+
+        exit "$WORST_CODE"
+    fi
+
+    # Single-worktree verify.
+    ABS_TARGET="$(cd "$VERIFY_TARGET" 2>/dev/null && pwd || true)"
+    if [ -z "$ABS_TARGET" ]; then
+        echo "worktree-sweep verify: not a directory: $VERIFY_TARGET" >&2
+        exit 1
+    fi
+
+    FOUND_BLOCK=""
+    while IFS= read -r -d '' block; do
+        [ -z "$block" ] && continue
+        wt_path=$(printf '%s\n' "$block" | awk '/^worktree /{print $2}')
+        if [ "$wt_path" = "$ABS_TARGET" ]; then
+            FOUND_BLOCK="$block"
+            break
+        fi
+    done < <(_worktree_blocks)
+
+    if [ -z "$FOUND_BLOCK" ]; then
+        echo "worktree-sweep verify: $ABS_TARGET is not a registered worktree of $REPO_ROOT" >&2
+        exit 1
+    fi
+
+    if [ "$ABS_TARGET" = "$REPO_ROOT" ]; then
+        echo "worktree-sweep verify: refusing to classify the main worktree" >&2
+        exit 1
+    fi
+
+    branch=$(printf '%s\n' "$FOUND_BLOCK" | awk '/^branch /{print $2}' | sed 's#^refs/heads/##')
+    _classify_worktree "$ABS_TARGET" "$branch"
+
+    if [ "$VERIFY_JSON" = "true" ]; then
+        V11_WT_PATH="$ABS_TARGET" V11_WT_BRANCH="${branch:-}" V11_WT_CODE="$_WT_CODE" \
+            V11_WT_LABEL="$_WT_LABEL" V11_WT_VERDICT="$_WT_VERDICT" V11_WT_BASE="$BASE_BRANCH" \
+            python3 -c '
+import json, os
+print(json.dumps({
+    "path": os.environ["V11_WT_PATH"],
+    "branch": os.environ.get("V11_WT_BRANCH") or None,
+    "base_branch": os.environ["V11_WT_BASE"],
+    "code": int(os.environ["V11_WT_CODE"]),
+    "label": os.environ["V11_WT_LABEL"],
+    "verdict": os.environ["V11_WT_VERDICT"],
+}, separators=(",", ":")))
+'
+    else
+        echo "$ABS_TARGET [${branch:-<detached>}]: $_WT_LABEL ($_WT_CODE) - $_WT_VERDICT"
+    fi
+
+    exit "$_WT_CODE"
+fi
+
+# ---------------------------------------------------------------------------
+# Default: sweep report / --apply
+# ---------------------------------------------------------------------------
+
+APPLY=false
+BASE_BRANCH=""
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --apply) APPLY=true; shift ;;
+        --base) BASE_BRANCH="${2:-}"; shift 2 ;;
+        *) echo "worktree-sweep: unknown arg: $1" >&2; exit 1 ;;
+    esac
+done
+
+if [ -z "$BASE_BRANCH" ]; then
+    BASE_BRANCH="$(git -C "$REPO_ROOT" rev-parse --abbrev-ref HEAD)"
+fi
+
+echo "worktree-sweep: base branch = $BASE_BRANCH, apply = $APPLY"
+echo "worktree-sweep: generated-artifact allowlist = $GENERATED_GLOBS"
+echo
+
+SAFE_REMOVE_PATHS=()
+SAFE_REMOVE_BRANCHES=()
+
+while IFS= read -r -d '' block; do
+    [ -z "$block" ] && continue
+    wt_path=$(printf '%s\n' "$block" | awk '/^worktree /{print $2}')
+    branch=$(printf '%s\n' "$block" | awk '/^branch /{print $2}' | sed 's#^refs/heads/##')
+    locked=$(printf '%s\n' "$block" | grep -c '^locked' || true)
+
+    [ "$wt_path" = "$REPO_ROOT" ] && continue   # never touch the main worktree
+
+    echo "--- $wt_path"
+    echo "    branch: ${branch:-<detached>}"
+
+    if [ "$locked" -gt 0 ]; then
+        lock_reason=$(printf '%s\n' "$block" | grep '^locked' | sed 's/^locked //')
+        echo "    LOCKED ($lock_reason) -> KEEP (active agent)"
+        echo
+        continue
+    fi
+
+    if [ -z "$branch" ]; then
+        echo "    KEEP (detached HEAD, cannot check merge status)"
+        echo
+        continue
+    fi
+
+    _classify_worktree "$wt_path" "$branch"
+    dirty_files=$(git -C "$wt_path" status --porcelain --untracked-files=all || true)
+
+    case "$_WT_CODE" in
+        10)
+            echo "    ** WARNING ** dirty with NON-generated changes -> KEEP (potential silent edit loss)"
+            printf '%s\n' "$dirty_files" | sed 's/^/      /'
+            echo
+            continue
+            ;;
+        11)
+            echo "    NOT MERGED into $BASE_BRANCH -> KEEP (merge before cleanup)"
+            if [ -n "$dirty_files" ]; then
+                echo "    dirty files:"
+                printf '%s\n' "$dirty_files" | sed 's/^/      /'
+            fi
+            echo
+            continue
+            ;;
+        0)
+            echo "    merged, clean -> SAFE_REMOVE"
+            SAFE_REMOVE_PATHS+=("$wt_path")
+            SAFE_REMOVE_BRANCHES+=("$branch")
+            echo
+            continue
+            ;;
+        12)
+            echo "    merged, dirty (generated artifacts only) -> SAFE_REMOVE"
+            printf '%s\n' "$dirty_files" | sed 's/^/      /'
+            SAFE_REMOVE_PATHS+=("$wt_path")
+            SAFE_REMOVE_BRANCHES+=("$branch")
+            echo
+            continue
+            ;;
+    esac
+done < <(_worktree_blocks)
+
+echo "=================================================="
+echo "SAFE_REMOVE candidates: ${#SAFE_REMOVE_PATHS[@]}"
+for p in "${SAFE_REMOVE_PATHS[@]:-}"; do
+    [ -n "$p" ] && echo "  - $p"
+done
+
+if [ "${#SAFE_REMOVE_PATHS[@]}" -eq 0 ]; then
+    echo "worktree-sweep: nothing to do."
+    exit 0
+fi
+
+if [ "$APPLY" != "true" ]; then
+    echo
+    echo "Dry-run only. Re-run with --apply to remove the above."
+    exit 0
+fi
+
+echo
+echo "Applying removal..."
+for i in "${!SAFE_REMOVE_PATHS[@]}"; do
+    p="${SAFE_REMOVE_PATHS[$i]}"
+    b="${SAFE_REMOVE_BRANCHES[$i]}"
+    echo "  removing worktree: $p"
+    git -C "$REPO_ROOT" worktree remove --force "$p"
+    if git -C "$REPO_ROOT" merge-base --is-ancestor "$b" "$BASE_BRANCH" 2>/dev/null; then
+        echo "  deleting merged branch: $b"
+        git -C "$REPO_ROOT" branch -D "$b" >/dev/null 2>&1 || echo "    (branch delete failed/already gone, continuing)"
+    fi
+done
+
+echo
+echo "worktree-sweep: done."

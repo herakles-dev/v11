@@ -1,0 +1,266 @@
+#!/bin/bash
+# V11 Hook: guard-effort (PreToolUse — Task)
+# Advises on effort level selection based on task keywords, subagent type, and metadata.
+#
+# Phase 4.5 Enhancement: Metadata-aware routing using complexity + scope fields
+# Advisory only — never blocks.
+#
+# Exit codes:
+#   0 - Always (advisory only)
+
+source "$(dirname "${BASH_SOURCE[0]}")/lib/common.sh"
+
+# Self-test for hook validation
+if [ "$1" == "--test" ]; then
+    echo "guard-effort v4"
+    exit 0
+fi
+
+# --- Parse input ---
+v11_parse_input
+
+# Only advise on agent-spawn tool invocations (Task or Agent — modern Claude Code uses Agent)
+case "$V11_TOOL_NAME" in
+    Task|Agent) ;;
+    *) exit 0 ;;
+esac
+
+# --- Per-field jq extraction ---
+# NOTE: A single jq call joined with "\t" and split via `IFS=$'\t' read -r`
+# was tried here previously, but tab is an IFS-whitespace character in bash:
+# consecutive tabs (from empty middle fields, e.g. an omitted subagent_type)
+# collapse into a single delimiter, shifting all downstream fields left into
+# the wrong variables. Per-field reads avoid the collapse entirely — each
+# field is read as a single jq invocation with no delimiter to lose.
+PROMPT=$(printf '%s' "$V11_RAW_INPUT" | jq -r '.tool_input.prompt // ""')
+MODEL=$(printf '%s' "$V11_RAW_INPUT" | jq -r '.tool_input.model // "sonnet"')
+SUBAGENT_TYPE=$(printf '%s' "$V11_RAW_INPUT" | jq -r '.tool_input.subagent_type // ""')
+COMPLEXITY=$(printf '%s' "$V11_RAW_INPUT" | jq -r '.tool_input.metadata.complexity // ""')
+SCOPE=$(printf '%s' "$V11_RAW_INPUT" | jq -r '.tool_input.metadata.scope // ""')
+RISK=$(printf '%s' "$V11_RAW_INPUT" | jq -r '.tool_input.metadata.risk // ""')
+TASK_TYPE=$(printf '%s' "$V11_RAW_INPUT" | jq -r '.tool_input.metadata.type // ""')
+SEVERITY=$(printf '%s' "$V11_RAW_INPUT" | jq -r '.tool_input.metadata.severity // ""')
+
+# Nothing to analyze without a prompt
+[ -z "$PROMPT" ] && exit 0
+
+PROMPT_LOWER=$(printf '%s' "$PROMPT" | tr '[:upper:]' '[:lower:]')
+
+# --- Keyword-based effort recommendation (single grep pass) ---
+# NOTE: Claude Code v2.1.72+ simplified effort to low/medium/high (removed max).
+# Former MAX_KEYWORDS now map to HIGH.
+HIGH_KEYWORDS="design|architect|security|threat|novel|complex|scalability|implement|fix|refactor|add|review|build|write|create|modify|debug"
+MEDIUM_KEYWORDS="test|coordinate|validate|optimize|integrate"
+LOW_KEYWORDS="format|lint|scan|check|list|count|find|read|edit"
+
+KEYWORD_EFFORT="high"
+MATCHED_KEYWORDS=""
+
+if printf '%s' "$PROMPT_LOWER" | grep -qE "$HIGH_KEYWORDS"; then
+    KEYWORD_EFFORT="high"
+    MATCHED_KEYWORDS=$(printf '%s' "$PROMPT_LOWER" | grep -oE "$HIGH_KEYWORDS" | sort -u | tr '\n' ',' )
+    MATCHED_KEYWORDS="${MATCHED_KEYWORDS%,}"
+elif printf '%s' "$PROMPT_LOWER" | grep -qE "$MEDIUM_KEYWORDS"; then
+    KEYWORD_EFFORT="medium"
+    MATCHED_KEYWORDS=$(printf '%s' "$PROMPT_LOWER" | grep -oE "$MEDIUM_KEYWORDS" | sort -u | tr '\n' ',' )
+    MATCHED_KEYWORDS="${MATCHED_KEYWORDS%,}"
+elif printf '%s' "$PROMPT_LOWER" | grep -qE "$LOW_KEYWORDS"; then
+    KEYWORD_EFFORT="low"
+    MATCHED_KEYWORDS=$(printf '%s' "$PROMPT_LOWER" | grep -oE "$LOW_KEYWORDS" | sort -u | tr '\n' ',' )
+    MATCHED_KEYWORDS="${MATCHED_KEYWORDS%,}"
+fi
+
+# --- Metadata-based effort calculation ---
+METADATA_EFFORT=""
+
+if [ -n "$COMPLEXITY" ] && [ -n "$SCOPE" ]; then
+    case "$COMPLEXITY:$SCOPE" in
+        novel:small)    METADATA_EFFORT="high" ;;
+        novel:medium)   METADATA_EFFORT="high" ;;
+        novel:large)    METADATA_EFFORT="high" ;;
+        complex:small)  METADATA_EFFORT="medium" ;;
+        complex:medium) METADATA_EFFORT="high" ;;
+        complex:large)  METADATA_EFFORT="high" ;;
+        medium:small)   METADATA_EFFORT="low" ;;
+        medium:medium)  METADATA_EFFORT="medium" ;;
+        medium:large)   METADATA_EFFORT="high" ;;
+        routine:small)  METADATA_EFFORT="low" ;;
+        routine:medium) METADATA_EFFORT="medium" ;;
+        routine:large)  METADATA_EFFORT="high" ;;
+        *)              METADATA_EFFORT="high" ;;
+    esac
+fi
+
+# --- Reconcile keyword vs metadata recommendations ---
+RECOMMENDED="$KEYWORD_EFFORT"
+CONFLICT_WARNING=""
+
+if [ -n "$METADATA_EFFORT" ]; then
+    if [ "$KEYWORD_EFFORT" = "low" ]; then
+        if [ "$METADATA_EFFORT" != "$KEYWORD_EFFORT" ]; then
+            CONFLICT_WARNING="Keyword suggests $KEYWORD_EFFORT, metadata suggests $METADATA_EFFORT"
+        fi
+        RECOMMENDED="$KEYWORD_EFFORT"
+    else
+        RECOMMENDED="$METADATA_EFFORT"
+    fi
+fi
+
+# --- Subagent type overrides ---
+case "$SUBAGENT_TYPE" in
+    *architect*|*security*|*design*)
+        RECOMMENDED="high" ;;
+    *specialist*|*engineer*|backend-*|frontend-*|database-*)
+        [ "$RECOMMENDED" = "low" ] || [ "$RECOMMENDED" = "medium" ] && RECOMMENDED="high" ;;
+    Explore|Bash)
+        ;; # low is acceptable for these
+esac
+
+# --- Map model to implied effort range ---
+case "$MODEL" in
+    *opus*)   MODEL_MIN="high"   MODEL_MAX="high"   ;;
+    *sonnet*) MODEL_MIN="medium" MODEL_MAX="high"   ;;
+    *haiku*)  MODEL_MIN="low"    MODEL_MAX="medium"  ;;
+    *)        exit 0 ;;
+esac
+
+# Numeric mapping: high=3 medium=2 low=1
+effort_num() {
+    case "$1" in
+        high) echo 3 ;; medium) echo 2 ;; low) echo 1 ;; *) echo 2 ;;
+    esac
+}
+
+REC_NUM=$(effort_num "$RECOMMENDED")
+MODEL_MAX_NUM=$(effort_num "$MODEL_MAX")
+MODEL_MIN_NUM=$(effort_num "$MODEL_MIN")
+
+# --- Mismatch detection ---
+if [ "$REC_NUM" -gt "$MODEL_MAX_NUM" ]; then
+    cat << EOF
+EFFORT ADVISORY: Task may need higher capability
+Keywords suggest $KEYWORD_EFFORT effort: [$MATCHED_KEYWORDS]
+EOF
+    [ -n "$METADATA_EFFORT" ] && echo "Metadata suggests $METADATA_EFFORT effort (complexity=$COMPLEXITY, scope=$SCOPE)"
+    cat << EOF
+Final recommendation: $RECOMMENDED effort
+Current model: $MODEL
+Recommendation: Use 'opus' or 'sonnet', or increase effort level
+EOF
+elif [ "$REC_NUM" -lt "$MODEL_MIN_NUM" ]; then
+    cat << EOF
+EFFORT NOTE: Opus may be overkill for this task
+This appears to be a $RECOMMENDED effort task. Sonnet or Haiku would suffice.
+EOF
+    [ -n "$METADATA_EFFORT" ] && echo "Based on metadata: complexity=$COMPLEXITY, scope=$SCOPE"
+fi
+
+# Warn about keyword/metadata conflicts
+if [ -n "$CONFLICT_WARNING" ]; then
+    cat << EOF
+
+METADATA CONFLICT: $CONFLICT_WARNING
+Using keyword-based recommendation ($RECOMMENDED) due to strong keyword signal.
+Verify task metadata is accurate.
+EOF
+fi
+
+# Metadata contradiction checks
+if [ -n "$COMPLEXITY" ] && [ -n "$RISK" ]; then
+    if [ "$COMPLEXITY" == "routine" ] && [ "$RISK" == "high" ]; then
+        cat << EOF
+
+METADATA ADVISORY: Contradictory classification detected
+  complexity=routine + risk=high is unusual.
+  Routine tasks are well-understood and rarely high-risk.
+  Consider: Is this truly routine, or is it complex/novel?
+EOF
+    fi
+    if [ "$COMPLEXITY" == "novel" ] && [ "$RISK" == "low" ]; then
+        cat << EOF
+
+METADATA ADVISORY: Unusual classification detected
+  complexity=novel + risk=low is uncommon.
+  Novel tasks involve unknowns that typically carry medium+ risk.
+  Consider: Has this pattern been validated in this codebase before?
+EOF
+    fi
+fi
+
+# --- V11: Finding severity → effort advisory ---
+if [ "$TASK_TYPE" = "finding" ] && [ -n "$SEVERITY" ]; then
+    case "$SEVERITY" in
+        critical) FINDING_EFFORT="high" ;;
+        high)     FINDING_EFFORT="high" ;;
+        medium)   FINDING_EFFORT="medium" ;;
+        low)      FINDING_EFFORT="low" ;;
+        *)        FINDING_EFFORT="" ;;
+    esac
+
+    if [ -n "$FINDING_EFFORT" ]; then
+        cat << EOF
+
+FINDING ADVISORY: Task type=finding, severity=$SEVERITY
+  Suggested effort: $FINDING_EFFORT
+  Mapping: critical→high, high→high, medium→medium, low→low
+  Override: Always allowed — this is advisory only.
+EOF
+    fi
+fi
+
+# --- V11: Difficulty-Aware Formation Routing ---
+if [ -n "$COMPLEXITY" ] && [ -n "$SCOPE" ]; then
+    SUGGESTED_FORMATION=""
+    case "$COMPLEXITY:$SCOPE" in
+        routine:small)          SUGGESTED_FORMATION="single-file" ;;
+        routine:medium)         SUGGESTED_FORMATION="lightweight-feature" ;;
+        medium:small)           SUGGESTED_FORMATION="single-file or lightweight-feature" ;;
+        medium:medium)          SUGGESTED_FORMATION="lightweight-feature" ;;
+        medium:large)           SUGGESTED_FORMATION="feature-impl" ;;
+        complex:small)          SUGGESTED_FORMATION="lightweight-feature or feature-impl" ;;
+        complex:medium)         SUGGESTED_FORMATION="feature-impl" ;;
+        complex:large)          SUGGESTED_FORMATION="feature-impl" ;;
+        novel:small)            SUGGESTED_FORMATION="lightweight-feature (with architect consult)" ;;
+        novel:medium|novel:large) SUGGESTED_FORMATION="new-project (with architect)" ;;
+    esac
+
+    if [ -n "$SUGGESTED_FORMATION" ]; then
+        cat << EOF
+
+FORMATION SUGGESTION (V11): Based on complexity=$COMPLEXITY, scope=$SCOPE
+  Recommended: $SUGGESTED_FORMATION
+  Override: Always allowed — this is advisory only.
+  Source: DAAO difficulty-aware routing (+11.21% accuracy, -36% compute)
+EOF
+    fi
+fi
+
+# --- V11.6: PSF-aware domain advisory ---
+# If .plan-context.json exists with cynefin domain, use it to improve advice
+# SEC-C-02: sanitized read rejects path-traversal / metacharacter payloads
+_GE_PROJECT="$(v11_read_active_project)"
+if [ -n "$_GE_PROJECT" ]; then
+    _GE_PC="$SESSIONS_ROOT/$_GE_PROJECT/.plan-context.json"
+    if [ -f "$_GE_PC" ]; then
+        _GE_CYNEFIN=$(jq -r '.domain.cynefin // ""' "$_GE_PC" 2>/dev/null)
+        [ "$_GE_CYNEFIN" = "null" ] && _GE_CYNEFIN=""
+        if [ -n "$_GE_CYNEFIN" ]; then
+            case "$_GE_CYNEFIN" in
+                complex|chaotic)
+                    if [ "$RECOMMENDED" = "low" ]; then
+                        cat << EOF
+
+DOMAIN ADVISORY: Project is classified as '$_GE_CYNEFIN' (Cynefin)
+  Low effort may be insufficient for $_GE_CYNEFIN problems.
+  Consider higher effort for tasks in this domain.
+  Source: .plan-context.json
+EOF
+                    fi
+                    ;;
+            esac
+        fi
+    fi
+fi
+
+# Advisory only — always allow
+exit 0

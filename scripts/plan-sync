@@ -1,0 +1,307 @@
+#!/bin/bash
+# V11 Script: plan-sync
+# Snapshots V11 state (tasks, formation, autonomy) into a Claude Code plan file.
+# Plan files in ~/.claude/plans/ survive context clears.
+#
+# Usage:
+#   plan-sync [PROJECT]           # Sync specific project (or auto-detect)
+#   plan-sync --list              # List V11 plan files
+#   plan-sync --test              # Self-test
+#
+# Output: ~/.claude/plans/{slug}.md with V11 state snapshot
+
+set -euo pipefail
+
+V11_WORKSPACE_ROOT="${V11_WORKSPACE_ROOT:-$HOME/.v11}"
+SESSIONS_ROOT="${SESSIONS_ROOT:-$V11_WORKSPACE_ROOT/sessions}"
+METRICS_DIR="$V11_WORKSPACE_ROOT/.agent-metrics"
+TASK_STATE_DIR="$METRICS_DIR/task-state"
+ACTIVE_PROJECT_FILE="$METRICS_DIR/active-project"
+PLANS_DIR="$HOME/.claude/plans"
+
+# SEC-C-02: safe read of the active-project signal file.
+# Inline sanitizer (avoids sourcing common.sh in a script with `set -euo pipefail`).
+# Returns sanitized project name or empty string. Never leaks attacker-controlled content.
+_v11_read_active_project_safe() {
+    local raw
+    [ -f "$ACTIVE_PROJECT_FILE" ] || return 0
+    [ -s "$ACTIVE_PROJECT_FILE" ] || return 0
+    raw=$(head -n 1 "$ACTIVE_PROJECT_FILE" 2>/dev/null | tr -d '[:space:]')
+    if printf '%s' "$raw" | grep -qE '^[a-zA-Z0-9._-]{1,64}$'; then
+        printf '%s' "$raw"
+    else
+        echo "plan-sync: rejected invalid content in $ACTIVE_PROJECT_FILE" >&2
+        return 0
+    fi
+}
+
+# --- CLI flags ---
+if [ "${1:-}" == "--test" ]; then
+    echo "plan-sync v1.0 (V11.4)"
+    exit 0
+fi
+
+if [ "${1:-}" == "--list" ]; then
+    if [ -d "$PLANS_DIR" ]; then
+        { grep -rl '<!-- v11-plan:' "$PLANS_DIR" 2>/dev/null || true; } | while read -r f; do
+            PROJECT=$(grep -oP '<!-- v11-plan: \K[^>]+(?= -->)' "$f" 2>/dev/null || echo "unknown")
+            echo "  $PROJECT -> $f"
+        done
+    else
+        echo "No plans directory found."
+    fi
+    exit 0
+fi
+
+# --- Detect project ---
+PROJECT="${1:-}"
+
+if [ -z "$PROJECT" ]; then
+    # SEC-C-02: sanitized read — rejects path-traversal / metacharacter payloads
+    PROJECT="$(_v11_read_active_project_safe)"
+fi
+
+if [ -z "$PROJECT" ]; then
+    echo "ERROR: No project specified and no active project detected." >&2
+    echo "Usage: plan-sync [PROJECT]" >&2
+    exit 1
+fi
+
+# --- Read task state ---
+TASK_STATE_FILE="$TASK_STATE_DIR/${PROJECT}.json"
+if [ -f "$TASK_STATE_FILE" ]; then
+    TOTAL=$(jq -r '.total // 0' "$TASK_STATE_FILE")
+    COMPLETED=$(jq -r '.completed // 0' "$TASK_STATE_FILE")
+    PENDING=$(jq -r '.pending // 0' "$TASK_STATE_FILE")
+    IN_PROGRESS=$(jq -r '.in_progress // 0' "$TASK_STATE_FILE")
+    BLOCKED=$(jq -r '.blocked // 0' "$TASK_STATE_FILE")
+    PHASE=$(jq -r '.phase // "unknown"' "$TASK_STATE_FILE")
+    ACTIVE_IDS=$(jq -r '(.active_task_ids // []) | join(", ")' "$TASK_STATE_FILE")
+    PCT=0
+    [ "$TOTAL" -gt 0 ] && PCT=$((COMPLETED * 100 / TOTAL))
+else
+    TOTAL=0; COMPLETED=0; PENDING=0; IN_PROGRESS=0; BLOCKED=0
+    PHASE="no-tasks"; ACTIVE_IDS=""; PCT=0
+fi
+
+# --- Read formation ---
+FORMATION_REG="$SESSIONS_ROOT/$PROJECT/.formation-registry.json"
+FORMATION_NAME="none"
+FORMATION_AGENTS=""
+if [ -f "$FORMATION_REG" ]; then
+    FORMATION_NAME=$(jq -r '.formation // "unknown"' "$FORMATION_REG")
+    FORMATION_AGENTS=$(jq -r '
+        .teammates | to_entries | map("\(.key): \(.value.agent)") | join(", ")
+    ' "$FORMATION_REG" 2>/dev/null || echo "")
+fi
+
+# --- Read autonomy ---
+AUTONOMY_FILE="$SESSIONS_ROOT/$PROJECT/.autonomy-state"
+AUTONOMY_LEVEL=0; AUTONOMY_SUCCESSFUL=0; AUTONOMY_ERRORS=0
+if [ -f "$AUTONOMY_FILE" ]; then
+    AUTONOMY_LEVEL=$(jq -r '.level // 0' "$AUTONOMY_FILE")
+    AUTONOMY_SUCCESSFUL=$(jq -r '.successful // 0' "$AUTONOMY_FILE")
+    AUTONOMY_ERRORS=$(jq -r '.errors // 0' "$AUTONOMY_FILE")
+fi
+
+# --- Read sprint/gate from spec.md or task state ---
+SPRINT="unknown"
+GATE="unknown"
+SPEC_FILE="$SESSIONS_ROOT/$PROJECT/spec.md"
+if [ -f "$SPEC_FILE" ]; then
+    # Try to extract sprint from spec
+    SPRINT=$(grep -oP 'sprint-\d+-\S+' "$SPEC_FILE" 2>/dev/null | tail -1 || echo "unknown")
+    GATE=$(grep -oP 'gate-\d+-\S+' "$SPEC_FILE" 2>/dev/null | tail -1 || echo "unknown")
+fi
+[ -z "$SPRINT" ] && SPRINT="unknown"
+[ -z "$GATE" ] && GATE="unknown"
+
+# --- Read agents from spec.md ---
+AGENTS_SECTION=""
+if [ -f "$SPEC_FILE" ]; then
+    # Extract Agents section if it exists
+    AGENTS_SECTION=$(sed -n '/^## Agents/,/^## /p' "$SPEC_FILE" 2>/dev/null | head -20 || echo "")
+fi
+
+# --- Read plan-context.json ---
+PLAN_CONTEXT_FILE="$SESSIONS_ROOT/$PROJECT/.plan-context.json"
+PC_DOMAIN="" PC_HYPOTHESES="" PC_DECISIONS="" PC_BOTTLENECK="" PC_KILL="" PC_RESUME=""
+PC_RESUME_DECISION="" PC_RESUME_QUESTION="" PC_RESUME_EVIDENCE=""
+if [ -f "$PLAN_CONTEXT_FILE" ]; then
+    PC_DOMAIN=$(jq -r '.domain.cynefin // ""' "$PLAN_CONTEXT_FILE" 2>/dev/null)
+    [ "$PC_DOMAIN" = "null" ] && PC_DOMAIN=""
+
+    PC_HYPOTHESES=$(jq -r '
+        (.hypotheses // []) | map(select(.status == "active")) |
+        if length > 0 then
+            map("| H\(.id) | \(.statement[:60]) | \(.current // .prior // "?") |") | join("\n")
+        else ""
+        end
+    ' "$PLAN_CONTEXT_FILE" 2>/dev/null)
+
+    PC_DECISIONS=$(jq -r '
+        (.decisions // [])[-5:] |
+        if length > 0 then
+            map("- \(.title[:50]) → \(.chosen[:30])") | join("\n")
+        else ""
+        end
+    ' "$PLAN_CONTEXT_FILE" 2>/dev/null)
+
+    PC_BOTTLENECK=$(jq -r '.bottleneck.current // ""' "$PLAN_CONTEXT_FILE" 2>/dev/null)
+    [ "$PC_BOTTLENECK" = "null" ] && PC_BOTTLENECK=""
+
+    PC_KILL=$(jq -r '(.kill_conditions // []) | if length > 0 then map("- " + .) | join("\n") else "" end' "$PLAN_CONTEXT_FILE" 2>/dev/null)
+
+    PC_RESUME_DECISION=$(jq -r '.resume_context.last_decision_point // ""' "$PLAN_CONTEXT_FILE" 2>/dev/null)
+    PC_RESUME_QUESTION=$(jq -r '.resume_context.next_critical_question // ""' "$PLAN_CONTEXT_FILE" 2>/dev/null)
+    PC_RESUME_EVIDENCE=$(jq -r '.resume_context.evidence_received // ""' "$PLAN_CONTEXT_FILE" 2>/dev/null)
+    [ "$PC_RESUME_DECISION" = "null" ] && PC_RESUME_DECISION=""
+    [ "$PC_RESUME_QUESTION" = "null" ] && PC_RESUME_QUESTION=""
+    [ "$PC_RESUME_EVIDENCE" = "null" ] && PC_RESUME_EVIDENCE=""
+fi
+
+# --- Find or create plan file ---
+mkdir -p "$PLANS_DIR"
+
+PLAN_FILE=""
+MARKER="<!-- v11-plan: $PROJECT -->"
+
+# Search existing plans for our marker
+if [ -d "$PLANS_DIR" ]; then
+    PLAN_FILE=$(grep -rl "$MARKER" "$PLANS_DIR" 2>/dev/null | head -1 || echo "")
+fi
+
+NOW=$(date -Iseconds)
+
+# --- Helper: generate reasoning context section ---
+emit_reasoning_context() {
+    if [ -z "$PC_DOMAIN" ] && [ -z "$PC_HYPOTHESES" ] && [ -z "$PC_DECISIONS" ] && [ -z "$PC_BOTTLENECK" ]; then
+        return
+    fi
+    echo "## Reasoning Context"
+    [ -n "$PC_DOMAIN" ] && echo "- Domain: $PC_DOMAIN"
+    if [ -n "$PC_HYPOTHESES" ]; then
+        echo ""
+        echo "### Active Hypotheses"
+        echo "| ID | Statement | Confidence |"
+        echo "|----|-----------|------------|"
+        echo "$PC_HYPOTHESES"
+    fi
+    if [ -n "$PC_DECISIONS" ]; then
+        echo ""
+        echo "### Recent Decisions"
+        echo "$PC_DECISIONS"
+    fi
+    [ -n "$PC_BOTTLENECK" ] && echo "" && echo "### Bottleneck" && echo "- Current: $PC_BOTTLENECK"
+    if [ -n "$PC_KILL" ]; then
+        echo ""
+        echo "### Kill Conditions"
+        echo "$PC_KILL"
+    fi
+    echo ""
+}
+
+# --- Helper: generate resume instructions ---
+emit_resume_instructions() {
+    echo "## Resume Instructions"
+    echo "1. Read $V11_WORKSPACE_ROOT/v11/CLAUDE.md (protocol)"
+    echo "2. Read $SESSIONS_ROOT/$PROJECT/spec.md (intent)"
+    echo "3. TaskList (verify state)"
+    echo "4. Resume from: ${PHASE} phase, ${PENDING} tasks pending"
+    if [ -n "$PC_RESUME_DECISION" ] || [ -n "$PC_RESUME_QUESTION" ] || [ -n "$PC_RESUME_EVIDENCE" ]; then
+        echo ""
+        [ -n "$PC_RESUME_DECISION" ] && echo "Last decision point: $PC_RESUME_DECISION"
+        [ -n "$PC_RESUME_QUESTION" ] && echo "Next critical question: $PC_RESUME_QUESTION"
+        [ -n "$PC_RESUME_EVIDENCE" ] && echo "Evidence received: $PC_RESUME_EVIDENCE"
+    fi
+}
+
+# --- Helper: generate agents section ---
+emit_agents_section() {
+    if [ -n "$AGENTS_SECTION" ]; then
+        echo "## Agents"
+        echo "$AGENTS_SECTION" | grep -v '^## Agents' | grep -v '^$' | head -15
+        echo ""
+    elif [ -n "$FORMATION_AGENTS" ]; then
+        echo "## Agents"
+        echo "- Lead: Team Lead (Opus 4.6)"
+        echo "$FORMATION_AGENTS" | tr ',' '\n' | while read -r agent; do
+            agent=$(echo "$agent" | xargs)
+            [ -n "$agent" ] && echo "- $agent"
+        done
+        echo ""
+    fi
+}
+
+if [ -n "$PLAN_FILE" ] && [ -f "$PLAN_FILE" ]; then
+    # Extract and preserve Plan section from existing file before rewriting
+    PLAN_CONTENT=$(sed -n '/^## Plan$/,/^## /{/^## Plan$/d;/^## /d;p}' "$PLAN_FILE" 2>/dev/null || echo "")
+
+    # Rebuild the file
+    {
+        echo "# V11 Plan: $PROJECT"
+        echo "$MARKER"
+        echo ""
+        echo "## State Snapshot"
+        echo "- Project: $PROJECT"
+        echo "- Session: $SESSIONS_ROOT/$PROJECT/"
+        echo "- Tasks: ${COMPLETED}/${TOTAL} (${PCT}%)"
+        echo "- Formation: $FORMATION_NAME | Agents: ${FORMATION_AGENTS:-none}"
+        echo "- Autonomy: A${AUTONOMY_LEVEL} (${AUTONOMY_SUCCESSFUL} actions, ${AUTONOMY_ERRORS} errors)"
+        echo "- Sprint: $SPRINT | Gate: $GATE"
+        [ -n "$ACTIVE_IDS" ] && echo "- Active tasks: #${ACTIVE_IDS}"
+        echo ""
+
+        emit_agents_section
+        emit_reasoning_context
+
+        echo "## Plan"
+        if [ -n "$PLAN_CONTENT" ]; then
+            echo "$PLAN_CONTENT"
+        else
+            echo "(No plan content yet — add architectural decisions and implementation steps here)"
+        fi
+        echo ""
+
+        emit_resume_instructions
+        echo ""
+        echo "---"
+        echo "V11 Protocol | Updated: $NOW"
+    } > "$PLAN_FILE"
+
+else
+    # Create new plan file
+    SLUG=$(echo "$PROJECT" | tr '[:upper:]' '[:lower:]' | tr ' ' '-' | tr -cd 'a-z0-9-')
+    PLAN_FILE="$PLANS_DIR/v11-${SLUG}.md"
+
+    {
+        echo "# V11 Plan: $PROJECT"
+        echo "$MARKER"
+        echo ""
+        echo "## State Snapshot"
+        echo "- Project: $PROJECT"
+        echo "- Session: $SESSIONS_ROOT/$PROJECT/"
+        echo "- Tasks: ${COMPLETED}/${TOTAL} (${PCT}%)"
+        echo "- Formation: $FORMATION_NAME | Agents: ${FORMATION_AGENTS:-none}"
+        echo "- Autonomy: A${AUTONOMY_LEVEL} (${AUTONOMY_SUCCESSFUL} actions, ${AUTONOMY_ERRORS} errors)"
+        echo "- Sprint: $SPRINT | Gate: $GATE"
+        [ -n "$ACTIVE_IDS" ] && echo "- Active tasks: #${ACTIVE_IDS}"
+        echo ""
+
+        emit_agents_section
+        emit_reasoning_context
+
+        echo "## Plan"
+        echo "(Add architectural decisions and implementation steps here)"
+        echo ""
+        emit_resume_instructions
+        echo ""
+        echo "---"
+        echo "V11 Protocol | Updated: $NOW"
+    } > "$PLAN_FILE"
+fi
+
+echo "Plan synced: $PLAN_FILE"
+echo "  Tasks: ${COMPLETED}/${TOTAL} (${PCT}%)"
+echo "  Formation: $FORMATION_NAME"
+echo "  Autonomy: A${AUTONOMY_LEVEL}"

@@ -1,0 +1,16 @@
+id: BT-008
+title: "SWE-bench instance through V11 CLI"
+tier: 2
+type: live-cli
+category: swe-bench
+description: |
+  Runs a SWE-bench-lite instance through the V11 CLI pipeline.
+  This is a placeholder — actual SWE-bench integration uses swe_claude_code_agent.py.
+prompt: "Read src/app.py and add type hints to all functions. Run the tests to verify nothing breaks."
+model: haiku
+timeout: 300
+assertions:
+  - type: file_contains
+    path: src/app.py
+    text: "def hello"
+  - type: audit_entry

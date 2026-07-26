@@ -1,0 +1,181 @@
+#!/bin/bash
+# V11 Discipline Detector (T2/T3 of v11-handoff-hygiene)
+#
+# Flags in_progress tasks that have had recent file-edit audit activity
+# but no TaskUpdate(completed) — likely "work shipped, task never closed."
+#
+# Writes $SESSION_DIR/.handoff-discipline-log.json with the per-task nudge
+# evidence. Consumed by:
+#   - scripts/handoff (surfaces as warning block in handoff.md prompt)
+#   - T6 (AUTHORITATIVE label downgrade signal)
+#
+# Usage: scripts/handoff-discipline-check PROJECT
+#
+# Env vars:
+#   V11_DISCIPLINE_DETECTOR=off       → no-op, removes any existing artifact
+#   V11_DISCIPLINE_WINDOW_HOURS=N     → audit-log lookback window (default 6)
+#
+# Exit codes:
+#   0 — always (advisory, never fails)
+
+set -euo pipefail
+
+PROJECT="${1:-}"
+[ -z "$PROJECT" ] && exit 0
+# SEC: project whitelist
+if ! printf '%s' "$PROJECT" | grep -qE '^[a-zA-Z0-9._-]{1,64}$'; then
+    exit 0
+fi
+
+if [ "${V11_DISCIPLINE_DETECTOR:-on}" = "off" ]; then
+    # Honor rollback: clean up any stale artifact and exit
+    _DISC_LOG="${SESSIONS_ROOT:-$HOME/sessions}/$PROJECT/.handoff-discipline-log.json"
+    rm -f "$_DISC_LOG" 2>/dev/null || true
+    exit 0
+fi
+
+V11_WORKSPACE_ROOT="${V11_WORKSPACE_ROOT:-$HOME/.v11}"
+SESSIONS_ROOT="${SESSIONS_ROOT:-$V11_WORKSPACE_ROOT/sessions}"
+METRICS_DIR="${METRICS_DIR:-$V11_WORKSPACE_ROOT/.agent-metrics}"
+TASK_STATE_DIR="$METRICS_DIR/task-state"
+
+SESSION_DIR="$SESSIONS_ROOT/$PROJECT"
+STATE_FILE="$TASK_STATE_DIR/${PROJECT}.json"
+AUDIT_LOG="$METRICS_DIR/autonomy-audit.jsonl"
+DISC_LOG="$SESSION_DIR/.handoff-discipline-log.json"
+
+# Need state + audit log to do anything useful
+[ -f "$STATE_FILE" ] || exit 0
+[ -s "$STATE_FILE" ] || exit 0
+[ -f "$AUDIT_LOG" ] || exit 0
+mkdir -p "$SESSION_DIR" 2>/dev/null || true
+
+WINDOW_HOURS="${V11_DISCIPLINE_WINDOW_HOURS:-6}"
+if ! printf '%s' "$WINDOW_HOURS" | grep -qE '^[0-9]+$'; then
+    WINDOW_HOURS=6
+fi
+SINCE_EPOCH=$(( $(date +%s) - WINDOW_HOURS * 3600 ))
+# Pre-compute the ISO-8601 cutoff string so we can do lexical comparison
+# inside jq (more robust than fromdateiso8601, which trips on the colon
+# timezone format we use, e.g. "2026-05-22T22:24:27+02:00").
+SINCE_ISO=$(date -d "@$SINCE_EPOCH" -Iseconds 2>/dev/null || echo "1970-01-01T00:00:00+00:00")
+NOW_TS=$(date -Iseconds)
+
+# Extract in_progress tasks across all sessions in the aggregate
+IN_PROGRESS_TASKS=$(jq -c '
+    (.open_tasks_by_session // {}) | to_entries | map(
+        .key as $sid |
+        (.value | to_entries | map({
+            id: .key,
+            subject: (.value.subject // null),
+            status: (.value.status // null),
+            session_uuid: $sid
+        }))
+    ) | add // [] | map(select(.status == "in_progress"))
+' "$STATE_FILE" 2>/dev/null || echo "[]")
+
+IP_COUNT=$(printf '%s' "$IN_PROGRESS_TASKS" | jq 'length' 2>/dev/null || echo 0)
+IP_COUNT="${IP_COUNT//[!0-9]/}"; IP_COUNT="${IP_COUNT:-0}"
+
+if [ "$IP_COUNT" -eq 0 ]; then
+    # No in_progress tasks → nothing stale possible. Clean up artifact.
+    rm -f "$DISC_LOG" 2>/dev/null || true
+    exit 0
+fi
+
+# Recent file-edit audit entries for this project (Write/Edit only).
+# tail -1000 bounds the cost; for projects with very long audit history this
+# may miss old activity, but the discipline window is short (default 6h) so
+# the recent tail is what matters.
+RECENT_FILES=$(
+    tail -1000 "$AUDIT_LOG" 2>/dev/null \
+    | jq -c --arg p "$PROJECT" --arg since_iso "$SINCE_ISO" '
+        select(.project == $p)
+        | select(.action == "Write" or .action == "Edit")
+        | (.timestamp // "") as $ts
+        | select($ts >= $since_iso)
+        | {file: (.file // ""), agent_id: (.agent_id // ""),
+           task_id: (.task_id // ""), ts: $ts}
+    ' 2>/dev/null \
+    | jq -s -c '.' 2>/dev/null || echo "[]"
+)
+
+RF_COUNT=$(printf '%s' "$RECENT_FILES" | jq 'length' 2>/dev/null || echo 0)
+RF_COUNT="${RF_COUNT//[!0-9]/}"; RF_COUNT="${RF_COUNT:-0}"
+
+if [ "$RF_COUNT" -eq 0 ]; then
+    # In-progress tasks exist but no recent file activity attributed to this
+    # project → the in_progress state is honestly idle, not a discipline gap.
+    rm -f "$DISC_LOG" 2>/dev/null || true
+    exit 0
+fi
+
+# Pair audit entries with in_progress tasks. An entry "matches" a task when:
+#   (a) audit.task_id == task.id (strong signal), OR
+#   (b) audit.task_id is empty AND the file path contains the task subject's
+#       most-distinctive token (weak signal, advisory only)
+# The strong-signal pairing is preferred; weak-signal pairs are emitted only
+# when no strong matches exist for that task.
+NUDGES=$(jq -n -c \
+    --argjson tasks "$IN_PROGRESS_TASKS" \
+    --argjson files "$RECENT_FILES" '
+    def distinctive_tokens($s):
+        ($s // "" | ascii_downcase
+         | gsub("[^a-z0-9 ]"; " ")
+         | gsub("\\s+"; " ")
+         | split(" ")
+         | map(select(length > 4)));
+
+    $tasks | map(
+        . as $t
+        | ($files | map(select(.task_id == $t.id))) as $strong
+        | (if ($strong | length) > 0 then $strong
+           else
+               (distinctive_tokens($t.subject)) as $toks
+               | ($files | map(select(
+                   . as $f | $toks | any(. as $tok | $f.file | ascii_downcase | contains($tok))
+               ))) as $weak
+               | $weak
+           end) as $matches
+        | if ($matches | length) > 0
+          then $t + {
+              evidence: ($matches | .[0:5]),
+              evidence_count: ($matches | length),
+              match_strength: (if ($strong | length) > 0 then "strong" else "weak" end),
+              nudge: "Task #\($t.id) (\($t.subject)) has \($matches | length) recent file edit(s) under this project but is still in_progress. If the work is shipped, run TaskUpdate(taskId=\"\($t.id)\", status=\"completed\"); otherwise ignore."
+          }
+          else empty
+          end
+    )
+' 2>/dev/null || echo "[]")
+
+N_COUNT=$(printf '%s' "$NUDGES" | jq 'length' 2>/dev/null || echo 0)
+N_COUNT="${N_COUNT//[!0-9]/}"; N_COUNT="${N_COUNT:-0}"
+
+if [ "$N_COUNT" -eq 0 ]; then
+    # No matches → no honest nudge to make. Clear artifact.
+    rm -f "$DISC_LOG" 2>/dev/null || true
+    exit 0
+fi
+
+# Write the discipline log artifact atomically.
+TMP="$DISC_LOG.tmp.$$"
+jq -n \
+    --arg ts "$NOW_TS" \
+    --arg project "$PROJECT" \
+    --argjson window_hours "$WINDOW_HOURS" \
+    --argjson nudges "$NUDGES" '
+    {
+        generated_at: $ts,
+        project: $project,
+        window_hours: $window_hours,
+        stale_in_progress_count: ($nudges | length),
+        nudges: $nudges
+    }' > "$TMP" 2>/dev/null
+if [ -s "$TMP" ] && jq empty "$TMP" 2>/dev/null; then
+    mv "$TMP" "$DISC_LOG"
+else
+    rm -f "$TMP" 2>/dev/null || true
+fi
+
+exit 0

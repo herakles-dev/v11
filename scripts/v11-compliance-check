@@ -1,0 +1,624 @@
+#!/bin/bash
+# V11 Compliance Check — validate full V11 setup for a project
+# Usage: ./scripts/v11-compliance-check PROJECT [--fix]
+#
+# Checks 10 compliance gates:
+#   1. Session directory exists
+#   2. spec.md exists and is <100 lines
+#   3. .claude/settings.json has V11 hooks (all 13)
+#   4. All hook scripts exist and are executable
+#  4b. Hooks actually firing (advisory — detects mid-session installs)
+#   5. Autonomy state file exists
+#   6. Formation registry (if team project)
+#   7. No legacy artifacts (spec.yml, V8/V10 hooks)
+#   8. CLAUDE.md references V11 protocol
+#   9. Task state directory accessible
+#  10. Schemas accessible
+#
+# Exit codes: 0 = compliant, 1 = failures found, 2 = usage error
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+V11_HOME="$(dirname "$SCRIPT_DIR")"
+V11_WORKSPACE_ROOT="${V11_WORKSPACE_ROOT:-$HOME/.v11}"
+SESSIONS_ROOT="${SESSIONS_ROOT:-$V11_WORKSPACE_ROOT/sessions}"
+
+# Self-test
+if [ "${1:-}" = "--test" ]; then
+    echo "v11-compliance-check v1.0 (V11.8)"
+    exit 0
+fi
+
+PROJECT="${1:-}"
+FIX_MODE=false
+DARK_CODE_ONLY=false
+for arg in "${@:2}"; do
+    case "$arg" in
+        --fix) FIX_MODE=true ;;
+        --dark-code) DARK_CODE_ONLY=true ;;
+    esac
+done
+
+if [ -z "$PROJECT" ]; then
+    echo "V11 Compliance Check"
+    echo ""
+    echo "Usage: $0 PROJECT [--fix] [--dark-code]"
+    echo "       $0 --scan              Scan all projects"
+    echo "       $0 --test              Self-test"
+    echo ""
+    echo "Core gates (1-10):"
+    echo "  1. Session directory         6. Formation registry (if team)"
+    echo "  2. spec.md (<100 lines)      7. No legacy artifacts"
+    echo "  3. V11 hooks (all 13)        8. CLAUDE.md V11 reference"
+    echo "  4. Hook scripts executable   9. Task state accessible"
+    echo "  5. Autonomy state file      10. Schemas accessible"
+    echo ""
+    echo "Dark Code gates (11-13, advisory):"
+    echo " 11. Schema content            (spec_test_requirements + api_contract_entry + module-manifest)"
+    echo " 12. Layer 1 STR coverage      (complex/novel tasks with spec_test_requirements)"
+    echo " 13. MODULE.md coverage        (source modules with MODULE.md manifest)"
+    echo ""
+    echo "--fix:        Auto-fix what can be fixed (copy hooks, create dirs, init autonomy)"
+    echo "--dark-code:  Run only Dark Code gates 11-13 (skip core gates)"
+    exit 2
+fi
+
+# Scan mode: check all projects
+if [ "$PROJECT" = "--scan" ]; then
+    echo "=== V11 Compliance Scan ==="
+    echo ""
+
+    TOTAL=0
+    COMPLIANT=0
+    PARTIAL=0
+    NONCOMPLIANT=0
+
+    # Scan sessions/ and root projects with settings.json
+    PROJECTS=()
+    for d in "$SESSIONS_ROOT"/*/; do
+        [ -d "$d" ] && PROJECTS+=("session:$(basename "$d")")
+    done
+    for d in "$V11_WORKSPACE_ROOT"/*/; do
+        name=$(basename "$d")
+        # Skip non-project dirs
+        [[ "$name" =~ ^(v6_Ultra|v8|v9\.backup|v10|v11|node_modules|\.archive|scripts|system-apps-config)$ ]] && continue
+        [ -f "$d/.claude/settings.json" ] || [ -f "$d/CLAUDE.md" ] || continue
+        PROJECTS+=("root:$name")
+    done
+
+    printf "%-35s %-10s %s\n" "PROJECT" "SCORE" "STATUS"
+    printf "%-35s %-10s %s\n" "-------" "-----" "------"
+
+    for entry in "${PROJECTS[@]}"; do
+        type="${entry%%:*}"
+        name="${entry#*:}"
+
+        # Determine project dir
+        if [ "$type" = "session" ]; then
+            PROJECT_DIR="$SESSIONS_ROOT/$name"
+        else
+            PROJECT_DIR="$V11_WORKSPACE_ROOT/$name"
+        fi
+
+        # Quick scoring
+        score=0
+        max=10
+
+        # Gate 1: Session dir
+        [ -d "$SESSIONS_ROOT/$name" ] && ((score++)) || true
+
+        # Gate 2: spec.md
+        if [ -f "$SESSIONS_ROOT/$name/spec.md" ] || [ -f "$PROJECT_DIR/spec.md" ]; then
+            ((score++)) || true
+        fi
+
+        # Gate 3: V11 hooks
+        settings="$PROJECT_DIR/.claude/settings.json"
+        [ -f "$settings" ] || settings="$SESSIONS_ROOT/$name/.claude/settings.json"
+        if [ -f "$settings" ] && grep -q "v11/hooks" "$settings" 2>/dev/null; then
+            hook_count=$(grep -c "v11/hooks" "$settings" 2>/dev/null || echo 0)
+            [ "$hook_count" -ge 10 ] && ((score+=2)) || ((score++)) || true  # Gate 3+4 combined
+        fi
+
+        # Gate 5: Autonomy
+        if [ -f "$SESSIONS_ROOT/$name/.autonomy-state" ] || [ -f "$PROJECT_DIR/.autonomy-state" ]; then
+            ((score++)) || true
+        fi
+
+        # Gate 7: No legacy
+        has_legacy=false
+        [ -f "$PROJECT_DIR/spec.yml" ] && has_legacy=true
+        [ -f "$SESSIONS_ROOT/$name/spec.yml" ] && has_legacy=true
+        if [ -f "$settings" ]; then
+            grep -q "v8/hooks\|v10/hooks\|v6" "$settings" 2>/dev/null && has_legacy=true
+        fi
+        $has_legacy || ((score++)) || true
+
+        # Gate 8: CLAUDE.md V11 ref
+        if [ -f "$PROJECT_DIR/CLAUDE.md" ]; then
+            grep -qi "v11\|V11" "$PROJECT_DIR/CLAUDE.md" 2>/dev/null && ((score++)) || true
+        fi
+
+        # Classify
+        TOTAL=$((TOTAL + 1))
+        if [ $score -ge 7 ]; then
+            status="COMPLIANT"
+            COMPLIANT=$((COMPLIANT + 1))
+        elif [ $score -ge 4 ]; then
+            status="PARTIAL"
+            PARTIAL=$((PARTIAL + 1))
+        else
+            status="NON-COMPLIANT"
+            NONCOMPLIANT=$((NONCOMPLIANT + 1))
+        fi
+
+        printf "%-35s %-10s %s\n" "$name" "$score/$max" "$status"
+    done
+
+    echo ""
+    echo "Total: $TOTAL | Compliant: $COMPLIANT | Partial: $PARTIAL | Non-compliant: $NONCOMPLIANT"
+    exit 0
+fi
+
+# --- Single project check ---
+
+# Find project directory
+PROJECT_DIR=""
+SESSION_DIR="$SESSIONS_ROOT/$PROJECT"
+if [ -d "$V11_WORKSPACE_ROOT/$PROJECT" ]; then
+    PROJECT_DIR="$V11_WORKSPACE_ROOT/$PROJECT"
+elif [ -d "$SESSION_DIR" ]; then
+    PROJECT_DIR="$SESSION_DIR"
+else
+    echo "ERROR: Project '$PROJECT' not found"
+    exit 2
+fi
+
+echo "=== V11 Compliance Check: $PROJECT ==="
+echo "Project dir: $PROJECT_DIR"
+echo ""
+
+PASS=0
+FAIL=0
+WARN=0
+FIXES=0
+
+gate() {
+    local num=$1 name=$2 status=$3 detail=$4
+    if [ "$status" = "PASS" ]; then
+        printf "  [PASS] Gate %2d: %-30s %s\n" "$num" "$name" "$detail"
+        PASS=$((PASS + 1))
+    elif [ "$status" = "WARN" ]; then
+        printf "  [WARN] Gate %2d: %-30s %s\n" "$num" "$name" "$detail"
+        WARN=$((WARN + 1))
+    else
+        printf "  [FAIL] Gate %2d: %-30s %s\n" "$num" "$name" "$detail"
+        FAIL=$((FAIL + 1))
+    fi
+}
+
+fix() {
+    if $FIX_MODE; then
+        echo "         -> FIX: $1"
+        FIXES=$((FIXES + 1))
+        return 0
+    fi
+    return 1
+}
+
+if ! $DARK_CODE_ONLY; then
+# Gate 1: Session directory
+if [ -d "$SESSION_DIR" ]; then
+    gate 1 "Session directory" "PASS" "$SESSION_DIR"
+else
+    if fix "Creating session directory"; then
+        mkdir -p "$SESSION_DIR"
+        gate 1 "Session directory" "PASS" "Created $SESSION_DIR"
+    else
+        gate 1 "Session directory" "FAIL" "Missing: $SESSION_DIR (use --fix)"
+    fi
+fi
+
+# Gate 2: spec.md
+SPEC_FILE=""
+[ -f "$SESSION_DIR/spec.md" ] && SPEC_FILE="$SESSION_DIR/spec.md"
+[ -f "$PROJECT_DIR/spec.md" ] && SPEC_FILE="$PROJECT_DIR/spec.md"
+if [ -n "$SPEC_FILE" ]; then
+    lines=$(wc -l < "$SPEC_FILE")
+    if [ "$lines" -le 100 ]; then
+        gate 2 "spec.md" "PASS" "$lines lines"
+    else
+        gate 2 "spec.md" "WARN" "$lines lines (recommended <100)"
+    fi
+else
+    gate 2 "spec.md" "WARN" "No spec.md (optional for simple projects)"
+fi
+
+# Gate 3: V11 hooks in settings.json
+SETTINGS=""
+[ -f "$PROJECT_DIR/.claude/settings.json" ] && SETTINGS="$PROJECT_DIR/.claude/settings.json"
+[ -f "$SESSION_DIR/.claude/settings.json" ] && SETTINGS="$SESSION_DIR/.claude/settings.json"
+
+EXPECTED_HOOKS=(detect-project guard-write-gates guard-enforcement guard-effort enforce-test-coverage verify-syntax track-autonomy sync-tasks guard-agent-stall track-agents fix-team-model post-compact session-end)
+
+if [ -n "$SETTINGS" ]; then
+    v11_count=$(grep -c "v11/hooks" "$SETTINGS" 2>/dev/null || echo "0")
+    v11_count=$(echo "$v11_count" | tr -d '[:space:]' | head -c 5)
+    [ -z "$v11_count" ] && v11_count=0
+    if [ "$v11_count" -ge 13 ]; then
+        gate 3 "V11 hooks wired" "PASS" "$v11_count references"
+    elif [ "$v11_count" -gt 0 ]; then
+        gate 3 "V11 hooks wired" "WARN" "Only $v11_count/13+ references"
+    else
+        # Check for legacy hooks
+        legacy=""
+        grep -q "v10/hooks" "$SETTINGS" 2>/dev/null && legacy="V10"
+        grep -q "v8/hooks" "$SETTINGS" 2>/dev/null && legacy="V8"
+        grep -q "v6" "$SETTINGS" 2>/dev/null && legacy="V6"
+
+        if [ -n "$legacy" ]; then
+            if fix "Replacing $legacy hooks with V11"; then
+                cp "$SETTINGS" "${SETTINGS}.${legacy,,}-backup"
+                cp "$V11_HOME/.claude/settings.json" "$SETTINGS"
+                gate 3 "V11 hooks wired" "PASS" "Migrated from $legacy (backup: ${SETTINGS}.${legacy,,}-backup)"
+            else
+                gate 3 "V11 hooks wired" "FAIL" "Has $legacy hooks, not V11 (use --fix)"
+            fi
+        else
+            if fix "Installing V11 hooks"; then
+                mkdir -p "$(dirname "$SETTINGS")"
+                [ -z "$SETTINGS" ] && SETTINGS="$PROJECT_DIR/.claude/settings.json"
+                cp "$V11_HOME/.claude/settings.json" "$SETTINGS"
+                gate 3 "V11 hooks wired" "PASS" "Installed V11 hooks"
+            else
+                gate 3 "V11 hooks wired" "FAIL" "No V11 hooks (use --fix)"
+            fi
+        fi
+    fi
+else
+    SETTINGS="$PROJECT_DIR/.claude/settings.json"
+    if fix "Installing V11 settings.json"; then
+        mkdir -p "$(dirname "$SETTINGS")"
+        cp "$V11_HOME/.claude/settings.json" "$SETTINGS"
+        gate 3 "V11 hooks wired" "PASS" "Created settings.json with V11 hooks"
+    else
+        gate 3 "V11 hooks wired" "FAIL" "No settings.json (use --fix)"
+    fi
+fi
+
+# Gate 4: Hook scripts exist and are executable
+if [ -n "$SETTINGS" ] && [ -f "$SETTINGS" ]; then
+    missing_hooks=()
+    for hook in "${EXPECTED_HOOKS[@]}"; do
+        hook_path="$V11_HOME/hooks/$hook"
+        if [ ! -x "$hook_path" ]; then
+            missing_hooks+=("$hook")
+        fi
+    done
+    if [ ${#missing_hooks[@]} -eq 0 ]; then
+        gate 4 "Hook scripts executable" "PASS" "All 13 hooks OK"
+    else
+        gate 4 "Hook scripts executable" "FAIL" "Missing: ${missing_hooks[*]}"
+    fi
+else
+    gate 4 "Hook scripts executable" "WARN" "No settings.json to validate against"
+fi
+
+# Gate 4b: Hooks actually firing (advisory — detects mid-session installs)
+if [ -n "$SETTINGS" ] && [ -f "$SETTINGS" ]; then
+    AUDIT_LOG="$V11_WORKSPACE_ROOT/.agent-metrics/autonomy-audit.jsonl"
+    if [ -f "$AUDIT_LOG" ]; then
+        # Check for any audit entry for this project in the last 2 hours
+        _CUTOFF=$(date -d '2 hours ago' -Iseconds 2>/dev/null || date -Iseconds)
+        _RECENT=$(tail -n 500 "$AUDIT_LOG" 2>/dev/null | grep -c "\"project\":\"$PROJECT\"" || echo "0")
+        _RECENT=$(echo "$_RECENT" | tr -d '[:space:]')
+        if [ "${_RECENT:-0}" -gt 0 ]; then
+            gate 4 "Hooks firing" "PASS" "$_RECENT recent entries for $PROJECT"
+        else
+            gate 4 "Hooks firing" "WARN" "settings.json exists but no audit entries for '$PROJECT' — hooks may not be loaded (restart Claude Code or run v11-bootstrap-session)"
+        fi
+    else
+        gate 4 "Hooks firing" "WARN" "No audit log yet — fresh install?"
+    fi
+fi
+
+# Gate 5: Autonomy state
+AUTONOMY=""
+[ -f "$SESSION_DIR/.autonomy-state" ] && AUTONOMY="$SESSION_DIR/.autonomy-state"
+[ -f "$PROJECT_DIR/.autonomy-state" ] && AUTONOMY="$PROJECT_DIR/.autonomy-state"
+if [ -n "$AUTONOMY" ]; then
+    level=$(jq -r '.level // "unknown"' "$AUTONOMY" 2>/dev/null || echo "invalid")
+    gate 5 "Autonomy state" "PASS" "Level: $level"
+else
+    if fix "Initializing autonomy state at A0"; then
+        target_dir="$SESSION_DIR"
+        [ ! -d "$target_dir" ] && target_dir="$PROJECT_DIR"
+        cat > "$target_dir/.autonomy-state" << 'EOF'
+{"level": "A0", "name": "Manual", "successes": 0, "rollbacks": 0, "grants": [], "history": []}
+EOF
+        gate 5 "Autonomy state" "PASS" "Initialized at A0"
+    else
+        gate 5 "Autonomy state" "WARN" "No autonomy state (defaults to A0)"
+    fi
+fi
+
+# Gate 6: Per-task agent assignment (V11.11)
+TASK_STATE=""
+[ -f "$SESSION_DIR/.task-state.json" ] && TASK_STATE="$SESSION_DIR/.task-state.json"
+[ -f "$PROJECT_DIR/.task-state.json" ] && TASK_STATE="$PROJECT_DIR/.task-state.json"
+if [ -n "$TASK_STATE" ]; then
+    agents=$(jq '(.recommended_agents // {}) | keys | length' "$TASK_STATE" 2>/dev/null || echo 0)
+    if [ "$agents" -gt 0 ]; then
+        gate 6 "Task agent assignment" "PASS" "$agents tasks have metadata.agent"
+    else
+        gate 6 "Task agent assignment" "WARN" "No tasks with metadata.agent yet"
+    fi
+else
+    gate 6 "Task agent assignment" "WARN" "No task state yet"
+fi
+
+# Gate 7: No legacy artifacts
+legacy_issues=()
+[ -f "$PROJECT_DIR/spec.yml" ] && legacy_issues+=("spec.yml (V5)")
+[ -f "$SESSION_DIR/spec.yml" ] && legacy_issues+=("session/spec.yml (V5)")
+if [ -n "${SETTINGS:-}" ] && [ -f "$SETTINGS" ]; then
+    grep -q "v8/hooks" "$SETTINGS" 2>/dev/null && legacy_issues+=("V8 hooks in settings")
+    grep -q "v10/hooks" "$SETTINGS" 2>/dev/null && legacy_issues+=("V10 hooks in settings")
+fi
+# Check state.md for checkbox pattern
+for smd in "$SESSION_DIR/state.md" "$PROJECT_DIR/state.md"; do
+    [ -f "$smd" ] && grep -q '^\- \[ \]' "$smd" 2>/dev/null && legacy_issues+=("V7 checkboxes in state.md")
+done
+
+if [ ${#legacy_issues[@]} -eq 0 ]; then
+    gate 7 "No legacy artifacts" "PASS" "Clean"
+else
+    gate 7 "No legacy artifacts" "FAIL" "${legacy_issues[*]}"
+fi
+
+# Gate 8: CLAUDE.md V11 reference
+if [ -f "$PROJECT_DIR/CLAUDE.md" ]; then
+    if grep -qi "v11\|V11" "$PROJECT_DIR/CLAUDE.md" 2>/dev/null; then
+        gate 8 "CLAUDE.md V11 reference" "PASS" "V11 referenced"
+    else
+        gate 8 "CLAUDE.md V11 reference" "WARN" "No V11 reference in CLAUDE.md"
+    fi
+else
+    gate 8 "CLAUDE.md V11 reference" "WARN" "No project CLAUDE.md"
+fi
+
+# Gate 9: Task state accessible
+TASK_STATE=""
+[ -f "$SESSION_DIR/.task-state.json" ] && TASK_STATE="$SESSION_DIR/.task-state.json"
+if [ -n "$TASK_STATE" ]; then
+    total=$(jq '.totals.total // 0' "$TASK_STATE" 2>/dev/null || echo 0)
+    gate 9 "Task state" "PASS" "$total tasks tracked"
+else
+    gate 9 "Task state" "WARN" "No task state yet (created on first TaskCreate)"
+fi
+
+# Gate 10: V11 schemas accessible
+if [ -d "$V11_HOME/schemas" ]; then
+    schema_count=$(ls "$V11_HOME/schemas/"*.json 2>/dev/null | wc -l)
+    gate 10 "V11 schemas accessible" "PASS" "$schema_count schemas in $V11_HOME/schemas/"
+else
+    gate 10 "V11 schemas accessible" "FAIL" "Schemas directory missing"
+fi
+
+# Gate 14 (V11.23): Handoff scope integrity
+# If sessions/$PROJECT/handoff-tasks.json exists, every emitted entry's
+# metadata.project must equal $PROJECT (legacy null/missing is acceptable —
+# Layer 3 routing ensures null-metadata tasks only land in $PROJECT.json when
+# their source session's active-project was $PROJECT). Surfaces cross-project
+# leakage from pre-V11.23 aggregates.
+HANDOFF_TASKS_FILE="$SESSION_DIR/handoff-tasks.json"
+if [ -f "$HANDOFF_TASKS_FILE" ] && jq empty "$HANDOFF_TASKS_FILE" 2>/dev/null; then
+    scope_check=$(jq -c --arg p "$PROJECT" '
+        (.open_tasks // []) as $tasks
+        | ($tasks | length) as $n
+        | ($tasks | map(select((.metadata.project // null) != $p and (.metadata.project // null) != null))) as $foreign
+        | ($tasks | map(select((.metadata.project // null) == null))) as $unstamped
+        | {
+            total: $n,
+            foreign_count: ($foreign | length),
+            unstamped_count: ($unstamped | length),
+            foreign_projects: ([$foreign[] | .metadata.project] | unique),
+            foreign_examples: ([$foreign[] | {id, subject, claimed: .metadata.project}] | .[0:3])
+        }
+    ' "$HANDOFF_TASKS_FILE")
+    foreign_count=$(echo "$scope_check" | jq -r '.foreign_count')
+    handoff_total=$(echo "$scope_check" | jq -r '.total')
+    unstamped_count=$(echo "$scope_check" | jq -r '.unstamped_count')
+    if [ "${foreign_count:-0}" -eq 0 ]; then
+        if [ "${unstamped_count:-0}" -gt 0 ]; then
+            gate 14 "Handoff scope integrity" "PASS" "$handoff_total emitted, $unstamped_count unstamped (legacy-OK), 0 foreign"
+        else
+            gate 14 "Handoff scope integrity" "PASS" "$handoff_total emitted, all stamped $PROJECT"
+        fi
+    else
+        foreign_projs=$(echo "$scope_check" | jq -r '.foreign_projects | join(",")')
+        gate 14 "Handoff scope integrity" "WARN" "$foreign_count of $handoff_total emitted tasks have metadata.project != $PROJECT (foreign=$foreign_projs); run scripts/reconcile-aggregates --apply"
+    fi
+else
+    gate 14 "Handoff scope integrity" "PASS" "No handoff-tasks.json yet"
+fi
+
+# Gate 15 (V11.31 W2-5/H1c): Git-event hooks installed
+# post-commit-close-tasks (auto-close) + commit-msg-validation (Validation:
+# tag lint) should be wired for any project that is its own git repo — this is
+# the --fix path CLAUDE.md's "V11-scaffolded projects get this automatically"
+# claim relies on for projects configured after the fact (scaffold itself now
+# installs both hooks at creation time; see scripts/scaffold).
+# Rollback (same var used by scaffold): V11_GIT_HOOKS_AUTOINSTALL=off
+GIT_TARGET_DIR=""
+[ -d "$SESSION_DIR/.git" ] && GIT_TARGET_DIR="$SESSION_DIR"
+[ -z "$GIT_TARGET_DIR" ] && [ -d "$PROJECT_DIR/.git" ] && GIT_TARGET_DIR="$PROJECT_DIR"
+
+if [ -n "$GIT_TARGET_DIR" ]; then
+    postcommit_installed=false
+    validationlint_installed=false
+    _git_dir="$(git -C "$GIT_TARGET_DIR" rev-parse --absolute-git-dir 2>/dev/null || true)"
+    if [ -n "$_git_dir" ]; then
+        _pc_hook="${_git_dir}/hooks/post-commit"
+        _cm_hook="${_git_dir}/hooks/commit-msg"
+        if [ -e "$_pc_hook" ] && grep -q "post-commit-close-tasks\|V11_POSTCOMMIT\|v11-chain-wrapper-v1" "$_pc_hook" 2>/dev/null; then
+            postcommit_installed=true
+        fi
+        if [ -e "$_cm_hook" ] && grep -q "commit-msg-validation\|V11_VALIDATION_LINT\|v11-chain-wrapper-v1" "$_cm_hook" 2>/dev/null; then
+            validationlint_installed=true
+        fi
+    fi
+
+    if $postcommit_installed && $validationlint_installed; then
+        gate 15 "Git-event hooks installed" "PASS" "post-commit + commit-msg both wired"
+    else
+        missing=()
+        $postcommit_installed || missing+=("post-commit-close-tasks")
+        $validationlint_installed || missing+=("commit-msg-validation")
+        if [ "${V11_GIT_HOOKS_AUTOINSTALL:-on}" = "off" ]; then
+            gate 15 "Git-event hooks installed" "WARN" "Missing: ${missing[*]} (V11_GIT_HOOKS_AUTOINSTALL=off — skipping auto-install)"
+        elif fix "Installing git-event hooks (post-commit + commit-msg)"; then
+            "$V11_HOME/scripts/install-postcommit-hook" "$GIT_TARGET_DIR" >/dev/null 2>&1 || true
+            "$V11_HOME/scripts/install-validation-lint-hook" --repo "$GIT_TARGET_DIR" >/dev/null 2>&1 || true
+            gate 15 "Git-event hooks installed" "PASS" "Installed: ${missing[*]}"
+        else
+            gate 15 "Git-event hooks installed" "WARN" "Missing: ${missing[*]} (use --fix)"
+        fi
+    fi
+else
+    gate 15 "Git-event hooks installed" "WARN" "Not a git repository — run 'git init' first, then re-run --fix"
+fi
+
+fi  # end: !DARK_CODE_ONLY
+
+# === Dark Code Gates (11-13) — Advisory ===
+# These surface Layer 1-3 alignment but do NOT block compliance.
+# WARN counts keep PASS status unless --strict is introduced later.
+
+# Gate 11: Schema content check
+# Verify the active task-metadata.schema.json has the Dark Code extensions
+# (spec_test_requirements + api_contract_entry) and that module-manifest.schema.json exists.
+TASK_SCHEMA="$V11_HOME/schemas/task-metadata.schema.json"
+MODULE_SCHEMA="$V11_HOME/schemas/module-manifest.schema.json"
+schema_issues=()
+if [ -f "$TASK_SCHEMA" ]; then
+    if ! jq -e '.properties.spec_test_requirements' "$TASK_SCHEMA" >/dev/null 2>&1; then
+        schema_issues+=("task-metadata: missing spec_test_requirements")
+    fi
+    if ! jq -e '."$defs".api_contract_entry' "$TASK_SCHEMA" >/dev/null 2>&1; then
+        schema_issues+=("task-metadata: missing api_contract_entry \$def")
+    fi
+    if ! jq -e '."$defs".spec_test_requirement' "$TASK_SCHEMA" >/dev/null 2>&1; then
+        schema_issues+=("task-metadata: missing spec_test_requirement \$def")
+    fi
+else
+    schema_issues+=("task-metadata.schema.json missing")
+fi
+if [ ! -f "$MODULE_SCHEMA" ]; then
+    schema_issues+=("module-manifest.schema.json missing")
+fi
+# V11.8 (S1-11): Promote unvalidated MODULE.md to FAIL.
+# Previously Gate 11 only checked schema file presence. Now also verify that
+# every project manifest actually parses — unvalidated (no ```json block) fails
+# the gate with a remediation hint. Dark Code Layer 2 no longer tolerates
+# silent-skip manifests.
+MANIFEST_VALIDATOR="$V11_HOME/scripts/validate-module-manifest"
+unvalidated_count=0
+invalid_count=0
+manifest_issues=""
+if [ -x "$MANIFEST_VALIDATOR" ] && [ -d "$PROJECT_DIR" ]; then
+    manifest_json=$("$MANIFEST_VALIDATOR" "$PROJECT" --json 2>/dev/null || echo "")
+    if [ -n "$manifest_json" ] && echo "$manifest_json" | jq empty 2>/dev/null; then
+        unvalidated_count=$(echo "$manifest_json" | jq '[.manifests[] | select(.status == "unvalidated")] | length' 2>/dev/null || echo 0)
+        invalid_count=$(echo "$manifest_json" | jq '[.manifests[] | select(.status == "invalid")] | length' 2>/dev/null || echo 0)
+        if [ "${unvalidated_count:-0}" -gt 0 ]; then
+            unvalidated_paths=$(echo "$manifest_json" | jq -r '.manifests[] | select(.status == "unvalidated") | .path' 2>/dev/null | head -3 | tr '\n' ',' | sed 's/,$//')
+            manifest_issues="${unvalidated_count} MODULE.md unvalidated (no \`\`\`json block): ${unvalidated_paths}. Add a fenced JSON manifest using templates/MODULE.md.template."
+        fi
+        if [ "${invalid_count:-0}" -gt 0 ]; then
+            invalid_paths=$(echo "$manifest_json" | jq -r '.manifests[] | select(.status == "invalid") | .path' 2>/dev/null | head -3 | tr '\n' ',' | sed 's/,$//')
+            [ -n "$manifest_issues" ] && manifest_issues="$manifest_issues; "
+            manifest_issues="${manifest_issues}${invalid_count} MODULE.md invalid (schema violations): ${invalid_paths}"
+        fi
+    fi
+fi
+
+if [ ${#schema_issues[@]} -eq 0 ] && [ "${unvalidated_count:-0}" -eq 0 ] && [ "${invalid_count:-0}" -eq 0 ]; then
+    gate 11 "Dark Code schema content" "PASS" "task-metadata + module-manifest OK; all MODULE.md validated"
+elif [ "${unvalidated_count:-0}" -gt 0 ] || [ "${invalid_count:-0}" -gt 0 ]; then
+    # FAIL (V11.8) — silent-skip era is over
+    gate 11 "Dark Code schema content" "FAIL" "$manifest_issues"
+else
+    gate 11 "Dark Code schema content" "WARN" "${schema_issues[*]}"
+fi
+
+# Gate 12: Layer 1 STR coverage
+# Reads dark_code_advisories counter from task-state (persisted by sync-tasks).
+TASK_STATE_FILE="$V11_WORKSPACE_ROOT/.agent-metrics/task-state/${PROJECT}.json"
+[ ! -f "$TASK_STATE_FILE" ] && [ -f "$SESSION_DIR/.task-state.json" ] && TASK_STATE_FILE="$SESSION_DIR/.task-state.json"
+if [ -f "$TASK_STATE_FILE" ]; then
+    str_missing=$(jq -r '.dark_code_advisories.str_missing_count // 0' "$TASK_STATE_FILE" 2>/dev/null)
+    str_missing=${str_missing:-0}
+    if [ "$str_missing" -eq 0 ]; then
+        gate 12 "Layer 1 STR coverage" "PASS" "No complex/novel tasks missing spec_test_requirements"
+    else
+        complex_miss=$(jq -r '.dark_code_advisories.str_missing_complex // 0' "$TASK_STATE_FILE" 2>/dev/null)
+        novel_miss=$(jq -r '.dark_code_advisories.str_missing_novel // 0' "$TASK_STATE_FILE" 2>/dev/null)
+        gate 12 "Layer 1 STR coverage" "WARN" "$str_missing tasks missing STRs (complex=$complex_miss, novel=$novel_miss)"
+    fi
+else
+    gate 12 "Layer 1 STR coverage" "WARN" "No task state yet"
+fi
+
+# Gate 13: MODULE.md coverage (advisory)
+# Walk PROJECT_DIR recursively for any directory with 3+ code files (excluding
+# vendor/build dirs). This covers both monorepo layouts (client/src + server/src)
+# and single-root layouts (src/, app/, lib/).
+total_mods=0
+with_manifest=0
+while IFS= read -r dir; do
+    code_count=$(find "$dir" -maxdepth 1 -type f \( -name "*.py" -o -name "*.ts" -o -name "*.tsx" -o -name "*.js" -o -name "*.jsx" -o -name "*.go" -o -name "*.rs" -o -name "*.java" \) 2>/dev/null | wc -l)
+    [ "$code_count" -lt 3 ] && continue
+    total_mods=$((total_mods + 1))
+    if [ -f "$dir/MODULE.md" ] || [ -f "$dir/MODULE.json" ]; then
+        with_manifest=$((with_manifest + 1))
+    fi
+done < <(find "$PROJECT_DIR" \
+    \( -type d \( -name 'node_modules' -o -name '.git' -o -name '__pycache__' \
+                  -o -name 'target' -o -name 'dist' -o -name 'build' \
+                  -o -name '.venv' -o -name 'venv' -o -name '.next' \
+                  -o -name 'data' -o -name 'vendor' -o -name 'third_party' \
+                  -o -name 'fixtures' -o -name 'testdata' -o -name 'corpus' \
+                  -o -name 'tests' -o -name 'test' -o -name '__tests__' \
+                  -o -name 'results' -o -name 'coverage' -o -name 'out' \) -prune \) \
+    -o -type d -print 2>/dev/null)
+
+if [ "$total_mods" -eq 0 ]; then
+    gate 13 "MODULE.md coverage" "PASS" "No code modules detected (or skeleton project)"
+elif [ "$with_manifest" -eq "$total_mods" ]; then
+    gate 13 "MODULE.md coverage" "PASS" "$with_manifest/$total_mods modules manifested"
+else
+    pct=$((with_manifest * 100 / total_mods))
+    gate 13 "MODULE.md coverage" "WARN" "$with_manifest/$total_mods modules manifested (${pct}%)"
+fi
+
+# Summary
+echo ""
+echo "=== Results ==="
+TOTAL=$((PASS + FAIL + WARN))
+echo "  Pass: $PASS/$TOTAL | Fail: $FAIL | Warn: $WARN"
+if $FIX_MODE; then
+    echo "  Fixes applied: $FIXES"
+fi
+
+if [ $FAIL -eq 0 ]; then
+    echo ""
+    echo "  Status: V11 COMPLIANT"
+    exit 0
+else
+    echo ""
+    echo "  Status: NOT COMPLIANT ($FAIL gates failed)"
+    echo "  Run with --fix to auto-repair: $0 $PROJECT --fix"
+    exit 1
+fi

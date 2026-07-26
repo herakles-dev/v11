@@ -1,0 +1,24 @@
+# Project: ${PROJECT_NAME}
+
+## Intent
+${INTENT_DESCRIPTION}
+
+## Stack
+- Backend: ${BACKEND_TECH}
+- Database: ${DATABASE_TECH}
+- Frontend: ${FRONTEND_TECH}
+
+## Constraints
+- ${CONSTRAINT_1}
+- ${CONSTRAINT_2}
+
+## Runtime Verification Surface
+- Probe contract: ${RUNTIME_PROBE_CONTRACT} (web: `window.__debug` hooks; service: `/health` + `/__introspect`; CLI: `--json`)
+- Waiver (read-only/audit specs only): ${RUNTIME_VERIFICATION_WAIVER}
+
+## Notes
+(Add notes as the project progresses)
+
+---
+Created: ${DATE}
+Tasks: Use TaskList to view (created via TaskCreate)

@@ -1,0 +1,60 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "session-manifest.schema.json",
+  "title": "V11 Session Manifest",
+  "description": "Index of all session artifacts with scope-based requirements",
+  "type": "object",
+  "properties": {
+    "project": { "type": "string", "minLength": 1 },
+    "version": { "type": "string", "pattern": "^\\d+\\.\\d+\\.\\d+$" },
+    "last_checked": { "type": "string", "format": "date-time" },
+    "scope_signals": { "$ref": "#/$defs/scope_signals" },
+    "artifacts": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/artifact_entry" }
+    }
+  },
+  "required": ["project", "version", "artifacts"],
+  "$defs": {
+    "scope_signals": {
+      "type": "object",
+      "description": "Signals that determine which artifacts are required",
+      "properties": {
+        "task_count": { "type": "integer", "minimum": 0 },
+        "has_formation": { "type": "boolean" },
+        "cynefin": {
+          "type": "string",
+          "enum": ["clear", "complicated", "complex", "chaotic", "confused"]
+        },
+        "multi_sprint": { "type": "boolean" },
+        "has_audit": { "type": "boolean" }
+      }
+    },
+    "artifact_entry": {
+      "type": "object",
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "path": { "type": "string" },
+        "category": {
+          "type": "string",
+          "enum": ["session", "planning", "tracking", "governance", "documentation"]
+        },
+        "tier": {
+          "type": "string",
+          "enum": ["required", "conditional", "optional"],
+          "description": "required=always, conditional=scope-dependent, optional=nice-to-have"
+        },
+        "condition": {
+          "type": "string",
+          "description": "When this artifact becomes required (e.g., 'task_count >= 10')"
+        },
+        "exists": { "type": "boolean" },
+        "last_updated": {
+          "type": ["string", "null"],
+          "format": "date-time"
+        }
+      },
+      "required": ["name", "path", "tier", "exists"]
+    }
+  }
+}

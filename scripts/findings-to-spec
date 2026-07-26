@@ -1,0 +1,198 @@
+#!/bin/bash
+# V11 Findings-to-Spec — Convert audit findings into a V11 spec for fix execution
+# Usage: ./scripts/findings-to-spec PROJECT [--min-severity high] [--output DIR]
+
+set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+V11_HOME="${V11_HOME:-$(dirname "$SCRIPT_DIR")}"
+V11_WORKSPACE_ROOT="${V11_WORKSPACE_ROOT:-$HOME/.v11}"
+SESSIONS_ROOT="${SESSIONS_ROOT:-$V11_WORKSPACE_ROOT/sessions}"
+
+# --- Help ---
+if [ "${1:-}" == "--help" ] || [ "${1:-}" == "-h" ]; then
+    cat << 'HELP'
+V11 Findings-to-Spec — Convert audit findings into a V11 spec for remediation
+
+USAGE:
+    ./scripts/findings-to-spec PROJECT [OPTIONS]
+
+OPTIONS:
+    --min-severity S  Minimum severity to include in spec: critical, high, medium (default: high)
+    --output DIR      Output directory (default: sessions/PROJECT/)
+    --help            Show this help
+
+DESCRIPTION:
+    Reads issues.json (from synthesize-findings), converts CRITICAL + HIGH findings
+    into a V11 spec.md with:
+    - Intent and constraints
+    - Agent table with suggested formation
+    - Sprint task breakdown with dependencies
+    - Estimated effort per task
+
+    Also suggests the appropriate fix formation:
+    - Mostly security → security-review
+    - Mixed categories → feature-impl
+    - Performance-only → perf-optimization
+
+EXAMPLES:
+    ./scripts/findings-to-spec nova-forge
+    ./scripts/findings-to-spec nova-forge --min-severity medium
+HELP
+    exit 0
+fi
+
+# --- Args ---
+PROJECT="${1:?Error: PROJECT name required}"
+shift
+
+MIN_SEVERITY="high"
+OUTPUT_DIR="$SESSIONS_ROOT/$PROJECT"
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --min-severity) MIN_SEVERITY="${2:?--min-severity requires value}"; shift 2 ;;
+        --output)       OUTPUT_DIR="${2:?--output requires value}"; shift 2 ;;
+        *) echo "Unknown option: $1" >&2; exit 1 ;;
+    esac
+done
+
+# --- Validate ---
+ISSUES_JSON="$OUTPUT_DIR/issues.json"
+if [ ! -f "$ISSUES_JSON" ]; then
+    echo "Error: issues.json not found at $ISSUES_JSON" >&2
+    echo "Run synthesize-findings first: ./scripts/synthesize-findings $PROJECT" >&2
+    exit 1
+fi
+
+# --- Generate spec.md ---
+python3 - "$ISSUES_JSON" "$OUTPUT_DIR" "$MIN_SEVERITY" "$PROJECT" << 'PYTHON_SCRIPT'
+import json
+import sys
+import os
+from datetime import datetime
+from collections import Counter
+
+issues_json = sys.argv[1]
+output_dir = sys.argv[2]
+min_severity = sys.argv[3]
+project = sys.argv[4]
+
+SEVERITY_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+SEVERITY_MIN = SEVERITY_ORDER.get(min_severity, 1)
+
+with open(issues_json) as f:
+    report = json.load(f)
+
+findings = [f for f in report["findings"] if SEVERITY_ORDER.get(f["severity"], 3) <= SEVERITY_MIN]
+
+if not findings:
+    print(f"No findings at severity >= {min_severity}", file=sys.stderr)
+    sys.exit(0)
+
+# Suggest formation based on category distribution
+categories = Counter(f["category"] for f in findings)
+dominant = categories.most_common(1)[0][0]
+total = len(findings)
+
+if categories.get("security", 0) > total * 0.5:
+    formation = "security-review"
+    formation_reason = "majority security findings"
+elif categories.get("performance", 0) > total * 0.5:
+    formation = "perf-optimization"
+    formation_reason = "majority performance findings"
+elif total <= 8:
+    formation = "lightweight-feature"
+    formation_reason = f"{total} tasks, single-layer fix"
+else:
+    formation = "feature-impl"
+    formation_reason = "mixed categories, multi-layer fix"
+
+# Group by file for dependency analysis
+file_groups = {}
+for f in findings:
+    fname = f["location"]["file"]
+    file_groups.setdefault(fname, []).append(f)
+
+# Estimate effort
+effort_map = {"critical": "2-4h", "high": "1-2h", "medium": "30m-1h"}
+
+date = datetime.now().strftime("%Y-%m-%d")
+sprint_name = f"sprint-01-remediation"
+
+lines = []
+lines.append(f"# {project} — Remediation Spec")
+lines.append(f"")
+lines.append(f"**Generated**: {date} from codebase audit findings")
+lines.append(f"**Source**: `issues.json` ({report['summary']['total_deduped']} findings, {report['summary']['total_raw']} raw)")
+lines.append(f"")
+lines.append(f"## Intent")
+lines.append(f"")
+lines.append(f"Fix {len(findings)} {min_severity}+ severity findings from the codebase audit.")
+lines.append(f"Categories: {', '.join(f'{cat} ({count})' for cat, count in categories.most_common())}")
+lines.append(f"")
+lines.append(f"## Constraints")
+lines.append(f"")
+lines.append(f"- All fixes must include tests (unit or integration)")
+lines.append(f"- Security fixes must not introduce new attack surface")
+lines.append(f"- Performance fixes must include before/after metrics")
+lines.append(f"- No breaking API changes without migration path")
+lines.append(f"")
+lines.append(f"## Formation")
+lines.append(f"")
+lines.append(f"**Suggested**: `{formation}` ({formation_reason})")
+lines.append(f"")
+lines.append(f"## Agents")
+lines.append(f"")
+lines.append(f"| Role | Agent | Scope |")
+lines.append(f"|------|-------|-------|")
+
+if formation == "security-review":
+    lines.append(f"| Threat Modeler | spec-security-v11 | Verify fixes close the vulnerability |")
+    lines.append(f"| Fixer | spec-implementer-v11 | Implement security fixes |")
+    lines.append(f"| Tester | spec-tester-v11 | Regression + security tests |")
+elif formation == "perf-optimization":
+    lines.append(f"| Optimizer | spec-optimizer-v11 | Implement performance fixes |")
+    lines.append(f"| Tester | spec-tester-v11 | Regression + benchmark tests |")
+else:
+    lines.append(f"| Backend | spec-implementer-v11 | Fix backend issues |")
+    lines.append(f"| Frontend | spec-implementer-v11 | Fix frontend issues |")
+    lines.append(f"| Tester | spec-tester-v11 | Regression tests for all fixes |")
+
+lines.append(f"")
+lines.append(f"## Tasks")
+lines.append(f"")
+lines.append(f"### {sprint_name}")
+lines.append(f"")
+
+task_num = 0
+for f in findings:
+    task_num += 1
+    effort = effort_map.get(f["severity"], "1h")
+    loc = f["location"]
+    file_ref = f"{loc['file']}:{loc.get('line_start', '?')}"
+    if loc.get("line_end") and loc["line_end"] != loc.get("line_start"):
+        file_ref += f"-{loc['line_end']}"
+
+    lines.append(f"**Task {task_num}** [{f['severity'].upper()}]: Fix {f['id']} — {f['problem'][:80]}")
+    lines.append(f"- File: `{file_ref}`")
+    lines.append(f"- Fix: {f['fix']}")
+    lines.append(f"- Effort: ~{effort}")
+    lines.append(f"- Risk: {'high' if f['severity'] == 'critical' else 'medium'}")
+    lines.append(f"")
+
+lines.append(f"## Notes")
+lines.append(f"")
+lines.append(f"- Generated from `issues.json` by `findings-to-spec`")
+lines.append(f"- Review and adjust before executing")
+lines.append(f"- CRITICAL findings should be fixed first (blocking)")
+lines.append(f"- See `issues.md` for full findings with context")
+
+spec_path = os.path.join(output_dir, "spec.md")
+with open(spec_path, "w") as out:
+    out.write("\n".join(lines))
+
+print(f"Spec generated: {spec_path}", file=sys.stderr)
+print(f"Formation: {formation} ({formation_reason})", file=sys.stderr)
+print(f"Tasks: {task_num}", file=sys.stderr)
+print(f"Next: Review spec.md, then execute with /v11", file=sys.stderr)
+PYTHON_SCRIPT

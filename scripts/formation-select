@@ -1,0 +1,266 @@
+#!/bin/bash
+# V11 Script: formation-select — project-aware formation recommender
+#
+# Given a project's spec.md + task list, suggests the top-3 formations with
+# confidence scores and copy-paste create-formation-registry commands.
+#
+# Usage:
+#   ./scripts/formation-select PROJECT [--json]
+#   ./scripts/formation-select --test
+#
+# See: sessions/v11-sharpening/adr-002-formation-select.md (design rationale)
+# STR: STR-004
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+V11_HOME="${V11_HOME:-$(dirname "$SCRIPT_DIR")}"
+V11_WORKSPACE_ROOT="${V11_WORKSPACE_ROOT:-$HOME/.v11}"
+SESSIONS_ROOT="${SESSIONS_ROOT:-$V11_WORKSPACE_ROOT/sessions}"
+TASK_STATE_DIR="${TASK_STATE_DIR:-$V11_WORKSPACE_ROOT/.agent-metrics/task-state}"
+
+# --- Self-test ---
+if [ "${1:-}" == "--test" ]; then
+    echo "formation-select v1.0 (V11.8, S2-2)"
+    exit 0
+fi
+
+if [ "${1:-}" == "--help" ] || [ -z "${1:-}" ]; then
+    cat << 'HELP'
+V11 formation-select — Project-aware formation recommender
+
+USAGE:
+    ./scripts/formation-select PROJECT [--json]
+
+OPTIONS:
+    --json       Emit machine-readable JSON
+    --test       Self-test mode
+    --help       Show this help
+
+DESCRIPTION:
+    Analyzes a project's spec.md + task-state + optional .plan-context.json
+    and recommends the top-3 formations with confidence scores. Designed to
+    unblock the "14 formations declared, 0 used" gap.
+
+    Keyword-based rules + structural signals; no LLM calls (deterministic).
+    If no rule dominates, returns 'none — direct mode best' rather than
+    guessing.
+
+EXAMPLES:
+    ./scripts/formation-select v11-dark-code-audit
+    ./scripts/formation-select myproject --json
+HELP
+    exit 0
+fi
+
+PROJECT=""
+OUTPUT_JSON=false
+for arg in "$@"; do
+    case "$arg" in
+        --json) OUTPUT_JSON=true ;;
+        --help|-h|--test) ;;
+        *)
+            if [ -z "$PROJECT" ]; then PROJECT="$arg"; fi
+            ;;
+    esac
+done
+
+# Sanitize project name (SEC-C-02 pattern)
+if [[ -z "$PROJECT" ]] || [[ "$PROJECT" == *".."* ]] || [[ "$PROJECT" == *"/"* ]] \
+   || [[ "$PROJECT" =~ [^a-zA-Z0-9._-] ]]; then
+    echo "Error: Invalid or missing PROJECT name" >&2
+    exit 1
+fi
+
+SPEC_FILE="$SESSIONS_ROOT/$PROJECT/spec.md"
+TASK_STATE_FILE="$TASK_STATE_DIR/${PROJECT}.json"
+PLAN_CONTEXT_FILE="$SESSIONS_ROOT/$PROJECT/.plan-context.json"
+
+# --- Signal extraction ---
+python3 - "$PROJECT" "$SPEC_FILE" "$TASK_STATE_FILE" "$PLAN_CONTEXT_FILE" "$OUTPUT_JSON" << 'PYTHON_SCRIPT'
+import json, os, re, sys
+from collections import Counter
+
+project, spec_file, task_state_file, plan_context_file, output_json_s = sys.argv[1:]
+output_json = output_json_s.lower() == "true"
+
+# --- 1. Read spec ---
+spec_text = ""
+if os.path.exists(spec_file):
+    with open(spec_file, encoding="utf-8", errors="ignore") as f:
+        spec_text = f.read(20000)  # first 20KB — spec.md should be <100 lines anyway
+
+spec_lower = spec_text.lower()
+
+# --- 2. Read task state ---
+task_count = 0
+complexity_dist = Counter()
+if os.path.exists(task_state_file):
+    try:
+        with open(task_state_file) as f:
+            state = json.load(f)
+        task_count = int(state.get("total", 0))
+        # Derived from task-state tracker if present; else estimate from sprint metadata
+    except (json.JSONDecodeError, OSError):
+        pass
+
+# --- 3. Read plan-context (optional, Cynefin domain) ---
+cynefin = ""
+if os.path.exists(plan_context_file):
+    try:
+        with open(plan_context_file) as f:
+            ctx = json.load(f)
+        raw = ctx.get("cynefin_domain") or ctx.get("domain") or ""
+        if isinstance(raw, dict):
+            raw = raw.get("classification") or raw.get("value") or raw.get("domain") or ""
+        cynefin = str(raw).lower()
+    except (json.JSONDecodeError, OSError):
+        pass
+
+# --- 4. Keyword signals ---
+KEYWORD_MAP = {
+    "security-review": ["security", "owasp", "vulnerability", "pentest", "cve"],
+    "codebase-audit":   ["audit", "findings", "wave-review", "adversarial"],
+    "feature-impl":     ["refactor", "migrate", "upgrade", "rewrite", "consolidate"],
+    "single-file":      ["bug", "fix", "hotfix", "regression", "patch"],
+    "business-launch":  ["launch", "productize", "monetize", "go-to-market", "revenue"],
+    "new-project":      ["scaffold", "bootstrap", "new project", "greenfield", "from scratch"],
+    "lightweight-feature": ["small feature", "enhancement", "tweak"],
+    "wave-review":      ["review", "inspection"],
+}
+
+scores = Counter()
+hits = {}  # formation -> list of matched keywords
+
+for formation, keywords in KEYWORD_MAP.items():
+    matched = [kw for kw in keywords if kw in spec_lower]
+    if matched:
+        scores[formation] += 3 * len(matched)
+        hits.setdefault(formation, []).extend(matched)
+
+# --- 5. Task count signal ---
+tc_bucket = ""
+if task_count == 0:
+    tc_bucket = "none"
+elif 1 <= task_count <= 3:
+    tc_bucket = "1-3"
+    scores["single-file"] += 2
+elif 4 <= task_count <= 10:
+    tc_bucket = "4-10"
+    scores["lightweight-feature"] += 2
+elif 11 <= task_count <= 25:
+    tc_bucket = "11-25"
+    scores["feature-impl"] += 2
+else:
+    tc_bucket = ">25"
+    scores["codebase-audit"] += 2
+    scores["new-project"] += 1
+
+# --- 6. Cynefin signal ---
+CYNEFIN_MAP = {
+    "clear":       ("lightweight-feature", 1),
+    "obvious":     ("lightweight-feature", 1),
+    "complicated": ("feature-impl", 1),
+    "complex":     ("new-project", 1),
+    "chaotic":     ("__none__", 0),  # special: stabilize first
+}
+cynefin_hit = None
+if cynefin in CYNEFIN_MAP:
+    target, pts = CYNEFIN_MAP[cynefin]
+    if target == "__none__":
+        cynefin_hit = "chaotic"  # short-circuit below
+    else:
+        scores[target] += pts
+        cynefin_hit = target
+
+# --- 7. Rank ---
+# Short-circuit: Cynefin=chaotic → stabilize first
+if cynefin_hit == "chaotic":
+    result = {
+        "project": project,
+        "recommendations": [
+            {"rank": 1, "formation": "none — stabilize first",
+             "score": 0, "confidence": "n/a",
+             "rationale": "Cynefin domain=chaotic; no formation fits until conditions stabilize",
+             "command": "# No formation recommended — reduce scope or split the problem first"}
+        ],
+        "signals": {
+            "task_count": task_count, "task_count_bucket": tc_bucket,
+            "cynefin": cynefin, "spec_present": bool(spec_text),
+            "keyword_hits": hits,
+        },
+    }
+elif not scores or max(scores.values()) < 4:
+    # No signal dominates — direct mode is safest
+    why = "no keyword nor structural signal rose above the 4-point threshold"
+    if not spec_text:
+        why = "spec.md not found — cannot infer intent"
+    elif task_count == 0:
+        why = "no tasks yet; formations match the work volume, not empty plans"
+    result = {
+        "project": project,
+        "recommendations": [
+            {"rank": 1, "formation": "none — direct mode best",
+             "score": int(max(scores.values(), default=0)),
+             "confidence": "low",
+             "rationale": why,
+             "command": "# No formation — orchestrator stays in direct mode for 1-3 tasks"}
+        ],
+        "signals": {
+            "task_count": task_count, "task_count_bucket": tc_bucket,
+            "cynefin": cynefin, "spec_present": bool(spec_text),
+            "keyword_hits": hits,
+        },
+    }
+else:
+    ranked = scores.most_common(3)
+    max_score = ranked[0][1]
+    recommendations = []
+    for i, (formation, score) in enumerate(ranked, 1):
+        if score < 2:
+            continue
+        confidence = "high" if score >= max_score * 0.8 else ("medium" if score >= max_score * 0.5 else "low")
+        formation_hits = hits.get(formation, [])
+        rationale_parts = []
+        if formation_hits:
+            rationale_parts.append(f"keyword hits: {', '.join(formation_hits[:3])}")
+        if tc_bucket and tc_bucket != "none":
+            rationale_parts.append(f"task count {tc_bucket}")
+        if cynefin_hit == formation:
+            rationale_parts.append(f"Cynefin={cynefin}")
+        rationale = "; ".join(rationale_parts) or "structural match only"
+        recommendations.append({
+            "rank": i,
+            "formation": formation,
+            "score": int(score),
+            "confidence": confidence,
+            "rationale": rationale,
+            "command": f"./scripts/create-formation-registry {formation} {project}",
+        })
+    result = {
+        "project": project,
+        "recommendations": recommendations,
+        "signals": {
+            "task_count": task_count, "task_count_bucket": tc_bucket,
+            "cynefin": cynefin, "spec_present": bool(spec_text),
+            "keyword_hits": hits,
+        },
+    }
+
+if output_json:
+    print(json.dumps(result, indent=2))
+else:
+    print(f"Formation recommendations for: {result['project']}")
+    print("=" * 60)
+    sig = result["signals"]
+    print(f"  Tasks:   {sig['task_count']} ({sig['task_count_bucket']})")
+    print(f"  Cynefin: {sig['cynefin'] or '(not set)'}")
+    print(f"  Spec:    {'found' if sig['spec_present'] else 'missing'}")
+    print()
+    for rec in result["recommendations"]:
+        print(f"  [{rec['rank']}] {rec['formation']}  (score={rec['score']}, confidence={rec['confidence']})")
+        print(f"      {rec['rationale']}")
+        print(f"      $ {rec['command']}")
+        print()
+    print(f"  (See: sessions/v11-sharpening/adr-002-formation-select.md)")
+PYTHON_SCRIPT

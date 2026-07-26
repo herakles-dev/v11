@@ -1,0 +1,54 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "agent-errors.schema.json",
+  "title": "V11 Agent Error Ledger Line",
+  "description": "Schema for ONE line of ~/.agent-metrics/agent-errors.jsonl. Appended by sync-tasks (Layer 2: lite review, V11.15), wave-review-attribute (Layer 3: wave review, V11.20), and swarm-review-attribute (Layer 4: swarm review, V11.20). One line per error, attributed to the executing agent. V11.20 adds found_by_layer, caller_kind, task_id_inferred, attribution_key for cross-layer unified scorecards. All four new fields are ADDITIVE: legacy entries without them default to found_by_layer=lite, caller_kind=unknown, task_id_inferred=false, attribution_key absent.",
+  "type": "object",
+  "properties": {
+    "timestamp":  { "type": "string", "format": "date-time" },
+    "task_id":    { "type": "string" },
+    "agent_id":   {
+      "type": "string",
+      "description": "Executing agent the error is attributed to. Layer 2 (lite): from artifacts.review.agent_id, else task-state active_agent_id. Layer 3/4 (wave/swarm): resolved via v11_resolve_file_to_task (file→task→agent). Falls back to 'unattributed' when no task touched the file."
+    },
+    "error_type": {
+      "enum": ["compilation", "test_failure", "contract_violation", "security", "logic", "completeness", "integration", "quality", "rationale", "false_provenance"],
+      "description": "Error class. Tight enum (V11.20) prevents misspellings across the four review layers. false_provenance is a historical Layer 2 value retained for backward compat with V11.15 entries."
+    },
+    "severity":   { "enum": ["CRITICAL", "HIGH", "MEDIUM", "LOW"] },
+    "error_message": { "type": "string", "maxLength": 500 },
+    "found_by":   { "type": "string", "description": "Reviewer agent id. Layer 2: adversarial-lite-reviewer. Layer 3: adversarial-reviewer. Layer 4: swarm-review:<lens-name>." },
+    "fix_suggested": { "type": "string", "maxLength": 300 },
+    "fixed":      { "type": "boolean", "description": "True if adversarial-lite-fixer resolved it and re-verify passed (Layer 2 only — wave/swarm findings are advisory, no auto-fix)" },
+    "escalated":  { "type": "boolean", "description": "True if CRITICAL — escalated to orchestrator, not auto-fixed" },
+    "trace_id":   { "type": ["string", "null"], "description": "Carried from artifacts.trace_id for cross-hop correlation" },
+    "project":    { "type": ["string", "null"] },
+    "found_by_layer": {
+      "enum": ["lite", "lite_self", "lite_adversarial", "wave", "swarm", "runtime"],
+      "description": "V11.20/V11.21: which review layer caught this error. lite=legacy V11.15 per-task adversarial-lite (aliases to lite_adversarial at read time). lite_self=V11.21 self-review (Layer A: implementing agent emits verdict). lite_adversarial=V11.21 paired adversarial-lite-reviewer (Layer B). wave=5-lens adversarial-reviewer (V11.6+). swarm=parallel multi-lens audit (V11.5). runtime=harness/test failure (future). Legacy entries written before V11.21 use 'lite'; consumers must treat 'lite' as 'lite_adversarial' for backward-compat reporting."
+    },
+    "caller_kind": {
+      "enum": ["orchestrator", "subagent", "unknown", "daemon"],
+      "description": "V11.20: was the executing agent the main orchestrator session or a spawned subagent? Resolved by v11_caller_kind from V11_SUBAGENT env (subagent) or V11_PARENT_SESSION_ID==V11_SESSION_ID (orchestrator). Legacy entries default to 'unknown'."
+    },
+    "task_id_inferred": {
+      "type": "boolean",
+      "description": "V11.20: true when task_id was resolved via file→task mapping (wave/swarm paths). false when task_id was explicit in the verdict (lite path). Legacy entries default to false."
+    },
+    "attribution_key": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$",
+      "description": "V11.20: SHA256 hex digest of '|'.join(project, task_id, file, line, error_id). Deterministic. Used by wave/swarm attribute scripts for idempotent dedup via ~/.agent-metrics/attribution-keys.jsonl. Absent on legacy lite entries."
+    },
+    "executor_kind": {
+      "enum": ["self", "adversarial", "headless"],
+      "description": "V11.21: For lite-layer entries, distinguishes self-review (Layer A, agent reviews its own output in TaskUpdate(completed) payload) from adversarial-lite review (Layer B, paired adversarial-lite-reviewer agent). Orthogonal to caller_kind (which describes session: orchestrator vs subagent). Optional — absent on non-lite layers and on pre-V11.21 lite entries (those use found_by_layer='lite' which read-time aliases to lite_adversarial)."
+    },
+    "attribution_degraded": {
+      "type": "boolean",
+      "description": "V11.30: true when the writer could not determine the executing agent and agent_id fell back to 'unknown' (metadata.agent absent/null on the reviewable task). Emitted by sync-tasks Layer A actuation on self-review synthetic markers. Optional — absent on entries written before V11.30."
+    }
+  },
+  "required": ["timestamp", "task_id", "agent_id", "error_type", "severity", "found_by"],
+  "additionalProperties": false
+}

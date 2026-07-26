@@ -1,0 +1,453 @@
+#!/bin/bash
+# V10 Status - Show session progress from Tasks system
+# Usage: ./scripts/status [project] [--sprint NAME]
+
+set -e
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+V10_HOME="${V10_HOME:-$(dirname "$SCRIPT_DIR")}"
+V11_WORKSPACE_ROOT="${V11_WORKSPACE_ROOT:-$HOME/.v11}"
+SESSIONS_ROOT="${SESSIONS_ROOT:-$V11_WORKSPACE_ROOT/sessions}"
+
+# Help
+if [ "$1" == "--help" ] || [ "$1" == "-h" ]; then
+    cat << 'HELP'
+V10 Status - Show progress from Tasks system
+
+USAGE:
+    ./scripts/status [project]
+    ./scripts/status --all
+    ./scripts/status --sprint NAME
+    ./scripts/status --json
+    ./scripts/status --help
+
+ARGUMENTS:
+    project       Show status for specific project
+    --all         Show all active sessions
+    --sprint NAME Filter by sprint metadata
+    --json        Output raw JSON from Tasks
+    --help        Show this help
+
+EXAMPLES:
+    ./scripts/status              # Auto-detect active project
+    ./scripts/status my-api       # Show my-api status
+    ./scripts/status --all        # List all sessions
+    ./scripts/status --sprint sprint-02-features
+HELP
+    exit 0
+fi
+
+PROJECT="${1:-}"
+SPRINT_FILTER=""
+JSON_OUTPUT=false
+VIEW_MODE="grouped"   # V11.21: grouped (default) | verbose | raw
+
+# Parse flags
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --sprint)
+            SPRINT_FILTER="$2"
+            shift 2
+            ;;
+        --json)
+            JSON_OUTPUT=true
+            shift
+            ;;
+        --all)
+            PROJECT="--all"
+            shift
+            ;;
+        --verbose)
+            VIEW_MODE="verbose"
+            shift
+            ;;
+        --raw)
+            VIEW_MODE="raw"
+            shift
+            ;;
+        *)
+            if [ -z "$PROJECT" ]; then
+                PROJECT="$1"
+            fi
+            shift
+            ;;
+    esac
+done
+
+# Get task state file if it exists (synced by hook)
+get_task_state() {
+    local project="$1"
+    local state_file="$SESSIONS_ROOT/$project/.task-state.json"
+    if [ -f "$state_file" ]; then
+        cat "$state_file"
+    else
+        echo "{}"
+    fi
+}
+
+# Auto-detect active project from most recent .task-state.json
+if [ -z "$PROJECT" ]; then
+    STATE_FILE=$(find "$SESSIONS_ROOT" -name ".task-state.json" -mmin -60 2>/dev/null | head -1)
+    if [ -n "$STATE_FILE" ]; then
+        PROJECT=$(basename "$(dirname "$STATE_FILE")")
+    fi
+fi
+
+# List all sessions
+if [ "$PROJECT" == "--all" ]; then
+    echo "=== Active Sessions ==="
+    for dir in "$SESSIONS_ROOT"/*/; do
+        [ -d "$dir" ] || continue
+        name=$(basename "$dir")
+        # Skip archive
+        [ "$name" == ".archive" ] && continue
+
+        state_file="$dir/.task-state.json"
+        if [ -f "$state_file" ]; then
+            completed=$(jq -r '.completed // 0' "$state_file" 2>/dev/null || echo "0")
+            total=$(jq -r '.total // 0' "$state_file" 2>/dev/null || echo "0")
+            phase=$(jq -r '.phase // "unknown"' "$state_file" 2>/dev/null || echo "unknown")
+            modified=$(stat -c %Y "$state_file" 2>/dev/null || echo "0")
+            ago=$(( ($(date +%s) - modified) / 60 ))
+            echo "  $name: $phase ($completed/$total tasks, ${ago}m ago)"
+        elif [ -f "$dir/spec.md" ]; then
+            echo "  $name: no task state (spec.md exists)"
+        fi
+    done
+    exit 0
+fi
+
+# Show specific project
+if [ -z "$PROJECT" ]; then
+    echo "No active project detected."
+    echo "Usage: ./scripts/status <project>"
+    echo "       ./scripts/status --all"
+    exit 1
+fi
+
+SESSION_DIR="$SESSIONS_ROOT/$PROJECT"
+SPEC_FILE="$SESSION_DIR/spec.md"
+TASK_STATE="$SESSION_DIR/.task-state.json"
+
+if [ ! -d "$SESSION_DIR" ]; then
+    echo "Project '$PROJECT' not found"
+    exit 1
+fi
+
+# JSON output mode
+if [ "$JSON_OUTPUT" = true ]; then
+    if [ -f "$TASK_STATE" ]; then
+        cat "$TASK_STATE"
+    else
+        echo '{"error": "No task state found"}'
+    fi
+    exit 0
+fi
+
+echo "=== Session: $PROJECT ==="
+echo ""
+
+# Show task state
+if [ -f "$TASK_STATE" ]; then
+    echo "--- Progress ---"
+    completed=$(jq -r '.completed // 0' "$TASK_STATE")
+    pending=$(jq -r '.pending // 0' "$TASK_STATE")
+    in_progress=$(jq -r '.in_progress // 0' "$TASK_STATE")
+    blocked=$(jq -r '.blocked // 0' "$TASK_STATE")
+    total=$(jq -r '.total // 0' "$TASK_STATE")
+    phase=$(jq -r '.phase // "unknown"' "$TASK_STATE")
+
+    echo "Phase: $phase"
+    echo "Progress: $completed/$total completed"
+    [ "$in_progress" -gt 0 ] && echo "In Progress: $in_progress"
+    [ "$pending" -gt 0 ] && echo "Pending: $pending"
+    [ "$blocked" -gt 0 ] && echo "Blocked: $blocked"
+    echo ""
+
+    # V11.21: Review-sibling grouping + plain-language summary line.
+    # Reads open_tasks for tasks carrying metadata.review_of (review siblings) and
+    # separates them from work tasks. Default view (grouped) shows a plain-language
+    # one-liner above the work/review counters. --verbose adds telegraphic counts.
+    # --raw skips grouping entirely.
+    if [ "$VIEW_MODE" != "raw" ]; then
+        REVIEW_STATS=$(jq -r '
+            def is_review: (.metadata.review_of // "") != "" or
+                           ((.metadata.agent // "") | startswith("adversarial-"));
+            def parent_pending: (.metadata.parent_status // "") == "pending_parent";
+
+            (.open_tasks // {}) as $open
+            | [$open[]] as $tasks
+            | {
+                work_pending:    [$tasks[] | select(is_review | not) | select(.status == "pending")] | length,
+                work_in_prog:    [$tasks[] | select(is_review | not) | select(.status == "in_progress")] | length,
+                review_waiting:  [$tasks[] | select(is_review)       | select(parent_pending)] | length,
+                review_ready:    [$tasks[] | select(is_review)       | select(.status == "pending" and (parent_pending | not))] | length,
+                review_in_prog:  [$tasks[] | select(is_review)       | select(.status == "in_progress")] | length,
+                self_reviews:    (.task_artifacts // {} | [.[].self_review // empty] | length),
+                adv_reviews:     (.task_artifacts // {} | [.[].review // empty]      | length)
+              }
+            | "\(.work_pending) \(.work_in_prog) \(.review_waiting) \(.review_ready) \(.review_in_prog) \(.self_reviews) \(.adv_reviews)"
+        ' "$TASK_STATE" 2>/dev/null || echo "0 0 0 0 0 0 0")
+        read -r work_pending work_in_prog review_waiting review_ready review_in_prog self_reviews adv_reviews <<< "$REVIEW_STATS"
+
+        # Plain-language summary line — V11.21 INV-3 readable surface
+        total_reviews=$((review_waiting + review_ready + review_in_prog))
+        if [ "$total_reviews" -gt 0 ]; then
+            # "blocking" = adversarial CRITICAL or HIGH from completed review siblings
+            review_blocking=$(jq -r '
+                def is_review: (.metadata.review_of // "") != "";
+                (.open_tasks // {}) as $open
+                | [$open[]
+                   | select(is_review)
+                   | select(.status == "completed")
+                   | (.metadata.artifacts.review.errors // [])
+                   | map(select(.severity == "CRITICAL" or .severity == "HIGH"))
+                   | length] | add // 0
+            ' "$TASK_STATE" 2>/dev/null || echo 0)
+            echo "Reviews: ${total_reviews} waiting, ${review_blocking} blocking"
+        fi
+
+        if [ "$VIEW_MODE" = "verbose" ]; then
+            echo "  Work:    ${completed}/${total} (${work_in_prog} in-flight, ${work_pending} pending)"
+            echo "  Reviews: self ${self_reviews}/${total}, adversarial ${adv_reviews}/${total} (${review_waiting} pending_parent, ${review_in_prog} in-flight)"
+        fi
+        echo ""
+    fi
+
+    # V11.28.1 (loop-audit): surface the DURABLE review-queue depth. The V11.21 "Reviews:"
+    # line above reads in-band task-state siblings; the durable queue at
+    # ~/.agent-metrics/review-queue/$PROJECT.jsonl is a separate ledger that silently piled
+    # to 100s of undrained entries because drainage is a manual step nobody ran. Show net-open
+    # (pending minus done) so it can't grow invisibly. Drain: ./scripts/drain-review-queue $PROJECT.
+    _RQ_FILE="${METRICS_DIR:-$HOME/.agent-metrics}/review-queue/${PROJECT}.jsonl"
+    if [ -f "$_RQ_FILE" ]; then
+        _RQ_OPEN=$(V11_RQ="$_RQ_FILE" python3 - <<'PYEOF' 2>/dev/null || echo "0 0"
+import json, os
+pend = {}
+for line in open(os.environ["V11_RQ"], encoding="utf-8"):
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        r = json.loads(line)
+    except Exception:
+        continue
+    tid = r.get("task_id")
+    if not tid:
+        continue
+    if r.get("ev") == "pending":
+        pend.setdefault(tid, True)
+    elif r.get("ev") == "done":
+        pend[tid] = False
+o = sum(1 for v in pend.values() if v); d = sum(1 for v in pend.values() if not v)
+print(f"{o} {d}")
+PYEOF
+)
+        read -r _rq_open _rq_done <<< "$_RQ_OPEN"
+        if [ "${_rq_open:-0}" -gt 0 ]; then
+            _rq_warn=""
+            [ "$_rq_open" -ge 20 ] && _rq_warn="  ⚠ drain: ./scripts/drain-review-queue $PROJECT"
+            echo "Review queue (durable): ${_rq_open} open, ${_rq_done} resolved${_rq_warn}"
+            echo ""
+        fi
+    fi
+
+    # improvements/10 (S1-C3): pre-scope dashboard line — surfaces adoption of the
+    # S1-A1/A2 pre-scope advisory system (TaskCreate warns on missing/invalid/
+    # oversized metadata.scope) directly on the status dashboard, mirroring the
+    # durable review-queue line above. X = percent of OPEN (pending+in_progress)
+    # tasks in .task-state.json's open_tasks carrying a valid metadata.scope
+    # (small|medium|large). N = count of ev:"prescope" durable-ledger rows (S1-B2,
+    # ~/.agent-metrics/ledger/$PROJECT.jsonl) whose task_id is still open. Omitted
+    # (not "0%") when there are no open tasks, since a percentage is undefined —
+    # matches the "graceful absence" handling used elsewhere in this script rather
+    # than printing a misleading number. Honors V11_PRESCOPE_STATUS=off.
+    if [ "${V11_PRESCOPE_STATUS:-on}" != "off" ]; then
+        _PRESCOPE_LEDGER_FILE="${METRICS_DIR:-$HOME/.agent-metrics}/ledger/${PROJECT}.jsonl"
+        _PRESCOPE_OUT=$(TASK_STATE_PATH="$TASK_STATE" LEDGER_PATH="$_PRESCOPE_LEDGER_FILE" python3 - <<'PYEOF' 2>/dev/null || echo ""
+import json, os
+
+state_path = os.environ["TASK_STATE_PATH"]
+ledger_path = os.environ.get("LEDGER_PATH", "")
+
+try:
+    with open(state_path, encoding="utf-8") as f:
+        state = json.load(f)
+except Exception:
+    state = {}
+
+open_tasks = state.get("open_tasks") or {}
+total = len(open_tasks)
+if total == 0:
+    print("")
+else:
+    scoped = sum(
+        1 for t in open_tasks.values()
+        if isinstance(t, dict) and (t.get("metadata") or {}).get("scope") in ("small", "medium", "large")
+    )
+    pct = round(scoped * 100 / total)
+
+    open_ids = set(open_tasks.keys())
+    n = 0
+    if ledger_path and os.path.isfile(ledger_path):
+        try:
+            with open(ledger_path, encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        row = json.loads(line)
+                    except Exception:
+                        continue
+                    if row.get("ev") == "prescope" and row.get("task_id") in open_ids:
+                        n += 1
+        except Exception:
+            pass
+    print(f"{pct} {n}")
+PYEOF
+)
+        if [ -n "$_PRESCOPE_OUT" ]; then
+            read -r _prescope_pct _prescope_n <<< "$_PRESCOPE_OUT"
+            echo "Pre-scope: ${_prescope_pct}% scoped, ${_prescope_n} advisories open"
+            echo ""
+        fi
+    fi
+
+    # W1-5: unattributed-findings.jsonl is a dead-letter file that nothing surfaced,
+    # contradicting CLAUDE.md's "never silently dropped" claim for wave/swarm findings
+    # that can't be mapped to an attribution_key. Always-print (mirrors the Progress
+    # lines above) so a growing dead-letter count can't hide.
+    _UF_FILE="${METRICS_DIR:-$HOME/.agent-metrics}/unattributed-findings.jsonl"
+    _UF_COUNT=0
+    [ -f "$_UF_FILE" ] && _UF_COUNT=$(wc -l < "$_UF_FILE" 2>/dev/null | tr -d '[:space:]')
+    echo "Unattributed findings: ${_UF_COUNT:-0}"
+    echo ""
+
+    # v11-loop-keystone T4 ("Fix 2"): surface the improve-subagent calibration-
+    # miss trigger, exactly parallel to the review-queue depth line above. The
+    # check itself (dedup/cooldown, threshold read) lives in
+    # scripts/check-improve-subagent-triggers — this only prints its output.
+    # Silent when V11_IMPROVE_SUBAGENT_TRIGGER=off or when no agent crosses
+    # the >50%/30d calibration-miss threshold.
+    _CIST_OUT=$("$SCRIPT_DIR/check-improve-subagent-triggers" "$PROJECT" 2>/dev/null || true)
+    if [ -n "$_CIST_OUT" ]; then
+        echo "$_CIST_OUT"
+        echo ""
+    fi
+
+    # Show active tasks
+    active_task=$(jq -r '.active_task // empty' "$TASK_STATE")
+    if [ -n "$active_task" ] && [ "$active_task" != "null" ]; then
+        echo "--- Active Task ---"
+        echo "$active_task"
+        echo ""
+    fi
+
+    # Show recent completions
+    recent=$(jq -r '.recent_completed // [] | .[:5] | .[]' "$TASK_STATE" 2>/dev/null)
+    if [ -n "$recent" ]; then
+        echo "--- Recent Completions ---"
+        echo "$recent"
+        echo ""
+    fi
+
+    # Sprint filter
+    if [ -n "$SPRINT_FILTER" ]; then
+        echo "--- Sprint: $SPRINT_FILTER ---"
+        jq -r ".sprints[\"$SPRINT_FILTER\"] // \"No tasks in this sprint\"" "$TASK_STATE"
+        echo ""
+    fi
+else
+    echo "No task state found. Use TaskCreate to add tasks."
+    echo ""
+fi
+
+# V11.27 T2: Retro flywheel sanity guard (read-only; NO auto-reset).
+# The retro counter increments on every session-end CLOSE and is reset only by
+# `scripts/v11-retro PROJECT --reset` after a retrospective runs. A counter far
+# past threshold means the reset half of the flywheel (F4) was never wired/run —
+# surface it loudly so the operator runs the retro or repairs the reset path.
+# Threshold mirrors v11-retro (default 5). Honors V11_RETRO_SANITY_GUARD=off.
+if [ "${V11_RETRO_SANITY_GUARD:-on}" != "off" ]; then
+    RETRO_FILE="$SESSION_DIR/.retro-counter"
+    if [ -f "$RETRO_FILE" ]; then
+        RETRO_COUNT=$(tr -dc '0-9' < "$RETRO_FILE" 2>/dev/null || echo 0)
+        RETRO_COUNT="${RETRO_COUNT:-0}"
+        RETRO_LIMIT=$(( ${V11_RETRO_THRESHOLD:-5} * 10 ))
+        if [ "$RETRO_COUNT" -gt "$RETRO_LIMIT" ]; then
+            echo "--- Retro Flywheel ---"
+            echo "⚠ retro flywheel likely broken (counter=$RETRO_COUNT ≫ 10× threshold, never reset)"
+            echo "  Run: scripts/v11-retro $PROJECT  &&  scripts/v11-retro $PROJECT --reset"
+            echo ""
+        fi
+    fi
+fi
+
+# V11.27 T3: A4 high_risk_history dead-gate legibility (read-only).
+# Status-side mirror of the track-autonomy warn so an always-block A4 gate is
+# visible at-a-glance, not only at tool-time. Honors V11_A4_DEADGATE_WARN=off.
+if [ "${V11_A4_DEADGATE_WARN:-on}" != "off" ]; then
+    AUTONOMY_FILE="$SESSION_DIR/.autonomy-state"
+    if [ -f "$AUTONOMY_FILE" ]; then
+        A_LEVEL=$(jq -r '.level // 0' "$AUTONOMY_FILE" 2>/dev/null || echo 0)
+        HRH_LEN=$(jq -r '.high_risk_history // [] | length' "$AUTONOMY_FILE" 2>/dev/null || echo 0)
+        if [ "${A_LEVEL:-0}" -ge 4 ] 2>/dev/null && [ "${HRH_LEN:-0}" -eq 0 ] 2>/dev/null; then
+            echo "--- Autonomy ---"
+            echo "⚠ A$A_LEVEL but high_risk_history empty — high-risk gate is effectively always-block (no auto-approve path)"
+            echo ""
+        fi
+    fi
+fi
+
+# Show spec summary (intent only, no task list in V10)
+if [ -f "$SPEC_FILE" ]; then
+    echo "--- Spec Summary ---"
+    # Show Intent and Stack sections only
+    sed -n '/^## Intent/,/^## /p' "$SPEC_FILE" | head -10 || echo "(no intent found)"
+    echo ""
+fi
+
+# Show related services (if docker available)
+if command -v docker &> /dev/null; then
+    RUNNING=$(docker ps --filter "name=$PROJECT" --format "{{.Names}}: {{.Status}}" 2>/dev/null)
+    if [ -n "$RUNNING" ]; then
+        echo "--- Docker Services ---"
+        echo "$RUNNING"
+        echo ""
+    fi
+fi
+
+# Agent Teams status (V10)
+TEAMS_DIR="$HOME/.claude/teams"
+if [ -d "$TEAMS_DIR" ] && [ "$(ls -A "$TEAMS_DIR" 2>/dev/null)" ]; then
+    echo ""
+    echo "## Active Teams"
+    for team_dir in "$TEAMS_DIR"/*/; do
+        [ -d "$team_dir" ] || continue
+        team_name=$(basename "$team_dir")
+        member_count=$(ls "$team_dir" 2>/dev/null | wc -l)
+        echo "  - $team_name ($member_count members)"
+    done
+fi
+
+echo ""
+echo "Updated: $(date -Iseconds)"
+echo ""
+echo "Tip: Use TaskList in Claude to see full task details"
+
+# V11.21: First-run onboarding nudge — fires once per project when paired
+# review siblings first appear in task-state. Marker prevents repeat firing.
+if [ -f "$TASK_STATE" ] && [ "${V11_AUTO_PAIR_REVIEW:-on}" != "off" ]; then
+    HAS_PAIRED=$(jq -r '
+        [(.open_tasks // {})[] | select((.metadata.review_of // "") != "")] | length
+    ' "$TASK_STATE" 2>/dev/null || echo 0)
+    MARKER="$SESSIONS_ROOT/$PROJECT/.auto-pair-onboarded"
+    if [ "${HAS_PAIRED:-0}" -gt 0 ] && [ ! -f "$MARKER" ]; then
+        echo ""
+        echo "[V11.21] Review siblings enabled — each work task now has a paired review task."
+        echo "         See --verbose for the work/review breakdown. To disable: V11_AUTO_PAIR_REVIEW=off"
+        # Set marker so the nudge fires once per project
+        mkdir -p "$(dirname "$MARKER")" 2>/dev/null
+        touch "$MARKER" 2>/dev/null || true
+    fi
+fi

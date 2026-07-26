@@ -1,0 +1,538 @@
+#!/bin/bash
+# V11.19 Script: review-queue
+# CLI for the per-project adversarial-lite review queue.
+#
+# The queue is an append-only JSONL of pending/done events keyed by (project,
+# task_id). Replay semantics: latest event per task_id wins.
+#
+# USAGE:
+#   review-queue pending [PROJECT]           # List pending tasks (subjects only)
+#   review-queue pending [PROJECT] --json    # JSON for orchestrator consumption
+#   review-queue stats [PROJECT]             # Pending/done/total counts
+#   review-queue list [PROJECT]              # All entries (pending+done)
+#   review-queue mark-done PROJECT TASK_ID [SEV] [SESSION_UUID] [--verdict-file FILE]
+#                                            # Manually mark done (advisory; sync-tasks usually does this).
+#                                            # --verdict-file FILE (W5-T16): fold the full verdict JSON into
+#                                            # a durable store + ev:"review" ledger event; SEV may be omitted
+#                                            # (derived as max severity from the file). Rollback: V11_REVIEW_LEDGER=off.
+#   review-queue all-pending                 # Cross-project pending summary
+#   review-queue claim PROJECT TASK_ID [SESSION_UUID]
+#                                            # Claim a pending entry for draining (default: current session)
+#   review-queue gc PROJECT [--max-age MIN] [--json]
+#                                            # Clear stale claims (claimed_by set, unresolved >MIN min, default 30)
+#   review-queue dashboard PROJECT [--json]  # Honest drainable-vs-owned-by-concurrent-session summary (improvement 03 §C)
+#   review-queue backstop PROJECT [--json]   # DETECT-phase hard backstop check (improvement 03 §D)
+#   review-queue ack-stale PROJECT --reason "..."
+#                                            # Acknowledge the backstop without draining (escape hatch)
+#   review-queue --test
+#   review-queue --help
+#
+# Sources:
+#   ~/.agent-metrics/review-queue/PROJECT.jsonl
+#   ~/.agent-metrics/review-queue/PROJECT.ack.json   (backstop acknowledgments)
+#
+# When PROJECT is omitted (pending|stats|list), uses active-project file.
+#
+# Rollback: V11_REVIEW_ENFORCEMENT=off (whole queue) / V11_REVIEW_BACKSTOP=off
+# (just the §D hard backstop, independently of the former).
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+V11_HOME="${V11_HOME:-$(dirname "$SCRIPT_DIR")}"
+# shellcheck source=../hooks/lib/common.sh
+source "$V11_HOME/hooks/lib/common.sh"
+
+if [ "${1:-}" = "--test" ]; then
+    echo "review-queue v1.0 (V11.19)"
+    exit 0
+fi
+
+if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ] || [ $# -eq 0 ]; then
+    sed -n '2,37p' "$0" | sed 's/^# \{0,1\}//'
+    exit 0
+fi
+
+SUB="$1"; shift
+
+_resolve_project() {
+    local p="${1:-}"
+    if [ -z "$p" ]; then
+        p="$(v11_read_active_project 2>/dev/null || true)"
+    fi
+    if [ -z "$p" ]; then
+        echo "review-queue: no PROJECT and no active-project — pass project explicitly" >&2
+        return 1
+    fi
+    printf '%s' "$p"
+}
+
+# Emit the canonical pending-task summary as JSON array. One element per pending task.
+# Each: {task_id, subject, agent_id, files_changed[], pending_since, session_uuid}
+_pending_json() {
+    local project="$1"
+    local jsonl_file
+    jsonl_file=$(v11_review_queue_path "$project" jsonl) || return 1
+    if [ ! -f "$jsonl_file" ] || [ ! -s "$jsonl_file" ]; then
+        printf '[]'
+        return 0
+    fi
+    V11_RQ_FILE="$jsonl_file" python3 - <<'PYEOF'
+import os, json, sys
+path = os.environ["V11_RQ_FILE"]
+# Replay: latest event per task_id wins. Track full latest event for output.
+latest = {}
+try:
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                ev = json.loads(line)
+            except Exception:
+                continue
+            tid = str(ev.get("task_id", ""))
+            if not tid:
+                continue
+            latest[tid] = ev
+except Exception as e:
+    sys.stderr.write(f"review-queue: read error: {e}\n")
+    print("[]")
+    raise SystemExit(0)
+
+out = []
+for tid, ev in latest.items():
+    if ev.get("ev") != "pending":
+        continue
+    out.append({
+        "task_id": tid,
+        "subject": ev.get("subject", ""),
+        "agent_id": ev.get("agent_id", "unknown"),
+        "files_changed": ev.get("files_changed", []),
+        "pending_since": ev.get("ts", ""),
+        "session_uuid": ev.get("session_uuid", ""),
+        "claimed_by": ev.get("claimed_by") or None,
+        "claimed_at": ev.get("claimed_at") or None,
+    })
+# Sort by pending_since (oldest first — orchestrator drains FIFO)
+out.sort(key=lambda x: x["pending_since"])
+print(json.dumps(out, separators=(",", ":")))
+PYEOF
+}
+
+# Emit stats: pending, done, total tasks (unique task_ids), events.
+_stats_json() {
+    local project="$1"
+    local jsonl_file
+    jsonl_file=$(v11_review_queue_path "$project" jsonl) || return 1
+    if [ ! -f "$jsonl_file" ] || [ ! -s "$jsonl_file" ]; then
+        printf '{"pending":0,"done":0,"tasks":0,"events":0}'
+        return 0
+    fi
+    V11_RQ_FILE="$jsonl_file" python3 - <<'PYEOF'
+import os, json
+path = os.environ["V11_RQ_FILE"]
+latest = {}
+events = 0
+try:
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                ev = json.loads(line)
+            except Exception:
+                continue
+            tid = str(ev.get("task_id", ""))
+            if not tid:
+                continue
+            events += 1
+            latest[tid] = ev.get("ev", "")
+except Exception:
+    print('{"pending":0,"done":0,"tasks":0,"events":0}')
+    raise SystemExit(0)
+pending = sum(1 for s in latest.values() if s == "pending")
+done = sum(1 for s in latest.values() if s == "done")
+print(json.dumps({
+    "pending": pending,
+    "done": done,
+    "tasks": len(latest),
+    "events": events,
+}, separators=(",", ":")))
+PYEOF
+}
+
+case "$SUB" in
+    pending)
+        PROJECT=$(_resolve_project "${1:-}") || exit 1
+        # Consume PROJECT arg if it matched something (or was passed)
+        [ "${1:-}" = "$PROJECT" ] && shift || true
+        # Look for --json
+        JSON=false
+        for arg in "$@"; do
+            [ "$arg" = "--json" ] && JSON=true
+        done
+
+        PENDING=$(_pending_json "$PROJECT")
+        if [ "$JSON" = "true" ]; then
+            printf '%s\n' "$PENDING"
+        else
+            COUNT=$(printf '%s' "$PENDING" | jq 'length')
+            echo "Pending reviews for project '$PROJECT': $COUNT"
+            if [ "$COUNT" -gt 0 ]; then
+                printf '%s' "$PENDING" | jq -r '.[] | "  - task #\(.task_id): \(.subject) (agent: \(.agent_id), since: \(.pending_since))"'
+            fi
+        fi
+        ;;
+    stats)
+        PROJECT=$(_resolve_project "${1:-}") || exit 1
+        STATS=$(_stats_json "$PROJECT")
+        # Try --json
+        JSON=false
+        for arg in "$@"; do
+            [ "$arg" = "--json" ] && JSON=true
+        done
+        if [ "$JSON" = "true" ]; then
+            printf '%s\n' "$STATS"
+        else
+            printf '%s' "$STATS" | jq -r '. as $s | "Project: '"$PROJECT"'
+  Pending: \($s.pending)
+  Done:    \($s.done)
+  Tasks:   \($s.tasks)
+  Events:  \($s.events)"'
+        fi
+        ;;
+    list)
+        PROJECT=$(_resolve_project "${1:-}") || exit 1
+        jsonl_file=$(v11_review_queue_path "$PROJECT" jsonl) || exit 1
+        if [ ! -f "$jsonl_file" ] || [ ! -s "$jsonl_file" ]; then
+            echo "Project '$PROJECT' queue is empty."
+            exit 0
+        fi
+        cat "$jsonl_file"
+        ;;
+    mark-done)
+        # W5-T16 (improvements/09): pull --verdict-file FILE out of the arg
+        # list wherever it appears; remaining positionals keep their original
+        # order (PROJECT TASK_ID [SEV] [SESSION_UUID]).
+        VERDICT_FILE=""
+        ARGS=()
+        while [ $# -gt 0 ]; do
+            case "$1" in
+                --verdict-file)
+                    if [ $# -lt 2 ]; then
+                        echo "review-queue mark-done: --verdict-file requires a value" >&2
+                        exit 2
+                    fi
+                    VERDICT_FILE="${2:-}"
+                    shift 2
+                    ;;
+                *)
+                    ARGS+=("$1")
+                    shift
+                    ;;
+            esac
+        done
+        set -- "${ARGS[@]+"${ARGS[@]}"}"
+
+        if [ $# -lt 2 ]; then
+            echo "review-queue mark-done: requires PROJECT TASK_ID [SEV] [SESSION_UUID] [--verdict-file FILE]" >&2
+            exit 2
+        fi
+        PROJECT="$1"; TASK_ID="$2"; SEV="${3:-}"; SESSION_UUID="${4:-}"
+
+        # --verdict-file given without SEV: derive max severity from the
+        # file's errors[] using the same jq as review-daemon:198.
+        if [ -z "$SEV" ] && [ -n "$VERDICT_FILE" ] && [ -f "$VERDICT_FILE" ]; then
+            SEV=$(jq -r '
+                [(.errors // [])[].severity | ascii_upcase] as $sevs
+                | if ($sevs | index("CRITICAL")) then "CRITICAL"
+                  elif ($sevs | index("HIGH")) then "HIGH"
+                  elif ($sevs | index("MEDIUM")) then "MEDIUM"
+                  elif ($sevs | index("LOW")) then "LOW"
+                  else "NONE" end' "$VERDICT_FILE" 2>/dev/null || echo "NONE")
+        fi
+        SEV="${SEV:-NONE}"
+
+        RESULT=$(v11_review_queue_mark_done "$PROJECT" "$TASK_ID" "$SEV" "$SESSION_UUID" "$VERDICT_FILE")
+        echo "$RESULT"
+        ;;
+    all-pending)
+        QUEUE_DIR="$METRICS_DIR/review-queue"
+        if [ ! -d "$QUEUE_DIR" ]; then
+            echo "No review queue directory."
+            exit 0
+        fi
+        # Find every queue file with at least one pending task.
+        TOTAL_PENDING=0
+        printf '%-50s  %s\n' "PROJECT" "PENDING"
+        printf '%-50s  %s\n' "$(printf '=%.0s' {1..50})" "======="
+        for f in "$QUEUE_DIR"/*.jsonl; do
+            [ -f "$f" ] || continue
+            PROJECT=$(basename "$f" .jsonl)
+            COUNT=$(v11_review_queue_pending_count "$PROJECT")
+            if [ "$COUNT" != "0" ]; then
+                printf '%-50s  %s\n' "$PROJECT" "$COUNT"
+                TOTAL_PENDING=$((TOTAL_PENDING + COUNT))
+            fi
+        done
+        printf '%-50s  %s\n' "$(printf '=%.0s' {1..50})" "======="
+        printf '%-50s  %s\n' "TOTAL" "$TOTAL_PENDING"
+        ;;
+    claim)
+        if [ $# -lt 2 ]; then
+            echo "review-queue claim: requires PROJECT TASK_ID [SESSION_UUID]" >&2
+            exit 2
+        fi
+        PROJECT="$1"; TASK_ID="$2"
+        CLAIMANT="${3:-$(v11_session_uuid 2>/dev/null || echo "legacy-cli")}"
+        RESULT=$(v11_review_queue_claim "$PROJECT" "$TASK_ID" "$CLAIMANT")
+        echo "$RESULT"
+        ;;
+    gc)
+        if [ $# -lt 1 ]; then
+            echo "review-queue gc: requires PROJECT [--max-age MIN] [--json]" >&2
+            exit 2
+        fi
+        PROJECT="$1"; shift
+        MAX_AGE=30
+        JSON=false
+        while [ $# -gt 0 ]; do
+            case "$1" in
+                --max-age) MAX_AGE="${2:-30}"; shift ;;
+                --json) JSON=true ;;
+            esac
+            shift
+        done
+        RESULT=$(v11_review_queue_gc "$PROJECT" "$MAX_AGE")
+        if [ "$JSON" = "true" ]; then
+            printf '%s\n' "$RESULT"
+        else
+            printf '%s' "$RESULT" | jq -r '"Cleared \(.cleared) stale claim(s) (checked \(.checked)) for project '"'"'\(.project)'"'"'."'
+        fi
+        ;;
+    dashboard)
+        PROJECT=$(_resolve_project "${1:-}") || exit 1
+        [ "${1:-}" = "$PROJECT" ] && shift || true
+        JSON=false
+        for arg in "$@"; do
+            [ "$arg" = "--json" ] && JSON=true
+        done
+
+        MY_SESSION="$(v11_session_uuid 2>/dev/null || echo "legacy-cli")"
+        PENDING=$(_pending_json "$PROJECT")
+        CLASS=$(v11_review_queue_classify "$PROJECT" "$MY_SESSION")
+
+        DASH=$(V11_RQ_PENDING="$PENDING" V11_RQ_CLASS="$CLASS" V11_RQ_MY="$MY_SESSION" V11_RQ_PROJECT="$PROJECT" python3 - <<'PYEOF'
+import os, json
+
+pending = json.loads(os.environ.get("V11_RQ_PENDING", "[]"))
+classify = json.loads(os.environ.get("V11_RQ_CLASS", "[]"))
+project = os.environ.get("V11_RQ_PROJECT", "")
+
+by_id = {c["task_id"]: c for c in classify}
+
+drainable = 0
+owners = {}  # session -> count
+for e in pending:
+    c = by_id.get(e["task_id"])
+    if c is None or c.get("drainable", True):
+        drainable += 1
+        continue
+    owner = c.get("conflict_owner") or "unknown"
+    owners[owner] = owners.get(owner, 0) + 1
+
+owned = sum(owners.values())
+top_owner = None
+if owners:
+    top_owner = sorted(owners.items(), key=lambda kv: -kv[1])[0][0]
+
+print(json.dumps({
+    "project": project,
+    "pending": len(pending),
+    "drainable": drainable,
+    "owned": owned,
+    "owners": [{"session": k, "count": v} for k, v in sorted(owners.items(), key=lambda kv: -kv[1])],
+    "top_owner": top_owner,
+}, separators=(",", ":")))
+PYEOF
+)
+        if [ "$JSON" = "true" ]; then
+            printf '%s\n' "$DASH"
+        else
+            printf '%s' "$DASH" | jq -r --arg proj "$PROJECT" '
+              .pending as $p | .drainable as $d | .owned as $o | .top_owner as $t |
+              if $p == 0 then
+                "Reviews pending: 0"
+              elif $o == 0 then
+                "Reviews pending: \($p) ⚠  (\($d) drainable here)\nDrain: scripts/drain-review-queue \($proj) --safe\nDrain all anyway: scripts/drain-review-queue \($proj) --force"
+              else
+                "Reviews pending: \($p) ⚠  (\($d) drainable here, \($o) owned by concurrent session '"'"'\($t)'"'"')\nDrain \($d): scripts/drain-review-queue \($proj) --safe\nDrain all anyway: scripts/drain-review-queue \($proj) --force"
+              end'
+        fi
+        ;;
+    backstop)
+        PROJECT=$(_resolve_project "${1:-}") || exit 1
+        [ "${1:-}" = "$PROJECT" ] && shift || true
+        JSON=false
+        for arg in "$@"; do
+            [ "$arg" = "--json" ] && JSON=true
+        done
+
+        THRESH_COUNT="${V11_REVIEW_BACKSTOP_COUNT:-20}"
+        THRESH_AGE_H="${V11_REVIEW_BACKSTOP_AGE:-24}"
+        THRESH_HARDCOUNT="${V11_REVIEW_BACKSTOP_HARDCOUNT:-$((THRESH_COUNT * 2))}"
+        GATED=false
+        if [ "${V11_REVIEW_BACKSTOP:-on}" = "off" ] || [ "${V11_REVIEW_ENFORCEMENT:-on}" = "off" ]; then
+            GATED=true
+        fi
+
+        PENDING=$(_pending_json "$PROJECT")
+        COUNT=$(printf '%s' "$PENDING" | jq 'length')
+        ACK_FILE="$METRICS_DIR/review-queue/${PROJECT}.ack.json"
+        ACK_JSON="{}"
+        [ -f "$ACK_FILE" ] && ACK_JSON=$(cat "$ACK_FILE" 2>/dev/null || echo "{}")
+
+        RESULT=$(V11_RQ_PENDING="$PENDING" V11_RQ_COUNT="$COUNT" V11_RQ_THRESH_COUNT="$THRESH_COUNT" \
+                 V11_RQ_THRESH_AGE_H="$THRESH_AGE_H" V11_RQ_THRESH_HARDCOUNT="$THRESH_HARDCOUNT" \
+                 V11_RQ_GATED="$GATED" V11_RQ_ACK="$ACK_JSON" \
+                 V11_RQ_PROJECT="$PROJECT" python3 - <<'PYEOF'
+import os, json
+from datetime import datetime, timezone
+
+pending = json.loads(os.environ.get("V11_RQ_PENDING", "[]"))
+count = int(os.environ.get("V11_RQ_COUNT", "0"))
+thresh_count = int(os.environ.get("V11_RQ_THRESH_COUNT", "20"))
+thresh_age_h = float(os.environ.get("V11_RQ_THRESH_AGE_H", "24"))
+thresh_hardcount = int(os.environ.get("V11_RQ_THRESH_HARDCOUNT", str(thresh_count * 2)))
+gated = os.environ.get("V11_RQ_GATED", "false") == "true"
+project = os.environ.get("V11_RQ_PROJECT", "")
+
+try:
+    ack = json.loads(os.environ.get("V11_RQ_ACK", "{}"))
+except Exception:
+    ack = {}
+
+
+def parse_ts(s):
+    try:
+        return datetime.fromisoformat((s or "").replace("Z", "+00:00")).timestamp()
+    except Exception:
+        return None
+
+
+oldest_ts = newest_ts = None
+for e in pending:
+    ts = parse_ts(e.get("pending_since", ""))
+    if ts is None:
+        continue
+    if oldest_ts is None or ts < oldest_ts:
+        oldest_ts = ts
+    if newest_ts is None or ts > newest_ts:
+        newest_ts = ts
+
+now = datetime.now(timezone.utc).timestamp()
+oldest_age_h = (now - oldest_ts) / 3600.0 if oldest_ts is not None else 0.0
+
+age_gated = (count > thresh_count) and (oldest_age_h > thresh_age_h)
+hard_count = count > thresh_hardcount
+over_threshold = age_gated or hard_count
+
+condition_fired = None
+if hard_count:
+    # Hard-count fires regardless of age; named first since it dodges the
+    # age gate entirely (momentum-dodge fix, V11 R3.3).
+    condition_fired = "hard_count"
+elif age_gated:
+    condition_fired = "age_gated"
+
+acked = False
+if over_threshold and ack:
+    acked_at = parse_ts(ack.get("acked_at", ""))
+    # An ack only covers the queue as it existed at ack time -- if a pending
+    # entry newer than the ack has since arrived, the ack no longer suppresses.
+    if acked_at is not None and (newest_ts is None or newest_ts <= acked_at):
+        acked = True
+
+blocked = over_threshold and not gated and not acked
+
+message = None
+if blocked:
+    if condition_fired == "hard_count":
+        reason = "{count} pending exceeds hard cap {hardcount} (age-independent)".format(
+            count=count, hardcount=thresh_hardcount
+        )
+    else:
+        reason = "{count} pending, oldest {age:.0f}h".format(count=count, age=oldest_age_h)
+    message = (
+        "\U0001F6D1 Review queue overflowed [{cond}]: {reason}.\n"
+        "   Run: scripts/drain-review-queue {project} --safe --force-stale\n"
+        "   Or:  Acknowledge with: scripts/review-queue ack-stale {project} --reason \"...\""
+    ).format(cond=condition_fired, reason=reason, project=project)
+
+print(json.dumps({
+    "project": project,
+    "blocked": blocked,
+    "pending": count,
+    "oldest_age_hours": round(oldest_age_h, 1),
+    "threshold_count": thresh_count,
+    "threshold_age_hours": thresh_age_h,
+    "threshold_hardcount": thresh_hardcount,
+    "condition_fired": condition_fired,
+    "gated_off": gated,
+    "acked": acked,
+    "message": message,
+}, separators=(",", ":")))
+PYEOF
+)
+        if [ "$JSON" = "true" ]; then
+            printf '%s\n' "$RESULT"
+        else
+            printf '%s' "$RESULT" | jq -r '.message // "OK — review queue within backstop thresholds."'
+        fi
+        # Exit 1 when blocked so callers (DETECT) can branch on exit code, not just parse text.
+        printf '%s' "$RESULT" | jq -e '.blocked == true' >/dev/null 2>&1 && exit 1
+        exit 0
+        ;;
+    ack-stale)
+        if [ $# -lt 1 ]; then
+            echo "review-queue ack-stale: requires PROJECT --reason \"...\"" >&2
+            exit 2
+        fi
+        PROJECT="$1"; shift
+        if ! printf '%s' "$PROJECT" | grep -qE '^[a-zA-Z0-9._-]{1,64}$'; then
+            echo "review-queue ack-stale: invalid project name '$PROJECT'" >&2
+            exit 2
+        fi
+        REASON=""
+        while [ $# -gt 0 ]; do
+            case "$1" in
+                --reason) REASON="${2:-}"; shift ;;
+            esac
+            shift
+        done
+        if [ -z "$REASON" ]; then
+            echo "review-queue ack-stale: --reason is required (explain why the backstop is being overridden)" >&2
+            exit 2
+        fi
+        PENDING=$(_pending_json "$PROJECT")
+        COUNT=$(printf '%s' "$PENDING" | jq 'length')
+        NOW="$(date -u +%Y-%m-%dT%H:%M:%S+00:00)"
+        QUEUE_DIR="$METRICS_DIR/review-queue"
+        mkdir -p "$QUEUE_DIR"
+        ACK_FILE="$QUEUE_DIR/${PROJECT}.ack.json"
+        SESSION="$(v11_session_uuid 2>/dev/null || echo "legacy-cli")"
+        jq -cn --arg acked_at "$NOW" --arg reason "$REASON" --arg session "$SESSION" \
+            --argjson pending_count "$COUNT" \
+            '{acked_at:$acked_at, reason:$reason, session_uuid:$session, pending_count:$pending_count}' \
+            > "$ACK_FILE.tmp" && mv "$ACK_FILE.tmp" "$ACK_FILE"
+        echo "Acknowledged $COUNT pending review(s) for '$PROJECT' at $NOW. The backstop will not re-block on this snapshot -- draining is still owed, and a NEW pending entry re-arms it."
+        ;;
+    *)
+        echo "review-queue: unknown subcommand '$SUB'" >&2
+        echo "Run 'review-queue --help' for usage." >&2
+        exit 2
+        ;;
+esac

@@ -1,0 +1,132 @@
+#!/bin/bash
+# V11.20 — backfill-swarm-findings
+#
+# Scan sessions/*/audit-report.{json,md} across all projects (or a single
+# project with --project), invoke scripts/swarm-review-attribute on each.
+# Idempotent via T6's attribution_key dedup.
+#
+# Usage:
+#   ./scripts/backfill-swarm-findings                     # all projects
+#   ./scripts/backfill-swarm-findings --project P         # one project
+#   ./scripts/backfill-swarm-findings --dry-run           # report what would happen
+#   ./scripts/backfill-swarm-findings --since 2026-05-01  # ISO date (file mtime gate)
+#   ./scripts/backfill-swarm-findings --quiet             # only summary
+#
+# Honors V11_SWARM_ATTRIBUTE=off (delegated via T6).
+#
+# Exit codes:
+#   0    Success (including no reports found)
+#   1    Invalid arguments
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+V11_HOME="${V11_HOME:-$(dirname "$SCRIPT_DIR")}"
+# shellcheck source=../hooks/lib/common.sh
+source "$V11_HOME/hooks/lib/common.sh"
+
+usage() {
+    sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'
+}
+
+if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
+    usage; exit 0
+fi
+
+PROJECT_FILTER=""
+DRY_RUN=false
+SINCE=""
+QUIET=false
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --project)  PROJECT_FILTER="${2:-}"; shift 2 ;;
+        --dry-run)  DRY_RUN=true; shift ;;
+        --since)    SINCE="${2:-}"; shift 2 ;;
+        --quiet)    QUIET=true; shift ;;
+        --help|-h)  usage; exit 0 ;;
+        *) echo "backfill-swarm-findings: unknown arg '$1'" >&2; exit 1 ;;
+    esac
+done
+
+ATTR_SCRIPT="$SCRIPT_DIR/swarm-review-attribute"
+if [ ! -x "$ATTR_SCRIPT" ]; then
+    echo "backfill-swarm-findings: missing $ATTR_SCRIPT" >&2
+    exit 1
+fi
+
+SESSIONS_ROOT="${SESSIONS_ROOT:-$V11_WORKSPACE_ROOT/sessions}"
+if [ ! -d "$SESSIONS_ROOT" ]; then
+    echo "backfill-swarm-findings: no sessions dir at $SESSIONS_ROOT" >&2
+    exit 0
+fi
+
+SINCE_EPOCH=""
+if [ -n "$SINCE" ]; then
+    SINCE_EPOCH=$(date -d "$SINCE" +%s 2>/dev/null || true)
+    if [ -z "$SINCE_EPOCH" ]; then
+        echo "backfill-swarm-findings: bad --since '$SINCE' (use ISO date)" >&2
+        exit 1
+    fi
+fi
+
+PROJECTS=()
+if [ -n "$PROJECT_FILTER" ]; then
+    PROJECTS+=("$PROJECT_FILTER")
+else
+    while IFS= read -r d; do
+        [ -d "$d" ] || continue
+        PROJECTS+=("$(basename "$d")")
+    done < <(find "$SESSIONS_ROOT" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort)
+fi
+
+TOTAL_REPORTS=0
+TOTAL_ATTEMPTED=0
+TOTAL_WARNINGS=0
+
+for project in "${PROJECTS[@]}"; do
+    # Both audit-report.json and audit-report.md are valid; if both exist,
+    # JSON wins (delegated to T6 which prefers JSON).
+    SEEN_REPORTS=()
+    for ext in json md; do
+        f="$SESSIONS_ROOT/$project/audit-report.$ext"
+        [ -f "$f" ] || continue
+        if [ -n "$SINCE_EPOCH" ]; then
+            MTIME=$(stat -c%Y "$f" 2>/dev/null || echo 0)
+            [ "$MTIME" -ge "$SINCE_EPOCH" ] || continue
+        fi
+        SEEN_REPORTS+=("$f")
+    done
+
+    [ "${#SEEN_REPORTS[@]}" -eq 0 ] && continue
+    TOTAL_REPORTS=$((TOTAL_REPORTS + ${#SEEN_REPORTS[@]}))
+
+    if ! $QUIET; then
+        echo "[backfill] $project: ${#SEEN_REPORTS[@]} report(s)" >&2
+    fi
+
+    for report in "${SEEN_REPORTS[@]}"; do
+        TOTAL_ATTEMPTED=$((TOTAL_ATTEMPTED + 1))
+        ARGS=("$project" "--report-file" "$report")
+        $DRY_RUN && ARGS+=("--dry-run")
+        $QUIET && ARGS+=("--quiet")
+        set +e
+        "$ATTR_SCRIPT" "${ARGS[@]}" 2>&1 | (
+            if $QUIET; then grep -E "^\[(applied|DRY-RUN|skip|unattributed)\]" || true
+            else cat
+            fi
+        )
+        ATTR_EXIT=${PIPESTATUS[0]}
+        set -e
+        if [ "$ATTR_EXIT" -ne 0 ]; then
+            echo "[backfill-swarm-findings] WARNING: swarm-review-attribute exited $ATTR_EXIT for $project $report" >&2
+            TOTAL_WARNINGS=$((TOTAL_WARNINGS + 1))
+        fi
+    done
+done
+
+MODE="[applied]"
+$DRY_RUN && MODE="[DRY-RUN]"
+WARN_MSG=""
+[ "$TOTAL_WARNINGS" -gt 0 ] && WARN_MSG=", $TOTAL_WARNINGS warning(s)"
+echo "$MODE backfill-swarm-findings: ${#PROJECTS[@]} project(s) scanned, $TOTAL_REPORTS report(s) found, $TOTAL_ATTEMPTED attribution call(s) dispatched${WARN_MSG}" >&2

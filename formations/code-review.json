@@ -1,0 +1,42 @@
+{
+  "formations": {
+    "code-review": {
+      "name": "Code Review Formation",
+      "description": "Two-wave code review: three parallel specialist reviewers (correctness, security, test coverage) followed by an adversarial synthesis gate and a scoped fix pass. Use for medium-to-large pull requests where a single reviewer might miss cross-cutting issues.",
+      "teammates": [
+        {
+          "role": "correctness-reviewer",
+          "agent": "spec-reviewer-v11",
+          "file_ownership": "Read-only — reviews files_changed[] against spec.md acceptance criteria and flags logic errors, edge-case gaps, and design deviations."
+        },
+        {
+          "role": "security-reviewer",
+          "agent": "code-quality-engineer",
+          "file_ownership": "Read-only — audits files_changed[] for OWASP Top 10 issues, missing input validation, and insecure defaults. Defensive review only: identifies and explains weaknesses, never drafts exploit code."
+        },
+        {
+          "role": "test-coverage-reviewer",
+          "agent": "testing-engineer",
+          "file_ownership": "Read-only — evaluates test coverage for files_changed[], identifies untested branches and missing edge-case tests."
+        },
+        {
+          "role": "synthesis-gate",
+          "agent": "adversarial-reviewer",
+          "file_ownership": "Read-only — consumes all three wave-1 verdicts, adjudicates any conflicting findings, and emits one adversarial-verify verdict (approve | changes-requested)."
+        },
+        {
+          "role": "fixer",
+          "agent": "spec-implementer-v11",
+          "file_ownership": "Owns applying only the changes the synthesis-gate verdict approved; does not re-open items the gate did not flag."
+        }
+      ],
+      "task_flow": "Wave 1 (parallel): correctness-reviewer + security-reviewer + test-coverage-reviewer each independently review files_changed[] -> Wave 2: synthesis-gate reads all three verdicts, resolves conflicts, emits a single approve/changes-requested verdict -> fixer applies only the approved changes.",
+      "cost_multiplier": "3-4.5x",
+      "heartbeat_interval_minutes": 10,
+      "difficulty_routing": {
+        "min_complexity": "medium",
+        "min_scope": "medium"
+      }
+    }
+  }
+}

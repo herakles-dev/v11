@@ -1,0 +1,132 @@
+# Module Manifest: {{MODULE_NAME}}
+
+> V11 Dark Code Layer 2-3 compliance. This manifest makes the module self-describing. Validated by `schemas/module-manifest.schema.json`. Keep it honest — stale manifests are worse than missing ones.
+
+**Path:** `{{MODULE_PATH}}`
+**Stability:** experimental | beta | **stable** | frozen | deprecated
+**Owner agent:** {{AGENT_ID}}
+**Related spec:** `sessions/{{PROJECT}}/spec.md#{{SECTION}}`
+**Last reviewed:** {{YYYY-MM-DD}}
+
+---
+
+## Responsibility
+
+> One paragraph. What problem does this module solve that no other module solves? If you can't answer this cleanly, the module is doing too much.
+
+{{RESPONSIBILITY — 1-3 sentences max}}
+
+---
+
+## Public Interface
+
+> Only symbols other modules may depend on. Internal helpers do NOT belong here. If in doubt, leave it out — narrow surfaces age better.
+
+| Symbol | Kind | Purpose | Idempotent | Side effects |
+|--------|------|---------|:----------:|--------------|
+| `{{symbol}}` | function/class/type/endpoint | {{purpose}} | yes/no | {{effects or "none"}} |
+
+---
+
+## Invariants
+
+> What this module GUARANTEES to callers. Violating an invariant is a contract breach, not a bug.
+
+- {{Invariant 1 — e.g., "User IDs are never reused after deletion"}}
+- {{Invariant 2}}
+
+---
+
+## Upstream Dependencies
+
+> Direct imports only. For each, state WHY this specific dependency was chosen. If you can't justify a dep, it's dark code.
+
+| Target | Kind | Why | Substitutable |
+|--------|------|-----|:-------------:|
+| `{{package/module}}` | package/internal-module/service/database | {{rationale}} | yes/no |
+
+---
+
+## Downstream Consumers
+
+> Modules that depend on this one. Keep this updated during refactors — it's the blast radius of any breaking change.
+
+- `{{consumer path or glob}}`
+- `{{...}}`
+
+---
+
+## Performance Envelope
+
+> Absence of a metric means "not performance-critical" — which is itself a statement. Don't leave this empty silently.
+
+- **P99 latency:** {{ms or "N/A"}}
+- **Max throughput:** {{rps or "N/A"}}
+- **Memory budget:** {{MB or "N/A"}}
+- **Notes:** {{e.g., "Hot path — called on every request"}}
+
+---
+
+## Failure Modes
+
+> Known ways this module can fail and how it responds. Addresses Dark Code Layer 3 (Resilience Protocols).
+
+### {{Failure 1 name}}
+- **Trigger:** {{what condition causes it}}
+- **Handling:** retry | circuit-break | fallback | fail-fast | degrade | propagate | log-and-continue
+- **Retry policy:** {{max_attempts, backoff, timeout_ms — or "none"}}
+- **User visible:** yes/no
+
+---
+
+## Test Coverage
+
+- **Unit tests:** `{{glob}}`
+- **Integration tests:** `{{glob}}`
+- **Coverage:** {{pct}}%
+
+---
+
+---
+
+## Machine-readable manifest
+
+> **REQUIRED.** The fenced `json` block below is the source of truth for schema validation. `validate-module-manifest` extracts and validates this block against `schemas/module-manifest.schema.json`. Keep it in sync with the prose above — stale divergence is worse than missing.
+
+```json
+{
+  "schema_version": "1.0",
+  "name": "{{MODULE_NAME}}",
+  "path": "{{MODULE_PATH}}",
+  "stability": "stable",
+  "owner_agent": "{{AGENT_ID}}",
+  "related_spec": "sessions/{{PROJECT}}/spec.md#{{SECTION}}",
+  "last_reviewed": "{{YYYY-MM-DD}}",
+  "responsibility": "{{One-sentence responsibility — 10-300 chars. What problem does this module solve that no other module solves?}}",
+  "invariants": [
+    "{{Invariant 1 — what this module GUARANTEES to callers, max 200 chars each}}"
+  ],
+  "upstream_dependencies": [
+    {"target": "{{package or module}}", "kind": "package", "why": "{{rationale}}", "substitutable": false}
+  ],
+  "downstream_consumers": [
+    "{{consumer path or glob}}"
+  ],
+  "failure_modes": [
+    {"trigger": "{{failure condition}}", "handling": "fail-fast", "user_visible": true}
+  ],
+  "performance_envelope": {
+    "notes": "{{e.g., 'Hot path' or 'N/A — not performance-critical'}}"
+  }
+}
+```
+
+<!--
+  Alternative: store the same object in a sibling MODULE.json file. If both
+  exist, validate-module-manifest prefers MODULE.json. The ```json block in
+  this file is REQUIRED if MODULE.json does not exist — a MODULE.md with no
+  embedded JSON will be flagged UNVALIDATED by validate-module-manifest.
+
+  Update `last_reviewed` whenever the public interface, invariants, or
+  failure modes change.
+-->

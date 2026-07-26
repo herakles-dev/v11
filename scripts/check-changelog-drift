@@ -1,0 +1,74 @@
+#!/usr/bin/env bash
+# check-changelog-drift — durable guard against the CLAUDE.md §17 changelog drift.
+#
+# ROOT CAUSE this defends (see sessions/v11-handoff-prompt/subagent-context-config-spike.md):
+#   The changelog kept re-accumulating inside v11/CLAUDE.md §17 because (a) docs/CHANGELOG.md
+#   was framed as "extracted from CLAUDE.md" (inverted authority → authoring happened in §17),
+#   (b) the v11-coherence DC1 gate forces every protocol bump to touch CLAUDE.md's version
+#   footer, and §17 sits right above it (proximity pull), and (c) nothing flagged the growth
+#   while the manual "sync to docs" step got skipped (docs froze at v11.23 while §17 grew 5
+#   versions). This check closes (c) and makes (a)/(b) self-correcting.
+#
+# Two failure directions, both caught:
+#   INLINE_DRIFT   — CLAUDE.md §17 contains a full version-ENTRY heading (### v11.X / ## v11.X /
+#                    ### Current: v11.X as a heading). §17 must be a POINTER: heading + link +
+#                    one bold "Current:" line, no inline entries.
+#   CHANGELOG_STALE — the version named in CLAUDE.md's "**Current: v11.X**" pointer has no entry
+#                    in docs/CHANGELOG.md (the sync-to-docs step was skipped).
+#
+# Soft-block: wired into scripts/run-tests --regression; surfaces but never shadows a pytest
+# failure. Rollback: V11_CHECK_CHANGELOG_DRIFT=off.
+set -uo pipefail
+
+[ "${V11_CHECK_CHANGELOG_DRIFT:-on}" = "off" ] && exit 0
+
+V11_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+CLAUDE="$V11_ROOT/CLAUDE.md"
+CHANGELOG="$V11_ROOT/docs/CHANGELOG.md"
+
+fail=0
+say() { printf '%s\n' "$*" >&2; }
+
+[ -f "$CLAUDE" ]    || { say "check-changelog-drift: CLAUDE.md not found ($CLAUDE)"; exit 0; }
+[ -f "$CHANGELOG" ] || { say "check-changelog-drift: docs/CHANGELOG.md not found ($CHANGELOG)"; exit 0; }
+
+# --- Extract the §17 "Version History" section body (heading → next '## ' or EOF) ---
+sec="$(awk '
+  /^## .*Version History/ { insec=1; next }
+  insec && /^## /          { exit }
+  insec                    { print }
+' "$CLAUDE")"
+
+# --- INLINE_DRIFT: any full version-entry HEADING inside §17? (pointer must have none) ---
+# Entry headings look like: "### v11.28 — ...", "## v11.28 — ...", "### Current: v11.28 — ...".
+# The legit pointer is a **bold** line "**Current: v11.28 ...**" (not a heading) — excluded.
+drift_hits="$(printf '%s\n' "$sec" | grep -cE '^#{2,3}[[:space:]]+(Current:[[:space:]]+)?v11\.[0-9]' || true)"
+if [ "${drift_hits:-0}" -gt 0 ]; then
+    fail=1
+    say "❌ INLINE_DRIFT: CLAUDE.md §17 has $drift_hits inline version-entry heading(s)."
+    say "   §17 must be a POINTER (heading + link + one **Current:** line), not an inline changelog."
+    say "   Move the entry to docs/CHANGELOG.md and keep only the current pointer here."
+    printf '%s\n' "$sec" | grep -nE '^#{2,3}[[:space:]]+(Current:[[:space:]]+)?v11\.[0-9]' | sed 's/^/     drift → /' >&2
+fi
+
+# --- CHANGELOG_STALE: the "**Current: v11.X**" version must exist in docs/CHANGELOG.md ---
+cur="$(grep -oE '\*\*Current:[[:space:]]*v?11\.[0-9]+(\.[0-9]+)?' "$CLAUDE" | head -1 \
+       | grep -oE '11\.[0-9]+(\.[0-9]+)?' | head -1)"
+if [ -z "$cur" ]; then
+    say "⚠ check-changelog-drift: no '**Current: v11.X**' pointer found in CLAUDE.md §17 (cannot verify sync)."
+else
+    # Accept the exact version OR a same-minor line (e.g. Current v11.25.1 satisfied by a v11.25 entry).
+    minor="$(printf '%s' "$cur" | grep -oE '^11\.[0-9]+')"
+    if grep -qE "v?${cur//./\\.}([^0-9]|$)" "$CHANGELOG" || grep -qE "v?${minor//./\\.}([^0-9]|$)" "$CHANGELOG"; then
+        :
+    else
+        fail=1
+        say "❌ CHANGELOG_STALE: CLAUDE.md says Current v${cur}, but docs/CHANGELOG.md has no v${cur} (or v${minor}) entry."
+        say "   The sync-to-docs step was skipped. Add the entry to docs/CHANGELOG.md."
+    fi
+fi
+
+if [ "$fail" -eq 0 ]; then
+    say "✓ check-changelog-drift: §17 is a clean pointer and docs/CHANGELOG.md carries Current v${cur:-?}."
+fi
+exit "$fail"

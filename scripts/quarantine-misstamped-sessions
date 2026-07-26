@@ -1,0 +1,153 @@
+#!/usr/bin/env bash
+# quarantine-misstamped-sessions — V11.15.5 (Bug H, Part 2)
+#
+# Heals the *existing* on-disk damage that the Part 1 rebuild filter only
+# papers over: a per-session task-state.json whose session-level `.project`
+# stamp disagrees with the project its tasks actually declare
+# (`open_tasks[*].metadata.project`). Such a session — produced by
+# pre-Bug-E-fix active-project drift — both poisons the wrongly-stamped
+# project's aggregate AND starves its true project of the session.
+#
+# Detection rule (deliberately identical to the Part 1 rebuild filter, so the
+# two never disagree): consider only tasks that carry an EXPLICIT
+# metadata.project. If there are any, and NONE of them equals the session's
+# `.project` stamp, the session is mis-stamped and its true owner is the
+# single dominant explicit project. Sessions with no explicit per-task project
+# (legacy / pre-V11.14 records) are never touched — the stamp is trusted, same
+# as the rebuild.
+#
+# Default: DRY-RUN (read-only, prints a report, exits 0).
+# --fix : re-stamp `.project` to the true owner (atomic), then rebuild the
+#         aggregates of BOTH the old (wrong) and new (true) project so the
+#         poisoned aggregate is cleared and the starved project is restored.
+#
+# Usage:
+#   scripts/quarantine-misstamped-sessions            # dry-run report
+#   scripts/quarantine-misstamped-sessions --fix      # apply + rebuild
+#   scripts/quarantine-misstamped-sessions --json     # machine-readable dry-run
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=/dev/null
+source "$SCRIPT_DIR/../hooks/lib/common.sh"
+
+FIX=0
+JSON=0
+for a in "$@"; do
+    case "$a" in
+        --fix) FIX=1 ;;
+        --json) JSON=1 ;;
+        -h|--help) grep '^#' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        *) echo "unknown arg: $a" >&2; exit 2 ;;
+    esac
+done
+
+SESSIONS_DIR="$METRICS_DIR/sessions"
+[ -d "$SESSIONS_DIR" ] || { echo "no sessions dir: $SESSIONS_DIR" >&2; exit 0; }
+
+# Emit one detection record per mis-stamped session as compact JSON.
+detect() {
+    local f sid stamp report
+    for f in "$SESSIONS_DIR"/*/task-state.json; do
+        [ -f "$f" ] || continue
+        [ -s "$f" ] || continue
+        jq empty "$f" 2>/dev/null || continue
+        sid="$(basename "$(dirname "$f")")"
+        # stamp + explicit per-task project tally + dominant, in one jq pass.
+        report=$(jq -c --arg sid "$sid" '
+            (.project // "") as $stamp
+            | ([ (.open_tasks // {}) | to_entries[] | .value.metadata.project? ]
+               | map(select(. != null and . != ""))) as $explicit
+            | ($explicit | group_by(.)
+               | map({project: .[0], n: length})
+               | sort_by(-.n)) as $tally
+            | ($tally | length) as $distinct
+            | if ($explicit | length) == 0 then empty                 # legacy: trust stamp
+              elif ($explicit | any(. == $stamp)) then empty           # genuine (incl. mixed)
+              elif $distinct != 1 then                                 # foreign but ambiguous
+                  {sid:$sid, stamp:$stamp, status:"ambiguous",
+                   true_owner:null, tally:$tally,
+                   tasks:($explicit|length)}
+              else                                                     # cleanly mis-stamped
+                  {sid:$sid, stamp:$stamp, status:"misstamped",
+                   true_owner:($tally[0].project), tally:$tally,
+                   tasks:($explicit|length)}
+              end
+        ' "$f" 2>/dev/null || true)
+        [ -n "$report" ] && printf '%s\t%s\n' "$f" "$report"
+    done
+}
+
+MAPFILE=()
+while IFS= read -r line; do
+    [ -n "$line" ] && MAPFILE+=("$line")
+done < <(detect)
+
+if [ "$JSON" = "1" ]; then
+    printf '['
+    first=1
+    for row in "${MAPFILE[@]:-}"; do
+        [ -z "$row" ] && continue
+        [ "$first" = "0" ] && printf ','
+        printf '%s' "${row#*$'\t'}"
+        first=0
+    done
+    printf ']\n'
+    exit 0
+fi
+
+if [ "${#MAPFILE[@]}" -eq 0 ]; then
+    echo "✓ No mis-stamped sessions found ($(ls -d "$SESSIONS_DIR"/*/ 2>/dev/null | wc -l) scanned)."
+    exit 0
+fi
+
+echo "Mis-stamped session report (${#MAPFILE[@]} flagged):"
+echo
+declare -A REBUILD_PROJECTS=()
+for row in "${MAPFILE[@]}"; do
+    f="${row%%$'\t'*}"
+    j="${row#*$'\t'}"
+    sid=$(printf '%s' "$j" | jq -r '.sid')
+    stamp=$(printf '%s' "$j" | jq -r '.stamp')
+    status=$(printf '%s' "$j" | jq -r '.status')
+    owner=$(printf '%s' "$j" | jq -r '.true_owner // "?"')
+    tasks=$(printf '%s' "$j" | jq -r '.tasks')
+    tally=$(printf '%s' "$j" | jq -rc '.tally')
+    if [ "$status" = "ambiguous" ]; then
+        echo "  ? $sid  stamp='$stamp'  tasks=$tasks  tally=$tally  → AMBIGUOUS (skipped, needs manual review)"
+        continue
+    fi
+    echo "  ✗ $sid  stamp='$stamp'  →  true owner='$owner'  ($tasks task(s), tally=$tally)"
+    if [ "$FIX" = "1" ]; then
+        # Validate the new project name before writing (SEC-C-02 parity).
+        if ! printf '%s' "$owner" | grep -qE '^[a-zA-Z0-9._-]{1,64}$'; then
+            echo "      ! refusing to re-stamp to invalid project name '$owner'" >&2
+            continue
+        fi
+        tmp="$f.tmp.$$"
+        if jq --arg p "$owner" '.project = $p' "$f" > "$tmp" 2>/dev/null \
+           && [ -s "$tmp" ] && jq empty "$tmp" 2>/dev/null; then
+            mv "$tmp" "$f"
+            echo "      → re-stamped .project '$stamp' → '$owner'"
+            [ -n "$stamp" ] && REBUILD_PROJECTS["$stamp"]=1
+            REBUILD_PROJECTS["$owner"]=1
+        else
+            rm -f "$tmp"
+            echo "      ! re-stamp failed (jq); left unchanged" >&2
+        fi
+    fi
+done
+
+if [ "$FIX" = "1" ] && [ "${#REBUILD_PROJECTS[@]}" -gt 0 ]; then
+    echo
+    echo "Rebuilding affected aggregates:"
+    for p in "${!REBUILD_PROJECTS[@]}"; do
+        if v11_rebuild_project_aggregate "$p" 2>/dev/null; then
+            echo "  ✓ $p"
+        else
+            echo "  ! $p (rebuild returned non-zero)"
+        fi
+    done
+else
+    [ "$FIX" = "0" ] && { echo; echo "DRY-RUN — no files changed. Re-run with --fix to re-stamp + rebuild."; }
+fi

@@ -1,0 +1,419 @@
+#!/bin/bash
+# V11 Hook: guard-write-gates (PreToolUse — Write|Edit)
+# Consolidated write requirements: combines guard-task-state + guard-plan-mode.
+# Enforces task-state requirement and provides plan mode guidance.
+#
+# Performance: 2 hooks → 1 hook (reduces PreToolUse overhead by ~50ms)
+#
+# Exit codes:
+#   0 - Allow operation (may include advisory warning)
+#   2 - Block operation (task-state violation only; plan-mode is advisory)
+
+source "$(dirname "${BASH_SOURCE[0]}")/lib/common.sh"
+
+V11_HOME="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+TRACKING_FILE="$METRICS_DIR/plan-mode-tracking.json"
+
+# Test mode
+if [ "$1" == "--test" ]; then
+    echo "guard-write-gates v1 (consolidated: task-state + plan-mode)"
+    exit 0
+fi
+
+# Reset tracking state
+if [ "$1" == "--reset" ]; then
+    rm -f "$TRACKING_FILE"
+    echo "Plan mode tracking reset."
+    exit 0
+fi
+
+# Parse hook input
+v11_parse_input
+
+# Only guard Write and Edit tools
+[ "$V11_TOOL_NAME" != "Write" ] && [ "$V11_TOOL_NAME" != "Edit" ] && exit 0
+
+# No file path means nothing to guard
+[ -z "$V11_FILE_PATH" ] && exit 0
+
+# Skip metadata and infrastructure files
+v11_is_metadata_file "$V11_FILE_PATH" && exit 0
+
+# Skip infrastructure directories that are never real projects.
+# Without this, writes to v11/ framework files fall through to the stale
+# active-project file and get blocked by unrelated project task state.
+# Note: "sessions" and "portfolio-platform" are in NON_PROJECTS but CONTAIN
+# real projects, so we skip them from this check.
+if [[ "$V11_FILE_PATH" =~ ^$V11_WORKSPACE_ROOT/([^/]+) ]]; then
+    _GWG_CANDIDATE="${BASH_REMATCH[1]}"
+    if [[ "$_GWG_CANDIDATE" != "sessions" && "$_GWG_CANDIDATE" != "portfolio-platform" ]]; then
+        for _np in $NON_PROJECTS; do
+            [[ "$_GWG_CANDIDATE" == "$_np" ]] && exit 0
+        done
+    fi
+fi
+
+# === SCHEMA VALIDATION (Advisory) ===
+# Validate autonomy state when writing to it
+if [[ "$V11_FILE_PATH" == */.autonomy-state ]]; then
+    NEW_CONTENT=$(printf '%s' "$V11_RAW_INPUT" | jq -r '.tool_input.content // empty' 2>/dev/null)
+    if [ -n "$NEW_CONTENT" ] && [ "$NEW_CONTENT" != "null" ]; then
+        AUTONOMY_WARN=$(mktemp /tmp/v11-schema-XXXXXX.txt)
+        if ! v11_validate_json "$NEW_CONTENT" "autonomy-state.schema.json" 2>"$AUTONOMY_WARN"; then
+            echo "ADVISORY: Autonomy state validation warning:" >&2
+            cat "$AUTONOMY_WARN" >&2
+        fi
+        rm -f "$AUTONOMY_WARN"
+    fi
+fi
+
+# === TASK STATE CHECK ===
+
+# Detect project
+v11_detect_project "$V11_FILE_PATH"
+
+# Fallback 1: Walk up directory tree looking for .task-state.json
+if [ -z "$V11_PROJECT" ]; then
+    DIR=$(dirname "$V11_FILE_PATH")
+    while [ "$DIR" != "/" ] && [ "$DIR" != "$V11_WORKSPACE_ROOT" ] && [ ${#DIR} -gt ${#V11_WORKSPACE_ROOT} ]; do
+        if [ -f "$DIR/.task-state.json" ]; then
+            V11_PROJECT=$(basename "$DIR")
+            V11_DETECTION_METHOD="walk-up .task-state.json"
+            break
+        fi
+        DIR=$(dirname "$DIR")
+    done
+fi
+
+# Fallback 2: Registry lookup for unusual project layouts
+if [ -z "$V11_PROJECT" ] && [ -f "$REGISTRY_FILE" ]; then
+    V11_PROJECT=$(jq -r --arg path "$V11_FILE_PATH" '
+        to_entries
+        | map(select(.key[0:1] != "_"))
+        | map(select(.value[] as $p | $path | startswith($p)))
+        | sort_by(- (.value | map(length) | max))
+        | .[0].key // ""
+    ' "$REGISTRY_FILE" 2>/dev/null)
+    [ "$V11_PROJECT" = "null" ] && V11_PROJECT=""
+    [ -n "$V11_PROJECT" ] && V11_DETECTION_METHOD="registry lookup"
+fi
+
+# If project detected, check task state
+if [ -n "$V11_PROJECT" ]; then
+    # Record active project for downstream hooks (P4: dual-write to global + session-scoped)
+    v11_write_active_project "$V11_PROJECT"
+
+    # V11.34 (F3): rollback knob — off disables task-state enforcement entirely,
+    # warn downgrades the STALL branch below to advisory-only, block (default)
+    # is today's behavior unchanged.
+    WRITE_GATE_MODE="${V11_WRITE_GATE:-block}"
+
+    # Check task state
+    TASK_STATE=""
+    if [ -f "$TASK_STATE_DIR/${V11_PROJECT}.json" ]; then
+        TASK_STATE="$TASK_STATE_DIR/${V11_PROJECT}.json"
+    elif [ -f "$SESSIONS_ROOT/$V11_PROJECT/.task-state.json" ]; then
+        TASK_STATE="$SESSIONS_ROOT/$V11_PROJECT/.task-state.json"
+    fi
+
+    # Enforce task requirement if project uses tasks (V11_WRITE_GATE=off skips entirely)
+    if [ -n "$TASK_STATE" ] && [ "$WRITE_GATE_MODE" != "off" ]; then
+        # Skip enforcement for trivial projects (fewer than 2 tasks)
+        TOTAL=$(jq -r '.total // 0' "$TASK_STATE" 2>/dev/null)
+
+        if [ "$TOTAL" -ge 2 ]; then
+            # Skip enforcement for completed projects (all tasks done)
+            PHASE=$(jq -r '.phase // ""' "$TASK_STATE" 2>/dev/null)
+            COMPLETED=$(jq -r '.completed // 0' "$TASK_STATE" 2>/dev/null)
+            PENDING=$(jq -r '.pending // 0' "$TASK_STATE" 2>/dev/null)
+
+            if [ "$PHASE" = "complete" ] || { [ "$PENDING" -eq 0 ] && [ "$COMPLETED" -ge "$TOTAL" ]; }; then
+                # Project is done — allow new work without task enforcement.
+                # New tasks will re-enable enforcement via sync-tasks hook.
+                :
+            else
+                # Active project: must have an in_progress task.
+                # improvement 14 F1 (v11.34.2): read THIS SESSION's own
+                # in_progress, not the project aggregate. The aggregate sums
+                # in_progress across every session working the project, so a
+                # sibling session's active task (aggregate in_progress>=1)
+                # previously masked this session's own idle state, skipping
+                # the entire block region below for every session as long as
+                # ANY session in the project had a task in_progress. Reading
+                # the session-scoped file makes the DECISION correctly
+                # per-session; the discriminator below (v11_session_has_open_work)
+                # already reads the same session-scoped file, so this brings
+                # the entry condition into alignment with it.
+                IN_PROGRESS=$(jq -r '.in_progress // 0' "$(v11_session_state_path)" 2>/dev/null)
+                case "$IN_PROGRESS" in ''|*[!0-9]*) IN_PROGRESS=0 ;; esac
+
+                if [ "$IN_PROGRESS" -eq 0 ]; then
+                    # V11.34.1 (Q2 fix): own-open-work discriminator. Keys on
+                    # THIS SESSION'S OWN pending+in_progress, not "ever touched
+                    # the task system". This is reached only when the PROJECT
+                    # AGGREGATE shows in_progress==0 (so this session's own
+                    # in_progress is 0 too) — the remaining question is whether
+                    # THIS session still owns unresolved work:
+                    #   - no own file, or own pending==0 && in_progress==0
+                    #     (fresh session, OR a session that FINISHED every task
+                    #     it owns while siblings still have pending work) ->
+                    #     advisory + allow.
+                    #   - own pending>=1 (created-not-started, or a genuine
+                    #     stall) -> falls through to the block/warn/off branch
+                    #     below, unchanged.
+                    if ! v11_session_has_open_work; then
+                        # V11.34.1 (Q3 fix): count from the AGGREGATE already
+                        # loaded into $TASK_STATE (accurate regardless of
+                        # whether tasks were created by THIS session or a
+                        # sibling — handoff-tasks.json is 0/absent for the
+                        # latter, which is exactly the target scenario here).
+                        _GWG_OPEN_N="$PENDING"
+                        case "$_GWG_OPEN_N" in ''|*[!0-9]*) _GWG_OPEN_N=0 ;; esac
+
+                        # V11.34.1 (Q4 fix): once-per-session throttle, mirrors
+                        # the handoff-surfaced marker pattern in detect-project.
+                        # The exit 0 below always fires (this edit is always
+                        # allowed on this path); only the stderr advisory +
+                        # marker write are gated on first-occurrence.
+                        _GWG_ADV_MARKER="$METRICS_DIR/sessions/$(v11_session_uuid)/.fresh-advisory-surfaced"
+                        if [ ! -f "$_GWG_ADV_MARKER" ]; then
+                            echo "[V11] No unfinished task owned by this session in task-bearing project '$V11_PROJECT' (fresh session or finished wave) — $_GWG_OPEN_N open task(s) in the project aggregate. This edit is allowed and stays on the instrumented path. To attribute it: create+start a task (TaskCreate -> in_progress), or run /v11 to rehydrate if this project has a handoff. (guard-write-gates: fresh-session advisory)" >&2
+                            mkdir -p "$(dirname "$_GWG_ADV_MARKER")" 2>/dev/null || true
+                            : > "$_GWG_ADV_MARKER" 2>/dev/null || true
+                        fi
+                        exit 0
+                    fi
+
+                    # V11.34 (F3): warn mode — advisory only, never blocks.
+                    if [ "$WRITE_GATE_MODE" = "warn" ]; then
+                        cat >&2 << EOF
+ADVISORY (V11_WRITE_GATE=warn): No task in_progress
+
+Before modifying files in project "$V11_PROJECT", you should:
+1. Check available tasks: TaskList
+2. Start a task: TaskUpdate(taskId="<id>", status="in_progress")
+3. Then modify files
+4. When done: TaskUpdate(taskId="<id>", status="completed")
+
+---
+Project: $V11_PROJECT | Tasks: $TOTAL total, 0 in_progress (this session)
+File: $V11_FILE_PATH | Detected via: $V11_DETECTION_METHOD
+EOF
+                        exit 0
+                    fi
+
+                    cat >&2 << EOF
+TASK SYSTEM VIOLATION: No task in_progress
+
+Before modifying files in project "$V11_PROJECT", you must:
+1. Check available tasks: TaskList
+2. Start a task: TaskUpdate(taskId="<id>", status="in_progress")
+3. Then modify files
+4. When done: TaskUpdate(taskId="<id>", status="completed")
+
+---
+Project: $V11_PROJECT | Tasks: $TOTAL total, 0 in_progress (this session)
+File: $V11_FILE_PATH | Detected via: $V11_DETECTION_METHOD
+EOF
+                    # Emit block record before hard exit
+                    (
+                        _BLOCK_LOG="$METRICS_DIR/guard-blocks.jsonl"
+                        mkdir -p "$METRICS_DIR"
+                        # Cap file path to 512 chars (consistent with PROMPT cap in track-agents)
+                        _V11_FP="${V11_FILE_PATH:0:512}"
+                        jq -nc \
+                            --arg ts "$(date -Iseconds)" \
+                            --arg project "${V11_PROJECT:-}" \
+                            --arg file "$_V11_FP" \
+                            --arg reason "no-task-in-progress" \
+                            --arg method "${V11_DETECTION_METHOD:-}" \
+                            '{timestamp:$ts,
+                              project:(if $project=="" then null else $project end),
+                              file:$file,
+                              reason:$reason,
+                              detection_method:(if $method=="" then null else $method end)}' \
+                            >> "$_BLOCK_LOG" 2>/dev/null || true
+                        # Rotate at 10MB — flock-guarded to prevent double-rotation under concurrent blocks
+                        _SZ=$(stat -c%s "$_BLOCK_LOG" 2>/dev/null || echo 0)
+                        if [ "$_SZ" -gt 10485760 ]; then
+                            (
+                                flock -w 2 201 || exit 0
+                                # Re-check under lock — another instance may have rotated
+                                _SZ=$(stat -c%s "$_BLOCK_LOG" 2>/dev/null || echo 0)
+                                [ "$_SZ" -le 10485760 ] && exit 0
+                                _ROT="$_BLOCK_LOG.tmp.$$"
+                                tail -n 10000 "$_BLOCK_LOG" > "$_ROT" 2>/dev/null && \
+                                    mv "$_ROT" "$_BLOCK_LOG" 2>/dev/null || rm -f "$_ROT"
+                            ) 201>"$_BLOCK_LOG.lock"
+                        fi
+                    ) 2>/dev/null || true
+                    exit 2
+                fi
+            fi
+        fi
+    fi
+fi
+
+# === V11.4: ZERO-TASK ADVISORY NUDGE ===
+# When a project has V11 hooks but no tasks, nudge after 5+ writes
+
+if [ -n "$V11_PROJECT" ]; then
+    TASK_STATE=""
+    if [ -f "$TASK_STATE_DIR/${V11_PROJECT}.json" ]; then
+        TASK_STATE="$TASK_STATE_DIR/${V11_PROJECT}.json"
+    elif [ -f "$SESSIONS_ROOT/$V11_PROJECT/.task-state.json" ]; then
+        TASK_STATE="$SESSIONS_ROOT/$V11_PROJECT/.task-state.json"
+    fi
+
+    TASK_TOTAL=0
+    if [ -n "$TASK_STATE" ]; then
+        TASK_TOTAL=$(jq -r '.total // 0' "$TASK_STATE" 2>/dev/null)
+    fi
+
+    # Only nudge if session dir exists (V11 project) but no tasks
+    if [ "$TASK_TOTAL" -eq 0 ] && [ -d "$SESSIONS_ROOT/$V11_PROJECT" ]; then
+        # Check write count from plan-mode tracking
+        if [ -f "$TRACKING_FILE" ]; then
+            WRITE_COUNT=$(jq -r '.count // 0' "$TRACKING_FILE" 2>/dev/null)
+            if [ "${WRITE_COUNT:-0}" -ge 5 ]; then
+                cat << EOF >&2
+ADVISORY: V11 project "$V11_PROJECT" has $WRITE_COUNT edits without tasks.
+Consider running /v11 to create tasks and enable proof-of-work tracking.
+EOF
+            fi
+        fi
+    fi
+fi
+
+# === V11.5: INTERVIEW ADVISORY ===
+# When a project has NO tasks yet AND no interview_completed flag,
+# nudge the user to run /v11 for the structured planning interview.
+# Advisory only — never blocks (exit 0 after message).
+
+if [ -n "$V11_PROJECT" ]; then
+    _INTERVIEW_TASK_TOTAL=0
+    _INTERVIEW_TASK_STATE=""
+    if [ -f "$TASK_STATE_DIR/${V11_PROJECT}.json" ]; then
+        _INTERVIEW_TASK_STATE="$TASK_STATE_DIR/${V11_PROJECT}.json"
+    elif [ -f "$SESSIONS_ROOT/$V11_PROJECT/.task-state.json" ]; then
+        _INTERVIEW_TASK_STATE="$SESSIONS_ROOT/$V11_PROJECT/.task-state.json"
+    fi
+
+    if [ -n "$_INTERVIEW_TASK_STATE" ]; then
+        _INTERVIEW_TASK_TOTAL=$(jq -r '.total // 0' "$_INTERVIEW_TASK_STATE" 2>/dev/null)
+    fi
+
+    if [ "${_INTERVIEW_TASK_TOTAL:-0}" -eq 0 ] && [ -d "$SESSIONS_ROOT/$V11_PROJECT" ]; then
+        _PLAN_CONTEXT="$SESSIONS_ROOT/$V11_PROJECT/.plan-context.json"
+        _INTERVIEW_DONE="false"
+        if [ -f "$_PLAN_CONTEXT" ]; then
+            _INTERVIEW_DONE=$(jq -r '.interview_completed // false' "$_PLAN_CONTEXT" 2>/dev/null)
+        fi
+        if [ "$_INTERVIEW_DONE" != "true" ]; then
+            cat << EOF >&2
+ADVISORY: No structured interview detected for new project "$V11_PROJECT".
+Run /v11 to start the planning interview before creating tasks.
+EOF
+        fi
+    fi
+fi
+
+# === V11.7: TRACKER ARTIFACT ADVISORY ===
+# When scope signals indicate conditional artifacts should exist, nudge.
+# Advisory only — never blocks (exit 0 after message).
+
+if [ -n "$V11_PROJECT" ] && [ -n "${_INTERVIEW_TASK_STATE:-}" ]; then
+    _TRACKER_TASK_TOTAL="${_INTERVIEW_TASK_TOTAL:-0}"
+
+    # Roadmap advisory: 10+ tasks without roadmap.md
+    if [ "${_TRACKER_TASK_TOTAL:-0}" -ge 10 ] && [ ! -f "$SESSIONS_ROOT/$V11_PROJECT/roadmap.md" ]; then
+        cat << EOF >&2
+ADVISORY: Project "$V11_PROJECT" has $_TRACKER_TASK_TOTAL tasks but no roadmap.md.
+Consider creating one: cp $V11_HOME/templates/roadmap.md.template $SESSIONS_ROOT/$V11_PROJECT/roadmap.md
+EOF
+    fi
+
+    # Architecture advisory: Complex/Chaotic without architecture.md
+    if [ -f "$SESSIONS_ROOT/$V11_PROJECT/.plan-context.json" ]; then
+        _TRACKER_CYNEFIN=$(jq -r '.domain.cynefin // "confused"' "$SESSIONS_ROOT/$V11_PROJECT/.plan-context.json" 2>/dev/null || echo "confused")
+        if { [ "$_TRACKER_CYNEFIN" = "complex" ] || [ "$_TRACKER_CYNEFIN" = "chaotic" ]; } && [ ! -f "$SESSIONS_ROOT/$V11_PROJECT/architecture.md" ]; then
+            cat << EOF >&2
+ADVISORY: Project "$V11_PROJECT" classified as "$_TRACKER_CYNEFIN" but has no architecture.md.
+Consider creating one: cp $V11_HOME/templates/architecture.md.template $SESSIONS_ROOT/$V11_PROJECT/architecture.md
+EOF
+        fi
+    fi
+fi
+
+# === PLAN MODE GUIDANCE (ADVISORY ONLY) ===
+
+# Check plan mode markers - if present, skip tracking
+[ -f "$V11_HOME/.plan-mode" ] && exit 0
+[ -f "${V11_FILE_PATH%/*}/.plan-mode" ] && exit 0
+
+# Load or initialize tracking state
+mkdir -p "$METRICS_DIR"
+
+if [ -f "$TRACKING_FILE" ]; then
+    STORED_SESSION=$(jq -r '.session_id // ""' "$TRACKING_FILE" 2>/dev/null)
+else
+    STORED_SESSION=""
+fi
+
+# Reset if session changed or file missing
+if [ "$STORED_SESSION" != "$V11_SESSION_ID" ] || [ ! -f "$TRACKING_FILE" ]; then
+    jq -n --arg sid "$V11_SESSION_ID" --arg now "$(date -Iseconds)" \
+        '{session_id: $sid, files: [], count: 0, last_reset: $now}' \
+        > "$TRACKING_FILE"
+fi
+
+# Check if file already tracked, add if new
+ALREADY=$(jq -r --arg fp "$V11_FILE_PATH" '.files | map(select(. == $fp)) | length' "$TRACKING_FILE")
+
+if [ "$ALREADY" -eq 0 ]; then
+    jq --arg fp "$V11_FILE_PATH" \
+        '.files += [$fp] | .count = (.files | length)' \
+        "$TRACKING_FILE" > "${TRACKING_FILE}.tmp" \
+        && mv "${TRACKING_FILE}.tmp" "$TRACKING_FILE"
+fi
+
+COUNT=$(jq -r '.count' "$TRACKING_FILE")
+
+# Provide advisory guidance (never blocks)
+# V11: Advisory-only with enhanced messaging
+if [ "$COUNT" -gt 6 ]; then
+    FILE_LIST=$(jq -r '.files[:10][]' "$TRACKING_FILE" 2>/dev/null)
+    cat << EOF >&2
+ADVISORY: Large change scope detected ($COUNT files modified)
+
+You've modified $COUNT unique files in this session. For changes
+of this scope, V11 Protocol recommends using EnterPlanMode to:
+  - Document your intent
+  - Get user approval
+  - Track approval history
+  - Improve code review context
+
+Files modified (showing first 10):
+$FILE_LIST
+
+You can continue, but plan mode is strongly recommended.
+EOF
+    # Exit 0 - advisory only, never blocks
+    exit 0
+fi
+
+if [ "$COUNT" -ge 4 ] && [ "$COUNT" -le 6 ]; then
+    cat << EOF >&2
+SUGGESTION: Plan mode threshold approaching ($COUNT/6 files)
+
+V11 Protocol suggests using EnterPlanMode when:
+  - Making 5+ file modifications
+  - Cross-service changes
+  - Architecture-impacting edits
+  - Multi-day projects
+
+Use 'EnterPlanMode' task to create a formal plan.
+EOF
+fi
+
+exit 0

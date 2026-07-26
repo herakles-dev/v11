@@ -1,0 +1,112 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "agent-registry.schema.json",
+  "title": "V11 Agent Registry",
+  "description": "Schema for V11_AGENT_REGISTRY.json — defines V11 spec agents and pre-built formations",
+  "type": "object",
+  "properties": {
+    "metadata": {
+      "type": "object",
+      "properties": {
+        "version":           { "type": "string" },
+        "protocol":          { "type": "string", "const": "V11" },
+        "description":       { "type": "string" },
+        "created":           { "type": "string" },
+        "total_agents":      { "type": "integer", "minimum": 1 },
+        "agent_count":       { "type": "integer", "minimum": 1 },
+        "system_prompt_root":{ "type": "string" },
+        "formations_count":  { "type": "integer", "minimum": 1 },
+        "deprecated_v8_agents":  { "type": "array", "items": { "type": "string" } },
+        "deprecated_v5_agents":  { "type": "array", "items": { "type": "string" } }
+      },
+      "required": ["version", "protocol", "agent_count"],
+      "additionalProperties": false
+    },
+    "agents": {
+      "type": "object",
+      "additionalProperties": { "$ref": "#/$defs/agent_definition" },
+      "minProperties": 1
+    },
+    "formations": {
+      "type": "object",
+      "additionalProperties": { "$ref": "#/$defs/formation_definition" },
+      "minProperties": 1
+    }
+  },
+  "required": ["metadata", "agents", "formations"],
+  "additionalProperties": false,
+  "$defs": {
+    "agent_definition": {
+      "type": "object",
+      "properties": {
+        "version":       { "type": "string" },
+        "category":      { "type": "string" },
+        "description":   { "type": "string" },
+        "model":         { "type": "string", "enum": ["opus", "sonnet", "haiku"] },
+        "model_tier":    { "type": "string", "enum": ["reasoning", "intelligence", "speed"] },
+        "default_mode":  { "type": "string", "enum": ["direct", "teammate", "subagent"] },
+        "effort_level":  { "type": ["string", "null"], "enum": ["high", "medium", "low", null] },
+        "tool_profile":  { "type": "string", "enum": ["full", "coding", "testing", "readonly", "minimal"] },
+        "triggers":      { "type": "array", "items": { "type": "string" } },
+        "capabilities":  { "type": "array", "items": { "type": "string" } },
+        "tools":         { "type": "array", "items": { "type": "string" } },
+        "handoff_to":    { "type": "array", "items": { "type": "string" } },
+        "handoff_from":  { "type": "array", "items": { "type": "string" } },
+        "teammate_messaging": {
+          "type": "object",
+          "properties": {
+            "to":   { "type": "array", "items": { "type": "string" } },
+            "from": { "type": "array", "items": { "type": "string" } }
+          }
+        },
+        "color":          { "type": "string" },
+        "system_prompt":  { "type": "string" },
+        "v11_native":     { "type": "boolean" },
+        "most_frequent":  { "type": "boolean" },
+        "model_for_scanning": { "type": "string" },
+        "merged_from":    { "type": "array", "items": { "type": "string" } },
+        "read_only":      { "type": "boolean" }
+      },
+      "required": ["version", "description", "model", "default_mode", "tool_profile", "v11_native"],
+      "additionalProperties": false
+    },
+    "formation_definition": {
+      "type": "object",
+      "properties": {
+        "teammates":     { "type": "array", "items": { "type": "string" }, "minItems": 0, "maxItems": 10 },
+        "roles":         { "type": "array", "items": { "type": "string" }, "minItems": 0, "maxItems": 10 },
+        "when":          { "type": "string" },
+        "description":   { "type": "string" },
+        "mode":          { "type": "string" },
+        "wave_structure": { "type": ["array", "object"] },
+        "specialist_pool": { "type": "object" },
+        "task_count_range": { "type": "string" },
+        "artifact_schema": { "type": "array", "items": { "type": "string" } },
+        "max_iterations": { "type": "integer" },
+        "feedback_loop":  { "type": "boolean" },
+        "benchmark_script": { "type": "string" },
+        "parallelization": { "type": "string" },
+        "cost_estimate":  { "type": "string" },
+        "tool_policies": {
+          "type": "object",
+          "properties": {
+            "defaults": { "$ref": "#/$defs/policy_entry" },
+            "per_role":  { "type": "object", "additionalProperties": { "$ref": "#/$defs/policy_entry" } }
+          }
+        },
+        "agents": { "type": "array" }
+      },
+      "required": ["teammates"],
+      "additionalProperties": false
+    },
+    "policy_entry": {
+      "type": "object",
+      "properties": {
+        "profile": { "enum": ["full", "coding", "testing", "readonly", "minimal"] },
+        "allow":   { "type": "array", "items": { "type": "string" } },
+        "deny":    { "type": "array", "items": { "type": "string" } }
+      },
+      "additionalProperties": false
+    }
+  }
+}

@@ -1,0 +1,124 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "tool-policy.schema.json",
+  "title": "V11 Tool Policy",
+  "description": "Schema for tool group taxonomy, profile presets, and deny-wins policy cascade",
+  "type": "object",
+  "properties": {
+    "tool_groups": {
+      "type": "object",
+      "properties": {
+        "group:read": { "$ref": "#/$defs/tool_list" },
+        "group:write": { "$ref": "#/$defs/tool_list" },
+        "group:exec": { "$ref": "#/$defs/tool_list" },
+        "group:task": { "$ref": "#/$defs/tool_list" },
+        "group:team": { "$ref": "#/$defs/tool_list" },
+        "group:search": { "$ref": "#/$defs/tool_list" },
+        "group:fs": { "$ref": "#/$defs/tool_list" },
+        "group:all-read": { "$ref": "#/$defs/tool_list" },
+        "group:test": { "$ref": "#/$defs/tool_list" },
+        "group:deploy": { "$ref": "#/$defs/tool_list" }
+      },
+      "additionalProperties": { "$ref": "#/$defs/tool_list" }
+    },
+    "profiles": {
+      "type": "object",
+      "properties": {
+        "full": { "$ref": "#/$defs/profile" },
+        "coding": { "$ref": "#/$defs/profile" },
+        "testing": { "$ref": "#/$defs/profile" },
+        "readonly": { "$ref": "#/$defs/profile" },
+        "minimal": { "$ref": "#/$defs/profile" }
+      },
+      "additionalProperties": { "$ref": "#/$defs/profile" }
+    },
+    "defaults": {
+      "type": "object",
+      "properties": {
+        "tool_groups": {
+          "description": "Default tool group definitions",
+          "$ref": "#/$defs/tool_group_defaults"
+        },
+        "profile_presets": {
+          "description": "Default profile presets",
+          "$ref": "#/$defs/profile_presets"
+        }
+      }
+    }
+  },
+  "$defs": {
+    "tool_list": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "List of tool names or tool:subcommand patterns"
+    },
+    "profile": {
+      "type": "object",
+      "properties": {
+        "description": { "type": "string" },
+        "includes": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Tool groups or individual tools included"
+        },
+        "excludes": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Tools explicitly excluded from this profile"
+        }
+      },
+      "required": ["includes"],
+      "additionalProperties": false
+    },
+    "tool_group_defaults": {
+      "type": "object",
+      "description": "Standard tool group definitions",
+      "properties": {
+        "group:read": {
+          "const": ["Read", "Grep", "Glob"]
+        },
+        "group:write": {
+          "const": ["Write", "Edit"]
+        },
+        "group:exec": {
+          "const": ["Bash"]
+        },
+        "group:task": {
+          "const": ["TaskCreate", "TaskUpdate", "TaskList", "TaskGet"]
+        },
+        "group:team": {
+          "const": ["SendMessage", "TeamCreate"]
+        },
+        "group:search": {
+          "const": ["WebSearch", "WebFetch"]
+        }
+      }
+    },
+    "profile_presets": {
+      "type": "object",
+      "description": "Standard profile definitions",
+      "properties": {
+        "full": {
+          "description": "All tools — Implementer, Architect",
+          "const": { "includes": ["group:read", "group:write", "group:exec", "group:task", "group:team", "group:search"] }
+        },
+        "coding": {
+          "description": "FS + exec + task — Standard developer",
+          "const": { "includes": ["group:fs", "group:exec", "group:task"] }
+        },
+        "testing": {
+          "description": "Read + exec(test) + task — Tester",
+          "const": { "includes": ["group:read", "group:test", "group:task"] }
+        },
+        "readonly": {
+          "description": "Read + task — Reviewer, Analyst",
+          "const": { "includes": ["group:read", "group:task"] }
+        },
+        "minimal": {
+          "description": "Task only — Coordinator",
+          "const": { "includes": ["group:task"] }
+        }
+      }
+    }
+  }
+}

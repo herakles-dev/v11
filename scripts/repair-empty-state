@@ -1,0 +1,174 @@
+#!/bin/bash
+# V11 Script: repair-empty-state
+#
+# One-shot repair: reinitialize 0-byte task-state and .autonomy-state files
+# to valid JSON skeletons. Does NOT delete files — hooks still expect them
+# to exist. Instead, seeds them with empty-but-valid state so the next
+# TaskCreate/TaskUpdate/Write hook has something to read.
+#
+# Usage:
+#   repair-empty-state                # repair all empty files (with confirmation)
+#   repair-empty-state --dry-run      # preview — list what would be repaired
+#   repair-empty-state --task-state   # only task-state files
+#   repair-empty-state --autonomy     # only autonomy files
+#   repair-empty-state --force        # skip confirmation prompt
+#
+# Safety: skips any file that is NOT 0 bytes. Never overwrites valid state.
+
+set -euo pipefail
+
+V11_WORKSPACE_ROOT="${V11_WORKSPACE_ROOT:-$HOME/.v11}"
+SESSIONS_ROOT="${SESSIONS_ROOT:-$V11_WORKSPACE_ROOT/sessions}"
+METRICS_DIR="$V11_WORKSPACE_ROOT/.agent-metrics"
+TASK_STATE_DIR="$METRICS_DIR/task-state"
+
+DRY_RUN=0
+DO_TASK_STATE=1
+DO_AUTONOMY=1
+FORCE=0
+
+for arg in "$@"; do
+    case "$arg" in
+        --help|-h)
+            sed -n '3,18p' "$0" | sed 's/^# \{0,1\}//'
+            exit 0
+            ;;
+        --dry-run) DRY_RUN=1 ;;
+        --task-state) DO_AUTONOMY=0 ;;
+        --autonomy) DO_TASK_STATE=0 ;;
+        --force) FORCE=1 ;;
+        *) echo "Unknown flag: $arg" >&2; exit 1 ;;
+    esac
+done
+
+NOW=$(date -Iseconds)
+
+repair_task_state() {
+    local file="$1"
+    local project
+    project=$(basename "$file" .json)
+
+    if [ "$DRY_RUN" = "1" ]; then
+        echo "  would repair: $file (project=$project)"
+        return 0
+    fi
+
+    jq -n --arg project "$project" --arg now "$NOW" '{
+        project: $project,
+        total: 0, completed: 0, pending: 0,
+        in_progress: 0, blocked: 0,
+        phase: "discovery",
+        active_task: null, active_task_ids: [],
+        active_agent_id: null,
+        recent_completed: [],
+        blocked_tasks: [],
+        task_artifacts: {},
+        last_updated: $now,
+        repaired_at: $now,
+        repaired_reason: "0-byte corruption — seeded from repair-empty-state"
+    }' > "$file.tmp.$$"
+
+    if [ -s "$file.tmp.$$" ] && jq empty "$file.tmp.$$" 2>/dev/null; then
+        mv "$file.tmp.$$" "$file"
+        echo "  repaired: $file"
+    else
+        rm -f "$file.tmp.$$"
+        echo "  FAILED: $file (tmp file invalid — skipped)" >&2
+        return 1
+    fi
+}
+
+repair_autonomy() {
+    local file="$1"
+
+    if [ "$DRY_RUN" = "1" ]; then
+        echo "  would repair: $file"
+        return 0
+    fi
+
+    jq -n --arg now "$NOW" '{
+        level: 0,
+        successful: 0,
+        errors: 0,
+        rollbacks: 0,
+        approved_categories: [],
+        grants: [],
+        high_risk_history: [],
+        recent_errors: [],
+        last_updated: $now,
+        repaired_at: $now,
+        repaired_reason: "0-byte corruption — seeded from repair-empty-state"
+    }' > "$file.tmp.$$"
+
+    if [ -s "$file.tmp.$$" ] && jq empty "$file.tmp.$$" 2>/dev/null; then
+        mv "$file.tmp.$$" "$file"
+        echo "  repaired: $file"
+    else
+        rm -f "$file.tmp.$$"
+        echo "  FAILED: $file" >&2
+        return 1
+    fi
+}
+
+# --- Scan ---
+TASK_STATE_FILES=()
+AUTONOMY_FILES=()
+
+if [ "$DO_TASK_STATE" = "1" ] && [ -d "$TASK_STATE_DIR" ]; then
+    while IFS= read -r f; do
+        TASK_STATE_FILES+=("$f")
+    done < <(find "$TASK_STATE_DIR" -maxdepth 1 -name "*.json" -empty 2>/dev/null)
+fi
+
+if [ "$DO_AUTONOMY" = "1" ] && [ -d "$SESSIONS_ROOT" ]; then
+    while IFS= read -r f; do
+        AUTONOMY_FILES+=("$f")
+    done < <(find "$SESSIONS_ROOT" -maxdepth 2 -name ".autonomy-state" -empty 2>/dev/null)
+fi
+
+TOTAL=$((${#TASK_STATE_FILES[@]} + ${#AUTONOMY_FILES[@]}))
+
+if [ "$TOTAL" -eq 0 ]; then
+    echo "No empty state files found. Nothing to repair."
+    exit 0
+fi
+
+# --- Report ---
+echo "Empty state files found:"
+echo "  task-state: ${#TASK_STATE_FILES[@]}"
+echo "  autonomy:   ${#AUTONOMY_FILES[@]}"
+echo "  total:      $TOTAL"
+echo ""
+
+# --- Confirm ---
+if [ "$DRY_RUN" = "0" ] && [ "$FORCE" = "0" ]; then
+    read -r -p "Proceed with repair? [y/N] " ans
+    case "$ans" in
+        y|Y|yes|YES) ;;
+        *) echo "Aborted."; exit 0 ;;
+    esac
+fi
+
+# --- Repair ---
+echo ""
+echo "=== task-state files ==="
+for f in "${TASK_STATE_FILES[@]}"; do
+    repair_task_state "$f" || true
+done
+
+echo ""
+echo "=== autonomy-state files ==="
+for f in "${AUTONOMY_FILES[@]}"; do
+    repair_autonomy "$f" || true
+done
+
+echo ""
+if [ "$DRY_RUN" = "1" ]; then
+    echo "Dry run complete. $TOTAL files would be repaired."
+else
+    echo "Repair complete."
+    echo ""
+    echo "Remaining empty files:"
+    echo "  task-state: $(find "$TASK_STATE_DIR" -name "*.json" -empty 2>/dev/null | wc -l)"
+    echo "  autonomy:   $(find "$SESSIONS_ROOT" -name ".autonomy-state" -empty 2>/dev/null | wc -l)"
+fi

@@ -1,0 +1,16 @@
+id: BT-007
+title: "Live CLI fixes an intentional bug"
+tier: 1
+type: live-cli
+category: live-cli
+description: |
+  Claude fixes an intentional bug in the fixture project (a - b instead of a + b).
+  Validates that the fix is correct and audit trail is populated.
+prompt: "Read src/math_utils.py and fix the bug — the add function uses subtraction instead of addition. Fix it so the test in tests/test_math.py passes."
+model: haiku
+timeout: 120
+assertions:
+  - type: file_contains
+    path: src/math_utils.py
+    text: "a + b"
+  - type: audit_entry

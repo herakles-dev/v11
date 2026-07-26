@@ -1,0 +1,575 @@
+#!/bin/bash
+# V11.20 — swarm-review-attribute
+#
+# Read a swarm-review output (multi-lens parallel audit JSON or markdown) and
+# attribute every finding to the executing agent via file→task mapping. Writes
+# per-error lines to ~/.agent-metrics/agent-errors.jsonl with
+# found_by_layer="swarm" and an attribution_key for idempotent dedup.
+# Unmappable findings land in unattributed-findings.jsonl (never silently dropped).
+#
+# Sibling of wave-review-attribute. Differences: layer label, default report
+# paths, env rollback name (V11_SWARM_ATTRIBUTE), and a forward-compat markdown
+# parser for audit-report.md files. The existing audit-codebase pipeline does
+# NOT write audit-report.md — it stores findings in task_artifacts — so the
+# markdown parser is a hook for any downstream tool that emits the standard
+# ## Lens N format documented below.
+#
+# Usage:
+#   ./scripts/swarm-review-attribute PROJECT
+#   ./scripts/swarm-review-attribute PROJECT --report-file PATH
+#   ./scripts/swarm-review-attribute PROJECT --dry-run
+#   ./scripts/swarm-review-attribute PROJECT --mark-done
+#
+# Rollback: V11_SWARM_ATTRIBUTE=off causes the script to exit 0 immediately.
+#
+# Report path resolution (tried in order):
+#   1. --report-file PATH (explicit; .md auto-parsed)
+#   2. sessions/PROJECT/audit-report.json   (preferred — structured)
+#   3. sessions/PROJECT/audit-report.md     (markdown — parsed via lens-block heuristic)
+#
+# Verdict shape extraction (JSON, tried in order, first non-empty wins):
+#   .review.findings, .review.errors, .findings, .errors
+#
+# Markdown parsing (audit-report.md format):
+#   ## Lens N: NAME       → lens block (lens name carried into found_by)
+#   ### [SEVERITY] TITLE  → finding header
+#   **File**: `PATH`      → finding file
+#   **Line**: N           → finding line (optional)
+#   Following text        → finding detail (until next ### or ## Lens)
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+V11_HOME="${V11_HOME:-$(dirname "$SCRIPT_DIR")}"
+# shellcheck source=../hooks/lib/common.sh
+source "$V11_HOME/hooks/lib/common.sh"
+
+usage() {
+    cat <<'HELP'
+V11.20 swarm-review-attribute — attribute swarm-audit findings to executing agents
+
+USAGE:
+    ./scripts/swarm-review-attribute PROJECT [--mark-done] [--dry-run] [--quiet]
+    ./scripts/swarm-review-attribute PROJECT --report-file PATH [--mark-done] [--dry-run]
+
+OPTIONS:
+    --report-file PATH   Explicit path to report (JSON or markdown; .md is parsed)
+    --mark-done          Also call review-queue mark-done for any covered tasks
+                         with severity = max across that task's findings
+    --dry-run            Show what would be attributed; write nothing
+    --quiet              Suppress per-finding stderr; only summary
+
+EXIT CODES:
+    0    Success (including dry-run and V11_SWARM_ATTRIBUTE=off rollback)
+    1    Invalid arguments or missing report file
+    2    Report file exists but is unparseable
+
+ENV ROLLBACK:
+    V11_SWARM_ATTRIBUTE=off    Disable the script entirely (exits 0)
+HELP
+}
+
+if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ] || [ $# -lt 1 ]; then
+    usage
+    exit 0
+fi
+
+# Rollback gate — exits silently for callers expecting success
+if [ "${V11_SWARM_ATTRIBUTE:-}" = "off" ]; then
+    echo "[swarm-review-attribute] V11_SWARM_ATTRIBUTE=off — skipping" >&2
+    exit 0
+fi
+
+# --- Arg parsing ---
+PROJECT=""
+REPORT_FILE=""
+MARK_DONE=false
+DRY_RUN=false
+QUIET=false
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --report-file)  REPORT_FILE="${2:-}"; shift 2 ;;
+        --mark-done)    MARK_DONE=true; shift ;;
+        --dry-run)      DRY_RUN=true; shift ;;
+        --quiet)        QUIET=true; shift ;;
+        --help|-h)      usage; exit 0 ;;
+        --*)            echo "swarm-review-attribute: unknown flag: $1" >&2; exit 1 ;;
+        *)
+            if [ -z "$PROJECT" ]; then PROJECT="$1"
+            else echo "swarm-review-attribute: unexpected arg: $1" >&2; exit 1
+            fi
+            shift ;;
+    esac
+done
+
+if [ -z "$PROJECT" ]; then
+    echo "swarm-review-attribute: PROJECT required" >&2
+    exit 1
+fi
+
+if ! [[ "$PROJECT" =~ ^[A-Za-z0-9_.-]+$ ]]; then
+    echo "swarm-review-attribute: invalid PROJECT name (must match ^[A-Za-z0-9_.-]+$): $PROJECT" >&2
+    exit 1
+fi
+
+# --- Resolve report file ---
+if [ -z "$REPORT_FILE" ]; then
+    CAND_JSON="${SESSIONS_ROOT:-$V11_WORKSPACE_ROOT/sessions}/$PROJECT/audit-report.json"
+    CAND_MD="${SESSIONS_ROOT:-$V11_WORKSPACE_ROOT/sessions}/$PROJECT/audit-report.md"
+    if [ -f "$CAND_JSON" ]; then
+        REPORT_FILE="$CAND_JSON"
+    elif [ -f "$CAND_MD" ]; then
+        REPORT_FILE="$CAND_MD"
+    else
+        echo "swarm-review-attribute: no report at $CAND_JSON or $CAND_MD" >&2
+        exit 1
+    fi
+fi
+
+if [ ! -f "$REPORT_FILE" ]; then
+    echo "swarm-review-attribute: report file does not exist: $REPORT_FILE" >&2
+    exit 1
+fi
+
+# Compute caller_kind once for the whole batch (the agent running the attribute
+# step). Empty under V11_CALLER_KIND=off → field omitted from emitted lines.
+CALLER_KIND=$(v11_caller_kind 2>/dev/null || true)
+
+# --- Run the Python attribution engine ---
+V11_SRA_PROJECT="$PROJECT" \
+V11_SRA_REPORT="$REPORT_FILE" \
+V11_SRA_METRICS="${METRICS_DIR:-$V11_WORKSPACE_ROOT/.agent-metrics}" \
+V11_SRA_DRY_RUN="$DRY_RUN" \
+V11_SRA_QUIET="$QUIET" \
+V11_SRA_MARK_DONE="$MARK_DONE" \
+V11_SRA_CALLER_KIND="$CALLER_KIND" \
+V11_SRA_TASK_STATE_DIR="${TASK_STATE_DIR:-$V11_WORKSPACE_ROOT/.agent-metrics/task-state}" \
+V11_SRA_V11_WORKSPACE_ROOT="${V11_WORKSPACE_ROOT:-$HOME/.v11}" \
+V11_SRA_V11_HOME="$V11_HOME" \
+V11_SRA_REVIEW_QUEUE_SCRIPT="$V11_HOME/scripts/review-queue" \
+python3 - <<'PYEOF'
+import os, sys, json, hashlib, datetime, fcntl, pathlib, subprocess, re
+
+project       = os.environ["V11_SRA_PROJECT"]
+if not re.match(r'^[A-Za-z0-9_.-]+$', project):
+    print(f"[swarm-review-attribute] invalid project name: {project!r}", file=sys.stderr)
+    sys.exit(1)
+report_path   = os.environ["V11_SRA_REPORT"]
+metrics       = pathlib.Path(os.environ["V11_SRA_METRICS"])
+dry_run       = os.environ.get("V11_SRA_DRY_RUN", "false") == "true"
+quiet         = os.environ.get("V11_SRA_QUIET", "false") == "true"
+mark_done     = os.environ.get("V11_SRA_MARK_DONE", "false") == "true"
+caller_kind   = os.environ.get("V11_SRA_CALLER_KIND", "") or ""
+task_state_dir = pathlib.Path(os.environ["V11_SRA_TASK_STATE_DIR"])
+workspace_root = os.environ.get("V11_SRA_V11_WORKSPACE_ROOT", os.path.expanduser("~/.v11")).rstrip("/")
+v11_home      = os.environ.get("V11_SRA_V11_HOME", os.path.expanduser("~/.v11/v11")).rstrip("/")
+review_queue  = os.environ.get("V11_SRA_REVIEW_QUEUE_SCRIPT", "")
+
+LAYER = "swarm"
+
+# --- Markdown parser (audit-report.md) ---
+# Format (loose; conservative — ambiguous content routes to unattributed):
+#   ## Lens N: NAME            (lens block header)
+#   ### [SEVERITY] TITLE       (finding header within a lens)
+#   **File**: `PATH`           (optional)
+#   **Line**: N                (optional)
+#   Body text...               (finding detail until next ### or ## Lens)
+SEV_PAT = re.compile(r"###\s*\[(CRITICAL|HIGH|MEDIUM|LOW)\]\s*(.*)", re.IGNORECASE)
+LENS_PAT = re.compile(r"##\s*Lens\s+\d+\s*:\s*(.+)", re.IGNORECASE)
+FILE_PAT = re.compile(r"\*\*File\*\*\s*:\s*`([^`]+)`")
+LINE_PAT = re.compile(r"\*\*Line\*\*\s*:\s*(\d+)")
+
+def parse_markdown_findings(text):
+    """Return list of dicts: {id, severity, type, file, line, detail, lens}."""
+    findings = []
+    cur_lens = "unknown"
+    cur = None
+    finding_idx = 0
+    for raw in text.splitlines():
+        line = raw.rstrip()
+        m_lens = LENS_PAT.match(line)
+        if m_lens:
+            # Flush current finding before lens transition
+            if cur:
+                findings.append(cur)
+                cur = None
+            cur_lens = m_lens.group(1).strip().lower().replace(" ", "_")
+            continue
+        m_sev = SEV_PAT.match(line)
+        if m_sev:
+            if cur:
+                findings.append(cur)
+            finding_idx += 1
+            cur = {
+                "id": f"M{finding_idx}",
+                "severity": m_sev.group(1).upper(),
+                "title": m_sev.group(2).strip(),
+                "type": cur_lens or "unknown",
+                "file": "",
+                "line": None,
+                "detail": "",
+                "lens": cur_lens,
+            }
+            continue
+        if cur is None:
+            continue
+        m_file = FILE_PAT.search(line)
+        if m_file:
+            cur["file"] = m_file.group(1).strip()
+            continue
+        m_line = LINE_PAT.search(line)
+        if m_line:
+            try:
+                cur["line"] = int(m_line.group(1))
+            except Exception:
+                pass
+            continue
+        # Accumulate non-metadata body text as detail (cap at 500)
+        if line and not line.startswith("**"):
+            if len(cur["detail"]) < 500:
+                cur["detail"] = (cur["detail"] + " " + line).strip()[:500]
+    if cur:
+        findings.append(cur)
+    # Use 'title' as fallback detail when body was empty
+    for f in findings:
+        if not f["detail"]:
+            f["detail"] = f.get("title", "")
+    return findings
+
+# --- Load report (JSON or markdown) ---
+default_reviewer = "swarm-review"
+is_markdown = report_path.endswith(".md")
+
+if is_markdown:
+    try:
+        with open(report_path, "r", encoding="utf-8") as f:
+            md_text = f.read()
+    except OSError as e:
+        print(f"swarm-review-attribute: cannot read {report_path}: {e}", file=sys.stderr)
+        sys.exit(2)
+    findings = parse_markdown_findings(md_text)
+    verdict = {}
+else:
+    try:
+        with open(report_path, "r", encoding="utf-8") as f:
+            verdict = json.load(f)
+    except (OSError, json.JSONDecodeError) as e:
+        print(f"swarm-review-attribute: failed to parse {report_path}: {e}", file=sys.stderr)
+        sys.exit(2)
+
+    def _extract_findings(v):
+        if not isinstance(v, dict):
+            return []
+        for path in (("review", "findings"), ("review", "errors"),
+                     ("findings",), ("errors",)):
+            cur = v
+            ok = True
+            for k in path:
+                if isinstance(cur, dict) and k in cur:
+                    cur = cur[k]
+                else:
+                    ok = False
+                    break
+            if ok and isinstance(cur, list) and cur:
+                return cur
+        # Swarm-specific: also try .lenses[*].findings flattened
+        lenses = v.get("lenses")
+        if isinstance(lenses, list):
+            out = []
+            for lens in lenses:
+                if not isinstance(lens, dict):
+                    continue
+                lens_name = lens.get("name") or lens.get("lens") or "unknown"
+                for f in (lens.get("findings") or []):
+                    if isinstance(f, dict):
+                        f.setdefault("lens", lens_name)
+                        out.append(f)
+            if out:
+                return out
+        return []
+
+    findings = _extract_findings(verdict)
+
+reviewer = (verdict.get("reviewer") if isinstance(verdict, dict) else None) or default_reviewer
+
+if not findings:
+    print(f"[swarm-review-attribute] {report_path}: 0 findings (nothing to attribute)", file=sys.stderr)
+    sys.exit(0)
+
+# --- Load aggregate state for file→task resolution ---
+state_file = task_state_dir / f"{project}.json"
+state = {}
+if state_file.exists():
+    try:
+        state = json.loads(state_file.read_text())
+    except Exception as e:
+        print(f"swarm-review-attribute: task-state for {project} unreadable ({e}); "
+              f"all findings will be unattributed", file=sys.stderr)
+
+artifacts = state.get("task_artifacts") or {}
+recent_completed = state.get("recent_completed") or []
+# Legacy fleet data may contain non-dict entries here. Guard with isinstance
+# (mirror of T5 fix; same legacy shape can affect any project).
+completed_at_by_id = {}
+for r in recent_completed:
+    if not isinstance(r, dict):
+        continue
+    tid = r.get("id")
+    if tid:
+        completed_at_by_id[str(tid)] = r.get("at", "")
+
+# Build (task_id, agent_id, completed_at) lookup
+recommended_agents = state.get("recommended_agents") or {}
+active_agent = state.get("active_agent_id") or ""
+
+def resolve_agent_for_task(tid):
+    """Look up the agent who owned a task: recommended_agents > active_agent > 'unattributed'."""
+    a = recommended_agents.get(str(tid)) or active_agent
+    return a or "unattributed"
+
+# --- File→task resolution (mirrors v11_resolve_file_to_task; pure Python) ---
+def resolve_file_to_task(file_):
+    if not file_ or not artifacts:
+        return None  # caller routes to unattributed-findings.jsonl
+    cand = {file_}
+    if file_.startswith("/"):
+        if file_.startswith(v11_home + "/"):
+            cand.add(file_[len(v11_home)+1:])
+        if file_.startswith(workspace_root + "/"):
+            cand.add(file_[len(workspace_root)+1:])
+    else:
+        cand.add(f"{v11_home}/{file_}")
+        cand.add(f"{workspace_root}/{file_}")
+    basename = os.path.basename(file_) if "/" in file_ else file_
+
+    matches = []  # (quality, completed_at, tid_num, tid_str)
+    for tid_raw, art in artifacts.items():
+        if not isinstance(art, dict):
+            continue
+        files = art.get("files_changed") or []
+        quality = 0
+        for f in files:
+            if not isinstance(f, str):
+                continue
+            if f in cand:
+                quality = max(quality, 2)
+                break
+            if os.path.basename(f) == basename:
+                quality = max(quality, 1)
+        if quality == 0:
+            continue
+        tid_str = str(tid_raw)
+        try:
+            tid_num = int(tid_str)
+        except Exception:
+            tid_num = -1
+        matches.append((quality, completed_at_by_id.get(tid_str, ""), tid_num, tid_str))
+
+    if not matches:
+        return None
+    matches.sort(key=lambda m: (m[0], m[1], m[2], m[3]), reverse=True)
+    return matches[0][3]  # task_id
+
+
+# --- Attribution_key formula (BYTE-IDENTICAL to v11_compute_attribution_key) ---
+def attribution_key(proj, tid, file_, line_, eid):
+    parts = [
+        proj or "",
+        tid or "",
+        file_ or "",
+        "" if line_ is None else str(line_),
+        eid or "",
+    ]
+    return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()
+
+
+# --- Load already-attributed keys for idempotency ---
+keys_path = metrics / "attribution-keys.jsonl"
+seen_keys = set()
+if keys_path.exists():
+    try:
+        for line in keys_path.read_text().splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                ev = json.loads(line)
+                if ev.get("attribution_key"):
+                    seen_keys.add(ev["attribution_key"])
+            except (json.JSONDecodeError, TypeError) as e:
+                print(f"[swarm-review-attribute] corrupt attribution-keys line skipped: {e}", file=sys.stderr)
+                continue
+    except OSError:
+        pass
+
+
+# --- Atomic JSONL appender (flock-serialized) ---
+def append_jsonl(path: pathlib.Path, lines):
+    if not lines:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a", encoding="utf-8") as fh:
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        for ln in lines:
+            fh.write(json.dumps(ln, separators=(",", ":")) + "\n")
+        fcntl.flock(fh, fcntl.LOCK_UN)
+
+
+# --- Walk findings ---
+SEV_RANK = {"CRITICAL": 4, "HIGH": 3, "MEDIUM": 2, "LOW": 1}
+now = datetime.datetime.now().isoformat(timespec="seconds")
+
+errors_to_append = []
+keys_to_append = []
+unattributed_to_append = []
+attributed = 0
+skipped_seen = 0
+unattributed = 0
+per_task_max_sev = {}  # task_id → highest severity for --mark-done
+
+for f in findings:
+    if not isinstance(f, dict):
+        continue
+    eid = f.get("id") or ""
+    sev = (f.get("severity") or "LOW").upper()
+    if sev not in SEV_RANK:
+        sev = "LOW"
+    e_file = f.get("file") or ""
+    e_line = f.get("line")
+    e_type = f.get("type") or "unknown"
+
+    # Resolve task_id from file
+    tid = resolve_file_to_task(e_file)
+
+    if tid is None:
+        # Compute a key for dedup. Two cases:
+        # (a) We have a file → use the standard formula with task_id="" so the
+        #     key changes from any future "attributed" entry for the same finding
+        #     (different task_id segment); idempotent across reruns until task-state
+        #     catches up and the finding becomes attributable.
+        # (b) No file → key from (project, eid, error_type, source_report) so file-less
+        #     findings still dedup; otherwise every rerun would re-append the same
+        #     unattributable finding (reviewer E2 dogfood, 2026-05-23).
+        if e_file:
+            key = attribution_key(project, "", e_file, e_line, eid)
+        else:
+            # Synthetic key for file-less findings; report path keeps separate verdicts distinct.
+            key = hashlib.sha256(
+                "|".join(["UNATTR", project, eid, e_type, report_path]).encode("utf-8")
+            ).hexdigest()
+        if key in seen_keys:
+            skipped_seen += 1
+            continue
+        reason = "file_outside_task_scope" if e_file else "file_missing_in_artifacts"
+        if not artifacts:
+            reason = "no_completed_tasks_in_project"
+        entry = {
+            "timestamp": now,
+            "project": project,
+            "file": e_file,
+            "line": e_line,
+            "error_id": eid,
+            "severity": sev,
+            "error_type": e_type,
+            "error_message": (f.get("detail") or "")[:500],
+            "found_by": reviewer,
+            "found_by_layer": LAYER,
+            "reason": reason,
+            "source_report": report_path,
+            "attribution_key": key,
+        }
+        unattributed_to_append.append(entry)
+        # E2 fix: also append to attribution-keys.jsonl with task_id=null/agent_id=null
+        # so dedup state survives across runs (seen_keys is rebuilt from disk each run).
+        keys_to_append.append({
+            "attribution_key": key,
+            "layer": LAYER,
+            "attributed_at": now,
+            "project": project,
+            "task_id": None,
+            "agent_id": None,
+        })
+        seen_keys.add(key)
+        unattributed += 1
+        if not quiet:
+            print(f"[unattributed] {e_file}:{e_line} [{sev}] {eid} reason={reason}", file=sys.stderr)
+        continue
+
+    agent_id = resolve_agent_for_task(tid)
+    key = attribution_key(project, tid, e_file, e_line, eid)
+    if key in seen_keys:
+        skipped_seen += 1
+        if not quiet:
+            print(f"[skip:seen] {e_file}:{e_line} [{sev}] task={tid} agent={agent_id}", file=sys.stderr)
+        continue
+
+    # Track per-task max severity for --mark-done. Always store normalized severity
+    # in per_task_max_sev (guaranteed by `if sev not in SEV_RANK: sev = "LOW"` above);
+    # subscript both sides for clarity (reviewer E1 cleanup).
+    _cur_sev = per_task_max_sev.get(tid, "LOW")
+    if SEV_RANK[sev] > SEV_RANK[_cur_sev]:
+        per_task_max_sev[tid] = sev
+
+    # Swarm: encode lens name in found_by so cross-layer scorecard can split
+    # by which lens caught what. Falls back to plain `reviewer` if no lens.
+    lens_name = f.get("lens") or ""
+    found_by_val = f"{reviewer}:{lens_name}" if lens_name else reviewer
+    line = {
+        "timestamp": now,
+        "task_id": tid,
+        "agent_id": agent_id,
+        "error_type": e_type,
+        "severity": sev,
+        "error_message": (f.get("detail") or "")[:500],
+        "found_by": found_by_val,
+        "fix_suggested": (f.get("fix_hint") or "")[:300],
+        "fixed": False,
+        "escalated": (sev == "CRITICAL"),
+        "trace_id": (verdict.get("trace_id") if isinstance(verdict, dict) else None),
+        "project": project,
+        "found_by_layer": LAYER,
+        "task_id_inferred": True,
+        "attribution_key": key,
+    }
+    if caller_kind:
+        line["caller_kind"] = caller_kind
+
+    errors_to_append.append(line)
+    keys_to_append.append({
+        "attribution_key": key,
+        "layer": LAYER,
+        "attributed_at": now,
+        "project": project,
+        "task_id": tid,
+        "agent_id": agent_id,
+    })
+    seen_keys.add(key)
+    attributed += 1
+    if not quiet:
+        print(f"[attribute] {e_file}:{e_line} [{sev}] {eid} task={tid} agent={agent_id}", file=sys.stderr)
+
+# --- Persist (unless dry-run) ---
+if not dry_run:
+    append_jsonl(metrics / "agent-errors.jsonl", errors_to_append)
+    append_jsonl(metrics / "attribution-keys.jsonl", keys_to_append)
+    append_jsonl(metrics / "unattributed-findings.jsonl", unattributed_to_append)
+
+    if mark_done and review_queue and per_task_max_sev:
+        for tid, sev in per_task_max_sev.items():
+            try:
+                subprocess.run(
+                    [review_queue, "mark-done", project, str(tid), sev],  # positional SEV (V11.28.1: was "--severity" sev → flag leaked into the value)
+                    timeout=10, check=False,
+                    stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                )
+            except Exception:
+                pass  # Best-effort; never fail the attribute script over this
+
+# --- Summary ---
+agents_covered = len({l["agent_id"] for l in errors_to_append})
+mode = "[DRY-RUN]" if dry_run else "[applied]"
+src = pathlib.Path(report_path).name
+print(f"{mode} {src}: {attributed} attributed → {agents_covered} agents "
+      f"({unattributed} unattributed, {skipped_seen} already-seen)", file=sys.stderr)
+PYEOF

@@ -1,0 +1,103 @@
+#!/bin/bash
+# V11 Archive - Move a completed project session to archive
+# Usage: ./scripts/archive PROJECT [--dry-run] [--force]
+#
+# Archives a V11 project session. Only runs when ALL tasks are completed
+# and all sprint gates have passed. Use handoff (not archive) for paused work.
+#
+# Creates: sessions/archive/PROJECT-YYYYMMDD-HHMMSS/
+# Writes:  sessions/archive/PROJECT-YYYYMMDD-HHMMSS/archive-manifest.json
+
+set -euo pipefail
+
+V11_WORKSPACE_ROOT="${V11_WORKSPACE_ROOT:-$HOME/.v11}"
+SESSIONS_ROOT="${SESSIONS_ROOT:-$V11_WORKSPACE_ROOT/sessions}"
+ARCHIVE_ROOT="$SESSIONS_ROOT/archive"
+V11_HOME="${V11_HOME:-$V11_WORKSPACE_ROOT/v11}"
+
+# ── Args ──────────────────────────────────────────────────────────────────────
+PROJECT="${1:-}"
+DRY_RUN=false
+FORCE=false
+
+for arg in "${@:2}"; do
+  case "$arg" in
+    --dry-run) DRY_RUN=true ;;
+    --force)   FORCE=true ;;
+    *) echo "Unknown option: $arg" >&2; exit 1 ;;
+  esac
+done
+
+if [[ -z "$PROJECT" ]]; then
+  echo "Usage: archive PROJECT [--dry-run] [--force]" >&2
+  exit 1
+fi
+
+SESSION_DIR="$SESSIONS_ROOT/$PROJECT"
+
+if [[ ! -d "$SESSION_DIR" ]]; then
+  echo "ERROR: Session directory not found: $SESSION_DIR" >&2
+  exit 1
+fi
+
+# ── Gate: all tasks must be completed ─────────────────────────────────────────
+TASK_STATE="$SESSION_DIR/.task-state.json"
+if [[ -f "$TASK_STATE" ]]; then
+  PENDING=$(jq '[.tasks[]? | select(.status != "completed")] | length' "$TASK_STATE" 2>/dev/null || echo "0")
+  if [[ "$PENDING" -gt 0 && "$FORCE" != "true" ]]; then
+    echo "ERROR: $PENDING task(s) not completed. Archive requires all tasks done." >&2
+    echo "  Use --force to override, or 'handoff' to pause instead." >&2
+    exit 1
+  fi
+fi
+
+# ── Gate: no active formation ─────────────────────────────────────────────────
+FORMATION_FILE="$SESSION_DIR/.formation-registry.json"
+if [[ -f "$FORMATION_FILE" ]]; then
+  ACTIVE=$(jq '[.agents[]? | select(.agent_id != null)] | length' "$FORMATION_FILE" 2>/dev/null || echo "0")
+  if [[ "$ACTIVE" -gt 0 && "$FORCE" != "true" ]]; then
+    echo "ERROR: $ACTIVE active teammate(s) still running. Stop formation before archiving." >&2
+    exit 1
+  fi
+fi
+
+# ── Build archive path ─────────────────────────────────────────────────────────
+TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+ARCHIVE_PATH="$ARCHIVE_ROOT/${PROJECT}-${TIMESTAMP}"
+
+if [[ "$DRY_RUN" == "true" ]]; then
+  echo "DRY RUN — would archive:"
+  echo "  FROM: $SESSION_DIR"
+  echo "  TO:   $ARCHIVE_PATH"
+  echo ""
+  echo "Session contents:"
+  ls -la "$SESSION_DIR"
+  exit 0
+fi
+
+# ── Archive ────────────────────────────────────────────────────────────────────
+mkdir -p "$ARCHIVE_ROOT"
+cp -r "$SESSION_DIR" "$ARCHIVE_PATH"
+
+# Write manifest
+TASK_COUNT=$(jq '.tasks | length' "$TASK_STATE" 2>/dev/null || echo "unknown")
+COMPLETED=$(jq '[.tasks[]? | select(.status == "completed")] | length' "$TASK_STATE" 2>/dev/null || echo "unknown")
+
+cat > "$ARCHIVE_PATH/archive-manifest.json" <<EOF
+{
+  "project": "$PROJECT",
+  "archived_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+  "archived_by": "v11-archive",
+  "source_path": "$SESSION_DIR",
+  "archive_path": "$ARCHIVE_PATH",
+  "tasks_total": $TASK_COUNT,
+  "tasks_completed": $COMPLETED,
+  "forced": $FORCE
+}
+EOF
+
+echo "Archived: $PROJECT → $ARCHIVE_PATH"
+echo "  Tasks: $COMPLETED/$TASK_COUNT completed"
+echo ""
+echo "Session directory preserved at original path."
+echo "To remove original: rm -rf $SESSION_DIR"

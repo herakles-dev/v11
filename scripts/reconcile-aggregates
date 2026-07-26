@@ -1,0 +1,300 @@
+#!/usr/bin/env bash
+# V11.23 scripts/reconcile-aggregates
+# ----------------------------------------------------------------------
+# One-shot maintenance: walk $TASK_STATE_DIR/*.json and detect tasks
+# whose metadata.project does NOT match the aggregate file's project name.
+# Report dry-run by default; --apply triggers per-session rebuild via the
+# in-process v11_rebuild_project_aggregate (which now does per-task routing
+# under V11_TASK_ROUTE_BY_METADATA=on, default on).
+#
+# This script is SAFE TO RE-RUN. It does not edit per-session state files;
+# it only triggers rebuild of the derived aggregates. Per-session state
+# carries metadata.project on each task, and that is the source of truth.
+#
+# Use cases:
+#   1. After installing V11.23, run --dry-run to discover existing leaks
+#      in every project's aggregate.
+#   2. Run --apply to force-rebuild every project's aggregate (cleans up
+#      pre-V11.23 cross-project leakage that's been accumulating).
+#   3. Audit a specific project with --project NAME (limits scope).
+#
+# Output: human-readable summary to stdout + JSON report to
+# $METRICS_DIR/reconcile-report.<timestamp>.json
+#
+# Rollback: this script is read-only by default. --apply triggers
+# v11_rebuild_project_aggregate which is itself gated by
+# V11_TASK_ROUTE_BY_METADATA (=on default, =off for legacy behavior).
+
+set -euo pipefail
+
+V11_HOME="${V11_HOME:-$HOME/v11}"
+V11_WORKSPACE_ROOT="${V11_WORKSPACE_ROOT:-$HOME/.v11}"
+
+# shellcheck source=/dev/null
+source "$V11_HOME/hooks/lib/common.sh"
+
+MODE="dry-run"
+TARGET_PROJECT=""
+VERBOSE="false"
+JSON_OUT=""
+
+usage() {
+    cat <<EOF
+Usage: reconcile-aggregates [--dry-run | --apply] [--project NAME] [--verbose] [--json PATH]
+
+Scans \$TASK_STATE_DIR/*.json and reports per-task metadata.project mismatches.
+Optionally re-runs the V11.23 per-task aggregate rebuild for each affected project
+(under --apply) to clean up cross-project leakage.
+
+Options:
+  --dry-run         (default) Report mismatches only. No changes.
+  --apply           Re-run v11_rebuild_project_aggregate for each affected project.
+  --project NAME    Limit scope to a single project.
+  --verbose         Print per-task detail (default: summary only).
+  --json PATH       Write JSON report to PATH (default: \$METRICS_DIR/reconcile-report.<ts>.json).
+  -h, --help        Show this help.
+
+Examples:
+  reconcile-aggregates --dry-run
+  reconcile-aggregates --project my-project --verbose
+  reconcile-aggregates --apply --project my-project
+EOF
+}
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --dry-run)  MODE="dry-run"; shift ;;
+        --apply)    MODE="apply"; shift ;;
+        --project)  TARGET_PROJECT="$2"; shift 2 ;;
+        --verbose)  VERBOSE="true"; shift ;;
+        --json)     JSON_OUT="$2"; shift 2 ;;
+        -h|--help)  usage; exit 0 ;;
+        *)          echo "Unknown arg: $1" >&2; usage; exit 2 ;;
+    esac
+done
+
+NOW=$(date -Iseconds)
+NOW_FILE=$(date +%Y%m%dT%H%M%S)
+if [ -z "$JSON_OUT" ]; then
+    JSON_OUT="$METRICS_DIR/reconcile-report.${NOW_FILE}.json"
+fi
+
+if [ ! -d "$TASK_STATE_DIR" ]; then
+    echo "reconcile-aggregates: TASK_STATE_DIR not found: $TASK_STATE_DIR" >&2
+    exit 1
+fi
+
+mkdir -p "$(dirname "$JSON_OUT")" 2>/dev/null || true
+
+# Build aggregate file list
+AGG_FILES=()
+if [ -n "$TARGET_PROJECT" ]; then
+    f="$TASK_STATE_DIR/${TARGET_PROJECT}.json"
+    if [ -f "$f" ]; then
+        AGG_FILES+=("$f")
+    else
+        echo "reconcile-aggregates: no aggregate for '$TARGET_PROJECT' at $f" >&2
+        exit 1
+    fi
+else
+    for f in "$TASK_STATE_DIR"/*.json; do
+        [ -f "$f" ] || continue
+        # Skip non-aggregate files (e.g., lock files, hidden, dotfiles)
+        base="$(basename "$f" .json)"
+        [[ "$base" == .* ]] && continue
+        AGG_FILES+=("$f")
+    done
+fi
+
+if [ "${#AGG_FILES[@]}" -eq 0 ]; then
+    echo "reconcile-aggregates: no aggregate files found"
+    exit 0
+fi
+
+# Per-aggregate analysis. For each aggregate:
+#   - project_name = filename stem
+#   - For each task in open_tasks_by_session:
+#       * if task.metadata.project is set and != project_name -> MISMATCH
+#       * if task.metadata.project is null/missing -> UNSTAMPED (legacy)
+#       * if task.metadata.project == project_name -> CLEAN
+#   - Same for recent_completed[]
+# Output: per-aggregate counts {clean, unstamped, mismatched, mismatched_by_project}
+
+RESULTS_JSON="["
+first_result=1
+
+TOTAL_AGG=0
+TOTAL_MISMATCH=0
+TOTAL_UNSTAMPED=0
+TOTAL_CLEAN=0
+AFFECTED_PROJECTS=()
+
+for agg_file in "${AGG_FILES[@]}"; do
+    proj="$(basename "$agg_file" .json)"
+    TOTAL_AGG=$((TOTAL_AGG + 1))
+
+    if ! jq empty "$agg_file" 2>/dev/null; then
+        echo "  ⚠ skip: invalid JSON in $agg_file" >&2
+        continue
+    fi
+
+    # Per-task analysis via jq. Walk open_tasks_by_session and recent_completed.
+    # Defensive: legacy aggregates may have mixed-type entries (strings, nulls,
+    # objects with no metadata field) — guard each indexing with type checks.
+    analysis=$(jq -c --arg p "$proj" '
+        ([(.open_tasks_by_session // {}) | to_entries[]
+          | .key as $sid
+          | (.value | if type == "object" then to_entries[] else empty end
+              | .key as $tid
+              | (if (.value | type) == "object" then (.value.metadata.project // null) else null end) as $mp
+              | {
+                  sid: $sid,
+                  tid: $tid,
+                  subject: (if (.value | type) == "object" then (.value.subject // null) else null end),
+                  status: (if (.value | type) == "object" then (.value.status // null) else null end),
+                  metadata_project: $mp,
+                  verdict: (
+                      if $mp == $p then "clean"
+                      elif $mp == null then "unstamped"
+                      else "mismatch"
+                      end
+                  )
+              })
+         ]) as $open_tasks
+        | ([(.recent_completed // [])[]
+            | select(type == "object")
+            | (.metadata.project // null) as $mp
+            | {
+                tid: (.id // null),
+                subject: (.subject // null),
+                metadata_project: $mp,
+                verdict: (
+                    if $mp == $p then "clean"
+                    elif $mp == null then "unstamped"
+                    else "mismatch"
+                    end
+                )
+            }
+          ]) as $recent
+        | {
+            project: $p,
+            open: {
+                total: ($open_tasks | length),
+                clean:      [$open_tasks[] | select(.verdict == "clean")]      | length,
+                unstamped:  [$open_tasks[] | select(.verdict == "unstamped")]  | length,
+                mismatch:   [$open_tasks[] | select(.verdict == "mismatch")]   | length,
+                mismatched_by_project: (
+                    [$open_tasks[] | select(.verdict == "mismatch") | .metadata_project]
+                    | group_by(.) | map({project: .[0], count: length})
+                ),
+                mismatch_examples: ([$open_tasks[] | select(.verdict == "mismatch")] | .[0:5] | map({tid, subject, claimed: .metadata_project}))
+            },
+            recent_completed: {
+                total: ($recent | length),
+                clean:      [$recent[] | select(.verdict == "clean")]      | length,
+                unstamped:  [$recent[] | select(.verdict == "unstamped")]  | length,
+                mismatch:   [$recent[] | select(.verdict == "mismatch")]   | length,
+                mismatched_by_project: (
+                    [$recent[] | select(.verdict == "mismatch") | .metadata_project]
+                    | group_by(.) | map({project: .[0], count: length})
+                )
+            }
+        }
+    ' "$agg_file")
+
+    open_total=$(echo "$analysis" | jq -r '.open.total')
+    open_clean=$(echo "$analysis" | jq -r '.open.clean')
+    open_unstamped=$(echo "$analysis" | jq -r '.open.unstamped')
+    open_mismatch=$(echo "$analysis" | jq -r '.open.mismatch')
+    rc_total=$(echo "$analysis" | jq -r '.recent_completed.total')
+    rc_mismatch=$(echo "$analysis" | jq -r '.recent_completed.mismatch')
+
+    TOTAL_MISMATCH=$((TOTAL_MISMATCH + open_mismatch + rc_mismatch))
+    TOTAL_UNSTAMPED=$((TOTAL_UNSTAMPED + open_unstamped))
+    TOTAL_CLEAN=$((TOTAL_CLEAN + open_clean))
+
+    if [ "$open_mismatch" -gt 0 ] || [ "$rc_mismatch" -gt 0 ]; then
+        AFFECTED_PROJECTS+=("$proj")
+        # Per-project summary line
+        printf "  ⚠ %-32s open: %d clean / %d unstamped / %d MISMATCH" "$proj" "$open_clean" "$open_unstamped" "$open_mismatch"
+        if [ "$rc_mismatch" -gt 0 ]; then
+            printf "  recent_completed: %d mismatch" "$rc_mismatch"
+        fi
+        printf "\n"
+        if [ "$VERBOSE" = "true" ]; then
+            echo "$analysis" | jq -r '.open.mismatched_by_project[]
+                | "      → claimed=" + (.project // "null") + " count=" + (.count | tostring)'
+            echo "$analysis" | jq -r '.open.mismatch_examples[]
+                | "      example: tid=" + (.tid // "?") + " claimed=" + (.claimed // "null") + " subject=" + (.subject // "?")[0:60]'
+        fi
+    else
+        printf "  ✓ %-32s open: %d clean / %d unstamped (no mismatch)\n" "$proj" "$open_clean" "$open_unstamped"
+    fi
+
+    # Accumulate JSON
+    if [ $first_result -eq 1 ]; then
+        first_result=0
+    else
+        RESULTS_JSON="${RESULTS_JSON},"
+    fi
+    RESULTS_JSON="${RESULTS_JSON}${analysis}"
+done
+
+RESULTS_JSON="${RESULTS_JSON}]"
+
+# Final summary block (compute once; reused for stdout + JSON envelope)
+echo
+echo "==============================================================="
+echo "Reconcile report — $NOW"
+echo "  Aggregates scanned: $TOTAL_AGG"
+echo "  Open tasks: clean=$TOTAL_CLEAN unstamped=$TOTAL_UNSTAMPED mismatch=$TOTAL_MISMATCH"
+echo "  Affected projects: ${#AFFECTED_PROJECTS[@]}"
+if [ "${#AFFECTED_PROJECTS[@]}" -gt 0 ]; then
+    printf "    %s\n" "${AFFECTED_PROJECTS[@]}"
+fi
+
+# Apply mode: rebuild every affected project (per-task routing will clean up
+# the mismatches; tasks that are actually for OTHER projects will be removed
+# from this aggregate AND will appear correctly in their owning project's
+# aggregate on next rebuild of that project).
+if [ "$MODE" = "apply" ] && [ "${#AFFECTED_PROJECTS[@]}" -gt 0 ]; then
+    echo
+    echo "Applying — rebuilding affected aggregates via per-task routing..."
+    rebuilt=0
+    failed=0
+    # Also rebuild any project that MIGHT receive tasks routed away from
+    # affected aggregates (i.e., projects mentioned as "claimed" in mismatch_by_project).
+    declare -A REBUILD_SET
+    for p in "${AFFECTED_PROJECTS[@]}"; do
+        REBUILD_SET["$p"]=1
+    done
+    # Mine claimed-project names from the JSON report and add them.
+    while IFS= read -r claimed; do
+        [ -n "$claimed" ] && [ "$claimed" != "null" ] && REBUILD_SET["$claimed"]=1
+    done < <(printf '%s' "$RESULTS_JSON" \
+        | jq -r '.[].open.mismatched_by_project[].project // empty' 2>/dev/null)
+    for p in "${!REBUILD_SET[@]}"; do
+        if v11_rebuild_project_aggregate "$p" >/dev/null 2>&1; then
+            rebuilt=$((rebuilt + 1))
+            echo "  ✓ rebuilt $p"
+        else
+            failed=$((failed + 1))
+            echo "  ✗ failed: $p"
+        fi
+    done
+    echo "  rebuilt=$rebuilt failed=$failed"
+fi
+
+# Write JSON envelope
+{
+    printf '{"ts":"%s","mode":"%s","total_aggregates":%d,"total_clean":%d,"total_unstamped":%d,"total_mismatch":%d,"affected_projects":' \
+        "$NOW" "$MODE" "$TOTAL_AGG" "$TOTAL_CLEAN" "$TOTAL_UNSTAMPED" "$TOTAL_MISMATCH"
+    printf '%s' "${AFFECTED_PROJECTS[@]+\"${AFFECTED_PROJECTS[*]// /\",\"}\"}" | jq -R 'split(" ") | map(select(. != ""))' 2>/dev/null || printf '[]'
+    printf ',"per_project":%s}\n' "$RESULTS_JSON"
+} > "$JSON_OUT" 2>/dev/null || true
+
+echo
+echo "JSON report: $JSON_OUT"
+
+# Exit code: 0 always (advisory). The mismatch count is in the JSON report.
+exit 0

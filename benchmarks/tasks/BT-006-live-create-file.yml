@@ -1,0 +1,18 @@
+id: BT-006
+title: "Live CLI creates a file with audit trail"
+tier: 1
+type: live-cli
+category: live-cli
+description: |
+  Real claude -p (Haiku) creates a file in a V11 project.
+  Validates that hooks fire and audit trail is populated.
+prompt: "Write a new file src/utils.py with a single function 'add(a, b)' that returns a+b. Do not create any other files."
+model: haiku
+timeout: 120
+assertions:
+  - type: file_exists
+    path: src/utils.py
+  - type: file_contains
+    path: src/utils.py
+    text: "def add"
+  - type: audit_entry

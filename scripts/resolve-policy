@@ -1,0 +1,133 @@
+#!/bin/bash
+# V11 Script: resolve-policy
+# Debug tool showing the tool policy resolution chain for an agent.
+#
+# Usage: ./scripts/resolve-policy AGENT_ID TOOL_NAME [REGISTRY_PATH]
+#   AGENT_ID:      Agent identifier (from .formation-registry.json)
+#   TOOL_NAME:     Tool to check (Read, Write, Edit, Bash, etc.)
+#   REGISTRY_PATH: Optional path to registry (default: .formation-registry.json)
+#
+# Shows the full 4-layer resolution chain and final decision.
+
+set -euo pipefail
+
+AGENT_ID="${1:-}"
+TOOL_NAME="${2:-}"
+REGISTRY_PATH="${3:-.formation-registry.json}"
+
+if [ -z "$AGENT_ID" ] || [ -z "$TOOL_NAME" ]; then
+    echo "Usage: $0 AGENT_ID TOOL_NAME [REGISTRY_PATH]"
+    echo ""
+    echo "  AGENT_ID:      Agent identifier (e.g., a123456)"
+    echo "  TOOL_NAME:     Tool to check (Read, Write, Edit, Bash, etc.)"
+    echo "  REGISTRY_PATH: Path to .formation-registry.json (default: .)"
+    echo ""
+    echo "Examples:"
+    echo "  $0 a123456 Write"
+    echo "  $0 a789012 Bash ./sessions/myproject/.formation-registry.json"
+    exit 1
+fi
+
+if [ ! -f "$REGISTRY_PATH" ]; then
+    echo "ERROR: Registry not found at $REGISTRY_PATH"
+    exit 1
+fi
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/../hooks/lib/common.sh"
+
+echo "Tool Policy Resolution Chain"
+echo "============================"
+echo "  Agent ID:  $AGENT_ID"
+echo "  Tool:      $TOOL_NAME"
+echo "  Registry:  $REGISTRY_PATH"
+echo ""
+
+# Find role
+ROLE=$(jq -r --arg aid "$AGENT_ID" '
+    .teammates // {} | to_entries[]
+    | select(.value.agent_id == $aid)
+    | .key
+' "$REGISTRY_PATH" 2>/dev/null)
+
+if [ -z "$ROLE" ]; then
+    echo "  Role:      NOT FOUND (agent $AGENT_ID not in registry)"
+    echo ""
+    echo "RESULT: ALLOWED (no policy applies — agent not registered)"
+    exit 0
+fi
+
+AGENT_TYPE=$(jq -r --arg aid "$AGENT_ID" '
+    .teammates // {} | to_entries[]
+    | select(.value.agent_id == $aid)
+    | .value.agent
+' "$REGISTRY_PATH" 2>/dev/null)
+
+echo "  Role:      $ROLE"
+echo "  Agent:     ${AGENT_TYPE:-unknown}"
+echo ""
+
+# Layer 1: Formation defaults
+echo "Layer 1: Formation Defaults"
+echo "───────────────────────────"
+DEFAULT_PROFILE=$(jq -r '.tool_policies.defaults.profile // "none"' "$REGISTRY_PATH" 2>/dev/null)
+DEFAULT_DENY=$(jq -r '.tool_policies.defaults.deny // [] | join(", ")' "$REGISTRY_PATH" 2>/dev/null)
+DEFAULT_ALLOW=$(jq -r '.tool_policies.defaults.allow // [] | join(", ")' "$REGISTRY_PATH" 2>/dev/null)
+echo "  Profile:   $DEFAULT_PROFILE"
+echo "  Deny:      ${DEFAULT_DENY:-none}"
+echo "  Allow:     ${DEFAULT_ALLOW:-none}"
+if [ "$DEFAULT_PROFILE" != "none" ]; then
+    DEFAULT_TOOLS=$(v11_expand_profile "$DEFAULT_PROFILE")
+    if v11_tool_in_list "$TOOL_NAME" "$DEFAULT_TOOLS"; then
+        echo "  → $TOOL_NAME IN profile '$DEFAULT_PROFILE'"
+    else
+        echo "  → $TOOL_NAME NOT in profile '$DEFAULT_PROFILE'"
+    fi
+fi
+echo ""
+
+# Layer 2: Role overrides
+echo "Layer 2: Role Overrides ($ROLE)"
+echo "───────────────────────────"
+ROLE_PROFILE=$(jq -r --arg role "$ROLE" '.tool_policies.per_role[$role].profile // "none"' "$REGISTRY_PATH" 2>/dev/null)
+ROLE_DENY=$(jq -r --arg role "$ROLE" '.tool_policies.per_role[$role].deny // [] | join(", ")' "$REGISTRY_PATH" 2>/dev/null)
+ROLE_ALLOW=$(jq -r --arg role "$ROLE" '.tool_policies.per_role[$role].allow // [] | join(", ")' "$REGISTRY_PATH" 2>/dev/null)
+echo "  Profile:   $ROLE_PROFILE"
+echo "  Deny:      ${ROLE_DENY:-none}"
+echo "  Allow:     ${ROLE_ALLOW:-none}"
+echo ""
+
+# Effective profile
+EFFECTIVE_PROFILE="$DEFAULT_PROFILE"
+[ "$ROLE_PROFILE" != "none" ] && EFFECTIVE_PROFILE="$ROLE_PROFILE"
+[ "$EFFECTIVE_PROFILE" = "none" ] && EFFECTIVE_PROFILE="full"
+
+echo "Effective Profile: $EFFECTIVE_PROFILE"
+echo "───────────────────────────"
+EFFECTIVE_TOOLS=$(v11_expand_profile "$EFFECTIVE_PROFILE")
+echo "  Tools: $EFFECTIVE_TOOLS"
+echo ""
+
+# Resolve
+echo "Resolution"
+echo "───────────────────────────"
+
+# Set env for resolution function
+export V11_AGENT_ID="$AGENT_ID"
+
+# Call directly (not in subshell) so V11_POLICY_REASON propagates
+# Use || true to prevent set -e from killing script on denied result
+POLICY_OUT=$(mktemp /tmp/v11-policy-XXXXXX.txt)
+trap "rm -f '$POLICY_OUT'" EXIT
+v11_resolve_tool_policy "$TOOL_NAME" "$REGISTRY_PATH" > "$POLICY_OUT" 2>/dev/null || true
+EXIT_CODE=${PIPESTATUS[0]:-$?}
+
+# Re-check: if V11_POLICY_REASON indicates denial, exit code is 1
+if [ -n "$V11_POLICY_REASON" ] && echo "$V11_POLICY_REASON" | grep -qE "denied|not in profile"; then
+    RESULT_MSG=$(cat "$POLICY_OUT")
+    echo "  RESULT: ✗ DENIED"
+    echo "  Reason: ${RESULT_MSG:-$V11_POLICY_REASON}"
+else
+    echo "  RESULT: ✓ ALLOWED"
+    echo "  Reason: ${V11_POLICY_REASON:-profile allows tool}"
+fi

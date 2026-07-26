@@ -1,0 +1,115 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "formation-registry.schema.json",
+  "title": "V11 Formation Registry",
+  "description": "Schema for .formation-registry.json — defines teammate roles, ownership, and agent assignments",
+  "type": "object",
+  "properties": {
+    "formation": {
+      "type": "string",
+      "description": "Formation name from pre-built patterns. 14 named formations + custom. Must stay in sync with V11_AGENT_REGISTRY.json formations section.",
+      "enum": [
+        "new-project", "feature-impl", "bug-investigation",
+        "security-review", "perf-optimization", "code-review",
+        "single-file", "lightweight-feature", "swebench-solver",
+        "business-launch", "all-hands-planning", "codebase-audit",
+        "deep-research", "pm-audit", "custom"
+      ]
+    },
+    "project": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Project identifier"
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "heartbeat_interval_minutes": {
+      "type": "integer",
+      "minimum": 5,
+      "maximum": 30,
+      "default": 10,
+      "description": "How frequently (in minutes) team lead should run heartbeat checks"
+    },
+    "tool_policies": { "$ref": "#/$defs/tool_policies" },
+    "teammates": {
+      "type": "object",
+      "additionalProperties": { "$ref": "#/$defs/teammate" },
+      "minProperties": 1,
+      "maxProperties": 5,
+      "description": "Max 5 teammates per formation"
+    }
+  },
+  "required": ["formation", "project", "teammates"],
+  "additionalProperties": false,
+  "$defs": {
+    "teammate": {
+      "type": "object",
+      "properties": {
+        "agent": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Agent name from registry (spec-*-v11 or any custom agent)"
+        },
+        "agent_id": {
+          "type": "string",
+          "description": "Unique agent instance ID"
+        },
+        "ownership": { "$ref": "#/$defs/ownership" },
+        "tool_policies": { "$ref": "#/$defs/policy_entry" }
+      },
+      "required": ["agent", "agent_id", "ownership"],
+      "additionalProperties": false
+    },
+    "ownership": {
+      "type": "object",
+      "properties": {
+        "directories": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Owned directory paths (prefix match)"
+        },
+        "files": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Owned file paths (exact match)"
+        },
+        "patterns": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Owned file glob patterns"
+        }
+      },
+      "additionalProperties": false
+    },
+    "tool_policies": {
+      "type": "object",
+      "properties": {
+        "defaults": { "$ref": "#/$defs/policy_entry" },
+        "per_role": {
+          "type": "object",
+          "additionalProperties": { "$ref": "#/$defs/policy_entry" }
+        }
+      },
+      "additionalProperties": false
+    },
+    "policy_entry": {
+      "type": "object",
+      "properties": {
+        "profile": {
+          "enum": ["full", "coding", "testing", "readonly", "minimal"]
+        },
+        "allow": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "deny": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

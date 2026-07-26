@@ -1,0 +1,194 @@
+#!/bin/bash
+# V11.28.2 Script: check-improve-subagent-triggers
+#
+# v11-loop-keystone task 4 ("Fix 2" in improvements/06-self-improving-loop-
+# keystone.md): mechanizes the improve-subagent actuator as a TASK-CREATION
+# TRIGGER — explicitly NOT silent auto-actuation. Per v11.27 doctrine
+# ("mechanize acknowledgment not actuation"), this script never runs
+# improve-subagent itself. It only detects threshold-crossing on the
+# self_review_miss calibration counter (already computed by
+# scripts/agent-scorecard, INV-3) and emits a structured "task-needed"
+# signal — either a human dashboard line or a JSONL TaskCreate suggestion —
+# for the ORCHESTRATOR (a Claude session, during DETECT) to read and act on.
+# This is the exact pattern already established by the "Review queue
+# (durable): N open" line in scripts/status (06dd1d4, v11.28.1 loop-audit):
+# a script surfaces a signal, the orchestrator decides whether to dispatch.
+#
+# Dependency note: this reads scripts/agent-scorecard's self_review_miss
+# calibration block, which is only meaningful once the INV-3 join-key fix
+# lands in hooks/sync-tasks (agent-errors.jsonl lite_adversarial entries
+# must be keyed on the PARENT work task's task_id, not the reviewer
+# sibling's own task_id — see improvements/06-self-improving-loop-keystone.md
+# "Fix 1"). If that fix is not yet present, paired_count_last30 will stay 0
+# for most/all agents and this script correctly stays silent — no false
+# positives, just no signal until real paired data exists.
+#
+# USAGE:
+#   check-improve-subagent-triggers PROJECT              # human dashboard lines
+#   check-improve-subagent-triggers PROJECT --json       # JSONL task-needed signals
+#   check-improve-subagent-triggers --test
+#   check-improve-subagent-triggers --help
+#
+# Dedup / cooldown (so the orchestrator isn't spammed every session):
+#   1. If an OPEN task in this project's task-state already carries
+#      metadata.trigger="calibration-miss" AND metadata.candidate_agent=AGENT,
+#      suppress unconditionally (the task already covers it).
+#   2. Otherwise, a marker file at
+#      sessions/PROJECT/.improve-subagent-triggered/AGENT.json records the
+#      last time a signal was emitted. Suppressed until
+#      V11_IMPROVE_SUBAGENT_COOLDOWN_DAYS (default 7) has elapsed.
+#   On emission, the marker is written/refreshed with signaled_at + the
+#   miss-rate snapshot that triggered it.
+#
+# Rollback: V11_IMPROVE_SUBAGENT_TRIGGER=off (default: on). When off, this
+# script produces no output and exits 0 — matches the V11 convention used by
+# V11_REVIEW_BACKSTOP / V11_CALLER_KIND_INFERENCE / etc.
+#
+# Exit codes:
+#   0    Success (including no-signal case)
+#   2    Bad arguments
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+V11_HOME="${V11_HOME:-$(dirname "$SCRIPT_DIR")}"
+# shellcheck source=../hooks/lib/common.sh
+source "$V11_HOME/hooks/lib/common.sh"
+
+if [ "${1:-}" = "--test" ]; then
+    echo "check-improve-subagent-triggers v1.0 (v11-loop-keystone T4)"
+    exit 0
+fi
+
+if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
+    sed -n '2,38p' "$0" | sed 's/^# \{0,1\}//'
+    exit 0
+fi
+
+# Rollback lever — silent no-op, never blocks.
+if [ "${V11_IMPROVE_SUBAGENT_TRIGGER:-on}" = "off" ]; then
+    exit 0
+fi
+
+PROJECT="${1:-}"
+JSON_OUTPUT=false
+if [ "${2:-}" = "--json" ] || [ "${1:-}" = "--json" ]; then
+    JSON_OUTPUT=true
+fi
+if [ "$PROJECT" = "--json" ]; then
+    PROJECT=""
+fi
+
+if [ -z "$PROJECT" ]; then
+    PROJECT="$(v11_read_active_project 2>/dev/null || true)"
+fi
+if [ -z "$PROJECT" ]; then
+    echo "check-improve-subagent-triggers: no PROJECT and no active-project — pass project explicitly" >&2
+    exit 2
+fi
+
+SESSION_DIR="$SESSIONS_ROOT/$PROJECT"
+TASK_STATE="$SESSION_DIR/.task-state.json"
+COOLDOWN_DAYS="${V11_IMPROVE_SUBAGENT_COOLDOWN_DAYS:-7}"
+
+[ -f "$TASK_STATE" ] || exit 0   # nothing to check — no task-state yet
+
+# Candidate agents: anyone recommended for a task, or who has emitted a
+# self_review, in this project. Bounded scan — no cross-project fan-out.
+CANDIDATES=$(jq -r '
+    ([ (.recommended_agents // {}) | to_entries[]? | .value ]
+     + [ (.task_artifacts // {}) | to_entries[]?
+         | (.value.self_review.agent_id // .value.agent_id) ])
+    | map(select(. != null and . != "" and . != "unknown"))
+    | unique | .[]
+' "$TASK_STATE" 2>/dev/null || true)
+
+[ -n "$CANDIDATES" ] || exit 0
+
+JSON_LINES=()
+HUMAN_LINES=()
+
+while IFS= read -r AGENT; do
+    [ -n "$AGENT" ] || continue
+
+    SC_JSON=$("$SCRIPT_DIR/agent-scorecard" "$AGENT" --json --project "$PROJECT" 2>/dev/null || true)
+    [ -n "$SC_JSON" ] || continue
+
+    ADVISORY=$(printf '%s' "$SC_JSON" | jq -r '.self_review_calibration.advisory // false' 2>/dev/null || echo false)
+    [ "$ADVISORY" = "true" ] || continue
+
+    MISS_RATE=$(printf '%s' "$SC_JSON" | jq -r '.self_review_calibration.miss_rate_last30 // 0' 2>/dev/null || echo 0)
+    PAIRED_N=$(printf '%s' "$SC_JSON" | jq -r '.self_review_calibration.paired_count_last30 // 0' 2>/dev/null || echo 0)
+    MISS_PCT=$(awk -v r="$MISS_RATE" 'BEGIN{printf "%.0f", r*100}' 2>/dev/null || echo "?")
+
+    # Dedup 1: an open task already references this candidate_agent.
+    OPEN_TASK_ID=$(jq -r --arg agent "$AGENT" '
+        (.open_tasks // {}) | to_entries[]?
+        | select(.value.metadata.trigger == "calibration-miss"
+                 and .value.metadata.candidate_agent == $agent)
+        | .key
+    ' "$TASK_STATE" 2>/dev/null | head -1 || true)
+    if [ -n "$OPEN_TASK_ID" ]; then
+        continue   # already covered by an open task — no repeat signal
+    fi
+
+    # Dedup 2: cooldown marker.
+    MARKER_DIR="$SESSION_DIR/.improve-subagent-triggered"
+    MARKER_FILE="$MARKER_DIR/${AGENT}.json"
+    if [ -f "$MARKER_FILE" ]; then
+        SIGNALED_AT=$(jq -r '.signaled_at // empty' "$MARKER_FILE" 2>/dev/null || true)
+        if [ -n "$SIGNALED_AT" ]; then
+            SIGNALED_EPOCH=$(date -d "$SIGNALED_AT" +%s 2>/dev/null || echo 0)
+            NOW_EPOCH=$(date +%s)
+            AGE_DAYS=$(( (NOW_EPOCH - SIGNALED_EPOCH) / 86400 ))
+            if [ "$AGE_DAYS" -lt "$COOLDOWN_DAYS" ]; then
+                continue   # cooling down — suppress repeat signal
+            fi
+        fi
+    fi
+
+    # Emit — refresh marker, then queue output.
+    mkdir -p "$MARKER_DIR" 2>/dev/null || true
+    NOW_ISO=$(date -Iseconds)
+    jq -cn --arg ts "$NOW_ISO" --arg rate "$MISS_RATE" --arg paired "$PAIRED_N" \
+        '{signaled_at: $ts, miss_rate_last30: ($rate|tonumber), paired_count_last30: ($paired|tonumber)}' \
+        > "$MARKER_FILE" 2>/dev/null || true
+
+    HUMAN_LINES+=("Calibration miss: ${AGENT} at ${MISS_PCT}% (30d) — run scripts/agent-scorecard ${AGENT} --layer lite and consider TaskCreate for improve-subagent")
+
+    JSON_LINES+=("$(jq -cn \
+        --arg project "$PROJECT" \
+        --arg agent "$AGENT" \
+        --argjson miss_rate "$MISS_RATE" \
+        --argjson paired "$PAIRED_N" \
+        '{
+            trigger: "calibration-miss",
+            project: $project,
+            candidate_agent: $agent,
+            miss_rate_last30: $miss_rate,
+            paired_count_last30: $paired,
+            suggested_taskcreate: {
+                metadata: {
+                    agent: "improve-subagent",
+                    trigger: "calibration-miss",
+                    candidate_agent: $agent,
+                    risk: "medium",
+                    project: $project
+                },
+                subject: ("Calibration review: " + $agent + " self-review miss rate high (30d)"),
+                description: ("agent-scorecard shows " + $agent + " self_review_miss over 50% (>=4 paired self+adversarial data points) in the last 30 days. Run scripts/agent-scorecard " + $agent + " --layer lite for detail, then dispatch improve-subagent against this agent'"'"'s definition if the pattern holds.")
+            }
+        }')")
+done <<< "$CANDIDATES"
+
+if [ "$JSON_OUTPUT" = true ]; then
+    for line in "${JSON_LINES[@]:-}"; do
+        [ -n "$line" ] && echo "$line"
+    done
+else
+    for line in "${HUMAN_LINES[@]:-}"; do
+        [ -n "$line" ] && echo "$line"
+    done
+fi
+
+exit 0

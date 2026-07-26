@@ -1,0 +1,219 @@
+#!/bin/bash
+# V11 Audit Codebase - Orchestrate multi-agent codebase audit
+# Usage: ./scripts/audit-codebase PROJECT CODEBASE_PATH [--agents N] [--format md|json|both]
+
+set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+V11_HOME="${V11_HOME:-$(dirname "$SCRIPT_DIR")}"
+V11_WORKSPACE_ROOT="${V11_WORKSPACE_ROOT:-$HOME/.v11}"
+SESSIONS_ROOT="${SESSIONS_ROOT:-$V11_WORKSPACE_ROOT/sessions}"
+
+# --- Help ---
+if [ "${1:-}" == "--help" ] || [ "${1:-}" == "-h" ]; then
+    cat << 'HELP'
+V11 Audit Codebase — Orchestrate multi-agent codebase audit
+
+USAGE:
+    ./scripts/audit-codebase PROJECT CODEBASE_PATH [OPTIONS]
+
+OPTIONS:
+    --agents N         Number of audit agents: 3, 5, or 6 (default: 5)
+    --format FORMAT    Output format: md, json, or both (default: both)
+    --output DIR       Output directory (default: sessions/PROJECT/)
+    --dry-run          Show what would be spawned without executing
+    --help             Show this help
+
+DESCRIPTION:
+    Phase 0: Scopes the codebase (LOC, tech stack, file count)
+    Phase 1: Generates agent spawn prompts for the orchestrator
+    Phase 2: After agents complete, runs synthesize-findings
+
+    NOTE: This script cannot spawn Claude agents directly.
+    It generates the Agent() calls for the orchestrator to execute.
+    Use this script to prepare the audit, then paste the output.
+
+AGENTS (default 5 lenses):
+    1. security-engineer     OWASP Top 10, secrets, auth
+    2. code-quality-engineer SOLID, tech debt, smells
+    3. performance-optimizer N+1 queries, bundle size, caching
+    4. database-engineer     Schema, indexes, migrations
+    5. testing-engineer      Coverage gaps, untested paths
+    6. spec-architect-v11    Architecture review (optional, --agents 6)
+
+EXAMPLES:
+    ./scripts/audit-codebase nova-forge ~/nova-forge
+    ./scripts/audit-codebase my-project ~/my-project --agents 6
+    ./scripts/audit-codebase my-project ~/my-project --dry-run
+HELP
+    exit 0
+fi
+
+# --- Args ---
+PROJECT="${1:?Error: PROJECT name required}"
+CODEBASE="${2:?Error: CODEBASE_PATH required}"
+shift 2
+
+AGENT_COUNT=5
+FORMAT="both"
+OUTPUT_DIR="$SESSIONS_ROOT/$PROJECT"
+DRY_RUN=false
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --agents)    AGENT_COUNT="${2:?--agents requires value}"; shift 2 ;;
+        --format)    FORMAT="${2:?--format requires value}"; shift 2 ;;
+        --output)    OUTPUT_DIR="${2:?--output requires value}"; shift 2 ;;
+        --dry-run)   DRY_RUN=true; shift ;;
+        *) echo "Unknown option: $1" >&2; exit 1 ;;
+    esac
+done
+
+# --- Validate ---
+if [ ! -d "$CODEBASE" ]; then
+    echo "Error: Codebase directory not found: $CODEBASE" >&2
+    exit 1
+fi
+
+CODEBASE="$(cd "$CODEBASE" && pwd)"
+mkdir -p "$OUTPUT_DIR"
+
+# --- Phase 0: Scope ---
+echo "=== Phase 0: Scoping $CODEBASE ==="
+
+# Count lines of code (approximate)
+LOC=$(find "$CODEBASE" \
+  \( -type d \( -name 'node_modules' -o -name '.git' -o -name 'venv' -o -name '__pycache__' -o -name 'dist' -o -name 'build' \) -prune \) \
+  -o -type f \( -name '*.py' -o -name '*.js' -o -name '*.ts' -o -name '*.tsx' -o -name '*.jsx' -o -name '*.go' -o -name '*.rs' -o -name '*.java' -o -name '*.rb' -o -name '*.php' -o -name '*.sh' \) -print0 \
+  2>/dev/null | xargs -0 wc -l 2>/dev/null | tail -1 | awk '{print $1}' || echo "0")
+
+FILE_COUNT=$(find "$CODEBASE" \
+  \( -type d \( -name 'node_modules' -o -name '.git' -o -name 'venv' -o -name '__pycache__' -o -name 'dist' -o -name 'build' \) -prune \) \
+  -o -type f \( -name '*.py' -o -name '*.js' -o -name '*.ts' -o -name '*.tsx' -o -name '*.jsx' -o -name '*.go' -o -name '*.rs' -o -name '*.java' -o -name '*.rb' -o -name '*.php' \) -print \
+  2>/dev/null | wc -l || echo "0")
+
+# Detect tech stack
+STACK=""
+[ -f "$CODEBASE/package.json" ] && STACK="$STACK node"
+[ -f "$CODEBASE/requirements.txt" ] || [ -f "$CODEBASE/pyproject.toml" ] || [ -f "$CODEBASE/setup.py" ] && STACK="$STACK python"
+[ -f "$CODEBASE/go.mod" ] && STACK="$STACK go"
+[ -f "$CODEBASE/Cargo.toml" ] && STACK="$STACK rust"
+[ -f "$CODEBASE/docker-compose.yml" ] || [ -f "$CODEBASE/docker-compose.yaml" ] && STACK="$STACK docker"
+[ -f "$CODEBASE/Dockerfile" ] && STACK="$STACK docker"
+[ -d "$CODEBASE/migrations" ] || [ -d "$CODEBASE/alembic" ] && STACK="$STACK database"
+STACK="${STACK:- unknown}"
+
+echo "  LOC: ~$LOC"
+echo "  Files: $FILE_COUNT"
+echo "  Stack:$STACK"
+echo ""
+
+# Size recommendation
+if [ "$LOC" -gt 500000 ]; then
+    echo "  WARNING: Large codebase (>500K LOC). Consider --agents 6 with architecture lens."
+fi
+
+# --- Phase 1: Generate agent prompts ---
+echo "=== Phase 1: Generating audit agent prompts ==="
+
+FINDING_TEMPLATE='For each issue found, create a task:
+TaskCreate(
+    subject="[SEVERITY] Brief title",
+    description="Detailed description of the finding",
+    metadata={
+        "project": "'"$PROJECT"'",
+        "sprint": "sprint-01-audit",
+        "risk": "low",
+        "type": "finding",
+        "severity": "critical|high|medium|low",
+        "finding": {
+            "category": "YOUR_CATEGORY",
+            "location": {"file": "relative/path.ext", "line_start": N, "line_end": M},
+            "problem": "What is wrong (max 500 chars)",
+            "fix": "How to fix it (max 500 chars)",
+            "impact": "sandbox-bypass|data-loss|build-failure|security-exploit|performance-degradation|code-quality|developer-experience|test-gap",
+            "confidence": "high|medium|low"
+        }
+    }
+)'
+
+# Define audit lenses
+declare -A AGENTS
+declare -A CATEGORIES
+declare -A FOCUS
+
+AGENTS[1]="security-engineer"
+CATEGORIES[1]="security"
+FOCUS[1]="Audit for OWASP Top 10 vulnerabilities: injection (SQL, command, XSS), broken auth, sensitive data exposure, security misconfiguration, CSRF. Also check for: hardcoded secrets (API keys, tokens, passwords), missing rate limiting on auth endpoints, CORS misconfiguration, missing input validation, insecure cryptography."
+
+AGENTS[2]="code-quality-engineer"
+CATEGORIES[2]="maintainability"
+FOCUS[2]="Review code quality: SOLID principle violations (god classes, SRP violations), code smells (long methods >50 lines, deep nesting >4 levels, magic numbers), code duplication (DRY violations), dead code, unused imports, overly complex functions (cyclomatic complexity >10), missing error handling, inconsistent patterns."
+
+AGENTS[3]="performance-optimizer"
+CATEGORIES[3]="performance"
+FOCUS[3]="Profile for performance issues: N+1 query patterns, missing database indexes (check queries against schema), unbounded list fetches, missing pagination, synchronous I/O in hot paths, memory leaks (unclosed resources, growing collections), excessive logging in production paths, missing caching opportunities, large bundle sizes."
+
+AGENTS[4]="database-engineer"
+CATEGORIES[4]="reliability"
+FOCUS[4]="Inspect database layer: missing indexes on foreign keys and frequently-queried columns, schema inefficiencies (redundant columns, missing constraints, wrong data types), migration health (missing rollback support, data-destructive migrations), connection pooling configuration, N+1 queries in ORM usage, missing foreign key constraints."
+
+AGENTS[5]="testing-engineer"
+CATEGORIES[5]="test-coverage"
+FOCUS[5]="Assess test coverage: identify critical paths with no tests (auth, payments, data mutations), check unit vs integration vs E2E balance, find untested error paths and edge cases, check for flaky test patterns (timing-dependent, order-dependent), assess mock strategy (over-mocking vs real dependencies), check if test fixtures are realistic."
+
+AGENTS[6]="spec-architect-v11"
+CATEGORIES[6]="integration"
+FOCUS[6]="Architecture review: service boundary correctness, API contract consistency (request/response schemas match between services), circular dependencies, inappropriate coupling between layers, missing abstraction layers, configuration management patterns, deployment readiness, scalability bottlenecks at system level."
+
+echo ""
+echo "=== Agent Spawn Commands ==="
+echo ""
+echo "Copy and execute these Agent() calls in the orchestrator session:"
+echo ""
+
+for i in $(seq 1 "$AGENT_COUNT"); do
+    agent="${AGENTS[$i]}"
+    category="${CATEGORIES[$i]}"
+    focus="${FOCUS[$i]}"
+
+    cat << EOF
+Agent(
+    subagent_type="$agent",
+    prompt="""## Codebase Audit — $category lens
+
+**Project**: $PROJECT
+**Codebase**: $CODEBASE
+**Stack**:$STACK
+**LOC**: ~$LOC
+
+### Your Mission
+$focus
+
+### Output Format
+$FINDING_TEMPLATE
+
+### Rules
+- You are READ-ONLY. Do not modify any files.
+- Create one TaskCreate per finding (not one giant task with all findings).
+- Use severity: critical (safety/security breach), high (causes failures), medium (degrades quality), low (nice-to-have).
+- Include file:line citations for every finding.
+- Be specific in the fix field — actionable, not vague.
+- Confidence: high = certain, medium = likely, low = possible.
+""",
+    model="sonnet",
+    run_in_background=True,
+    name="audit-${category}",
+    description="Audit $CODEBASE for $category issues"
+)
+
+EOF
+done
+
+echo ""
+echo "=== After all agents complete ==="
+echo ""
+echo "Run synthesis:"
+echo "  $SCRIPT_DIR/synthesize-findings $PROJECT --format $FORMAT"
+echo ""
+echo "Then optionally generate spec:"
+echo "  $SCRIPT_DIR/findings-to-spec $PROJECT"

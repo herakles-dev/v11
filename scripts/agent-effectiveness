@@ -1,0 +1,521 @@
+#!/bin/bash
+# V11.15 Script: agent-effectiveness
+# Per-agent effectiveness dashboard. Reads the review-loop ledgers written by
+# the sync-tasks hook (T7) and renders the per-agent scorecard that replaces
+# the "errors 100% orchestrator" attribution blindspot.
+#
+# Sources:
+#   ~/.agent-metrics/agent-errors.jsonl         (one line per reviewed error)
+#   ~/.agent-metrics/agent-effectiveness.jsonl  (rolling-window snapshots)
+#   ~/.agent-metrics/usage.jsonl                (agent launch volume — context)
+#   ~/.agent-metrics/dispatch-trace.jsonl       (W3-T13: completion-event tokens — avg-tokens/spawn)
+#
+# Usage:
+#   agent-effectiveness                       # human table, all agents
+#   agent-effectiveness --json                # machine-readable
+#   agent-effectiveness --agent X             # single agent detail
+#   agent-effectiveness --since DATE          # ISO date lower bound (e.g. 2026-05-01)
+#   agent-effectiveness --project P           # restrict errors to project P
+#   agent-effectiveness --rank                # sort by success_rate ascending (worst first)
+#   agent-effectiveness --layer L             # V11.20: filter errors by layer
+#                                             # L ∈ lite|wave|swarm|runtime|all (default all)
+#   agent-effectiveness --caller-kind K       # V11.20: filter by caller
+#                                             # K ∈ orchestrator|subagent|all (default all)
+#   agent-effectiveness --test                # self-test
+#
+# ADVISORY ONLY (V11.15 constraint): this dashboard does not feed DAAO routing.
+
+set -euo pipefail
+
+V11_WORKSPACE_ROOT="${V11_WORKSPACE_ROOT:-$HOME/.v11}"
+METRICS_DIR="${METRICS_DIR:-$V11_WORKSPACE_ROOT/.agent-metrics}"
+
+if [ "${1:-}" == "--test" ]; then
+    echo "agent-effectiveness v1.0 (V11.15)"
+    exit 0
+fi
+
+if [ "${1:-}" == "--help" ] || [ "${1:-}" == "-h" ]; then
+    sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//'
+    exit 0
+fi
+
+JSON=false AGENT="" SINCE="" PROJECT="" RANK=false LAYER="all" CALLER_KIND="all"
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --json) JSON=true ;;
+        --rank) RANK=true ;;
+        --agent) AGENT="${2:-}"; shift ;;
+        --since) SINCE="${2:-}"; shift ;;
+        --project) PROJECT="${2:-}"; shift ;;
+        --layer) LAYER="${2:-all}"; shift ;;
+        --caller-kind) CALLER_KIND="${2:-all}"; shift ;;
+        *) echo "agent-effectiveness: unknown arg '$1'" >&2; exit 2 ;;
+    esac
+    shift
+done
+
+# V11.20: validate filter values
+case "$LAYER" in
+    all|lite|wave|swarm|runtime) ;;
+    *) echo "agent-effectiveness: --layer must be all|lite|wave|swarm|runtime (got: $LAYER)" >&2; exit 2 ;;
+esac
+case "$CALLER_KIND" in
+    all|orchestrator|subagent|unknown) ;;
+    *) echo "agent-effectiveness: --caller-kind must be all|orchestrator|subagent|unknown (got: $CALLER_KIND)" >&2; exit 2 ;;
+esac
+
+ERRORS_LEDGER="$METRICS_DIR/agent-errors.jsonl"
+EFF_LEDGER="$METRICS_DIR/agent-effectiveness.jsonl"
+USAGE_LEDGER="$METRICS_DIR/usage.jsonl"
+TRACE_LEDGER="$METRICS_DIR/dispatch-trace.jsonl"
+
+V11_AE_ERRORS="$ERRORS_LEDGER" V11_AE_EFF="$EFF_LEDGER" V11_AE_USAGE="$USAGE_LEDGER" \
+V11_AE_TRACE="$TRACE_LEDGER" \
+V11_AE_JSON="$JSON" V11_AE_AGENT="$AGENT" V11_AE_SINCE="$SINCE" \
+V11_AE_PROJECT="$PROJECT" V11_AE_RANK="$RANK" \
+V11_AE_LAYER="$LAYER" V11_AE_CALLER_KIND="$CALLER_KIND" \
+V11_AE_TASK_STATE_DIR="$METRICS_DIR/task-state" \
+python3 - <<'PYEOF'
+import os, json, datetime, sys
+
+def env(k, d=""):
+    return os.environ.get(k, d)
+
+errors_path = env("V11_AE_ERRORS")
+eff_path    = env("V11_AE_EFF")
+usage_path  = env("V11_AE_USAGE")
+trace_path  = env("V11_AE_TRACE")   # W3-T13
+as_json     = env("V11_AE_JSON") == "true"
+only_agent  = env("V11_AE_AGENT") or None
+since_raw   = env("V11_AE_SINCE") or None
+only_proj   = env("V11_AE_PROJECT") or None
+rank        = env("V11_AE_RANK") == "true"
+only_layer  = env("V11_AE_LAYER") or "all"          # V11.20
+only_caller = env("V11_AE_CALLER_KIND") or "all"    # V11.20
+task_state_dir = env("V11_AE_TASK_STATE_DIR")        # V11.21 T16
+
+# V11.20: filtering by --layer or --caller-kind requires recomputing per-agent
+# stats from the raw errors ledger (effectiveness.jsonl snapshots are layer-
+# agnostic and caller-kind-agnostic). When unfiltered, prefer snapshot path
+# for performance + historical fidelity.
+_REFINE = (only_layer != "all") or (only_caller != "all")
+
+def caller_kind_pass(rec_kind):
+    if only_caller == "all":
+        return True
+    if rec_kind is None:
+        return only_caller == "unknown"
+    return rec_kind == only_caller
+
+def layer_pass(rec_layer):
+    if only_layer == "all":
+        return True
+    # Legacy entries (no found_by_layer) default to 'lite' per V11.20 schema
+    rec_layer = rec_layer or "lite"
+    return rec_layer == only_layer
+
+def parse_ts(s):
+    # Always return a UTC-aware datetime. A bare date / tz-naive string is
+    # assumed UTC. This makes every comparison aware-vs-aware — no tz juggling.
+    try:
+        dt = datetime.datetime.fromisoformat(str(s).replace("Z", "+00:00"))
+    except Exception:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=datetime.timezone.utc)
+    return dt
+
+since_dt = None
+if since_raw:
+    since_dt = parse_ts(since_raw) or parse_ts(since_raw + "T00:00:00")
+    if since_dt is None:
+        print(f"agent-effectiveness: bad --since '{since_raw}' (use ISO date)",
+              file=sys.stderr)
+        sys.exit(2)
+
+def read_jsonl(path):
+    if not path or not os.path.exists(path):
+        return []
+    out = []
+    with open(path) as fh:
+        for ln in fh:
+            ln = ln.strip()
+            if not ln:
+                continue
+            try:
+                out.append(json.loads(ln))
+            except Exception:
+                continue
+    return out
+
+errors = read_jsonl(errors_path)
+snaps  = read_jsonl(eff_path)
+usage  = read_jsonl(usage_path)
+traces = read_jsonl(trace_path)   # W3-T13
+
+def in_window(rec, ts_key="timestamp"):
+    if since_dt is None:
+        return True
+    ts = parse_ts(rec.get(ts_key))
+    if ts is None:
+        return True
+    # Both are UTC-aware (parse_ts guarantees it) — direct comparison.
+    return ts >= since_dt
+
+# --- Aggregate per agent ---
+agents = {}
+
+def slot(aid):
+    return agents.setdefault(aid, {
+        "agent_id": aid,
+        "tasks_completed": 0,
+        "tasks_error_free": 0,
+        "success_rate": 0.0,
+        "avg_difficulty": 0.0,
+        "error_count": 0,
+        "error_types": {},
+        "trend": "stable",
+        "launches": 0,
+    })
+
+# Latest snapshot per agent = authoritative rolling-window scorecard
+latest = {}
+for s in snaps:
+    aid = s.get("agent_id")
+    if not aid or not in_window(s):
+        continue
+    if only_agent and aid != only_agent:
+        continue
+    ts = parse_ts(s.get("timestamp")) or datetime.datetime.min
+    cur = latest.get(aid)
+    if cur is None or (parse_ts(cur.get("timestamp")) or datetime.datetime.min) <= ts:
+        latest[aid] = s
+
+for aid, s in latest.items():
+    sl = slot(aid)
+    sl["tasks_completed"]  = s.get("tasks_completed", 0)
+    sl["tasks_error_free"] = s.get("tasks_error_free", 0)
+    sl["success_rate"]     = s.get("success_rate", 0.0)
+    sl["avg_difficulty"]   = s.get("avg_difficulty", 0.0)
+    sl["error_count"]      = s.get("error_count", 0)
+    sl["error_types"]      = s.get("error_types", {}) or {}
+    sl["trend"]            = s.get("trend", "stable")
+
+# Error ledger refinement: recompute error_types / counts when any per-line
+# filter is active (--project, --layer, --caller-kind). Snapshots are agnostic
+# to these dimensions, so a filter MUST consult the raw ledger.
+if only_proj or _REFINE:
+    for sl in agents.values():
+        sl["error_types"] = {}
+        sl["error_count"] = 0
+    for e in errors:
+        aid = e.get("agent_id")
+        if not aid or not in_window(e):
+            continue
+        if only_agent and aid != only_agent:
+            continue
+        if only_proj and e.get("project") != only_proj:
+            continue
+        if not layer_pass(e.get("found_by_layer")):
+            continue
+        if not caller_kind_pass(e.get("caller_kind")):
+            continue
+        sl = slot(aid)
+        sl["error_count"] += 1
+        et = e.get("error_type", "unknown")
+        sl["error_types"][et] = sl["error_types"].get(et, 0) + 1
+
+# Launch volume from usage.jsonl for context
+for u in usage:
+    aid = u.get("agent")
+    if not aid or not in_window(u):
+        continue
+    if only_agent and aid != only_agent:
+        continue
+    slot(aid)["launches"] += 1
+
+# W3-T13: per-agent avg-tokens/spawn from dispatch-trace.jsonl completion
+# events. Only populated when a completion-event line with a numeric tokens
+# field exists — never fabricated as 0. Keyed by spawned_agent (the agent
+# that actually executed the spawn), matching the agent_id identifier space
+# used by the rest of this dashboard.
+_token_totals = {}  # aid -> [sum_tokens, sample_count]
+for t in traces:
+    if t.get("event") != "completion":
+        continue
+    tok = t.get("tokens")
+    if not isinstance(tok, (int, float)) or isinstance(tok, bool):
+        continue
+    aid = t.get("spawned_agent")
+    if not aid:
+        continue
+    if not in_window(t, ts_key="ts"):
+        continue
+    if only_agent and aid != only_agent:
+        continue
+    if only_proj and t.get("project") != only_proj:
+        continue
+    totals = _token_totals.setdefault(aid, [0, 0])
+    totals[0] += tok
+    totals[1] += 1
+
+for aid, (total, cnt) in _token_totals.items():
+    if cnt <= 0:
+        continue
+    sl = slot(aid)
+    sl["avg_tokens"] = round(total / cnt, 1)
+    sl["token_samples"] = cnt
+
+# V11.21 T16: per-agent self_review_miss (fleet-wide INV-3 calibration column).
+# Reads task-state aggregates for self_review verdicts; pairs with adversarial
+# severity from agent-errors.jsonl. Miss = self ∈ {NONE,LOW} + adv ∈ {HIGH,CRITICAL}.
+SELF_LOW_SET = {"NONE", "LOW"}
+ADV_HIGH_SET = {"HIGH", "CRITICAL"}
+SEV_RANK = {"NONE": 0, "LOW": 1, "MEDIUM": 2, "HIGH": 3, "CRITICAL": 4}
+
+# Adversarial max severity per (project, task_id)
+_adv_max = {}
+for e in errors:
+    layer_val = e.get("found_by_layer")
+    if layer_val == "lite_self":
+        continue
+    if layer_val not in ("lite_adversarial", "lite", None):
+        continue
+    tid = e.get("task_id")
+    if tid is None:
+        continue
+    project = e.get("project")
+    if only_proj and project != only_proj:
+        continue
+    sev = (e.get("severity") or "LOW").upper()
+    key = (project, str(tid))
+    cur = _adv_max.get(key, "NONE")
+    if SEV_RANK.get(sev, 0) > SEV_RANK.get(cur, 0):
+        _adv_max[key] = sev
+
+# Walk task-state aggregates for self_review verdicts
+def _read_task_state_aggregates(d):
+    if not d or not os.path.isdir(d):
+        return
+    for name in os.listdir(d):
+        if not name.endswith(".json"):
+            continue
+        try:
+            with open(os.path.join(d, name), "r", encoding="utf-8") as fh:
+                yield (name[:-5], json.load(fh))
+        except Exception:
+            continue
+
+# Initialize self-review fields per agent
+for sl in agents.values():
+    sl["self_review_paired"] = 0
+    sl["self_review_miss"] = 0
+    sl["self_review_miss_rate"] = 0.0
+
+for project, state in _read_task_state_aggregates(task_state_dir):
+    if only_proj and (state.get("project") or project) != only_proj:
+        continue
+    artifacts = state.get("task_artifacts") or {}
+    rec_agents = state.get("recommended_agents") or {}
+    completed_ts = {}
+    for rc in state.get("recent_completed") or []:
+        if not isinstance(rc, dict):
+            continue
+        tid = str(rc.get("id") or rc.get("task_id") or "")
+        ts = rc.get("at") or rc.get("completed_at")
+        if tid and ts:
+            completed_ts.setdefault(tid, ts)
+    for tid, arts in artifacts.items():
+        if not isinstance(arts, dict):
+            continue
+        sr = arts.get("self_review")
+        if not isinstance(sr, dict):
+            continue
+        sev = (sr.get("severity") or "").upper()
+        if sev not in (SEV_RANK):
+            continue
+        executor = (
+            sr.get("agent_id")
+            or arts.get("agent_id")
+            or rec_agents.get(str(tid))
+            or "unknown"
+        )
+        if only_agent and executor != only_agent:
+            continue
+        # since_dt window filter on completed_at
+        if since_dt is not None:
+            ts_parsed = parse_ts(completed_ts.get(str(tid)))
+            if ts_parsed is None or ts_parsed < since_dt:
+                continue
+        proj_used = state.get("project") or project
+        adv_sev = _adv_max.get((proj_used, str(tid)))
+        if adv_sev is None:
+            continue   # un-paired; not a calibration data point
+        sl = slot(executor)
+        sl["self_review_paired"] += 1
+        if sev in SELF_LOW_SET and adv_sev in ADV_HIGH_SET:
+            sl["self_review_miss"] += 1
+
+for sl in agents.values():
+    paired = sl.get("self_review_paired", 0)
+    miss = sl.get("self_review_miss", 0)
+    sl["self_review_miss_rate"] = round(miss / paired, 3) if paired > 0 else 0.0
+
+rows = list(agents.values())
+if only_agent:
+    rows = [r for r in rows if r["agent_id"] == only_agent]
+else:
+    # V11.19 T9: filter agents with zero review activity (zero reviewed tasks
+    # AND zero errors). They appear only because they were launched per
+    # usage.jsonl — launch volume is context, not effectiveness signal. The
+    # dashboard's purpose is "which agents were reviewed and how did they
+    # do" — agents the orchestrator never let a review touch don't belong.
+    rows = [r for r in rows if r["tasks_completed"] > 0 or r["error_count"] > 0]
+
+if rank:
+    rows.sort(key=lambda r: (r["success_rate"], -r["error_count"]))
+else:
+    rows.sort(key=lambda r: r["agent_id"])
+
+if as_json:
+    print(json.dumps({
+        "generated_at": datetime.datetime.now().isoformat(),
+        "filters": {"agent": only_agent, "since": since_raw,
+                    "project": only_proj, "rank": rank,
+                    "layer": only_layer, "caller_kind": only_caller},
+        "advisory_only": True,
+        "agents": rows,
+    }, indent=2))
+    sys.exit(0)
+
+# --- Human table ---
+if not rows:
+    # V11.20: when filters are active, the empty case has actionable next steps
+    # rather than a generic "no data" — tell the user what's needed.
+    if only_layer == "wave":
+        print("No wave findings yet for the selected filter.")
+        print("  Run scripts/backfill-wave-findings to ingest historical wave reports,")
+        print("  or scripts/wave-review --attribute PROJECT WAVE after a fresh review.")
+        sys.exit(0)
+    if only_layer == "swarm":
+        print("No swarm findings yet for the selected filter.")
+        print("  Run scripts/backfill-swarm-findings to ingest historical audit reports,")
+        print("  or scripts/swarm-review-attribute PROJECT after a fresh swarm review.")
+        sys.exit(0)
+    print("No agent effectiveness data yet.")
+    print(f"  errors ledger: {errors_path} ({'present' if os.path.exists(errors_path) else 'absent'})")
+    print(f"  effectiveness:  {eff_path} ({'present' if os.path.exists(eff_path) else 'absent'})")
+    print("Reviewed tasks populate these via the sync-tasks hook (V11.15).")
+    sys.exit(0)
+
+TREND_GLYPH = {"improving": "▲ improving", "degrading": "▼ degrading",
+               "stable": "= stable"}
+
+print("V11.15 Agent Effectiveness  (ADVISORY ONLY — not DAAO routing)")
+filt_bits = []
+if since_raw:               filt_bits.append(f"since={since_raw}")
+if only_proj:               filt_bits.append(f"project={only_proj}")
+if only_layer != "all":     filt_bits.append(f"layer={only_layer}")
+if only_caller != "all":    filt_bits.append(f"caller_kind={only_caller}")
+if filt_bits:
+    print("  " + "  ".join(filt_bits))
+def _fmt_avg_tokens(r):
+    # W3-T13: never render 0 as fact — absent data renders as "-".
+    n = r.get("token_samples", 0)
+    if not n:
+        return "-"
+    avg = r.get("avg_tokens", 0)
+    if avg >= 1000:
+        return f"{avg/1000:.0f}k avg (n={n})"
+    return f"{avg:.0f} avg (n={n})"
+
+print("=" * 128)
+print(f"{'AGENT':<28} {'TASKS':>6} {'OK':>5} {'SUCC%':>6} "
+      f"{'DIFF':>5} {'ERRS':>5} {'MISS%':>6} {'TREND':<13} {'AVG TOKENS':<18} TOP ERROR TYPES")
+print("-" * 128)
+for r in rows:
+    sr = f"{r['success_rate']*100:5.1f}"
+    paired = r.get("self_review_paired", 0)
+    miss = r.get("self_review_miss", 0)
+    miss_pct = (miss / paired * 100.0) if paired > 0 else None
+    miss_s = "  —  " if miss_pct is None else f"{miss_pct:5.1f}"
+    top = sorted(r["error_types"].items(), key=lambda kv: -kv[1])[:3]
+    top_s = ", ".join(f"{k}:{v}" for k, v in top) if top else "—"
+    print(f"{r['agent_id']:<28} {r['tasks_completed']:>6} "
+          f"{r['tasks_error_free']:>5} {sr:>6} "
+          f"{r['avg_difficulty']:>5.1f} {r['error_count']:>5} "
+          f"{miss_s:>6} "
+          f"{TREND_GLYPH.get(r['trend'], r['trend']):<13} {_fmt_avg_tokens(r):<18} {top_s}")
+print("-" * 128)
+total_t = sum(r["tasks_completed"] for r in rows)
+total_e = sum(r["error_count"] for r in rows)
+total_paired = sum(r.get("self_review_paired", 0) for r in rows)
+total_miss = sum(r.get("self_review_miss", 0) for r in rows)
+fleet_miss_rate = (total_miss / total_paired * 100.0) if total_paired > 0 else None
+fleet_miss_s = "—" if fleet_miss_rate is None else f"{fleet_miss_rate:.1f}%"
+print(f"{len(rows)} agent(s)  ·  {total_t} reviewed task(s)  ·  {total_e} error(s)  "
+      f"·  fleet self-review miss: {fleet_miss_s} ({total_miss}/{total_paired} paired)")
+
+# V11.21 T16: calibration advisory at fleet level + per-agent advisories.
+flagged = [r for r in rows
+           if r.get("self_review_paired", 0) >= 4
+           and (r["self_review_miss"] / r["self_review_paired"]) > 0.50]
+if flagged:
+    print()
+    print("⚠ V11.21 CALIBRATION ADVISORIES (self-review miss rate > 50%, ≥4 paired data points):")
+    for r in flagged:
+        rate = r["self_review_miss"] / r["self_review_paired"] * 100.0
+        print(f"  • {r['agent_id']}: miss rate {rate:.1f}% "
+              f"({r['self_review_miss']}/{r['self_review_paired']} paired). "
+              f"Review postamble accuracy — agent is calling severity NONE/LOW on tasks "
+              f"adversarial review found HIGH/CRITICAL.")
+elif total_paired > 0 and fleet_miss_rate is not None and fleet_miss_rate <= 25.0:
+    print(f"   Fleet calibration healthy (miss rate ≤25% across {total_paired} paired tasks).")
+
+# V11.19 T9: surface the review-queue pending count as the bottom signal.
+# A growing pending count means reviews are not being drained — that's the
+# dashboard's leading indicator for "Phase 4r discipline is slipping" before
+# the rolling effectiveness numbers go stale.
+try:
+    import subprocess
+    rq_dir = os.path.join(os.path.dirname(errors_path or ""), "review-queue")
+    if os.path.isdir(rq_dir):
+        total_pending = 0
+        projects_with_pending = 0
+        for fn in sorted(os.listdir(rq_dir)):
+            if not fn.endswith(".jsonl"):
+                continue
+            project_name = fn[:-len(".jsonl")]
+            if only_proj and project_name != only_proj:
+                continue
+            try:
+                # Replay: latest event per task_id wins
+                latest = {}
+                with open(os.path.join(rq_dir, fn), "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            ev = json.loads(line)
+                        except Exception:
+                            continue
+                        tid = str(ev.get("task_id", ""))
+                        if not tid:
+                            continue
+                        latest[tid] = ev.get("ev", "")
+                pending = sum(1 for s in latest.values() if s == "pending")
+                if pending > 0:
+                    total_pending += pending
+                    projects_with_pending += 1
+            except Exception:
+                pass
+        if total_pending > 0:
+            print(f"V11.19 Review Queue:  {total_pending} pending review(s) across {projects_with_pending} project(s)  "
+                  f"·  run scripts/review-queue all-pending")
+        else:
+            print("V11.19 Review Queue:  0 pending  (drained)")
+except Exception:
+    pass
+PYEOF

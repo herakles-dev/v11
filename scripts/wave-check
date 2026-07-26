@@ -1,0 +1,437 @@
+#!/usr/bin/env python3
+# V11.21 Wave-Check — INV-12 gate enforcement for orchestrator wave dispatch.
+#
+# Usage: scripts/wave-check PROJECT WAVE
+#         WAVE accepts "02", "2", or "sprint-02-foo" forms.
+#
+# Reads:
+#   sessions/PROJECT/.task-state.json (or ~/.agent-metrics/task-state/PROJECT.json fallback)
+#
+# Exit codes:
+#   0  → INV-12 conditions met. Wave N may close; Wave N+1 may dispatch.
+#        (Self-review CRITICAL still surfaces a stderr warning at exit 0.)
+#   1  → WORK_INCOMPLETE     — at least one wave-N work task is not completed.
+#   2  → REVIEW_INCOMPLETE   — work done but paired adversarial review siblings not complete.
+#   3  → CRITICAL_BLOCKING   — a completed adversarial-lite review carries CRITICAL severity.
+#   4  → BAD_USAGE           — missing args / unreadable task-state.
+#
+# INV-12 wording (verbatim from spec.md):
+#   Wave N is complete only when (a) all Wave N work tasks status=completed AND
+#   (b) all Wave N paired review tasks status=completed with severity ≤ HIGH.
+#   Adversarial CRITICAL blocks the gate until resolved. Self-review CRITICAL emits
+#   warning + creates a follow-up task but does NOT block the gate.
+#
+# Rollback: V11_WAVE_CHECK=off forces exit 0 with stderr notice (defensive bypass).
+#
+# V11.21 — gate-1 (T3). Authored by spec-implementer-v11.
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import subprocess
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+EXIT_OK = 0
+EXIT_WORK_INCOMPLETE = 1
+EXIT_REVIEW_INCOMPLETE = 2
+EXIT_CRITICAL_BLOCKING = 3
+EXIT_BAD_USAGE = 4
+
+HOME = Path.home()
+WORKSPACE_ROOT = Path(os.environ.get("V11_WORKSPACE_ROOT", HOME))
+
+
+def task_state_path(project: str) -> Path:
+    """Return the path to read task-state from, preferring the per-session mirror."""
+    primary = WORKSPACE_ROOT / "sessions" / project / ".task-state.json"
+    if primary.exists():
+        return primary
+    fallback = HOME / ".agent-metrics" / "task-state" / f"{project}.json"
+    return fallback
+
+
+def parse_wave_arg(raw: str) -> str:
+    """Accept 02 / 2 / sprint-02-foo and return the numeric WAVE key (2-digit string)."""
+    m = re.match(r"(?:sprint-)?0*(\d+)", raw)
+    if not m:
+        return raw
+    return f"{int(m.group(1)):02d}"
+
+
+def sprint_matches_wave(sprint: str | None, wave: str) -> bool:
+    """sprint field starts with sprint-NN or equals sprint-NN-anything."""
+    if not sprint:
+        return False
+    return sprint == f"sprint-{wave}" or sprint.startswith(f"sprint-{wave}-")
+
+
+def severity_rank(sev: str | None) -> int:
+    """Map verdict severity strings to a sortable rank."""
+    return {"NONE": 0, "LOW": 1, "MEDIUM": 2, "HIGH": 3, "CRITICAL": 4}.get((sev or "").upper(), 0)
+
+
+def extract_self_review_severity(task: dict[str, Any]) -> str | None:
+    artifacts = (task.get("metadata") or {}).get("artifacts") or {}
+    sr = artifacts.get("self_review") or {}
+    return sr.get("severity")
+
+
+def extract_adversarial_severity(task: dict[str, Any]) -> str | None:
+    """Return the worst severity in the adversarial review verdict's errors list, else verdict-level."""
+    artifacts = (task.get("metadata") or {}).get("artifacts") or {}
+    review = artifacts.get("review") or {}
+    if not review:
+        return None
+    worst = None
+    for err in review.get("errors") or []:
+        sev = (err or {}).get("severity")
+        if not sev:
+            continue
+        if worst is None or severity_rank(sev) > severity_rank(worst):
+            worst = sev
+    if worst:
+        return worst
+    # Verdict-only signal: BLOCKED implies CRITICAL effect.
+    verdict = review.get("verdict")
+    if verdict == "BLOCKED":
+        return "CRITICAL"
+    if verdict == "ISSUES_FOUND":
+        return "HIGH"
+    return "NONE"
+
+
+def is_review_task(task: dict[str, Any]) -> bool:
+    meta = task.get("metadata") or {}
+    if meta.get("review_of"):
+        return True
+    agent = meta.get("agent") or ""
+    return agent.startswith("adversarial-")
+
+
+def collect_wave_tasks(state: dict[str, Any], wave: str) -> list[tuple[str, dict[str, Any]]]:
+    """Yield (task_id, task) pairs whose sprint matches the wave."""
+    out: list[tuple[str, dict[str, Any]]] = []
+    # Modern aggregate: open_tasks + completed map
+    for key in ("open_tasks", "completed", "blocked_tasks"):
+        bucket = state.get(key) or {}
+        if isinstance(bucket, dict):
+            for tid, t in bucket.items():
+                if not isinstance(t, dict):
+                    continue
+                if sprint_matches_wave((t.get("metadata") or {}).get("sprint"), wave):
+                    out.append((str(tid), t))
+    # De-duplicate (a task may appear in multiple buckets across cycles)
+    seen: set[str] = set()
+    uniq: list[tuple[str, dict[str, Any]]] = []
+    for tid, t in out:
+        if tid in seen:
+            continue
+        seen.add(tid)
+        uniq.append((tid, t))
+    return uniq
+
+
+def v11_home_dir() -> Path:
+    return Path(os.environ.get("V11_HOME", str(WORKSPACE_ROOT / "v11")))
+
+
+def ledger_path(project: str) -> Path:
+    return WORKSPACE_ROOT / ".agent-metrics" / "ledger" / f"{project}.jsonl"
+
+
+def print_review_queue_pending(project: str) -> None:
+    """V11 R3 mid-sprint visibility: one stderr line with the review-queue pending count.
+
+    Best-effort — never raises, never affects wave-check's exit code.
+    """
+    script = v11_home_dir() / "scripts" / "review-queue"
+    count: str = "?"
+    try:
+        if script.exists():
+            result = subprocess.run(
+                ["bash", str(script), "pending", project, "--json"],
+                capture_output=True, text=True, timeout=10,
+            )
+            if result.returncode == 0:
+                data = json.loads(result.stdout)
+                if isinstance(data, list):
+                    count = str(len(data))
+    except (OSError, subprocess.SubprocessError, json.JSONDecodeError):
+        pass
+    print(f"[wave-check] review-queue pending for project={project!r}: {count}", file=sys.stderr)
+
+
+def replay_ledger_by_task_id(ledger_file: Path, project: str) -> dict[str, dict[str, Any]]:
+    """Latest-wins replay of a project ledger, keyed by task_id.
+
+    Mirrors the replay approach in scripts/lib/postcommit_analysis.py, but
+    indexes by task_id (rather than subject_norm+create_seq identity) since
+    that's the key wave-check already has from task-state. Each record
+    retains subject_norm/create_seq (needed to construct a valid closing
+    event) and the most recent non-empty metadata blob (carried on
+    "created" events per hooks/sync-tasks).
+    """
+    records: dict[str, dict[str, Any]] = {}
+    if not ledger_file.exists():
+        return records
+    try:
+        raw_lines = ledger_file.read_text(encoding="utf-8", errors="replace").split("\n")
+    except OSError:
+        return records
+
+    for raw in raw_lines:
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            ev = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(ev, dict) or ev.get("v") != 1 or ev.get("project") != project:
+            continue
+        tid = ev.get("task_id") or ""
+        if not tid:
+            continue
+        rec = records.setdefault(
+            tid, {"status": "unknown", "subject_norm": "", "create_seq": None, "metadata": {}}
+        )
+        ev_type = ev.get("ev", "")
+        if ev_type in ("pending", "in_progress", "completed", "blocked"):
+            rec["status"] = ev_type
+        elif ev_type == "created" and rec["status"] == "unknown":
+            rec["status"] = "pending"
+        if ev.get("subject_norm"):
+            rec["subject_norm"] = ev["subject_norm"]
+        if ev.get("create_seq") is not None:
+            rec["create_seq"] = ev["create_seq"]
+        meta = ev.get("metadata")
+        if isinstance(meta, dict) and meta:
+            rec["metadata"] = meta
+    return records
+
+
+def append_gate_close_event(project: str, event: dict[str, Any]) -> bool:
+    """Append a completed ledger event via v11_ledger_append (hooks/lib/common.sh).
+
+    wave-check is Python; v11_ledger_append is a bash function, so it's invoked
+    via a short bash -c wrapper. Best-effort: any failure is logged to stderr
+    and returns False, never raises.
+    """
+    common_sh = v11_home_dir() / "hooks" / "lib" / "common.sh"
+    if not common_sh.exists():
+        print(f"[wave-check] GATE_AUTOCLOSE: common.sh not found at {common_sh} — skipping", file=sys.stderr)
+        return False
+    event_json = json.dumps(event)
+    wrapper = 'source "$1"; v11_ledger_append "$2" "$3"'
+    env = dict(os.environ)
+    env["V11_WORKSPACE_ROOT"] = str(WORKSPACE_ROOT)
+    env["V11_HOME"] = str(v11_home_dir())
+    try:
+        result = subprocess.run(
+            ["bash", "-c", wrapper, "bash", str(common_sh), project, event_json],
+            capture_output=True, text=True, timeout=15, env=env,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        print(f"[wave-check] GATE_AUTOCLOSE: ledger append raised for task_id="
+              f"{event.get('task_id')}: {exc}", file=sys.stderr)
+        return False
+    if result.returncode != 0:
+        print(f"[wave-check] GATE_AUTOCLOSE: v11_ledger_append failed for task_id="
+              f"{event.get('task_id')}: {result.stderr.strip()}", file=sys.stderr)
+        return False
+    return True
+
+
+def close_terminal_but_open_tasks(
+    project: str,
+    wave: str,
+    work_tasks: list[tuple[str, dict[str, Any]]],
+    review_tasks: list[tuple[str, dict[str, Any]]],
+) -> None:
+    """V11 R2.2 close-on-gate: when INV-12 passes, backstop-close wave work
+    tasks that are shipped (completed in task-state) but never got a
+    "completed" event appended to the ledger (e.g. no post-commit match).
+
+    Reuses the exact append pattern hooks/post-commit-close-tasks uses:
+    ev=completed, caller_kind="hook". Never closes a task whose paired
+    review sibling (metadata.review_of pointing at it) is open or carries
+    an unresolved CRITICAL adversarial verdict.
+    """
+    records = replay_ledger_by_task_id(ledger_path(project), project)
+    if not records:
+        return
+
+    # sibling lookup: parent work task_id -> review task dict
+    siblings: dict[str, dict[str, Any]] = {}
+    for _rtid, rt in review_tasks:
+        parent = (rt.get("metadata") or {}).get("review_of")
+        if parent:
+            siblings[str(parent)] = rt
+
+    now_ts = datetime.now(timezone.utc).isoformat()
+    closed: list[str] = []
+
+    for tid, _t in work_tasks:
+        rec = records.get(str(tid))
+        if not rec:
+            continue  # never entered the ledger — nothing to backstop
+        if rec.get("status") == "completed":
+            continue  # ledger already agrees; not terminal-but-open
+
+        if not rec.get("subject_norm") or rec.get("create_seq") is None:
+            print(
+                f"[wave-check] GATE_AUTOCLOSE: skipping task {tid} — missing ledger "
+                f"identity (subject_norm/create_seq); cannot append a valid close event",
+                file=sys.stderr,
+            )
+            continue
+
+        sib = siblings.get(str(tid))
+        if sib is not None:
+            if (sib.get("status") or "pending") != "completed":
+                continue  # unresolved review sibling — never close
+            adv_sev = extract_adversarial_severity(sib)
+            if severity_rank(adv_sev) >= severity_rank("CRITICAL"):
+                print(
+                    f"[wave-check] GATE_AUTOCLOSE: skipping task {tid} — paired review "
+                    f"carries unresolved CRITICAL severity",
+                    file=sys.stderr,
+                )
+                continue
+
+        event = {
+            "v": 1,
+            "ev": "completed",
+            "ts": now_ts,
+            "project": project,
+            "subject_norm": rec["subject_norm"],
+            "create_seq": rec["create_seq"],
+            "task_id": str(tid),
+            "session_uuid": "wave-check-gate",
+            "counters_delta": {"in_progress": -1, "completed": 1},
+            "closed_by": "wave-check",
+            "close_reason": "gate-pass",
+            "wave": wave,
+            "hook_version": "wave-check-v11.28",
+            "caller_kind": "hook",
+            "from": "in_progress",
+            "to": "completed",
+        }
+        if append_gate_close_event(project, event):
+            closed.append(str(tid))
+
+    if closed:
+        print(
+            f"[wave-check] GATE_AUTOCLOSE — wave {wave}: closed {len(closed)} "
+            f"terminal-but-open task(s) in ledger: {closed[:5]}",
+            file=sys.stderr,
+        )
+
+
+def main() -> int:
+    if os.environ.get("V11_WAVE_CHECK", "").lower() == "off":
+        print("[wave-check] V11_WAVE_CHECK=off — bypass enabled, exiting 0", file=sys.stderr)
+        return EXIT_OK
+
+    if len(sys.argv) != 3:
+        print("usage: wave-check PROJECT WAVE", file=sys.stderr)
+        return EXIT_BAD_USAGE
+
+    project, raw_wave = sys.argv[1], sys.argv[2]
+    wave = parse_wave_arg(raw_wave)
+
+    ts_path = task_state_path(project)
+    if not ts_path.exists():
+        print(f"[wave-check] task-state not found for project={project!r}: {ts_path}",
+              file=sys.stderr)
+        return EXIT_BAD_USAGE
+
+    try:
+        state = json.loads(ts_path.read_text())
+    except (OSError, json.JSONDecodeError) as e:
+        print(f"[wave-check] failed to read {ts_path}: {e}", file=sys.stderr)
+        return EXIT_BAD_USAGE
+
+    # V11 R3 mid-sprint visibility (best-effort, never affects exit code).
+    print_review_queue_pending(project)
+
+    tasks = collect_wave_tasks(state, wave)
+    if not tasks:
+        print(f"[wave-check] no tasks found for project={project!r} wave={wave!r}",
+              file=sys.stderr)
+        return EXIT_BAD_USAGE
+
+    work_tasks = [(tid, t) for tid, t in tasks if not is_review_task(t)]
+    review_tasks = [(tid, t) for tid, t in tasks if is_review_task(t)]
+
+    # (a) all work tasks completed
+    work_open = [tid for tid, t in work_tasks if (t.get("status") or "pending") != "completed"]
+    if work_open:
+        print(
+            f"[wave-check] WORK_INCOMPLETE — wave {wave}: "
+            f"{len(work_open)} work task(s) not completed: {work_open[:5]}",
+            file=sys.stderr,
+        )
+        return EXIT_WORK_INCOMPLETE
+
+    # (b) all paired review tasks completed (self CRITICAL warns, adversarial CRITICAL blocks)
+    review_open = [tid for tid, t in review_tasks if (t.get("status") or "pending") != "completed"]
+    if review_open:
+        print(
+            f"[wave-check] REVIEW_INCOMPLETE — wave {wave}: "
+            f"{len(review_open)} review task(s) not completed: {review_open[:5]}",
+            file=sys.stderr,
+        )
+        return EXIT_REVIEW_INCOMPLETE
+
+    # Severity scan — adversarial CRITICAL blocks; self-review CRITICAL warns-not-blocks
+    critical_blockers: list[str] = []
+    self_critical_warnings: list[str] = []
+
+    for tid, t in review_tasks:
+        adv_sev = extract_adversarial_severity(t)
+        if severity_rank(adv_sev) >= severity_rank("CRITICAL"):
+            critical_blockers.append(f"{tid}({adv_sev})")
+
+    # Self-review CRITICAL on the WORK tasks (Layer A lives on the parent task)
+    for tid, t in work_tasks:
+        sr = extract_self_review_severity(t)
+        if severity_rank(sr) >= severity_rank("CRITICAL"):
+            self_critical_warnings.append(f"{tid}({sr})")
+
+    if critical_blockers:
+        print(
+            f"[wave-check] CRITICAL_BLOCKING — wave {wave}: adversarial review verdict CRITICAL "
+            f"on {len(critical_blockers)} task(s): {critical_blockers[:5]}",
+            file=sys.stderr,
+        )
+        return EXIT_CRITICAL_BLOCKING
+
+    if self_critical_warnings:
+        print(
+            f"[wave-check] WARNING — wave {wave}: self-review CRITICAL on "
+            f"{len(self_critical_warnings)} task(s): {self_critical_warnings[:5]}; "
+            f"does NOT block per INV-12 (self-review is optimistic-by-construction). "
+            f"Consider follow-up tasks.",
+            file=sys.stderr,
+        )
+
+    # V11 R2.2 close-on-gate: backstop-close terminal-but-open work tasks now
+    # that INV-12 has passed. Gated behind V11_GATE_AUTOCLOSE (default on).
+    if os.environ.get("V11_GATE_AUTOCLOSE", "on").lower() != "off":
+        close_terminal_but_open_tasks(project, wave, work_tasks, review_tasks)
+    else:
+        print("[wave-check] V11_GATE_AUTOCLOSE=off — skipping ledger close-on-gate", file=sys.stderr)
+
+    print(f"[wave-check] OK — wave {wave}: {len(work_tasks)} work + {len(review_tasks)} "
+          f"review task(s) all completed; INV-12 satisfied", file=sys.stderr)
+    return EXIT_OK
+
+
+if __name__ == "__main__":
+    sys.exit(main())

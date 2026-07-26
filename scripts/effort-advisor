@@ -1,0 +1,74 @@
+#!/bin/bash
+# V11 Effort Advisor - Suggest optimal effort level for a task
+# Usage: ./scripts/effort-advisor "description of task"
+#    or: echo "description" | ./scripts/effort-advisor
+
+# Read input from argument or stdin
+if [ -n "$1" ]; then
+    TEXT="$*"
+else
+    TEXT=$(cat)
+fi
+
+if [ -z "$TEXT" ]; then
+    echo "Usage: ./scripts/effort-advisor \"description of task\""
+    echo "   or: echo \"description\" | ./scripts/effort-advisor"
+    echo ""
+    echo "Effort Levels:"
+    echo "  max    - Architecture, security, threat modeling, novel problems"
+    echo "  high   - Implementation, bug fixes, refactoring, code review"
+    echo "  medium - Testing, validation, coordination, optimization"
+    echo "  low    - Formatting, linting, scanning, simple checks"
+    exit 1
+fi
+
+# Convert to lowercase
+TEXT_LOWER=$(echo "$TEXT" | tr '[:upper:]' '[:lower:]')
+
+# Keyword matching (same as guard-effort hook)
+MAX_KEYWORDS="design|architect|security|threat|novel|complex|scalability|model threat"
+HIGH_KEYWORDS="implement|fix|refactor|add|review|build|write|create|modify|debug|feature|endpoint|component"
+MEDIUM_KEYWORDS="test|coordinate|validate|optimize|integrate|migrate|update|configure"
+LOW_KEYWORDS="format|lint|scan|check|list|count|find|read|copy|move|rename"
+
+EFFORT="high"  # default
+MATCHED=""
+RATIONALE=""
+
+# Check max first (highest priority)
+if echo "$TEXT_LOWER" | grep -qiE "$MAX_KEYWORDS"; then
+    EFFORT="max"
+    MATCHED=$(echo "$TEXT_LOWER" | grep -oiE "$MAX_KEYWORDS" | head -3 | tr '\n' ', ' | sed 's/,$//')
+    RATIONALE="Task involves architectural/security decisions requiring deep reasoning"
+elif echo "$TEXT_LOWER" | grep -qiE "$LOW_KEYWORDS"; then
+    # Check low before medium (low is more specific)
+    if ! echo "$TEXT_LOWER" | grep -qiE "$HIGH_KEYWORDS|$MAX_KEYWORDS"; then
+        EFFORT="low"
+        MATCHED=$(echo "$TEXT_LOWER" | grep -oiE "$LOW_KEYWORDS" | head -3 | tr '\n' ', ' | sed 's/,$//')
+        RATIONALE="Simple operation that doesn't require deep reasoning"
+    fi
+elif echo "$TEXT_LOWER" | grep -qiE "$MEDIUM_KEYWORDS"; then
+    EFFORT="medium"
+    MATCHED=$(echo "$TEXT_LOWER" | grep -oiE "$MEDIUM_KEYWORDS" | head -3 | tr '\n' ', ' | sed 's/,$//')
+    RATIONALE="Task involves testing/validation/coordination work"
+elif echo "$TEXT_LOWER" | grep -qiE "$HIGH_KEYWORDS"; then
+    EFFORT="high"
+    MATCHED=$(echo "$TEXT_LOWER" | grep -oiE "$HIGH_KEYWORDS" | head -3 | tr '\n' ', ' | sed 's/,$//')
+    RATIONALE="Implementation/development task requiring focused work"
+fi
+
+echo "=== Effort Advisory ==="
+echo ""
+echo "Input: $TEXT"
+echo ""
+echo "Recommended Effort: $EFFORT"
+echo "Keywords Matched: $MATCHED"
+echo "Rationale: $RATIONALE"
+echo ""
+echo "Model Recommendation:"
+case "$EFFORT" in
+    max)  echo "  Use Opus 4.6 with maximum adaptive thinking" ;;
+    high) echo "  Use Opus 4.6 (default) or Sonnet 4.6 for routine implementation" ;;
+    medium) echo "  Use Sonnet 4.6 for efficient execution" ;;
+    low)  echo "  Use Haiku 4.5 for fast, cost-effective execution" ;;
+esac

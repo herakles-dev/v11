@@ -1,0 +1,364 @@
+#!/bin/bash
+# V11 Script: validate-invariants — static checker for MODULE.md invariants
+#
+# Walks MODULE.md files in a project, extracts invariants from the fenced
+# JSON manifest, classifies each via patterns from ADR-003, and reports
+# violations with evidence.
+#
+# Patterns (v1):
+#   1. Security-primitive label match (HK-002 family)
+#   2. "called on every" / "consulted every" (HK-007 family)
+#   3. "never X" / "always X" (forbidden/required)
+#   Anything else → UNPARSEABLE (explicit skip, never silent)
+#
+# Usage:
+#   ./scripts/validate-invariants PROJECT [--strict] [--json]
+#   ./scripts/validate-invariants --test
+#
+# Exit codes:
+#   0  advisory: all invariants OK, UNPARSEABLE reported but not fatal
+#   1  --strict: at least one VIOLATION
+#   2  usage error or schema missing
+#
+# See: sessions/v11-sharpening/adr-003-invariant-parser.md
+# STR: STR-005
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+V11_HOME="${V11_HOME:-$(dirname "$SCRIPT_DIR")}"
+V11_WORKSPACE_ROOT="${V11_WORKSPACE_ROOT:-$HOME/.v11}"
+
+if [ "${1:-}" == "--test" ]; then
+    echo "validate-invariants v1.0 (V11.8, S2-6)"
+    exit 0
+fi
+
+if [ "${1:-}" == "--help" ] || [ -z "${1:-}" ]; then
+    cat << 'HELP'
+V11 validate-invariants — static checker for MODULE.md invariants
+
+USAGE:
+    ./scripts/validate-invariants PROJECT [--strict] [--json]
+
+OPTIONS:
+    --strict    Exit non-zero on any VIOLATION (default: advisory)
+    --json      Machine-readable output
+    --test      Self-test
+    --help      This help
+
+Per ADR-003 (sessions/v11-sharpening/adr-003-invariant-parser.md):
+    Patterns covered: crypto-label mismatch, "consulted every X", "never X"
+    Patterns skipped: wire-format byte claims, deep semantic assertions
+    Goal: ~40% invariant coverage, 0 false positives on known-clean projects.
+HELP
+    exit 0
+fi
+
+PROJECT=""
+STRICT=false
+JSON_OUT=false
+for arg in "$@"; do
+    case "$arg" in
+        --strict) STRICT=true ;;
+        --json)   JSON_OUT=true ;;
+        --help|-h|--test) ;;
+        *)
+            if [ -z "$PROJECT" ]; then PROJECT="$arg"; fi
+            ;;
+    esac
+done
+
+# Sanitize
+if [[ -z "$PROJECT" ]] || [[ "$PROJECT" == *".."* ]] || [[ "$PROJECT" == *"/"* ]] \
+   || [[ "$PROJECT" =~ [^a-zA-Z0-9._-] ]]; then
+    echo "Error: Invalid or missing PROJECT name" >&2
+    exit 2
+fi
+
+PROJECT_DIR="$V11_WORKSPACE_ROOT/$PROJECT"
+if [ ! -d "$PROJECT_DIR" ]; then
+    echo "Error: Project directory not found: $PROJECT_DIR" >&2
+    exit 2
+fi
+
+python3 - "$PROJECT" "$PROJECT_DIR" "$STRICT" "$JSON_OUT" << 'PYTHON_SCRIPT'
+import json, os, re, sys
+from pathlib import Path
+
+project, project_dir, strict_s, json_s = sys.argv[1:]
+strict = strict_s.lower() == "true"
+json_out = json_s.lower() == "true"
+project_dir = Path(project_dir)
+
+# --- Crypto aliases (Pattern 1) ---
+CRYPTO_ALIASES = {
+    "hkdf-sha256": ["hkdf", "HKDF", "hkdf_expand", "hkdf_extract", "Hkdf"],
+    "hkdf":        ["hkdf", "HKDF", "hkdf_expand", "hkdf_extract", "Hkdf"],
+    "hmac":        ["hmac", "HMAC"],
+    "aes-256-gcm": ["aes_gcm", "AESGCM", "AES-GCM", "aes256gcm", "ChaCha20Poly1305"],
+    "aes-gcm":     ["aes_gcm", "AESGCM", "AES-GCM"],
+    "aes-256-cbc": ["aes_cbc", "AESCBC", "AES-CBC", "Cipher(AES"],
+    "bcrypt":      ["bcrypt", "Bcrypt"],
+    "pbkdf2":      ["PBKDF2HMAC", "pbkdf2"],
+    "scrypt":      ["scrypt", "Scrypt"],
+    "ed25519":     ["Ed25519", "ed25519"],
+    "rsa-oaep":    ["RSA-OAEP", "OAEP", "padding.OAEP"],
+    "sha256":      ["sha256", "SHA256", "sha2::Sha256"],
+    "sha512":      ["sha512", "SHA512"],
+    "hsts":        ["Strict-Transport-Security", "hsts"],
+    "csp":         ["Content-Security-Policy", "csp"],
+    "csrf":        ["csrf", "CSRF"],
+}
+
+# --- Find MODULE.md files ---
+# Skip heavy dirs via -prune via Python os.walk with skip list
+SKIP_DIRS = {"node_modules", ".git", "__pycache__", "target", "dist", "build",
+             ".venv", ".next", "venv", "archive"}
+
+def walk_modules(root: Path):
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
+        for fn in filenames:
+            if fn == "MODULE.md":
+                yield Path(dirpath) / fn
+
+# --- Extract JSON from MODULE.md ---
+def extract_json_block(md_path: Path):
+    try:
+        text = md_path.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return None
+    # fenced ```json block
+    m = re.search(r'```json\s*\n(.*?)\n```', text, re.DOTALL)
+    if not m:
+        return None
+    try:
+        return json.loads(m.group(1))
+    except json.JSONDecodeError:
+        return None
+
+# --- Read module code files for grep-based checks ---
+# Strips comments + docstrings so prose references to primitives
+# (e.g. "# Wrong: not HKDF") don't pollute the presence check.
+def _strip_comments(text: str, ext: str) -> str:
+    if ext == ".py":
+        # strip # comments
+        text = re.sub(r'#.*$', '', text, flags=re.MULTILINE)
+        # strip triple-quoted strings (docstrings)
+        text = re.sub(r'"""[\s\S]*?"""', '', text)
+        text = re.sub(r"'''[\s\S]*?'''", '', text)
+    elif ext in (".rs", ".ts", ".js", ".go"):
+        text = re.sub(r'//.*$', '', text, flags=re.MULTILINE)
+        text = re.sub(r'/\*[\s\S]*?\*/', '', text)
+    return text
+
+def read_module_code(module_dir: Path):
+    code = []
+    for ext in (".py", ".rs", ".ts", ".js", ".go"):
+        for f in module_dir.rglob(f"*{ext}"):
+            # Skip descendants inside SKIP_DIRS
+            if any(part in SKIP_DIRS for part in f.parts):
+                continue
+            try:
+                text = f.read_text(encoding="utf-8", errors="ignore")
+                text = _strip_comments(text, ext)
+                code.append((str(f), text))
+            except OSError:
+                pass
+    return code
+
+# --- Pattern classifiers ---
+def classify_invariant(invariant: str, module_dir: Path, code_files):
+    """Returns (status, evidence_str). status in {OK, VIOLATION, UNPARSEABLE, SUSPICIOUS}."""
+    inv_lower = invariant.lower()
+
+    # Pattern 1: crypto-label
+    primitives_mentioned = []
+    for prim in CRYPTO_ALIASES:
+        if prim in inv_lower:
+            primitives_mentioned.append(prim)
+    if primitives_mentioned:
+        # At least one crypto label mentioned. For each, check if ANY alias appears in code.
+        all_code_text = "\n".join(c[1] for c in code_files)
+        missing = []
+        for prim in primitives_mentioned:
+            aliases = CRYPTO_ALIASES[prim]
+            if not any(a in all_code_text for a in aliases):
+                missing.append(prim)
+        if missing:
+            return ("VIOLATION",
+                    f"Invariant mentions {missing} but no matching import/call in {len(code_files)} code files")
+        # Cross-module check: if invariant mentions interop, also check peer-language code
+        # (HK-002 family: Rust MODULE.md claims HKDF for Rust/Python, Python impl may drift)
+        if re.search(r'\b(?:rust/python|python/rust|python\s+interop|python\s+side|python\s+caller)', inv_lower):
+            # Determine module's primary language from its own code files
+            exts_in_module = {Path(n).suffix for n, _ in code_files}
+            peer_exts = (".py",) if ".rs" in exts_in_module else (".rs",)
+            peer_text = []
+            for ext in peer_exts:
+                for f in project_dir.rglob(f"*{ext}"):
+                    if any(part in SKIP_DIRS for part in f.parts):
+                        continue
+                    try:
+                        t = f.read_text(encoding="utf-8", errors="ignore")
+                        peer_text.append(_strip_comments(t, ext))
+                    except OSError:
+                        pass
+            peer_all = "\n".join(peer_text)
+            peer_missing = []
+            for prim in primitives_mentioned:
+                aliases = CRYPTO_ALIASES[prim]
+                if not any(a in peer_all for a in aliases):
+                    peer_missing.append(prim)
+            if peer_missing and peer_text:
+                return ("VIOLATION",
+                        f"Invariant claims {peer_missing} for interop; peer-language "
+                        f"({peer_exts[0]}) code has no matching import/call — likely drift")
+        return ("OK", f"Crypto labels {primitives_mentioned} present in code")
+
+    # Pattern 2: "called/consulted/checked on every X" / "between every"
+    # Broader regex: catches "X [action] (on|after|at|between) every|each Y"
+    m = re.search(
+        r'\b([\w-]+(?:[\s-]state)?)\s+(?:is\s+)?(?:consulted|checked|called|invoked|applied|verified)\s+(?:on|after|at|between)?\s*(?:every|each)\s+\w+',
+        inv_lower
+    ) or re.search(
+        r'\b(\w[\w-]*)\s+(?:checked|consulted)\s+after\s+every\s+\w+',
+        inv_lower
+    )
+    if m:
+        callable_name = m.group(1).strip()
+        # Normalize: "kill-switch state" → kill_switch (strip trailing words)
+        callable_name = callable_name.replace(" state", "").strip()
+        candidates = {callable_name, callable_name.replace("-", "_"), callable_name.replace("-", "")}
+        # Spatial check: require refs INSIDE the file(s) with iteration sites
+        iteration_site_patterns = [
+            r'asyncio\.gather\b',
+            r'\bfor\s+\w+\s+in\s+',
+            r'\basync\s+for\s+',
+            r'\bwhile\s+True\b',
+        ]
+        co_located = 0  # refs found within +-20 lines of an iteration site
+        total_iter_sites = 0
+        total_refs = 0
+        for name, text in code_files:
+            lines = text.split("\n")
+            iter_line_nums = []
+            for i, line in enumerate(lines):
+                for p in iteration_site_patterns:
+                    if re.search(p, line):
+                        iter_line_nums.append(i)
+                        total_iter_sites += 1
+                        break
+            # Count refs in this file
+            file_refs = sum(text.count(c) for c in candidates)
+            total_refs += file_refs
+            # Count refs co-located (within ±20 lines of any iteration site)
+            if iter_line_nums and file_refs > 0:
+                for i, line in enumerate(lines):
+                    if any(c in line for c in candidates):
+                        if any(abs(i - s) <= 20 for s in iter_line_nums):
+                            co_located += 1
+        if total_iter_sites > 0 and total_refs == 0:
+            return ("VIOLATION",
+                    f"Invariant claims `{callable_name}` consulted every iteration; "
+                    f"0 references in {len(code_files)} files with {total_iter_sites} iteration sites")
+        if total_iter_sites > 0 and co_located == 0 and total_refs > 0:
+            return ("SUSPICIOUS",
+                    f"Invariant claims `{callable_name}` consulted every iteration; "
+                    f"{total_refs} refs found globally but 0 co-located with {total_iter_sites} iteration sites — "
+                    "refs may be in wrong place")
+        if total_iter_sites > 0 and co_located > 0:
+            return ("OK",
+                    f"`{callable_name}` co-located with iteration sites ({co_located} near-site refs)")
+        return ("OK",
+                f"`{callable_name}` referenced {total_refs} times; no iteration sites to co-locate with")
+
+    # Pattern 3: "never write" / "read-only" / "never cached"
+    if re.search(r'\bnever\s+writ', inv_lower) or 'read-only' in inv_lower:
+        all_code_text = "\n".join(c[1] for c in code_files)
+        write_markers = [r'open\([^)]*["\']\w*w', r'os\.remove\(', r'shutil\.rmtree\(', r'\.unlink\(', r'fs::write\(', r'fs::remove\(']
+        hits = []
+        for marker in write_markers:
+            for name, text in code_files:
+                for m in re.finditer(marker, text):
+                    hits.append(f"{Path(name).name}: {marker}")
+                    break
+        if hits:
+            return ("VIOLATION",
+                    f"Invariant claims read-only, but write calls found: {hits[:3]}")
+        return ("OK", "No file-write calls found in module code")
+
+    if re.search(r'\bnever\s+cached\b', inv_lower):
+        all_code_text = "\n".join(c[1] for c in code_files)
+        if re.search(r'@(?:lru_)?cache|functools\.cache|@cached_property', all_code_text):
+            return ("VIOLATION",
+                    "Invariant claims never-cached, but cache decorator found in code")
+        return ("OK", "No cache decorators found")
+
+    # Unparseable
+    return ("UNPARSEABLE", "No pattern class matched this invariant")
+
+# --- Walk & check ---
+report = {
+    "project": project,
+    "modules": [],
+    "summary": {"ok": 0, "violation": 0, "suspicious": 0, "unparseable": 0, "error": 0},
+}
+
+for md_path in walk_modules(project_dir):
+    manifest = extract_json_block(md_path)
+    if not manifest:
+        report["modules"].append({
+            "module": str(md_path.relative_to(project_dir)),
+            "invariants": [],
+            "error": "no fenced JSON block — run validate-module-manifest to fix",
+        })
+        continue
+    invariants = manifest.get("invariants", []) or []
+    module_dir = md_path.parent
+    code_files = read_module_code(module_dir)
+    per_module = {"module": str(md_path.relative_to(project_dir)), "invariants": []}
+    for inv in invariants:
+        if not isinstance(inv, str):
+            status, evidence = "ERROR", "invariant is not a string"
+        else:
+            status, evidence = classify_invariant(inv, module_dir, code_files)
+        per_module["invariants"].append({
+            "text": (inv if isinstance(inv, str) else str(inv))[:250],
+            "status": status,
+            "evidence": evidence,
+        })
+        key = status.lower()
+        report["summary"][key] = report["summary"].get(key, 0) + 1
+    report["modules"].append(per_module)
+
+# --- Output ---
+if json_out:
+    print(json.dumps(report, indent=2))
+else:
+    print(f"Invariant validation: {project}")
+    print("=" * 60)
+    for m in report["modules"]:
+        print(f"\nModule: {m['module']}")
+        if m.get("error"):
+            print(f"  [ERROR] {m['error']}")
+            continue
+        for inv in m["invariants"]:
+            status = inv["status"]
+            color = {"OK": "", "VIOLATION": "!!", "SUSPICIOUS": "?", "UNPARSEABLE": "-"}.get(status, "")
+            print(f"  [{status}{color}] {inv['text'][:80]}")
+            if status in ("VIOLATION", "SUSPICIOUS"):
+                print(f"         evidence: {inv['evidence']}")
+    print("\nSummary:")
+    for k, v in report["summary"].items():
+        print(f"  {k.upper()}: {v}")
+    total = sum(report["summary"].values())
+    if total > 0:
+        covered = total - report["summary"].get("unparseable", 0)
+        print(f"  Coverage: {covered}/{total} ({100*covered//total if total else 0}% parseable)")
+
+if strict and report["summary"].get("violation", 0) > 0:
+    sys.exit(1)
+sys.exit(0)
+PYTHON_SCRIPT

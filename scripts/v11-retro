@@ -1,0 +1,202 @@
+#!/bin/bash
+# V11 Script: v11-retro
+# Manage the per-project retrospective counter that drives the journal flywheel.
+#
+# Counter location: sessions/{project}/.retro-counter
+# Incremented by: hooks/session-end on every CLOSE
+# Threshold: V11_RETRO_THRESHOLD env var (default 5)
+#
+# Usage:
+#   v11-retro PROJECT                  # Show counter status for one project
+#   v11-retro PROJECT --reset          # Reset counter to 0 (after running /v11 retrospective)
+#   v11-retro --due                    # List all projects with retro due (counter >= threshold)
+#   v11-retro --scan                   # Show counter for every project in SESSIONS_ROOT
+#   v11-retro --test                   # Self-test
+#   v11-retro --help                   # Show usage
+#
+# Exit codes:
+#   0  success
+#   1  usage error
+#   2  project not found
+#   3  file I/O failure
+
+set -euo pipefail
+
+V11_WORKSPACE_ROOT="${V11_WORKSPACE_ROOT:-$HOME/.v11}"
+SESSIONS_ROOT="${SESSIONS_ROOT:-$V11_WORKSPACE_ROOT/sessions}"
+RETRO_THRESHOLD="${V11_RETRO_THRESHOLD:-5}"
+
+usage() {
+    cat <<'EOF'
+Usage:
+  v11-retro PROJECT                  Show counter status for one project
+  v11-retro PROJECT --reset          Reset counter to 0
+  v11-retro --due                    List projects with retro due
+  v11-retro --scan                   Show all project counters
+  v11-retro --test                   Self-test
+
+The /v11 retrospective workflow:
+  1. session-end hook increments .retro-counter on every CLOSE
+  2. When counter >= V11_RETRO_THRESHOLD (default 5), DETECT/handoff surfaces "retro due"
+  3. User runs /v11 retrospective PROJECT — Haiku Explore writes synthesis JSON
+  4. User runs `v11-retro PROJECT --reset` to zero the counter
+
+See: ~/.claude/skills/team-orchestrator/playbooks/journal.md
+EOF
+}
+
+# --- Read counter ---
+read_counter() {
+    local project="$1"
+    local file="$SESSIONS_ROOT/$project/.retro-counter"
+    if [ -f "$file" ]; then
+        tr -dc '0-9' < "$file" 2>/dev/null || printf '0'
+    else
+        printf '0'
+    fi
+}
+
+# --- Reset counter ---
+reset_counter() {
+    local project="$1"
+    local dir="$SESSIONS_ROOT/$project"
+    local file="$dir/.retro-counter"
+    if [ ! -d "$dir" ]; then
+        echo "v11-retro: project not found: $dir" >&2
+        return 2
+    fi
+    local before
+    before=$(read_counter "$project")
+    before="${before:-0}"
+    local tmp="$file.tmp.$$"
+    printf '0\n' > "$tmp" 2>/dev/null && mv "$tmp" "$file" 2>/dev/null
+    rm -f "$tmp" 2>/dev/null || true
+    echo "v11-retro: counter reset for $project (was $before, now 0)"
+}
+
+# --- Last retro date ---
+last_retro() {
+    local project="$1"
+    local retros_dir="$SESSIONS_ROOT/$project/retros"
+    [ -d "$retros_dir" ] || { printf 'never'; return; }
+    local newest
+    newest=$(ls -1 "$retros_dir"/*.json 2>/dev/null | sort | tail -n 1)
+    if [ -n "$newest" ]; then
+        basename "$newest" .json
+    else
+        printf 'never'
+    fi
+}
+
+# --- Status for one project ---
+show_one() {
+    local project="$1"
+    local dir="$SESSIONS_ROOT/$project"
+    if [ ! -d "$dir" ]; then
+        echo "v11-retro: project not found: $dir" >&2
+        return 2
+    fi
+    local count last opt_out=""
+    count=$(read_counter "$project")
+    count="${count:-0}"
+    last=$(last_retro "$project")
+    [ -f "$dir/.no-auto-retro" ] && opt_out=" [auto-retro disabled]"
+    local status="ok"
+    if [ "$count" -ge "$RETRO_THRESHOLD" ]; then
+        status="DUE"
+    fi
+    printf '%-40s sessions=%-4s threshold=%-3s last=%-10s status=%s%s\n' \
+        "$project" "$count" "$RETRO_THRESHOLD" "$last" "$status" "$opt_out"
+    if [ "$status" = "DUE" ]; then
+        echo ""
+        echo "  Retrospective due. Orchestrator handles automatically next /v11 invocation."
+        echo "  Manual flow if needed:"
+        echo "    /v11 retrospective $project        (writes synthesis to retros/{date}.json)"
+        echo "    $0 $project --reset                (zero counter on success)"
+    fi
+}
+
+# --- Scan all projects ---
+scan_all() {
+    local due_only="$1"
+    local found=0
+    local due_count=0
+    if [ ! -d "$SESSIONS_ROOT" ]; then
+        echo "v11-retro: SESSIONS_ROOT not found: $SESSIONS_ROOT" >&2
+        return 3
+    fi
+    for d in "$SESSIONS_ROOT"/*/; do
+        [ -d "$d" ] || continue
+        local project
+        project=$(basename "$d")
+        local count
+        count=$(read_counter "$project")
+        count="${count:-0}"
+        if [ "$due_only" = "yes" ]; then
+            if [ "$count" -ge "$RETRO_THRESHOLD" ]; then
+                printf '%-40s sessions=%-4s status=DUE\n' "$project" "$count"
+                due_count=$((due_count + 1))
+            fi
+        else
+            local status="ok"
+            [ "$count" -ge "$RETRO_THRESHOLD" ] && status="DUE"
+            [ "$count" -eq 0 ] && status="-"
+            printf '%-40s sessions=%-4s threshold=%-3s status=%s\n' "$project" "$count" "$RETRO_THRESHOLD" "$status"
+            found=$((found + 1))
+        fi
+    done
+    if [ "$due_only" = "yes" ]; then
+        echo ""
+        if [ "$due_count" -eq 0 ]; then
+            echo "v11-retro: no retrospectives due (threshold $RETRO_THRESHOLD sessions)"
+        else
+            echo "v11-retro: $due_count project(s) due. Run /v11 retrospective PROJECT for each."
+        fi
+    fi
+}
+
+# --- Self-test ---
+self_test() {
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    SESSIONS_ROOT="$tmpdir" mkdir -p "$tmpdir/test-project"
+    SESSIONS_ROOT="$tmpdir" RETRO_THRESHOLD=3 "$0" test-project >/dev/null
+    [ "$?" -eq 0 ] || { echo "FAIL: empty counter read"; rm -rf "$tmpdir"; exit 1; }
+    printf '5\n' > "$tmpdir/test-project/.retro-counter"
+    local out
+    out=$(SESSIONS_ROOT="$tmpdir" V11_RETRO_THRESHOLD=3 "$0" test-project)
+    echo "$out" | grep -q "DUE" || { echo "FAIL: threshold not detected"; rm -rf "$tmpdir"; exit 1; }
+    SESSIONS_ROOT="$tmpdir" "$0" test-project --reset >/dev/null
+    local count
+    count=$(cat "$tmpdir/test-project/.retro-counter" | tr -dc '0-9')
+    [ "$count" = "0" ] || { echo "FAIL: counter not reset"; rm -rf "$tmpdir"; exit 1; }
+    rm -rf "$tmpdir"
+    echo "v11-retro self-test PASSED"
+}
+
+# --- Main ---
+case "${1:-}" in
+    ""|--help|-h)
+        usage
+        exit 0
+        ;;
+    --test)
+        self_test
+        ;;
+    --due)
+        scan_all yes
+        ;;
+    --scan)
+        scan_all no
+        ;;
+    *)
+        PROJECT="$1"
+        if [ "${2:-}" = "--reset" ]; then
+            reset_counter "$PROJECT"
+        else
+            show_one "$PROJECT"
+        fi
+        ;;
+esac
+
+exit 0

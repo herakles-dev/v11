@@ -1,0 +1,181 @@
+#!/bin/bash
+# V11 Script: formation-heartbeat
+# Proactive health polling for active formations.
+# Reads task state + formation registry. Zero API calls.
+#
+# Usage: ./scripts/formation-heartbeat [PROJECT]
+#   PROJECT: Optional project name. If omitted, uses active project.
+#
+# Exit codes:
+#   0 - Heartbeat completed
+#   1 - No active formation found
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/../hooks/lib/common.sh"
+
+PROJECT="${1:-}"
+
+# Auto-detect project if not specified
+# SEC-C-02: sanitized read — rejects path-traversal / metacharacter payloads
+if [ -z "$PROJECT" ]; then
+    PROJECT="$(v11_read_active_project)"
+fi
+
+if [ -z "$PROJECT" ]; then
+    echo "ERROR: No project specified and no active project detected."
+    echo "Usage: $0 [PROJECT]"
+    exit 1
+fi
+
+# Find formation registry
+REGISTRY=""
+if [ -f "$SESSIONS_ROOT/$PROJECT/.formation-registry.json" ]; then
+    REGISTRY="$SESSIONS_ROOT/$PROJECT/.formation-registry.json"
+elif [ -f "$V11_WORKSPACE_ROOT/$PROJECT/.formation-registry.json" ]; then
+    REGISTRY="$V11_WORKSPACE_ROOT/$PROJECT/.formation-registry.json"
+fi
+
+# Find task state
+TASK_STATE=""
+if [ -f "$TASK_STATE_DIR/${PROJECT}.json" ]; then
+    TASK_STATE="$TASK_STATE_DIR/${PROJECT}.json"
+elif [ -f "$SESSIONS_ROOT/$PROJECT/.task-state.json" ]; then
+    TASK_STATE="$SESSIONS_ROOT/$PROJECT/.task-state.json"
+fi
+
+# Header
+NOW=$(date '+%H:%M:%S')
+echo "Formation Heartbeat [$NOW]"
+echo "=========================="
+echo "  Project: $PROJECT"
+
+# Formation info
+if [ -n "$REGISTRY" ]; then
+    FORMATION=$(jq -r '.formation // "unknown"' "$REGISTRY" 2>/dev/null)
+    TEAMMATE_COUNT=$(jq '.teammates | length' "$REGISTRY" 2>/dev/null)
+    HEARTBEAT_INTERVAL=$(jq -r '.heartbeat_interval_minutes // 10' "$REGISTRY" 2>/dev/null)
+    echo "  Formation: $FORMATION"
+    echo "  Teammates: $TEAMMATE_COUNT"
+    echo "  Interval: ${HEARTBEAT_INTERVAL}min"
+else
+    echo "  Formation: none (no registry found)"
+fi
+echo ""
+
+# Task status
+if [ -n "$TASK_STATE" ] && [ -f "$TASK_STATE" ]; then
+    TOTAL=$(jq -r '.total // 0' "$TASK_STATE" 2>/dev/null)
+    COMPLETED=$(jq -r '.completed // 0' "$TASK_STATE" 2>/dev/null)
+    IN_PROGRESS=$(jq -r '.in_progress // 0' "$TASK_STATE" 2>/dev/null)
+    PENDING=$(jq -r '.pending // 0' "$TASK_STATE" 2>/dev/null)
+
+    if [ "$TOTAL" -gt 0 ]; then
+        PCT=$((COMPLETED * 100 / TOTAL))
+    else
+        PCT=0
+    fi
+
+    echo "Progress: $COMPLETED/$TOTAL tasks ($PCT%)"
+    echo "  Pending:     $PENDING"
+    echo "  In Progress: $IN_PROGRESS"
+    echo "  Completed:   $COMPLETED"
+    echo ""
+
+    # Show active task info (supports multiple parallel teammates)
+    if [ "$IN_PROGRESS" -gt 0 ]; then
+        ACTIVE_IDS=$(jq -r '(.active_task_ids // []) | join(", #")' "$TASK_STATE" 2>/dev/null)
+        if [ -n "$ACTIVE_IDS" ] && [ "$ACTIVE_IDS" != "" ]; then
+            echo "Active Tasks: #$ACTIVE_IDS"
+        else
+            echo "Active Tasks: $IN_PROGRESS in progress"
+        fi
+        echo ""
+    fi
+else
+    echo "Progress: No task state found"
+    echo ""
+fi
+
+# Teammate activity check (if registry exists)
+if [ -n "$REGISTRY" ]; then
+    echo "Teammate Activity:"
+    IDLE_COUNT=0
+    ACTIVE_COUNT=0
+
+    INTERVAL="${HEARTBEAT_INTERVAL:-10}"
+
+    while IFS= read -r role; do
+        [ -z "$role" ] && continue
+
+        # Get directories owned by this role
+        OWNED_DIRS=$(jq -r --arg role "$role" '.teammates[$role].ownership.directories // [] | .[]' "$REGISTRY" 2>/dev/null)
+
+        # Check last modification time in owned directories
+        LAST_MOD=0
+        for dir in $OWNED_DIRS; do
+            # Resolve relative to project root
+            FULL_DIR=""
+            if [ -d "$SESSIONS_ROOT/$PROJECT/$dir" ]; then
+                FULL_DIR="$SESSIONS_ROOT/$PROJECT/$dir"
+            elif [ -d "$V11_WORKSPACE_ROOT/$PROJECT/$dir" ]; then
+                FULL_DIR="$V11_WORKSPACE_ROOT/$PROJECT/$dir"
+            fi
+
+            if [ -n "$FULL_DIR" ] && [ -d "$FULL_DIR" ]; then
+                # Find most recently modified file using stat
+                RECENT_MOD=$(find "$FULL_DIR" -type f -printf '%T@\n' 2>/dev/null | sort -rn | head -1)
+                RECENT_MOD="${RECENT_MOD%.*}"  # Truncate to integer seconds
+                if [ -n "$RECENT_MOD" ] && [ "${RECENT_MOD:-0}" -gt "$LAST_MOD" ] 2>/dev/null; then
+                    LAST_MOD="$RECENT_MOD"
+                fi
+            fi
+        done
+
+        CURRENT_TIME=$(date +%s)
+        if [ "$LAST_MOD" -gt 0 ]; then
+            ELAPSED=$(( (CURRENT_TIME - LAST_MOD) / 60 ))
+            if [ "$ELAPSED" -gt "$INTERVAL" ]; then
+                echo "  $role: IDLE (no writes in ${ELAPSED}min)"
+                IDLE_COUNT=$((IDLE_COUNT + 1))
+            else
+                echo "  $role: ACTIVE (last write ${ELAPSED}min ago)"
+                ACTIVE_COUNT=$((ACTIVE_COUNT + 1))
+            fi
+        else
+            echo "  $role: UNKNOWN (no owned directories found)"
+        fi
+    done < <(jq -r '.teammates | keys[]' "$REGISTRY" 2>/dev/null)
+
+    echo ""
+    if [ "$IDLE_COUNT" -gt 0 ]; then
+        echo "WARNING: $IDLE_COUNT teammate(s) idle. Consider pinging or restarting."
+    fi
+fi
+
+# System resources
+echo ""
+echo "Resources:"
+DISK_AVAIL=$(df -BG "${V11_WORKSPACE_ROOT:-$HOME/.v11}" 2>/dev/null | awk 'NR==2 {print $4}' | tr -d 'G' || echo "")
+MEM_PCT=$(free 2>/dev/null | awk 'NR==2 {printf "%.0f", $3/$2 * 100}' || echo "")
+
+DISK_STATUS="OK"
+if [ -n "${DISK_AVAIL:-}" ] && [ "${DISK_AVAIL:-0}" -lt 5 ] 2>/dev/null; then
+    DISK_STATUS="LOW (<5GB)"
+fi
+
+MEM_STATUS="OK"
+if [ -n "${MEM_PCT:-}" ] && [ "${MEM_PCT:-0}" -gt 80 ] 2>/dev/null; then
+    MEM_STATUS="HIGH (>80%)"
+fi
+
+echo "  Disk: ${DISK_AVAIL:-?}GB available ($DISK_STATUS)"
+echo "  Memory: ${MEM_PCT:-?}% used ($MEM_STATUS)"
+
+# Summary line
+echo ""
+if [ -n "$TASK_STATE" ] && [ -f "$TASK_STATE" ]; then
+    REMAINING=$((TOTAL - COMPLETED))
+    echo "Summary: ${COMPLETED}/${TOTAL} complete, ${IN_PROGRESS} active, ${REMAINING} remaining"
+fi

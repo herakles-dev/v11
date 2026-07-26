@@ -1,0 +1,263 @@
+#!/usr/bin/env bash
+# V11 git post-commit hook: auto-close tasks whose patterns appear in HEAD subject.
+#
+# This is a GIT-EVENT hook (not a Claude Code tool-event hook). It fires after
+# every successful commit in any repo that has installed this hook via
+# scripts/install-postcommit-hook.
+#
+# Algorithm (matches v11.25-postcommit-spec.md §Contract):
+#   1. Confirm git repo; else exit 0.
+#   2. Read HEAD subject only (git log -1 --format='%s').
+#   3. Extract sprint-task patterns: ^S{N}[-prep]-T{M}[,T{M}...]: or + shapes.
+#   4. Resolve active project via $V11_PROJECT > active-project file > repo basename.
+#   5. Replay ledger (read-only) to find in_progress tasks for each pattern.
+#   6. Idempotency: skip tasks already closed by THIS commit_sha in ledger.
+#   7. For each in_progress match: v11_ledger_append (ev=completed, audit fields).
+#   8. Emit one stderr line: [post-commit] auto-closed N task(s): P1, P2 ...
+#
+# Env knobs:
+#   V11_POSTCOMMIT_AUTOCLOSE=off  — short-circuit at step 1 (no-op).
+#   V11_POSTCOMMIT_DRYRUN=on      — steps 1-6 run; step 7 prints planned JSON to
+#                                   stderr prefixed [dryrun] and writes nothing.
+#
+# Failure mode: any error emits to stderr and exits 0.
+# A post-commit hook MUST NEVER block a commit.
+#
+# Rollback:
+#   Per-project: V11_POSTCOMMIT_AUTOCLOSE=off
+#   Per-commit:  V11_POSTCOMMIT_DRYRUN=on
+#   Full:        rm .git/hooks/post-commit
+#
+# V11.20 attribution: caller_kind="hook". Closures are ground-truth completions
+# NOT credited to any agent (see v11.25-postcommit-spec.md §Q2).
+#
+# Hook version: v11.25.0
+# CLAUDE.md §13: git_event_hooks subgroup — first member.
+
+set -euo pipefail
+
+# --- locate V11_HOME and source common library ---
+# realpath first: when installed as a .git/hooks symlink, BASH_SOURCE points at
+# the symlink, so dirname would resolve lib/ against .git/hooks/ (W2-4b canary catch;
+# same fix as hooks/commit-msg-validation in W2-3).
+_HOOK_REAL="$(realpath "${BASH_SOURCE[0]}" 2>/dev/null || readlink -f "${BASH_SOURCE[0]}")"
+_HOOK_DIR="$(cd "$(dirname "$_HOOK_REAL")" && pwd)"
+V11_HOME="${V11_HOME:-$(dirname "$_HOOK_DIR")}"
+source "${V11_HOME}/hooks/lib/common.sh"
+
+HOOK_VERSION="v11.25.0"
+SESSION_UUID="git-hook"
+
+# Self-test
+if [ "${1:-}" = "--test" ]; then
+    echo "post-commit-close-tasks $HOOK_VERSION"
+    exit 0
+fi
+
+# ── Knob: V11_POSTCOMMIT_AUTOCLOSE=off ─────────────────────────────────────
+if [ "${V11_POSTCOMMIT_AUTOCLOSE:-on}" = "off" ]; then
+    echo "[post-commit] V11_POSTCOMMIT_AUTOCLOSE=off — skipping auto-close" >&2
+    exit 0
+fi
+
+# ── Step 1: confirm git repo ────────────────────────────────────────────────
+if ! git rev-parse --git-dir >/dev/null 2>&1; then
+    echo "[post-commit] not a git repository — skipping" >&2
+    exit 0
+fi
+
+# ── Step 2: read HEAD SUBJECT ONLY (not body) ───────────────────────────────
+# Subject (%s): first line only, used for pattern matching.
+# Body (%b):    scanned for HYPOTHESIZED Pairs: exclusion markers ONLY.
+COMMIT_SHA="$(git log -1 --format='%H' 2>/dev/null || true)"
+COMMIT_SUBJECT="$(git log -1 --format='%s' 2>/dev/null || true)"
+COMMIT_BODY="$(git log -1 --format='%b' 2>/dev/null || true)"
+
+if [ -z "$COMMIT_SHA" ] || [ -z "$COMMIT_SUBJECT" ]; then
+    echo "[post-commit] could not read HEAD commit — skipping" >&2
+    exit 0
+fi
+
+# ── Step 2b: scan body for HYPOTHESIZED Pairs: exclusion markers ─────────────
+# Discipline coherence (orchestrator B2 intervention): if the commit body contains
+#   Validation: HYPOTHESIZED
+#   Pairs: T7,T8           ← within 5 lines of the Validation: line
+# then every task ID in Pairs: is EXCLUDED from auto-close, even if the subject
+# matches their pattern. This prevents closing tasks that still carry a live
+# HYPOTHESIZED causal claim that needs human validation.
+# Log to stderr when exclusions occur so the author sees why tasks weren't closed.
+HYPOTHESIZED_EXCLUDED_IDS=""
+if printf '%s' "$COMMIT_BODY" | grep -q "Validation: HYPOTHESIZED" 2>/dev/null; then
+    # Extract Pairs: within 5 lines after Validation: HYPOTHESIZED
+    # Use env var to pass body into Python (avoids heredoc-inside-$() complexity)
+    HYPOTHESIZED_EXCLUDED_IDS="$(V11_PC_BODY="$COMMIT_BODY" python3 -c '
+import os, re, sys
+body = os.environ.get("V11_PC_BODY", "")
+lines = body.split("\n")
+excluded = []
+for i, line in enumerate(lines):
+    if re.search(r"Validation:\s+HYPOTHESIZED", line):
+        for j in range(i+1, min(i+6, len(lines))):
+            m = re.search(r"Pairs:\s*(.+)", lines[j])
+            if m:
+                tokens = [t.strip() for t in m.group(1).split(",")]
+                excluded.extend(t for t in tokens if re.match(r"^T[A-Za-z0-9]+$", t))
+                break
+print(",".join(excluded))
+' 2>/dev/null || true)"
+    if [ -n "$HYPOTHESIZED_EXCLUDED_IDS" ] && [ "$HYPOTHESIZED_EXCLUDED_IDS" != "," ]; then
+        echo "[post-commit] excluding HYPOTHESIZED-paired tasks: $HYPOTHESIZED_EXCLUDED_IDS" >&2
+    fi
+fi
+
+# ── Step 3: extract sprint-task patterns from subject ───────────────────────
+# Delegated to scripts/lib/postcommit_extract_patterns.py for reliable regex.
+# Only the first line (subject) is analyzed — body tokens do not trigger closure.
+EXTRACT_SCRIPT="${V11_HOME}/scripts/lib/postcommit_extract_patterns.py"
+if [ ! -f "$EXTRACT_SCRIPT" ]; then
+    echo "[post-commit] ERROR: missing $EXTRACT_SCRIPT — cannot extract patterns" >&2
+    exit 0
+fi
+
+PATTERNS_RAW="$(python3 "$EXTRACT_SCRIPT" "$COMMIT_SUBJECT" 2>/dev/null || true)"
+
+# No patterns found → no-op (exit cleanly, never block the commit)
+if [ -z "$PATTERNS_RAW" ]; then
+    exit 0
+fi
+
+# ── Step 4: resolve active project ──────────────────────────────────────────
+# Priority: $V11_PROJECT env > active-project file > repo basename.
+# On unresolved: exit 0 with warning (never cross-project writes).
+NOW="$(date -Iseconds)"
+PROJECT=""
+PROJECT_SOURCE=""
+
+if [ -n "${V11_PROJECT:-}" ] && printf '%s' "$V11_PROJECT" | grep -qE '^[a-zA-Z0-9._-]{1,64}$'; then
+    PROJECT="$V11_PROJECT"
+    PROJECT_SOURCE="env-V11_PROJECT"
+fi
+
+if [ -z "$PROJECT" ]; then
+    _active="$(v11_read_active_project 2>/dev/null || true)"
+    if [ -n "$_active" ]; then
+        PROJECT="$_active"
+        PROJECT_SOURCE="active-project-file"
+    fi
+fi
+
+if [ -z "$PROJECT" ]; then
+    # Fallback: repo basename (the directory containing .git)
+    _GIT_DIR="$(git rev-parse --absolute-git-dir 2>/dev/null || true)"
+    if [ -n "$_GIT_DIR" ]; then
+        _REPO_ROOT="$(dirname "$_GIT_DIR")"
+        _BASENAME="$(basename "$_REPO_ROOT")"
+        if printf '%s' "$_BASENAME" | grep -qE '^[a-zA-Z0-9._-]{1,64}$'; then
+            PROJECT="$_BASENAME"
+            PROJECT_SOURCE="repo-basename"
+        fi
+    fi
+fi
+
+if [ -z "$PROJECT" ]; then
+    echo "[post-commit] WARNING: could not resolve active project — skipping auto-close (no cross-project writes)" >&2
+    exit 0
+fi
+
+# ── Steps 5 & 6: replay ledger + idempotency via analysis helper ─────────────
+LEDGER_FILE="${METRICS_DIR}/ledger/${PROJECT}.jsonl"
+
+if [ ! -f "$LEDGER_FILE" ]; then
+    # No ledger for this project — nothing to close
+    exit 0
+fi
+
+ANALYSIS_SCRIPT="${V11_HOME}/scripts/lib/postcommit_analysis.py"
+if [ ! -f "$ANALYSIS_SCRIPT" ]; then
+    echo "[post-commit] ERROR: missing $ANALYSIS_SCRIPT — cannot analyze ledger" >&2
+    exit 0
+fi
+
+# Invoke analysis: outputs PATTERN\tSUBJECT_NORM\tCREATE_SEQ\tTASK_ID per match
+# Pass HYPOTHESIZED_EXCLUDED_IDS so the analysis can filter them out before
+# returning matches (discipline coherence: B2 intervention).
+MATCH_OUTPUT="$(python3 "$ANALYSIS_SCRIPT" \
+    "$PROJECT" "$LEDGER_FILE" "$COMMIT_SHA" "$PATTERNS_RAW" "$V11_HOME" \
+    "${HYPOTHESIZED_EXCLUDED_IDS:-}" \
+    2>/dev/null || true)"
+
+# ── Steps 7 & 8: append ledger events and report ────────────────────────────
+CLOSED_PATTERNS=()
+DRYRUN="${V11_POSTCOMMIT_DRYRUN:-off}"
+
+if [ -n "$MATCH_OUTPUT" ]; then
+    while IFS=$'\t' read -r PATTERN SUBJECT_NORM CREATE_SEQ TASK_ID; do
+        [ -z "$PATTERN" ] && continue
+
+        # Validate required identity fields
+        if [ -z "$SUBJECT_NORM" ] || [ -z "$CREATE_SEQ" ] || [ "$CREATE_SEQ" = "0" ]; then
+            echo "[post-commit] WARNING: no identity (create_seq=0) for pattern=$PATTERN — skipping" >&2
+            continue
+        fi
+
+        # Build the ledger event JSON.
+        # Uses ev="completed" so v11_replay_ledger state machine recognizes it.
+        # Extra audit fields ride on the standard completed event shape.
+        EVENT_JSON="$(jq -cn \
+            --arg project "$PROJECT" \
+            --arg subject_norm "$SUBJECT_NORM" \
+            --argjson create_seq "$CREATE_SEQ" \
+            --arg task_id "${TASK_ID:-}" \
+            --arg session_uuid "$SESSION_UUID" \
+            --arg ts "$NOW" \
+            --arg commit_sha "$COMMIT_SHA" \
+            --arg matched_pattern "$PATTERN" \
+            --arg hook_version "$HOOK_VERSION" '
+            {
+                v: 1,
+                ev: "completed",
+                ts: $ts,
+                project: $project,
+                subject_norm: $subject_norm,
+                create_seq: ($create_seq | tonumber),
+                task_id: (if $task_id != "" then $task_id else "hook-unknown" end),
+                session_uuid: $session_uuid,
+                counters_delta: {"in_progress": -1, "completed": 1},
+                closed_by: "post-commit-hook",
+                commit_sha: $commit_sha,
+                matched_pattern: $matched_pattern,
+                hook_version: $hook_version,
+                caller_kind: "hook",
+                from: "in_progress",
+                to: "completed"
+            }
+        ' 2>/dev/null || true)"
+
+        if [ -z "$EVENT_JSON" ]; then
+            echo "[post-commit] WARNING: failed to build event JSON for pattern=$PATTERN — skipping" >&2
+            continue
+        fi
+
+        if [ "$DRYRUN" = "on" ]; then
+            echo "[dryrun] would append: $EVENT_JSON" >&2
+        else
+            # v11_ledger_append handles FD-207 flock internally — concurrent-safe.
+            v11_ledger_append "$PROJECT" "$EVENT_JSON" || true
+        fi
+        CLOSED_PATTERNS+=("$PATTERN")
+
+    done <<< "$MATCH_OUTPUT"
+fi
+
+# ── Report ───────────────────────────────────────────────────────────────────
+N="${#CLOSED_PATTERNS[@]}"
+if [ "$N" -gt 0 ]; then
+    PATTERN_LIST="$(IFS=', '; printf '%s' "${CLOSED_PATTERNS[*]}")"
+    if [ "$DRYRUN" = "on" ]; then
+        echo "[post-commit][dryrun] would auto-close $N task(s): $PATTERN_LIST" >&2
+    else
+        echo "[post-commit] auto-closed $N task(s): $PATTERN_LIST" >&2
+    fi
+fi
+
+exit 0

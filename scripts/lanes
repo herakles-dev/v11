@@ -1,0 +1,202 @@
+#!/bin/bash
+# V11.29 Script: lanes
+# CLI for the per-project V11 task-execution lane lease (hooks/lib/common.sh
+# "Lane lease (V11.29)" section: v11_lane_claim/release/gc/status).
+#
+# The lane lease prevents two concurrent orchestrator sessions from executing
+# the same task at once. It is an append-only per-project JSONL of
+# claim/release events; replay semantics: latest event per task_id wins.
+#
+# USAGE:
+#   lanes status PROJECT [--json]           # Currently-held lanes: task_id,
+#                                            # holder, claimed_at age, live/stale
+#   lanes gc PROJECT [--max-age MIN]         # Release stale (dead-holder) lanes
+#   lanes release PROJECT TASK_ID [--force]  # Release own-session's claim;
+#                                            # --force releases any holder
+#   lanes --help
+#
+# Sources:
+#   ~/.agent-metrics/lanes/PROJECT.jsonl
+#
+# Rollback: V11_LANE_LEASE=off -> lane lease mechanism is a no-op everywhere;
+# this CLI reports "lane lease disabled" and exits 0 without touching state.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+V11_HOME="${V11_HOME:-$(dirname "$SCRIPT_DIR")}"
+# shellcheck source=../hooks/lib/common.sh
+source "$V11_HOME/hooks/lib/common.sh"
+
+_usage() {
+    sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'
+}
+
+if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ] || [ $# -eq 0 ]; then
+    _usage
+    exit 0
+fi
+
+SUB="$1"; shift
+
+if [ "${V11_LANE_LEASE:-on}" = "off" ]; then
+    echo "lane lease disabled"
+    exit 0
+fi
+
+# Emit the status array with age_min/stale computed, given raw v11_lane_status JSON.
+_status_enriched() {
+    local raw="$1"
+    V11_LN_RAW="$raw" python3 - <<'PYEOF'
+import os, json
+from datetime import datetime, timezone
+
+raw = os.environ.get("V11_LN_RAW", "[]")
+try:
+    lanes = json.loads(raw)
+except Exception:
+    lanes = []
+
+now = datetime.now(timezone.utc).timestamp()
+
+
+def parse_ts(s):
+    try:
+        return datetime.fromisoformat((s or "").replace("Z", "+00:00")).timestamp()
+    except Exception:
+        return None
+
+
+out = []
+for e in lanes:
+    ts = parse_ts(e.get("claimed_at", ""))
+    age_min = round((now - ts) / 60.0, 1) if ts is not None else None
+    live = bool(e.get("live", False))
+    out.append({
+        "task_id": e.get("task_id", ""),
+        "session_uuid": e.get("session_uuid", ""),
+        "claimed_at": e.get("claimed_at", ""),
+        "age_min": age_min,
+        "live": live,
+        "stale": not live,
+    })
+out.sort(key=lambda x: x["task_id"])
+print(json.dumps(out, separators=(",", ":")))
+PYEOF
+}
+
+case "$SUB" in
+    status)
+        if [ $# -lt 1 ]; then
+            echo "lanes status: requires PROJECT [--json]" >&2
+            exit 2
+        fi
+        PROJECT="$1"; shift
+        JSON=false
+        for arg in "$@"; do
+            [ "$arg" = "--json" ] && JSON=true
+        done
+
+        RAW=$(v11_lane_status "$PROJECT")
+        ENRICHED=$(_status_enriched "$RAW")
+
+        if [ "$JSON" = "true" ]; then
+            printf '%s\n' "$ENRICHED"
+        else
+            COUNT=$(printf '%s' "$ENRICHED" | jq 'length' 2>/dev/null || echo 0)
+            echo "Held lanes for project '$PROJECT': $COUNT"
+            if [ "$COUNT" -gt 0 ]; then
+                printf '%-10s  %-14s  %-10s  %-6s\n' "TASK" "HOLDER" "AGE(min)" "STATE"
+                printf '%s' "$ENRICHED" | jq -r '
+                    .[] | [
+                        .task_id,
+                        (.session_uuid[0:14]),
+                        (if .age_min == null then "?" else (.age_min | tostring) end),
+                        (if .live then "live" else "stale" end)
+                    ] | @tsv' | while IFS=$'\t' read -r tid holder age state; do
+                    printf '%-10s  %-14s  %-10s  %-6s\n' "$tid" "$holder" "$age" "$state"
+                done
+            fi
+        fi
+        ;;
+    gc)
+        if [ $# -lt 1 ]; then
+            echo "lanes gc: requires PROJECT [--max-age MIN]" >&2
+            exit 2
+        fi
+        PROJECT="$1"; shift
+        MAX_AGE=30
+        JSON=false
+        while [ $# -gt 0 ]; do
+            case "$1" in
+                --max-age)
+                    if [ $# -ge 2 ]; then
+                        MAX_AGE="$2"
+                        shift 2
+                    else
+                        # --max-age given as the last arg with no value: keep default, don't crash
+                        shift 1
+                    fi
+                    ;;
+                --json) JSON=true; shift ;;
+                *) shift ;;
+            esac
+        done
+        RESULT=$(v11_lane_gc "$PROJECT" "$MAX_AGE")
+        if [ "$JSON" = "true" ]; then
+            printf '%s\n' "$RESULT"
+        else
+            printf '%s' "$RESULT" | jq -r '"Released \(.released) stale lane(s) (checked \(.checked)) for project '"'"'\(.project)'"'"'."'
+        fi
+        ;;
+    release)
+        if [ $# -lt 2 ]; then
+            echo "lanes release: requires PROJECT TASK_ID [--force]" >&2
+            exit 2
+        fi
+        PROJECT="$1"; TASK_ID="$2"; shift 2
+        FORCE=false
+        for arg in "$@"; do
+            [ "$arg" = "--force" ] && FORCE=true
+        done
+
+        if [ "$FORCE" = "true" ]; then
+            RESULT=$(v11_lane_force_release "$PROJECT" "$TASK_ID")
+            case "$RESULT" in
+                released:*)
+                    DISPOSSESSED="${RESULT#released:}"
+                    if [ -n "$DISPOSSESSED" ]; then
+                        echo "WARNING: force-released lane for task '$TASK_ID' in project '$PROJECT' — dispossessed session '$DISPOSSESSED'."
+                    else
+                        echo "released"
+                    fi
+                    ;;
+                not_held)
+                    echo "lanes release --force: task '$TASK_ID' has no held lane in project '$PROJECT' (not_held)"
+                    exit 1
+                    ;;
+                absent)
+                    echo "lanes release --force: invalid project or task id" >&2
+                    exit 2
+                    ;;
+                *)
+                    echo "$RESULT"
+                    ;;
+            esac
+        else
+            MY_SESSION="$(v11_session_uuid 2>/dev/null || echo "legacy-cli")"
+            RESULT=$(v11_lane_release "$PROJECT" "$TASK_ID" "$MY_SESSION")
+            echo "$RESULT"
+            case "$RESULT" in
+                released) exit 0 ;;
+                not_held) exit 1 ;;
+                absent) exit 2 ;;
+            esac
+        fi
+        ;;
+    *)
+        echo "lanes: unknown subcommand '$SUB'" >&2
+        echo "Run 'lanes --help' for usage." >&2
+        exit 2
+        ;;
+esac

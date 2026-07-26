@@ -1,0 +1,23 @@
+{
+  "project": "{{PROJECT}}",
+  "version": "1.0.0",
+  "last_checked": "{{TIMESTAMP}}",
+  "scope_signals": {
+    "task_count": 0,
+    "has_formation": false,
+    "cynefin": "confused",
+    "multi_sprint": false,
+    "has_audit": false
+  },
+  "artifacts": [
+    {"name": "spec.md", "path": "spec.md", "tier": "required", "category": "session", "exists": true, "last_updated": "{{TIMESTAMP}}"},
+    {"name": ".task-state.json", "path": ".task-state.json", "tier": "required", "category": "session", "exists": true, "last_updated": "{{TIMESTAMP}}"},
+    {"name": ".autonomy-state", "path": ".autonomy-state", "tier": "required", "category": "governance", "exists": true, "last_updated": "{{TIMESTAMP}}"},
+    {"name": ".plan-context.json", "path": ".plan-context.json", "tier": "required", "category": "planning", "exists": true, "last_updated": "{{TIMESTAMP}}"},
+    {"name": "roadmap.md", "path": "roadmap.md", "tier": "conditional", "category": "tracking", "condition": "task_count >= 10", "exists": false, "last_updated": null},
+    {"name": "architecture.md", "path": "architecture.md", "tier": "conditional", "category": "documentation", "condition": "cynefin in [complex, chaotic]", "exists": false, "last_updated": null},
+    {"name": "gates.md", "path": "gates.md", "tier": "conditional", "category": "governance", "condition": "multi_sprint", "exists": false, "last_updated": null},
+    {"name": ".formation-registry.json", "path": ".formation-registry.json", "tier": "conditional", "category": "governance", "condition": "has_formation", "exists": false, "last_updated": null},
+    {"name": "handoff.md", "path": "handoff.md", "tier": "optional", "category": "session", "exists": false, "last_updated": null}
+  ]
+}

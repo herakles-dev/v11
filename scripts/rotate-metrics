@@ -1,0 +1,169 @@
+#!/bin/bash
+# V8 Metrics Rotation Script
+# Rotates JSONL metrics files when they exceed size threshold
+# Usage: ./scripts/rotate-metrics [--dry-run] [--threshold MB]
+
+set -e
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+METRICS_DIR="${METRICS_DIR:-$HOME/.agent-metrics}"
+ARCHIVE_DIR="$METRICS_DIR/archive"
+THRESHOLD_MB="${THRESHOLD_MB:-10}"
+DRY_RUN=false
+# P4: orphan session-scoped active-project cleanup
+SESSIONS_TTL_DAYS="${SESSIONS_TTL_DAYS:-7}"
+DO_SESSIONS=false
+
+# Help
+if [ "$1" == "--help" ] || [ "$1" == "-h" ]; then
+    cat << 'HELP'
+V8 Metrics Rotation - Rotate JSONL files when they exceed threshold
+
+USAGE:
+    ./scripts/rotate-metrics
+    ./scripts/rotate-metrics --dry-run
+    ./scripts/rotate-metrics --threshold 5
+    ./scripts/rotate-metrics --help
+
+OPTIONS:
+    --dry-run        Show what would be rotated without acting
+    --threshold MB   Size threshold in MB (default: 10)
+    --sessions       Also clean orphan session-scoped active-project dirs
+                     (older than $SESSIONS_TTL_DAYS days)
+    --sessions-ttl N  Override session TTL in days (default: 7)
+
+FILES MANAGED:
+    ~/.agent-metrics/usage.jsonl
+    ~/.agent-metrics/autonomy-audit.jsonl
+    ~/.agent-metrics/model-escalation.jsonl
+    ~/.agent-metrics/dispatch-trace.jsonl   (V11.21 — orchestrator Phase 4 spawn record)
+    All *.jsonl in ~/.agent-metrics/ (rotate-metrics globs the directory)
+
+SESSIONS CLEANUP (--sessions):
+    ~/.agent-metrics/sessions/{session-id}/active-project
+    (P4: per-session active-project scoping introduced 2026-05-14)
+
+ARCHIVE FORMAT:
+    ~/.agent-metrics/archive/{filename}.{YYYYMMDD-HHMMSS}.jsonl.gz
+HELP
+    exit 0
+fi
+
+# Parse arguments
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --dry-run)
+            DRY_RUN=true
+            shift
+            ;;
+        --threshold)
+            THRESHOLD_MB="$2"
+            shift 2
+            ;;
+        --sessions)
+            DO_SESSIONS=true
+            shift
+            ;;
+        --sessions-ttl)
+            SESSIONS_TTL_DAYS="$2"
+            shift 2
+            ;;
+        *)
+            shift
+            ;;
+    esac
+done
+
+# Convert MB to bytes
+THRESHOLD_BYTES=$((THRESHOLD_MB * 1024 * 1024))
+
+# Create archive directory
+mkdir -p "$ARCHIVE_DIR"
+
+# Rotate function
+rotate_file() {
+    local file="$1"
+    local basename=$(basename "$file" .jsonl)
+    local timestamp=$(date +%Y%m%d-%H%M%S)
+    local archive_name="${basename}.${timestamp}.jsonl"
+
+    if [ "$DRY_RUN" = true ]; then
+        echo "  [DRY-RUN] Would rotate: $file -> $ARCHIVE_DIR/$archive_name.gz"
+    else
+        # Move and compress
+        mv "$file" "$ARCHIVE_DIR/$archive_name"
+        gzip "$ARCHIVE_DIR/$archive_name"
+
+        # Create fresh empty file
+        touch "$file"
+
+        echo "  ✅ Rotated: $file -> $ARCHIVE_DIR/$archive_name.gz"
+    fi
+}
+
+echo "=== V8 Metrics Rotation ==="
+echo "Threshold: ${THRESHOLD_MB}MB (${THRESHOLD_BYTES} bytes)"
+echo "Directory: $METRICS_DIR"
+echo ""
+
+# Check each metrics file
+ROTATED=0
+for jsonl_file in "$METRICS_DIR"/*.jsonl; do
+    [ -f "$jsonl_file" ] || continue
+
+    filename=$(basename "$jsonl_file")
+    size=$(stat -f%z "$jsonl_file" 2>/dev/null || stat -c%s "$jsonl_file" 2>/dev/null || echo 0)
+    size_mb=$(echo "scale=2; $size / 1024 / 1024" | bc)
+
+    echo "Checking: $filename (${size_mb}MB)"
+
+    if [ "$size" -gt "$THRESHOLD_BYTES" ]; then
+        echo "  ⚠️  Exceeds threshold"
+        rotate_file "$jsonl_file"
+        ROTATED=$((ROTATED + 1))
+    else
+        echo "  ✓ Within threshold"
+    fi
+done
+
+echo ""
+echo "=== Summary ==="
+echo "Files rotated: $ROTATED"
+echo "Archive location: $ARCHIVE_DIR"
+
+# Show archive contents
+if [ -d "$ARCHIVE_DIR" ] && [ "$(ls -A "$ARCHIVE_DIR" 2>/dev/null)" ]; then
+    echo ""
+    echo "Archived files:"
+    ls -lh "$ARCHIVE_DIR"/*.gz 2>/dev/null | awk '{print "  " $NF " (" $5 ")"}'
+fi
+
+echo ""
+
+# P4: optional orphan session-scoped active-project cleanup
+if $DO_SESSIONS; then
+    SESSIONS_DIR="$METRICS_DIR/sessions"
+    if [ -d "$SESSIONS_DIR" ]; then
+        echo "=== Session cleanup (TTL: ${SESSIONS_TTL_DAYS} days) ==="
+        cleaned=0
+        # Find directories older than TTL; -mindepth 1 -maxdepth 1 = direct children only
+        while IFS= read -r dir; do
+            [ -z "$dir" ] && continue
+            if $DRY_RUN; then
+                echo "  [DRY-RUN] Would remove: $dir"
+            else
+                rm -rf "$dir" && echo "  Removed: $dir"
+            fi
+            cleaned=$((cleaned + 1))
+        done < <(find "$SESSIONS_DIR" -mindepth 1 -maxdepth 1 -type d -mtime "+${SESSIONS_TTL_DAYS}" 2>/dev/null)
+
+        if [ "$cleaned" -eq 0 ]; then
+            echo "  No orphan session dirs older than ${SESSIONS_TTL_DAYS} days"
+        else
+            echo "  Total session dirs ${DRY_RUN:+would be }cleaned: $cleaned"
+        fi
+        echo ""
+    fi
+fi
+
+echo "Tip: Add to crontab for automatic rotation:"
+echo "  0 0 * * * $V11_WORKSPACE_ROOT/v11/scripts/rotate-metrics --sessions"

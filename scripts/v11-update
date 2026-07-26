@@ -1,0 +1,354 @@
+#!/bin/bash
+# V11 Update — Upgrade project V11 hooks to latest version
+# Usage: ./scripts/v11-update PROJECT [--dry-run]
+#        ./scripts/v11-update --scan
+#        ./scripts/v11-update --all [--dry-run]
+#
+# Detects current V11 version from hook wiring, applies incremental upgrades.
+# All changes are backed up before modification.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+V11_HOME="$(cd "$SCRIPT_DIR/.." && pwd)"
+source "$SCRIPT_DIR/../hooks/lib/common.sh" 2>/dev/null || {
+  V11_WORKSPACE_ROOT="${V11_WORKSPACE_ROOT:-$HOME/.v11}"
+  SESSIONS_ROOT="${SESSIONS_ROOT:-$V11_WORKSPACE_ROOT/sessions}"
+}
+
+CURRENT_VERSION="v11.11"
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+err() { echo "ERROR: $*" >&2; exit 1; }
+
+detect_version() {
+  local settings="$1"
+  [ ! -f "$settings" ] && echo "none" && return
+
+  local hook_count
+  hook_count=$(grep -c 'v11/hooks/' "$settings" 2>/dev/null || echo "0")
+  hook_count="${hook_count//[!0-9]/}"; hook_count="${hook_count:-0}"
+  local has_post_compact
+  has_post_compact=$(grep -c 'post-compact' "$settings" 2>/dev/null || echo "0")
+  has_post_compact="${has_post_compact//[!0-9]/}"; has_post_compact="${has_post_compact:-0}"
+  local has_fix_team_pre
+  has_fix_team_pre=$(jq -r '[.hooks.PreToolUse[]? | select(.command? // "" | contains("fix-team-model"))] | length' "$settings" 2>/dev/null || echo "0")
+  has_fix_team_pre="${has_fix_team_pre//[!0-9]/}"; has_fix_team_pre="${has_fix_team_pre:-0}"
+
+  if [ "$hook_count" -eq 0 ]; then echo "none"
+  elif [ "$hook_count" -le 11 ]; then echo "v11.0"
+  elif [ "$hook_count" -le 13 ] && [ "$has_fix_team_pre" -eq 0 ]; then echo "v11.1"
+  elif [ "$has_post_compact" -eq 0 ]; then echo "v11.2"
+  else echo "v11.5"
+  fi
+}
+
+# Check if shared hooks contain current-version (V11.6+) features.
+# V11.7 (tracker system) and V11.8 (formation-select, STR interview, strict
+# Gate 11) are framework-level — they ship via shared scripts/agents, not
+# new per-project settings.json hooks. So a project with full V11.6 wiring
+# running against current shared hooks is effectively at $CURRENT_VERSION.
+detect_current_features() {
+  grep -q 'V11_HOME' "$V11_HOME/hooks/lib/common.sh" 2>/dev/null && \
+  grep -q 'PYEOF\|context_tracker' "$V11_HOME/hooks/sync-tasks" 2>/dev/null
+}
+# Backward-compat alias
+detect_v11_6() { detect_current_features; }
+
+find_settings() {
+  local project="$1"
+  for p in "$V11_WORKSPACE_ROOT/$project/.claude/settings.json" \
+           "$SESSIONS_ROOT/$project/.claude/settings.json"; do
+    [ -f "$p" ] && echo "$p" && return
+  done
+  echo ""
+}
+
+version_num() {
+  case "$1" in
+    none) echo 0 ;; v11.0) echo 1 ;; v11.1) echo 2 ;;
+    v11.2) echo 3 ;; v11.5) echo 4 ;; v11.6) echo 5 ;;
+    v11.7) echo 6 ;; v11.8) echo 7 ;; v11.9) echo 8 ;;
+    v11.10) echo 9 ;; v11.11) echo 10 ;;
+    *) echo 0 ;;
+  esac
+}
+
+# ── Upgrade Steps ─────────────────────────────────────────────────────────────
+
+upgrade_to_v11_1() {
+  local settings="$1" dry="$2"
+  # V11.11: TeamCreate is deprecated; fix-team-model is a dormant safety net kept for
+  # backwards compatibility. The matcher is still wired so older projects that reference
+  # TeamCreate don't lose the guard entirely.
+  echo "  + Add fix-team-model PostToolUse (TeamCreate|Agent) [V11.11: dormant safety net]"
+  [ "$dry" = "true" ] && return
+  local tmp="${settings}.tmp"
+  jq --arg cmd "$V11_HOME/hooks/fix-team-model" \
+    '.hooks.PostToolUse += [{"matcher": "TeamCreate|Agent", "type": "command", "command": $cmd}]' \
+    "$settings" > "$tmp" && mv "$tmp" "$settings"
+}
+
+upgrade_to_v11_2() {
+  local settings="$1" dry="$2"
+  # V11.11: TeamCreate is deprecated; fix-team-model is a dormant safety net kept for
+  # backwards compatibility. The PreToolUse trigger fires only if TeamCreate is invoked.
+  echo "  + Add fix-team-model PreToolUse (TeamCreate|Agent) [V11.11: dormant safety net]"
+  [ "$dry" = "true" ] && return
+  local tmp="${settings}.tmp"
+  jq --arg cmd "$V11_HOME/hooks/fix-team-model" \
+    '.hooks.PreToolUse += [{"matcher": "TeamCreate|Agent", "type": "command", "command": $cmd}]' \
+    "$settings" > "$tmp" && mv "$tmp" "$settings"
+}
+
+upgrade_to_v11_5() {
+  local settings="$1" dry="$2"
+  echo "  + Add post-compact PostToolUse hook"
+  [ "$dry" = "true" ] && return
+  local tmp="${settings}.tmp"
+  jq --arg cmd "$V11_HOME/hooks/post-compact" \
+    '.hooks.PostToolUse += [{"type": "command", "command": $cmd}]' \
+    "$settings" > "$tmp" && mv "$tmp" "$settings"
+}
+
+upgrade_to_v11_6() {
+  local project="$1" dry="$2"
+  echo "  + V11.6: shared hooks already updated (context tracking, wave review, recovery)"
+  echo "  + Run validate-project-setup for 14-check verification"
+  [ "$dry" = "true" ] && return
+  "$SCRIPT_DIR/validate-project-setup" "$project" 2>/dev/null || true
+}
+
+upgrade_to_v11_7() {
+  local project="$1" dry="$2"
+  echo "  + V11.7: tracker system — shared scripts/agents already updated"
+  echo "  + New: tracker-status, F13 deep-research, F14 pm-audit, adversarial-reviewer"
+  [ "$dry" = "true" ] && return
+  # No per-project settings.json change. Optional: refresh session-manifest.
+  if [ -x "$SCRIPT_DIR/tracker-status" ]; then
+    "$SCRIPT_DIR/tracker-status" "$project" >/dev/null 2>&1 || true
+  fi
+}
+
+upgrade_to_v11_8() {
+  local project="$1" dry="$2"
+  echo "  + V11.8: formation-select + validate-invariants + flywheel taxonomy"
+  echo "  + STR interview hook + strict Gate 11 + verify-gate0 (all framework-level)"
+  [ "$dry" = "true" ] && return
+  # No per-project settings.json change. V11.8 enforcement runs at compliance check.
+}
+
+upgrade_to_v11_11() {
+  local project="$1" dry="$2"
+  echo "  + V11.11: per-task agent assignment via metadata.agent on TaskCreate"
+  echo "  + TeamCreate deprecated; guard-teammate-timeout renamed to guard-agent-stall"
+  echo "  + .formation-registry.json is legacy/optional — no crash if missing"
+  [ "$dry" = "true" ] && return
+  # Framework-level: sync-tasks metadata.agent support + guard-agent-stall hook ship
+  # via shared hooks/scripts. No per-project settings.json hook change required.
+  # Validate compliance to surface any stale guard-teammate-timeout references.
+  if [ -x "$SCRIPT_DIR/v11-compliance-check" ]; then
+    "$SCRIPT_DIR/v11-compliance-check" "$project" 2>/dev/null || true
+  fi
+}
+
+# ── Apply Upgrades ────────────────────────────────────────────────────────────
+
+apply_upgrade() {
+  local project="$1" settings="$2" current="$3" dry="${4:-false}"
+  local cur_num target_num
+  cur_num=$(version_num "$current")
+  target_num=$(version_num "$CURRENT_VERSION")
+
+  if [ "$cur_num" -ge "$target_num" ]; then
+    echo "  Already on $CURRENT_VERSION. Nothing to update."
+    return 0
+  fi
+
+  local steps=$(( target_num - cur_num ))
+  echo "  Upgrading $current -> $CURRENT_VERSION ($steps steps)"
+
+  # Backup
+  if [ "$dry" != "true" ]; then
+    cp "$settings" "${settings}.${current}-backup"
+    echo "  Backup: ${settings}.${current}-backup"
+  fi
+
+  # Apply each step
+  [ "$cur_num" -lt 2 ]  && upgrade_to_v11_1  "$settings" "$dry"
+  [ "$cur_num" -lt 3 ]  && upgrade_to_v11_2  "$settings" "$dry"
+  [ "$cur_num" -lt 4 ]  && upgrade_to_v11_5  "$settings" "$dry"
+  [ "$cur_num" -lt 5 ]  && upgrade_to_v11_6  "$project"  "$dry"
+  [ "$cur_num" -lt 6 ]  && upgrade_to_v11_7  "$project"  "$dry"
+  [ "$cur_num" -lt 7 ]  && upgrade_to_v11_8  "$project"  "$dry"
+  # v11.9 and v11.10 were framework-level releases (no per-project hook changes).
+  # v11.11 covers all three in a single upgrade step.
+  [ "$cur_num" -lt 10 ] && upgrade_to_v11_11 "$project"  "$dry"
+
+  return 0
+}
+
+# ── Commands ──────────────────────────────────────────────────────────────────
+
+cmd_scan() {
+  echo ""
+  echo "V11 Version Survey"
+  echo "==================="
+  echo ""
+
+  local count_current=0 count_v11_5=0 count_v11_2=0 count_v11_1=0 count_v11_0=0 count_none=0
+  local projects_v11_5="" projects_v11_2="" projects_v11_0="" projects_none=""
+
+  for dir in "$SESSIONS_ROOT"/*/; do
+    [ -d "$dir" ] || continue
+    local proj
+    proj=$(basename "$dir")
+    local settings
+    settings=$(find_settings "$proj")
+    local ver
+    if [ -z "$settings" ]; then
+      ver="none"
+    else
+      ver=$(detect_version "$settings")
+    fi
+
+    case "$ver" in
+      v11.5)
+        if detect_current_features; then
+          count_current=$((count_current + 1))
+        else
+          count_v11_5=$((count_v11_5 + 1))
+          projects_v11_5="$projects_v11_5 $proj"
+        fi
+        ;;
+      v11.2) count_v11_2=$((count_v11_2 + 1)); projects_v11_2="$projects_v11_2 $proj" ;;
+      v11.1) count_v11_1=$((count_v11_1 + 1)); projects_v11_0="$projects_v11_0 $proj" ;;
+      v11.0) count_v11_0=$((count_v11_0 + 1)); projects_v11_0="$projects_v11_0 $proj" ;;
+      none)  count_none=$((count_none + 1)); projects_none="$projects_none $proj" ;;
+    esac
+  done
+
+  printf "  %-22s %3d projects\n" "v11.11 (current):" "$count_current"
+  printf "  %-22s %3d projects" "v11.5-10 (1-6 behind):" "$count_v11_5"
+  [ -n "$projects_v11_5" ] && printf "  (%s)" "$(echo $projects_v11_5 | tr ' ' ', ')"
+  echo
+  printf "  %-22s %3d projects" "v11.2-4 (4-6 behind):" "$count_v11_2"
+  [ -n "$projects_v11_2" ] && printf "  (%s)" "$(echo $projects_v11_2 | tr ' ' ', ')"
+  echo
+  printf "  %-22s %3d projects" "v11.0-1 (7+ behind):" "$(( count_v11_0 + count_v11_1 ))"
+  [ -n "$projects_v11_0" ] && printf "  (%s)" "$(echo $projects_v11_0 | tr ' ' ', ')"
+  echo
+  printf "  %-22s %3d sessions" "No V11:" "$count_none"
+  echo
+  echo ""
+
+  local total_outdated=$(( count_v11_5 + count_v11_2 + count_v11_1 + count_v11_0 ))
+  if [ "$total_outdated" -gt 0 ]; then
+    echo "Update all: /v11-update --all"
+  else
+    echo "All V11 projects are current."
+  fi
+  echo ""
+}
+
+cmd_update_all() {
+  local dry="${1:-false}"
+  local updated=0 failed=0 skipped=0
+
+  echo ""
+  echo "V11 Batch Update to $CURRENT_VERSION"
+  echo "======================================"
+  [ "$dry" = "true" ] && echo "(DRY RUN — no changes)"
+  echo ""
+
+  for dir in "$SESSIONS_ROOT"/*/; do
+    [ -d "$dir" ] || continue
+    local proj
+    proj=$(basename "$dir")
+    local settings
+    settings=$(find_settings "$proj")
+    [ -z "$settings" ] && continue
+
+    local ver
+    ver=$(detect_version "$settings")
+    [ "$ver" = "none" ] && continue
+
+    printf "  %-30s %s -> %s  " "$proj" "$ver" "$CURRENT_VERSION"
+
+    if [ "$(version_num "$ver")" -ge "$(version_num "$CURRENT_VERSION")" ]; then
+      echo "[current]"
+      skipped=$((skipped + 1))
+      continue
+    fi
+
+    if apply_upgrade "$proj" "$settings" "$ver" "$dry" > /dev/null 2>&1; then
+      echo "[OK]"
+      updated=$((updated + 1))
+    else
+      echo "[FAIL]"
+      failed=$((failed + 1))
+    fi
+  done
+
+  echo ""
+  echo "$updated updated, $skipped current, $failed failed."
+  echo ""
+}
+
+cmd_update_single() {
+  local project="$1" dry="${2:-false}"
+
+  # Sanitize project name
+  if [[ "$project" == *".."* ]] || [[ "$project" == *"/"* ]] || [[ "$project" =~ [^a-zA-Z0-9._-] ]]; then
+    err "Invalid project name: $project"
+  fi
+
+  local settings
+  settings=$(find_settings "$project")
+  if [ -z "$settings" ]; then
+    echo "No settings.json found for '$project'."
+    echo "Not a V11 project. Use: ./scripts/migrate-to-v11 $project"
+    exit 1
+  fi
+
+  local ver
+  ver=$(detect_version "$settings")
+  echo ""
+  echo "V11 Update: $project"
+  echo "  Settings: $settings"
+  echo "  Current version: $ver"
+  echo "  Target version: $CURRENT_VERSION"
+  [ "$dry" = "true" ] && echo "  (DRY RUN)"
+  echo ""
+
+  apply_upgrade "$project" "$settings" "$ver" "$dry"
+  echo ""
+}
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
+  cat << 'HELP'
+V11 Update — Upgrade project V11 hooks to latest version
+
+Usage:
+  ./scripts/v11-update PROJECT [--dry-run]   Update single project
+  ./scripts/v11-update --scan                Show version survey
+  ./scripts/v11-update --all [--dry-run]     Update all V11 projects
+
+HELP
+  exit 0
+fi
+
+case "${1:-}" in
+  --scan) cmd_scan ;;
+  --all)  cmd_update_all "${2:-false}" ;;
+  --test) echo "v11-update v11.11.0"; exit 0 ;;
+  "")     echo "Usage: ./scripts/v11-update PROJECT [--dry-run] | --scan | --all"; exit 1 ;;
+  *)
+    DRY=false
+    [ "${2:-}" = "--dry-run" ] && DRY=true
+    cmd_update_single "$1" "$DRY"
+    ;;
+esac

@@ -1,0 +1,324 @@
+#!/bin/bash
+# V11.20.2 — improve-subagent
+#
+# Gather all V11.20 + retrospective signal for AGENT into a structured evidence
+# dossier that drives the orchestrator's improvement synthesis. Closes the
+# V11.20 audit→improve loop:
+#
+#   audit (scorecard, errors, journal)
+#     → analyze (cluster patterns, identify prompt weaknesses — by orchestrator)
+#     → propose (specific amendments per section with evidence)
+#     → apply (with timestamped backup + rollback)
+#
+# USAGE:
+#     ./scripts/improve-subagent AGENT [options]
+#     ./scripts/improve-subagent AGENT --apply --from-proposal PATH
+#     ./scripts/improve-subagent --list-improvable    # agents with logged errors
+#
+# OPTIONS:
+#     --since DATE              Only errors since DATE (ISO 8601; default: 30d ago)
+#     --from PROJECT            Filter to errors from this project
+#     --layer L                 Filter to one of: runtime|lite|wave|swarm
+#     --json                    Emit machine-readable JSON dossier (default: markdown)
+#     --apply --from-proposal P Apply the patch in P (after orchestrator review)
+#     --list-improvable         List agents with any logged errors
+#     --rollback AGENT          Restore most-recent backup
+#
+# OUTPUTS (default md mode):
+#   stdout: human-readable evidence report for orchestrator synthesis
+#   /tmp/improve-{agent}-{timestamp}.json: full dossier (cited by stdout)
+#
+# RATIONALE: kept as a data-gathering tool. The analysis + amendment proposal
+# is the orchestrator's job (Opus, with full context). This script avoids
+# baking analysis logic into bash — keeps the loop reusable.
+#
+# SAFETY: --apply requires explicit --from-proposal pointing at an
+# orchestrator-blessed patch file. Never auto-edits agent files without it.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+V11_HOME="${V11_HOME:-$(dirname "$SCRIPT_DIR")}"
+V11_WORKSPACE_ROOT="${V11_WORKSPACE_ROOT:-$HOME/.v11}"
+METRICS_DIR="${METRICS_DIR:-$V11_WORKSPACE_ROOT/.agent-metrics}"
+AGENTS_DIR="${AGENTS_DIR:-$V11_WORKSPACE_ROOT/.claude/agents}"
+JOURNAL_DIR="${JOURNAL_DIR:-$V11_WORKSPACE_ROOT/.claude/skills/team-orchestrator/journal}"
+SESSIONS_ROOT="${SESSIONS_ROOT:-$V11_WORKSPACE_ROOT/sessions}"
+
+usage() {
+    sed -n '/^# V11/,/^set -euo/p' "$0" | grep -v '^set' | sed 's/^# \?//'
+    exit 0
+}
+
+# --- Arg parsing ---
+AGENT=""
+SINCE=""
+FROM_PROJECT=""
+LAYER=""
+MODE="md"
+APPLY=false
+PROPOSAL_PATH=""
+LIST_MODE=false
+ROLLBACK_AGENT=""
+FORCE=false
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --since)            SINCE="${2:-}"; shift 2 ;;
+        --from)             FROM_PROJECT="${2:-}"; shift 2 ;;
+        --layer)            LAYER="${2:-}"; shift 2 ;;
+        --json)             MODE="json"; shift ;;
+        --apply)            APPLY=true; shift ;;
+        --from-proposal)    PROPOSAL_PATH="${2:-}"; shift 2 ;;
+        --list-improvable)  LIST_MODE=true; shift ;;
+        --rollback)         ROLLBACK_AGENT="${2:-}"; shift 2 ;;
+        --force)            FORCE=true; shift ;;
+        --help|-h)          usage ;;
+        --*)                echo "improve-subagent: unknown flag: $1" >&2; exit 1 ;;
+        *)
+            if [ -z "$AGENT" ]; then AGENT="$1"
+            else echo "improve-subagent: unexpected arg: $1" >&2; exit 1
+            fi
+            shift ;;
+    esac
+done
+
+# --- Mode: list-improvable ---
+if $LIST_MODE; then
+    if [ ! -f "$METRICS_DIR/agent-errors.jsonl" ]; then
+        echo "No agent-errors.jsonl ledger yet." >&2
+        exit 0
+    fi
+    echo "Agents with logged errors (V11.20 ledger):"
+    jq -r '.agent_id // empty' "$METRICS_DIR/agent-errors.jsonl" 2>/dev/null \
+        | sort | uniq -c | sort -rn \
+        | awk '{printf "  %5d  %s\n", $1, $2}'
+    exit 0
+fi
+
+# --- Mode: rollback ---
+if [ -n "$ROLLBACK_AGENT" ]; then
+    AGENT_FILE="$AGENTS_DIR/$ROLLBACK_AGENT.md"
+    LATEST_BACKUP=$(ls -t "$AGENT_FILE".backup.* 2>/dev/null | head -1 || true)
+    if [ -z "$LATEST_BACKUP" ]; then
+        echo "improve-subagent: no backup found for $ROLLBACK_AGENT" >&2
+        exit 1
+    fi
+    echo "Rolling back $ROLLBACK_AGENT from $LATEST_BACKUP" >&2
+    cp "$LATEST_BACKUP" "$AGENT_FILE"
+    echo "Restored. Backup preserved at $LATEST_BACKUP" >&2
+    exit 0
+fi
+
+# --- Mode: apply ---
+if $APPLY; then
+    if [ -z "$AGENT" ] || [ -z "$PROPOSAL_PATH" ]; then
+        echo "improve-subagent: --apply requires AGENT and --from-proposal PATH" >&2
+        exit 1
+    fi
+    AGENT_FILE="$AGENTS_DIR/$AGENT.md"
+    if [ ! -f "$AGENT_FILE" ]; then
+        echo "improve-subagent: agent file not found: $AGENT_FILE" >&2
+        exit 1
+    fi
+    if [ ! -f "$PROPOSAL_PATH" ]; then
+        echo "improve-subagent: proposal file not found: $PROPOSAL_PATH" >&2
+        exit 1
+    fi
+    TS=$(date -u +%Y%m%dT%H%M%SZ)
+    BACKUP="$AGENT_FILE.backup.$TS"
+    cp "$AGENT_FILE" "$BACKUP"
+    echo "Backup: $BACKUP" >&2
+    # Apply the proposal as a unified diff (orchestrator emits patch format)
+    if ! patch --silent -p0 "$AGENT_FILE" < "$PROPOSAL_PATH"; then
+        echo "improve-subagent: patch failed; restoring backup" >&2
+        cp "$BACKUP" "$AGENT_FILE"
+        exit 2
+    fi
+    # Verify YAML frontmatter still parses
+    if ! head -30 "$AGENT_FILE" | python3 -c "import yaml,sys; doc=sys.stdin.read().split('---',2)[1]; yaml.safe_load(doc)" 2>/dev/null; then
+        echo "improve-subagent: post-patch YAML frontmatter invalid; restoring" >&2
+        cp "$BACKUP" "$AGENT_FILE"
+        exit 3
+    fi
+    echo "Applied. Rollback: $0 --rollback $AGENT" >&2
+    exit 0
+fi
+
+# --- Mode: gather (default) ---
+if [ -z "$AGENT" ]; then
+    echo "improve-subagent: AGENT required (or --list-improvable)" >&2
+    exit 1
+fi
+
+AGENT_FILE="$AGENTS_DIR/$AGENT.md"
+if [ ! -f "$AGENT_FILE" ]; then
+    echo "improve-subagent: agent file not found: $AGENT_FILE" >&2
+    echo "Use --list-improvable to see agents with logged errors" >&2
+    exit 1
+fi
+
+# Default --since: 30 days ago (ISO 8601)
+if [ -z "$SINCE" ]; then
+    SINCE=$(date -u -d '30 days ago' +%Y-%m-%dT00:00:00Z 2>/dev/null \
+        || date -u -v-30d +%Y-%m-%dT00:00:00Z 2>/dev/null \
+        || echo "1970-01-01T00:00:00Z")
+fi
+
+TS=$(date -u +%Y%m%dT%H%M%SZ)
+DOSSIER="/tmp/improve-${AGENT}-${TS}.json"
+
+# --- 1. Scorecard ---
+SCORECARD_JSON=$("$V11_HOME/scripts/agent-scorecard" "$AGENT" --json 2>/dev/null || echo '{}')
+
+# --- 2. Sample raw errors (most recent 30 since SINCE, optionally filtered) ---
+ERROR_LEDGER="$METRICS_DIR/agent-errors.jsonl"
+if [ -f "$ERROR_LEDGER" ]; then
+    RAW_ERRORS=$(jq -c --arg a "$AGENT" --arg since "$SINCE" --arg proj "$FROM_PROJECT" --arg layer "$LAYER" '
+        select(.agent_id == $a)
+        | select(.timestamp >= $since)
+        | (if $proj == "" then . else select(.project == $proj) end)
+        | (if $layer == "" then . else select((.found_by_layer // "lite") == $layer) end)
+    ' "$ERROR_LEDGER" 2>/dev/null | tail -30 | jq -s '.' 2>/dev/null || echo '[]')
+else
+    RAW_ERRORS='[]'
+fi
+
+# --- 3. Journal mentions ---
+JOURNAL_HITS=""
+if [ -d "$JOURNAL_DIR" ]; then
+    JOURNAL_HITS=$(grep -l "$AGENT" "$JOURNAL_DIR"/*.md 2>/dev/null \
+        | xargs -I{} grep -B 1 -A 3 "$AGENT" {} 2>/dev/null \
+        | head -60 || true)
+fi
+JOURNAL_JSON=$(printf '%s' "$JOURNAL_HITS" | jq -Rs '.' 2>/dev/null || echo '""')
+
+# --- 4. Recent lite-reviews JSONs that mention this agent ---
+LITE_REVIEWS='[]'
+if [ -d "$SESSIONS_ROOT" ]; then
+    LR_FILES=$(find "$SESSIONS_ROOT" -path '*/review-*/lite-reviews.json' -mtime -30 2>/dev/null || true)
+    if [ -n "$LR_FILES" ]; then
+        LITE_REVIEWS=$(echo "$LR_FILES" | xargs -I{} jq --arg a "$AGENT" '
+            {file: input_filename, matching: [.verdicts[]? | select(.agent_id == $a)]}
+            | select(.matching | length > 0)
+        ' {} 2>/dev/null | jq -s '.' 2>/dev/null || echo '[]')
+    fi
+fi
+
+# --- 5. Current agent definition (the prompt to be improved) ---
+AGENT_DEF=$(cat "$AGENT_FILE")
+AGENT_DEF_JSON=$(printf '%s' "$AGENT_DEF" | jq -Rs '.')
+
+# --- Compose dossier ---
+jq -n \
+    --arg agent "$AGENT" \
+    --arg agent_file "$AGENT_FILE" \
+    --arg since "$SINCE" \
+    --arg ts "$TS" \
+    --argjson scorecard "$SCORECARD_JSON" \
+    --argjson raw_errors "$RAW_ERRORS" \
+    --argjson journal "$JOURNAL_JSON" \
+    --argjson lite_reviews "$LITE_REVIEWS" \
+    --argjson agent_def "$AGENT_DEF_JSON" \
+    '{
+        agent: $agent,
+        agent_file: $agent_file,
+        gathered_at: $ts,
+        since: $since,
+        scorecard: $scorecard,
+        raw_error_sample: $raw_errors,
+        journal_context: $journal,
+        lite_review_history: $lite_reviews,
+        current_agent_definition: $agent_def
+    }' > "$DOSSIER"
+
+# --- Output ---
+if [ "$MODE" = "json" ]; then
+    cat "$DOSSIER"
+    exit 0
+fi
+
+# Human-readable summary for orchestrator
+ERROR_COUNT=$(echo "$RAW_ERRORS" | jq 'length' 2>/dev/null || echo 0)
+TOP_TYPES=$(echo "$RAW_ERRORS" | jq -r '[.[] | .error_type] | group_by(.) | map({type: .[0], n: length}) | sort_by(-.n) | .[:5] | .[] | "  \(.n)× \(.type)"' 2>/dev/null || echo "")
+LITE_REVIEW_COUNT=$(echo "$LITE_REVIEWS" | jq 'length' 2>/dev/null || echo 0)
+JOURNAL_LINES=$(printf '%s' "$JOURNAL_HITS" | wc -l)
+# Total signal across all evidence channels (matches SKILL.md rule 8 confidence floor)
+TOTAL_SIGNAL=$((ERROR_COUNT + LITE_REVIEW_COUNT + JOURNAL_LINES))
+
+cat <<EOF
+# Evidence dossier — $AGENT (V11.20.2 improve-subagent)
+
+Gathered: $TS  ·  Window: since $SINCE  ·  Dossier: $DOSSIER
+
+## Quick stats
+- Agent file:        $AGENT_FILE
+- Errors in window:  $ERROR_COUNT
+- Lite-reviews seen: $LITE_REVIEW_COUNT
+- Journal mentions:  $JOURNAL_LINES line(s)
+- Total signal:      $TOTAL_SIGNAL
+
+## Top error types
+$TOP_TYPES
+
+## Scorecard (V11.20)
+$(echo "$SCORECARD_JSON" | jq -r '
+    if .error_count_by_layer then
+        "  runtime: \(.error_count_by_layer.runtime // 0)  lite: \(.error_count_by_layer.lite // 0)  wave: \(.error_count_by_layer.wave // 0)  swarm: \(.error_count_by_layer.swarm // 0)"
+    else
+        "  (scorecard data not yet computed for this agent)"
+    end
+' 2>/dev/null || echo "  (scorecard unavailable)")
+
+EOF
+
+# Confidence floor (matches SKILL.md rule 8): refuse to fabricate when signal thin
+if [ "$ERROR_COUNT" -lt 3 ] && ! $FORCE; then
+    cat <<EOF
+## Verdict — INSUFFICIENT SIGNAL
+
+Only $ERROR_COUNT logged error(s) for this agent in the window since $SINCE.
+Per SKILL.md rule 8 (confidence floor), the orchestrator MUST defer rather
+than fabricate amendments.
+
+### Why this is the right answer
+- Agent-improvement amendments must be cited by ≥1 logged error each.
+- With <3 errors total, there is no error cluster to inform a pattern-level fix.
+- Fabricating amendments from a blank ledger produces speculative prompt drift —
+  the opposite of evidence-driven improvement.
+
+### What to do instead
+1. **Let the agent run more.** Per-task lite review (V11.19) will generate signal as
+   tasks complete. Re-run \`./scripts/improve-subagent $AGENT\` after the next sprint.
+2. **Check if this agent is actually used.** If \`scripts/agent-effectiveness\` shows
+   0 tasks ever, it may be an inactive specialist — improvement target should be
+   "promote / demote / merge" via agent-optimizer, not prompt amendment.
+3. **Manual signal you have NOT logged?** If you (the operator) have unwritten
+   feedback about this agent's failure modes, run \`/v11 reflect\` first to land
+   it in the journal, then re-run this skill.
+
+### Override (NOT recommended)
+If you want a speculative proposal anyway, pass \`--force\` to bypass the floor.
+The output will be labeled SPECULATIVE and should be reviewed with extreme skepticism.
+
+EOF
+    exit 0
+fi
+
+# Sufficient signal — guide orchestrator through Phase 2+3
+cat <<EOF
+## Next steps (orchestrator)
+
+Per SKILL.md Phase 2:
+1. Read \`$DOSSIER\` for full evidence.
+2. Grep agent file sections: \`grep -n '^##\|^###\|^####' $AGENT_FILE\`
+   (Section names vary by agent — adapt to what's actually there, don't assume Step 4 Verify exists.)
+3. Cluster errors by type. Map each cluster to the closest existing section per SKILL.md table.
+4. Apply rules 1-9 — especially: generalize examples, behavior-shift question per amendment, split by cluster, severity order, surface self-critique BEFORE asking.
+
+Per SKILL.md Phase 3:
+5. Generate patches via \`diff -u\` from working copies (NOT hand-written @@ headers).
+6. Verify each patch: \`patch --dry-run -p0 $AGENT_FILE < /tmp/improve-${AGENT}-X.patch\`.
+7. Apply in severity order: \`./scripts/improve-subagent $AGENT --apply --from-proposal /tmp/improve-${AGENT}-X.patch\`
+8. Rollback (if needed): \`./scripts/improve-subagent --rollback $AGENT\`
+EOF

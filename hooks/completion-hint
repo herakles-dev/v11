@@ -1,0 +1,158 @@
+#!/bin/bash
+# V11 Hook: completion-hint (PostToolUse — Write|Edit)
+# T4 of v11-handoff-hygiene.
+#
+# When an edit is the kind of edit that LIKELY completes the current
+# in_progress task (heuristic: edited file's basename appears in the task
+# subject as a token), emit a one-shot stderr suggestion to mark the task
+# completed. Per-task marker prevents re-nag.
+#
+# Env vars:
+#   V11_COMPLETION_HINT=off       → disable entirely
+#   V11_COMPLETION_HINT_DEBUG=1   → log heuristic evaluation to stderr
+#
+# Exit codes:
+#   0 — always (advisory, never blocks)
+
+# Defensive — never fail Write/Edit on hook errors. The hook intentionally
+# DOES emit stderr (its whole purpose is to nudge), so we cannot wrap the
+# whole body in 2>/dev/null. Instead, every individual side-effect that
+# could fail is guarded with `|| true`, and the outermost `set +e` keeps
+# any one error from killing the process.
+set -u +e
+
+[ "${V11_COMPLETION_HINT:-on}" = "off" ] && exit 0
+
+# Load shared lib
+_LIB="$(dirname "${BASH_SOURCE[0]}")/lib/common.sh"
+[ -f "$_LIB" ] || exit 0
+source "$_LIB" 2>/dev/null || exit 0
+
+# Guard: common.sh must export METRICS_DIR. If it didn't (minimal env,
+# lazy init, source partial-failure), bail before set -u trips on first use.
+# V11.25.2: silent failure here was indistinguishable from "no active task".
+[ -z "${METRICS_DIR:-}" ] && exit 0
+
+# Test mode
+if [ "${1:-}" = "--test" ]; then
+    echo "completion-hint v1"
+    exit 0
+fi
+
+# Read stdin (Claude Code passes JSON event)
+_STDIN_JSON="$(cat 2>/dev/null || true)"
+[ -z "$_STDIN_JSON" ] && exit 0
+
+# Extract tool_input.file_path (or .filePath / .path — variants by tool variant)
+_FILE_PATH="$(printf '%s' "$_STDIN_JSON" | jq -r '
+    (.tool_input.file_path // .tool_input.filePath // .tool_input.path // "")
+' 2>/dev/null || true)"
+[ "$_FILE_PATH" = "null" ] && _FILE_PATH=""
+[ -z "$_FILE_PATH" ] && exit 0
+
+_TOOL_NAME="$(printf '%s' "$_STDIN_JSON" | jq -r '.tool_name // ""' 2>/dev/null || true)"
+case "$_TOOL_NAME" in
+    Write|Edit) ;;
+    *) exit 0 ;;
+esac
+
+# Resolve session + project
+_SID="$(printf '%s' "$_STDIN_JSON" | jq -r '.session_id // empty' 2>/dev/null || true)"
+[ -z "$_SID" ] && _SID="${V11_SESSION_ID:-}"
+[ -z "$_SID" ] && exit 0
+
+PROJECT="$(v11_read_active_project 2>/dev/null || true)"
+[ -z "$PROJECT" ] && exit 0
+
+# Per-session state file (the source of truth for THIS session's active task)
+_SESS_STATE="$METRICS_DIR/sessions/$_SID/task-state.json"
+[ -f "$_SESS_STATE" ] || exit 0
+[ -s "$_SESS_STATE" ] || exit 0
+
+# Get the active in_progress tasks for this session
+_ACTIVE=$(jq -c '
+    (.open_tasks // {}) | to_entries
+    | map(select(.value.status == "in_progress"))
+    | map({id: .key, subject: (.value.subject // ""), description: (.value.description // "")})
+' "$_SESS_STATE" 2>/dev/null || echo "[]")
+
+_ACTIVE_COUNT=$(printf '%s' "$_ACTIVE" | jq 'length' 2>/dev/null || echo 0)
+_ACTIVE_COUNT="${_ACTIVE_COUNT//[!0-9]/}"; _ACTIVE_COUNT="${_ACTIVE_COUNT:-0}"
+[ "$_ACTIVE_COUNT" -eq 0 ] && exit 0
+
+# Compute "salient tokens" from the edited file's basename (drop path,
+# extension, separators) and check whether any active in_progress task's
+# subject contains those tokens. The heuristic is intentionally narrow:
+# the file basename usually IS the unique identifier of the work
+# (e.g. editing accuracy_tracker.py while task says "Fix
+# HourlyAccuracyTracker numpy bug" → tracker matches).
+_BASE="$(basename "$_FILE_PATH" 2>/dev/null || echo "")"
+[ -z "$_BASE" ] && exit 0
+_BASE_NOEXT="${_BASE%.*}"
+# Split on _ - . / digits and emit tokens >=4 chars (filter out short noise)
+_FILE_TOKS=$(printf '%s' "$_BASE_NOEXT" | tr 'A-Z' 'a-z' \
+    | tr -c '[:alpha:]' '\n' \
+    | awk 'length($0) >= 4 {print}' | sort -u)
+if [ -z "$_FILE_TOKS" ]; then
+    # V11.25.2: distinguish "no usable tokens" from "no active task" in DEBUG.
+    [ "${V11_COMPLETION_HINT_DEBUG:-}" = "1" ] && \
+        echo "completion-hint: no tokens >=4 chars from basename '$_BASE_NOEXT' (file=$_FILE_PATH)" >&2
+    exit 0
+fi
+
+# For each in_progress task, check token overlap with subject.
+# Match is "any file-token appears as a substring of normalized subject".
+_HINT_TASK_ID=""
+_HINT_SUBJECT=""
+while IFS= read -r _row; do
+    _id=$(printf '%s' "$_row" | jq -r '.id // ""' 2>/dev/null)
+    _subj=$(printf '%s' "$_row" | jq -r '.subject // ""' 2>/dev/null)
+    [ -z "$_id" ] && continue
+    _subj_lower=$(printf '%s' "$_subj" | tr 'A-Z' 'a-z')
+    while IFS= read -r _tok; do
+        [ -z "$_tok" ] && continue
+        if printf '%s' "$_subj_lower" | grep -qF -- "$_tok"; then
+            _HINT_TASK_ID="$_id"
+            _HINT_SUBJECT="$_subj"
+            break 2
+        fi
+    done <<< "$_FILE_TOKS"
+done < <(printf '%s' "$_ACTIVE" | jq -c '.[]' 2>/dev/null)
+
+[ -z "$_HINT_TASK_ID" ] && exit 0
+
+# Per-task marker: one hint per task per session
+_HINT_MARKER="$METRICS_DIR/sessions/$_SID/.completion-hint.${_HINT_TASK_ID}"
+[ -f "$_HINT_MARKER" ] && exit 0
+
+# Optional debug
+if [ "${V11_COMPLETION_HINT_DEBUG:-}" = "1" ]; then
+    echo "completion-hint: matched task #${_HINT_TASK_ID} (subject: ${_HINT_SUBJECT}) against $_FILE_PATH" >&2
+fi
+
+# Emit one-shot stderr hint
+_CH_SUFFIX=""
+if [ "${V11_SELF_REVIEW_ACTUATE:-on}" != "off" ]; then
+    _CH_SUFFIX=" Also include metadata.artifacts.self_review ({severity, summary, errors[], reviewed_at, agent_id})."
+fi
+echo "[V11 hint] Edit on '$_BASE' matches task #${_HINT_TASK_ID} subject ('${_HINT_SUBJECT}'). If this edit completes the task, run: TaskUpdate(taskId=\"${_HINT_TASK_ID}\", status=\"completed\").${_CH_SUFFIX}" >&2
+
+# Also append to the audit log for observability
+_CH_LOG="$METRICS_DIR/completion-hints.jsonl"
+mkdir -p "$METRICS_DIR" 2>/dev/null || true
+{
+    jq -c -n \
+        --arg ts "$(date -Iseconds)" \
+        --arg project "$PROJECT" \
+        --arg session_id "$_SID" \
+        --arg task_id "$_HINT_TASK_ID" \
+        --arg subject "$_HINT_SUBJECT" \
+        --arg file "$_FILE_PATH" \
+        '{ts: $ts, project: $project, session_id: $session_id, task_id: $task_id, subject: $subject, file: $file}'
+} >> "$_CH_LOG" 2>/dev/null || true
+
+# Mark so we don't nag for this task again
+mkdir -p "$(dirname "$_HINT_MARKER")" 2>/dev/null || true
+date -Iseconds > "$_HINT_MARKER" 2>/dev/null || true
+
+exit 0

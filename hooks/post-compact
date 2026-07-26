@@ -1,0 +1,228 @@
+#!/bin/bash
+# V11 Hook: post-compact (PostCompact)
+# Re-injects V11 context after conversation compaction.
+#
+# After compaction, the model loses detailed conversation but keeps compressed
+# summary. This hook injects the most actionable context that compaction drops:
+#   - What project and task am I working on? (with subject, not just ID)
+#   - Sprint/gate progress
+#   - What just completed? (last 5 with subjects)
+#   - What's blocked and why?
+#   - Recommended agents per task (V11.11)
+#   - Recent files modified
+#   - Plan file and key decisions
+#
+# Data sources: task-state JSON (enriched by sync-tasks), autonomy state,
+# audit trail, plan files, spec.md
+#
+# Design: concise, structured, <50 lines output. Every line earns its place.
+#
+# Exit codes:
+#   0 - Always (informational, never blocks)
+
+source "$(dirname "${BASH_SOURCE[0]}")/lib/common.sh"
+
+if [ "$1" == "--test" ]; then
+    echo "post-compact v3"
+    exit 0
+fi
+
+# --- Determine active project ---
+# SEC-C-02: sanitized read — rejects path-traversal / metacharacter payloads
+PROJECT="$(v11_read_active_project)"
+[ -z "$PROJECT" ] && exit 0
+
+PROJECT_DIR="$SESSIONS_ROOT/$PROJECT"
+STATE_FILE="$TASK_STATE_DIR/${PROJECT}.json"
+
+# ── Header ──────────────────────────────────────────────────────────────
+echo "V11 CONTEXT RESTORED after compaction"
+echo "Project: $PROJECT"
+
+# ── 1. Task state + current work ────────────────────────────────────────
+if [ -f "$STATE_FILE" ]; then
+    # Single jq: counts + phase + sprint/gate + active task detail
+    jq -r '
+        "\nProgress: \(.completed // 0)/\(.total // 0) done, \(.in_progress // 0) active, \(.pending // 0) pending, \(.blocked // 0) blocked" +
+        (if .phase and .phase != "null" then " [phase: \(.phase)]" else "" end) +
+        (if .active_task_sprint and .active_task_sprint != "null" then "\nSprint: \(.active_task_sprint)" + (if .active_task_gate and .active_task_gate != "null" then " | Gate: \(.active_task_gate)" else "" end) else "" end) +
+        (if (.active_task_ids | length) > 0 then "\nActive task IDs: " + (.active_task_ids | join(", ")) else "" end) +
+        (if .active_agent_id and .active_agent_id != "null" then "\nActive agent: " + .active_agent_id else "" end) +
+        (if .active_task and .active_task != "null" then "\nCurrent work: " + (.active_task | tostring | .[0:120]) else "" end)
+    ' "$STATE_FILE" 2>/dev/null
+else
+    echo ""
+    echo "Progress: (no task state)"
+fi
+
+# ── 2. Recent completions (with subjects) ──────────────────────────────
+if [ -f "$STATE_FILE" ]; then
+    RECENT=$(jq -r '
+        (.recent_completed // [])[:5] |
+        if length > 0 then
+            "\nRecently completed:" +
+            (map(
+                if type == "object" then
+                    "\n  #\(.id // "?"): \(.subject // "unknown" | .[0:80])"
+                elif type == "string" then
+                    "\n  " + .[0:80]
+                else ""
+                end
+            ) | join(""))
+        else ""
+        end
+    ' "$STATE_FILE" 2>/dev/null)
+    [ -n "$RECENT" ] && printf '%s\n' "$RECENT"
+fi
+
+# ── 3. Blocked tasks (with reasons) ────────────────────────────────────
+if [ -f "$STATE_FILE" ]; then
+    BLOCKED=$(jq -r '
+        (.blocked_tasks // [])[:3] |
+        if length > 0 then
+            "\nBlocked tasks:" +
+            (map("\n  #\(.id // "?"): \(.subject // "unknown" | .[0:60]) — \(.reason // "unspecified" | .[0:60])") | join(""))
+        else ""
+        end
+    ' "$STATE_FILE" 2>/dev/null)
+    [ -n "$BLOCKED" ] && printf '%s\n' "$BLOCKED"
+fi
+
+# ── 4. Spec intent ─────────────────────────────────────────────────────
+SPEC_FILE="$PROJECT_DIR/spec.md"
+if [ -f "$SPEC_FILE" ]; then
+    TITLE=$(head -1 "$SPEC_FILE" | sed 's/^#\+ *//')
+    INTENT=$(sed -n '/^## Intent/,/^## /{/^## Intent/d;/^## /d;/^$/d;p}' "$SPEC_FILE" 2>/dev/null | head -1)
+    [ -z "$INTENT" ] && INTENT=$(grep -v '^#\|^$\|^---\|^>' "$SPEC_FILE" 2>/dev/null | head -1)
+    [ ${#INTENT} -gt 120 ] && INTENT="${INTENT:0:117}..."
+    if [ -n "$TITLE" ]; then
+        echo ""
+        echo "Spec: $TITLE"
+        [ -n "$INTENT" ] && echo "  $INTENT"
+    fi
+fi
+
+# ── 5. Recommended agents (V11.11 — per-task assignment) ───────────────
+if [ -f "$TASK_STATE" ]; then
+    AGENTS=$(jq -r '.recommended_agents // {} | to_entries[] | "\(.key)=\(.value)"' "$TASK_STATE" 2>/dev/null | head -5)
+    if [ -n "$AGENTS" ]; then
+        echo ""
+        echo "Task agents: $AGENTS"
+    fi
+fi
+
+# ── 6. Autonomy ────────────────────────────────────────────────────────
+AUTONOMY_FILE="$PROJECT_DIR/.autonomy-state"
+if [ -f "$AUTONOMY_FILE" ]; then
+    jq -r '"Autonomy: A\(.level // 0) (\(.successful // 0) successes, \(.errors // 0) errors)"' \
+        "$AUTONOMY_FILE" 2>/dev/null
+fi
+
+# ── 7. Recent files modified ───────────────────────────────────────────
+AUDIT_LOG="$METRICS_DIR/autonomy-audit.jsonl"
+if [ -f "$AUDIT_LOG" ]; then
+    RECENT_FILES=$(tail -50 "$AUDIT_LOG" 2>/dev/null \
+        | jq -r --arg p "$PROJECT" 'select(.project == $p and .file and .file != "null" and (.action == "Write" or .action == "Edit")) | .file' 2>/dev/null \
+        | grep -v '^$' | grep '^/' | sort -u | tail -5)
+    if [ -n "$RECENT_FILES" ]; then
+        echo ""
+        echo "Recently modified files:"
+        echo "$RECENT_FILES" | while read -r f; do echo "  $f"; done
+    fi
+fi
+
+# ── 8. Plan file + key decisions ────────────────────────────────────────
+PLANS_DIR="$HOME/.claude/plans"
+
+# ── 8b. Reasoning context ─────────────────────────────────────────────
+PLAN_CONTEXT_FILE="$PROJECT_DIR/.plan-context.json"
+if [ -f "$PLAN_CONTEXT_FILE" ]; then
+    PC_OUT=$(jq -r '
+        (if .domain.cynefin and .domain.cynefin != "null" and .domain.cynefin != "confused" then "Domain: " + .domain.cynefin else "" end) +
+        (if (.hypotheses // []) | map(select(.status == "active")) | length > 0 then
+            "\nActive hypotheses:" +
+            ((.hypotheses // []) | map(select(.status == "active"))[:5] | map(
+                "\n  H" + .id + " (" + ((.current // .prior // 0) * 100 | floor | tostring) + "%): " + (.statement[:80])
+            ) | join(""))
+        else "" end) +
+        (if .bottleneck.current and .bottleneck.current != "" and .bottleneck.current != "null" then
+            "\nBottleneck: " + .bottleneck.current
+        else "" end) +
+        (if (.constraints.hard // []) | length > 0 then
+            "\nHard constraints: " + ((.constraints.hard // []) | map(.name) | join(", "))
+        else "" end) +
+        (if .resume_context.next_critical_question and .resume_context.next_critical_question != "" and .resume_context.next_critical_question != "null" then
+            "\nResume: " + .resume_context.next_critical_question
+        else "" end)
+    ' "$PLAN_CONTEXT_FILE" 2>/dev/null)
+    if [ -n "$PC_OUT" ]; then
+        echo ""
+        echo "Reasoning context:"
+        printf '%s\n' "$PC_OUT" | while IFS= read -r line; do
+            [ -n "$line" ] && echo "  $line"
+        done
+    fi
+fi
+if [ -d "$PLANS_DIR" ]; then
+    PLAN_FILE=$(grep -rl "<!-- v11-plan: $PROJECT -->" "$PLANS_DIR" 2>/dev/null | head -1)
+    if [ -n "$PLAN_FILE" ] && [ -f "$PLAN_FILE" ]; then
+        echo ""
+        echo "Plan file: $PLAN_FILE"
+        # Extract first 3 non-empty lines from ## Plan section
+        PLAN_PREVIEW=$(sed -n '/^## Plan$/,/^## /{/^## /d;/^$/d;p}' "$PLAN_FILE" 2>/dev/null | head -3)
+        if [ -n "$PLAN_PREVIEW" ] && [ "$PLAN_PREVIEW" != "(No plan content yet — add architectural decisions and implementation steps here)" ] && [ "$PLAN_PREVIEW" != "(Add architectural decisions and implementation steps here)" ]; then
+            echo "Plan preview:"
+            echo "$PLAN_PREVIEW" | while read -r line; do echo "  $line"; done
+        fi
+    fi
+fi
+
+# ── 9. Gates progress (for multi-sprint projects) ──────────────────────
+GATES_FILE="$PROJECT_DIR/gates.md"
+if [ -f "$GATES_FILE" ]; then
+    # Show passed/pending gates
+    PASSED=$(grep -c '\[x\]' "$GATES_FILE" 2>/dev/null || true)
+    PASSED="${PASSED//[!0-9]/}"; PASSED="${PASSED:-0}"
+    TOTAL_GATES=$(grep -c '\[.\]' "$GATES_FILE" 2>/dev/null || true)
+    TOTAL_GATES="${TOTAL_GATES//[!0-9]/}"; TOTAL_GATES="${TOTAL_GATES:-0}"
+    NEXT_GATE=$(grep -m1 '\[ \]' "$GATES_FILE" 2>/dev/null | sed 's/.*\[ \] *//' | head -c 80)
+    if [ "$TOTAL_GATES" -gt 0 ]; then
+        echo ""
+        echo "Gates: $PASSED/$TOTAL_GATES passed"
+        [ -n "$NEXT_GATE" ] && echo "  Next: $NEXT_GATE"
+    fi
+fi
+
+# ── 10. Pending handoff awareness (V11.17 Fix 5) ────────────────────────
+# If a non-empty handoff-tasks.json exists, surface it as one line. Don't dump
+# the full <v11-resume> block — that would auto-recreate tasks already loaded.
+# Opt-out: V11_COMPACT_HANDOFF_LINE=off.
+if [ "${V11_COMPACT_HANDOFF_LINE:-}" != "off" ]; then
+    HO_TASKS_FILE="$PROJECT_DIR/handoff-tasks.json"
+    if [ -f "$HO_TASKS_FILE" ] && [ -s "$HO_TASKS_FILE" ]; then
+        HO_OPEN_COUNT=$(jq -r '(.open_tasks // []) | length' "$HO_TASKS_FILE" 2>/dev/null || echo 0)
+        [[ "$HO_OPEN_COUNT" =~ ^[0-9]+$ ]] || HO_OPEN_COUNT=0
+        if [ "$HO_OPEN_COUNT" -gt 0 ]; then
+            echo ""
+            echo "Handoff waiting: $HO_OPEN_COUNT open task(s). Run /v11 to rehydrate."
+        fi
+    fi
+fi
+
+# ── Footer ──────────────────────────────────────────────────────────────
+echo ""
+echo "Next: TaskList for full details, or continue current work."
+
+# Context compaction notice (V11.6)
+echo ""
+echo "Context was compacted. State restored above. Consider /handoff for clean continuation."
+# Reset context tracker for fresh estimate
+python3 - "$V11_HOME" <<'PYEOF' 2>/dev/null || true
+import sys; sys.path.insert(0, sys.argv[1] + '/scripts/lib')
+from context_tracker import ContextTracker
+t = ContextTracker()
+t.reset()
+t.record_event('hook', {'note': 'post-compact reset'})
+PYEOF
+
+exit 0

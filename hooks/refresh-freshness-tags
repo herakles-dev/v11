@@ -1,0 +1,83 @@
+#!/bin/bash
+# V11 Hook: refresh-freshness-tags
+# SessionEnd / sprint-closeout: auto-refresh <!-- Validated: YYYY-MM-DD --> markers.
+# Rollback: V11_FRESHNESS_REFRESH=off   Exit: always 0
+
+[ "${V11_FRESHNESS_REFRESH:-}" = "off" ] && exit 0
+[ "$1" = "--test" ] && echo "refresh-freshness-tags v1" && exit 0
+
+source "$(dirname "${BASH_SOURCE[0]}")/lib/common.sh"
+
+TODAY="$(date +%Y-%m-%d)"
+METRICS_LOG="$METRICS_DIR/freshness-refresh.jsonl"
+
+# --- qualify: at least one completed task this session ---
+# C-E5 fix: use only v11_session_state_path (project-scoped); removed hardcoded
+# reference-project fallback which caused cross-project blast radius in a global hook.
+# If no session state file exists, the hook is a no-op (project has no completions).
+_SESS_STATE="$(v11_session_state_path 2>/dev/null || true)"
+_COMPLETED=0
+if [ -n "$_SESS_STATE" ] && [ -f "$_SESS_STATE" ] && jq empty "$_SESS_STATE" 2>/dev/null; then
+    _C=$(jq -r '.completed // 0' "$_SESS_STATE" 2>/dev/null || echo 0)
+    _C="${_C//[!0-9]/}"; [ "${_C:-0}" -gt 0 ] && _COMPLETED=1
+fi
+[ "$_COMPLETED" -eq 0 ] && exit 0
+
+# --- sprint label from session manifest ---
+SPRINT_LABEL=""
+PROJECT="$(v11_read_active_project 2>/dev/null || true)"
+if [ -n "$PROJECT" ]; then
+    _MF="$SESSIONS_ROOT/$PROJECT/.session-manifest.json"
+    if [ -f "$_MF" ] && jq empty "$_MF" 2>/dev/null; then
+        _SP=$(jq -r '.scope_signals.sprint // empty' "$_MF" 2>/dev/null || true)
+        # C-E6 fix: removed dead line that self-referenced blank SPRINT_LABEL
+        if [ -n "$_SP" ] && [ "$_SP" != "null" ]; then
+            # Sanitize: escape sed metacharacters (\, &, |) before interpolation
+            _SP="$(printf '%s' "$_SP" | sed 's/[\\&|]/\\&/g')"
+            SPRINT_LABEL=" — $_SP active"
+        fi
+    fi
+fi
+NEW_SUFFIX="${TODAY}${SPRINT_LABEL}"
+
+# --- refresh one file (args: absolute path) ---
+refresh_file() {
+    local f="$1"
+    [ -f "$f" ] || return 0
+    case "$f" in */node_modules/*|*/.venv/*|*/__pycache__/*|*/archive/*|*/sessions/*) return 0 ;; esac
+
+    local old new tmp old_tag
+    old="$(cat "$f" 2>/dev/null)" || return 0
+    new="$(printf '%s' "$old" | sed -E \
+        -e "s|(<!-- Validated: )[0-9]{4}-[0-9]{2}-[0-9]{2}[^>]*(-->)|\1${NEW_SUFFIX} \2|g" \
+        -e "s|(Validated: )[0-9]{4}-[0-9]{2}-[0-9]{2}[[:blank:]]*$|\1${NEW_SUFFIX}|gm" \
+        2>/dev/null)" || return 0
+    [ "$old" = "$new" ] && return 0
+
+    tmp="${f}.freshness.$$"
+    printf '%s' "$new" > "$tmp" 2>/dev/null || { rm -f "$tmp"; return 0; }
+    mv "$tmp" "$f" 2>/dev/null || { rm -f "$tmp"; return 0; }
+
+    old_tag=$(printf '%s' "$old" | grep -Eo '<!-- Validated: [0-9]{4}-[0-9]{2}-[0-9]{2}[^>]* -->|Validated: [0-9]{4}-[0-9]{2}-[0-9]{2}' | head -1 || true)
+    mkdir -p "$METRICS_DIR"
+    printf '%s\n' "$(jq -cn --arg fp "$f" --arg ot "$old_tag" --arg nt "Validated: $NEW_SUFFIX" \
+        --arg ts "$(date -Iseconds)" '{file_path:$fp,old_tag:$ot,new_tag:$nt,timestamp:$ts}' 2>/dev/null)" \
+        >> "$METRICS_LOG" 2>/dev/null || true
+}
+
+# --- resolve project root ---
+PROJECT_ROOT=""
+[ -n "$PROJECT" ] && for _t in "$V11_WORKSPACE_ROOT/$PROJECT" "$SESSIONS_ROOT/$PROJECT"; do
+    [ -d "$_t" ] && PROJECT_ROOT="$_t" && break
+done
+[ -z "$PROJECT_ROOT" ] && PROJECT_ROOT="$(pwd)"
+
+# --- scan: CLAUDE.md, spec.md, docs/*.md (maxdepth 1, no archive/sessions) ---
+for _top in CLAUDE.md spec.md; do refresh_file "$PROJECT_ROOT/$_top"; done
+if [ -d "$PROJECT_ROOT/docs" ]; then
+    while IFS= read -r -d '' _doc; do
+        refresh_file "$_doc"
+    done < <(find "$PROJECT_ROOT/docs" -maxdepth 1 -name "*.md" -print0 2>/dev/null)
+fi
+
+exit 0

@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "dispatch-trace.schema.json",
+  "title": "V11.21 Dispatch-Trace Line",
+  "description": "Schema for ONE line of ~/.agent-metrics/dispatch-trace.jsonl. Appended by scripts/dispatch-trace-append once per orchestrator Phase 4 spawn (skill-level, NOT a Claude Code hook). Captures routing intent vs reality so V11.22 can calibrate META_MAP/COMPLEXITY_ROUTING from real dogfood data. Line size cap: 4096 bytes (override_reason truncated first when over). Rollback: V11_DISPATCH_TRACE=off.",
+  "type": "object",
+  "properties": {
+    "ts":                  { "type": "string", "format": "date-time" },
+    "task_id":             { "type": "string" },
+    "project":             { "type": "string" },
+    "sprint":              { "type": "string" },
+    "recommended_agent":   { "type": "string", "description": "Agent the orchestrator's routing logic (scripts/agent-recommend / metadata.agent) recommended." },
+    "spawned_agent":       { "type": "string", "description": "Agent actually spawned. Diverges from recommended_agent on user override, agent unavailable, or DAAO escalation." },
+    "override_reason":     { "type": "string", "maxLength": 1024, "description": "Free-text rationale when spawned_agent != recommended_agent. Truncated with '…' suffix when the full line would exceed 4096 bytes." },
+    "model":               { "type": "string", "description": "Spawn model: sonnet | opus | haiku | inherit." },
+    "mode":                { "type": "string", "description": "Spawn mode: default | acceptEdits | bypassPermissions (autonomy-aware per orchestrate.md)." },
+    "caller_kind":         { "enum": ["orchestrator", "subagent", "unknown", "daemon"], "description": "Was the spawning agent the main orchestrator session or a delegated subagent?" },
+    "self_review_omitted": { "type": "boolean", "description": "True when the spawned agent's prompt lacks the V11.21 self_review postamble (one of the ~100 agents phased to V11.22). Surfaces the known coverage gap without blocking dispatch." },
+    "batch_review_ids":    { "type": "array", "items": { "type": "string" }, "minItems": 1, "description": "OPTIONAL. Present when one reviewer spawn covers K review tasks (batch-claim mode) — the full set of task-id strings covered by this single dispatch. Absent means single-review dispatch (backward compatible with all pre-R6 callers)." },
+    "event":               { "type": "string", "description": "OPTIONAL (W3-T12). Record shape marker, e.g. 'dispatch' (default, when any token-capture flag is supplied) or 'completion'. Absent entirely on pre-W3-T12-shaped lines (backward compatible)." },
+    "tokens":              { "type": "integer", "description": "OPTIONAL (W3-T12). Total tokens reported for this spawn (harness task-notification subagent_tokens). Never fabricated — absent when the harness didn't report it." },
+    "tool_uses":           { "type": "integer", "description": "OPTIONAL (W3-T12). Tool-use count reported for this spawn. Never fabricated — absent when the harness didn't report it." },
+    "duration_ms":         { "type": "integer", "description": "OPTIONAL (W3-T12). Wall-clock duration in ms reported for this spawn. Never fabricated — absent when the harness didn't report it." }
+  },
+  "required": ["ts", "task_id", "project", "sprint", "recommended_agent", "spawned_agent", "model", "mode", "caller_kind", "self_review_omitted"],
+  "additionalProperties": false
+}

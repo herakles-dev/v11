@@ -1,0 +1,8 @@
+{
+  "enabled": true,
+  "scope": "all",
+  "sample_rate": 1,
+  "min_difficulty_to_review": 1,
+  "severity_autofix": ["LOW", "MEDIUM", "HIGH"],
+  "severity_escalate": ["CRITICAL"]
+}

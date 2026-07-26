@@ -1,0 +1,347 @@
+#!/bin/bash
+# V11 Synthesize Findings - Deduplicate, rank, and generate audit report
+# Usage: ./scripts/synthesize-findings PROJECT [--format md|json|both] [--output DIR]
+
+set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+V11_HOME="${V11_HOME:-$(dirname "$SCRIPT_DIR")}"
+V11_WORKSPACE_ROOT="${V11_WORKSPACE_ROOT:-$HOME/.v11}"
+SESSIONS_ROOT="${SESSIONS_ROOT:-$V11_WORKSPACE_ROOT/sessions}"
+
+# --- Help ---
+if [ "${1:-}" == "--help" ] || [ "${1:-}" == "-h" ]; then
+    cat << 'HELP'
+V11 Synthesize Findings — Deduplicate, rank, and generate audit report
+
+USAGE:
+    ./scripts/synthesize-findings PROJECT [OPTIONS]
+
+OPTIONS:
+    --format FORMAT   Output format: md, json, or both (default: both)
+    --output DIR      Output directory (default: sessions/PROJECT/)
+    --min-severity S  Minimum severity to include: critical, high, medium, low (default: low)
+    --help            Show this help
+
+DESCRIPTION:
+    Reads all finding tasks (metadata.type="finding") from the task-state JSON,
+    deduplicates by file:line:category, reconciles severity across agents,
+    and generates issues.md (human-readable) + issues.json (machine-readable).
+
+DEDUPLICATION RULES:
+    1. Same file:line_start:category = duplicate (merge, aggregate found_by)
+    2. Same file, lines within 5 of each other, same category = suspected duplicate
+    3. 3+ agents flag same location = auto-promote to high confidence
+    4. Severity reconciliation: majority vote, escalation bias for critical
+
+EXAMPLES:
+    ./scripts/synthesize-findings nova-forge
+    ./scripts/synthesize-findings nova-forge --format md --min-severity high
+    ./scripts/synthesize-findings nova-forge --output /tmp/audit/
+HELP
+    exit 0
+fi
+
+# --- Args ---
+PROJECT="${1:?Error: PROJECT name required. Usage: ./scripts/synthesize-findings PROJECT}"
+shift
+
+FORMAT="both"
+OUTPUT_DIR="$SESSIONS_ROOT/$PROJECT"
+MIN_SEVERITY="low"
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --format)   FORMAT="${2:?--format requires value}"; shift 2 ;;
+        --output)   OUTPUT_DIR="${2:?--output requires value}"; shift 2 ;;
+        --min-severity) MIN_SEVERITY="${2:?--min-severity requires value}"; shift 2 ;;
+        *) echo "Unknown option: $1" >&2; exit 1 ;;
+    esac
+done
+
+# --- Validate ---
+TASK_STATE_FILE="$V11_WORKSPACE_ROOT/.agent-metrics/task-state/${PROJECT}.json"
+if [ ! -f "$TASK_STATE_FILE" ]; then
+    echo "Error: No task-state found for project '$PROJECT'" >&2
+    echo "Expected: $TASK_STATE_FILE" >&2
+    exit 1
+fi
+
+mkdir -p "$OUTPUT_DIR"
+
+# --- Extract findings from task state ---
+# The task-state JSON stores task_artifacts keyed by task ID
+# We also need to read the raw findings from task descriptions
+# For now, we generate a Python helper for the heavy lifting
+
+python3 - "$TASK_STATE_FILE" "$OUTPUT_DIR" "$FORMAT" "$MIN_SEVERITY" "$PROJECT" << 'PYTHON_SCRIPT'
+import json
+import sys
+import os
+from datetime import datetime
+from collections import defaultdict
+
+task_state_file = sys.argv[1]
+output_dir = sys.argv[2]
+output_format = sys.argv[3]
+min_severity = sys.argv[4]
+project = sys.argv[5]
+
+SEVERITY_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+SEVERITY_MIN = SEVERITY_ORDER.get(min_severity, 3)
+
+CATEGORY_PRIORITY = {
+    "security": 0, "reliability": 1, "correctness": 2,
+    "performance": 3, "integration": 4, "maintainability": 5,
+    "test-coverage": 6, "observability": 7
+}
+
+# --- Read task state ---
+with open(task_state_file) as f:
+    task_state = json.load(f)
+
+# --- Read findings from task artifacts ---
+# Findings are stored in task_artifacts with finding metadata
+findings_raw = []
+task_artifacts = task_state.get("task_artifacts", {})
+
+for task_id, artifact in task_artifacts.items():
+    if not isinstance(artifact, dict):
+        continue
+    # Check if this is a finding task (has finding metadata)
+    finding = artifact.get("finding")
+    severity = artifact.get("severity")
+    task_type = artifact.get("type")
+
+    if task_type != "finding" or not finding or not severity:
+        continue
+
+    if SEVERITY_ORDER.get(severity, 3) > SEVERITY_MIN:
+        continue
+
+    loc = finding.get("location", {})
+    findings_raw.append({
+        "task_id": task_id,
+        "severity": severity,
+        "category": finding.get("category", "unknown"),
+        "file": loc.get("file", "unknown"),
+        "line_start": loc.get("line_start", 0),
+        "line_end": loc.get("line_end", loc.get("line_start", 0)),
+        "context": loc.get("context", ""),
+        "problem": finding.get("problem", ""),
+        "fix": finding.get("fix", ""),
+        "impact": finding.get("impact", "unknown"),
+        "confidence": finding.get("confidence", "medium"),
+        "found_by": finding.get("found_by", []),
+        "subject": artifact.get("summary", artifact.get("subject", "")),
+    })
+
+# Also scan for findings stored as direct metadata (from TaskCreate)
+# These may be in a separate findings file
+findings_file = os.path.join(output_dir, ".raw-findings.json")
+if os.path.exists(findings_file):
+    with open(findings_file) as f:
+        extra = json.load(f)
+        for item in extra:
+            if SEVERITY_ORDER.get(item.get("severity", "low"), 3) <= SEVERITY_MIN:
+                findings_raw.append(item)
+
+if not findings_raw:
+    print(f"No findings found for project '{project}'", file=sys.stderr)
+    print("Findings are created as tasks with metadata.type='finding'", file=sys.stderr)
+    sys.exit(0)
+
+total_raw = len(findings_raw)
+
+# --- Deduplication ---
+# Key: (file, line_start, category) -> merge duplicates
+dedup_map = defaultdict(list)
+for f in findings_raw:
+    key = (f["file"], f["line_start"], f["category"])
+    dedup_map[key].append(f)
+
+# Near-match: same file, category, lines within 5
+merged_keys = set()
+sorted_keys = sorted(dedup_map.keys())
+for i, k1 in enumerate(sorted_keys):
+    for k2 in sorted_keys[i+1:]:
+        if k1 in merged_keys or k2 in merged_keys:
+            continue
+        if k1[0] == k2[0] and k1[2] == k2[2]:  # same file, same category
+            if abs(k1[1] - k2[1]) <= 5:  # lines within 5
+                dedup_map[k1].extend(dedup_map[k2])
+                merged_keys.add(k2)
+
+for k in merged_keys:
+    del dedup_map[k]
+
+# --- Build deduplicated findings ---
+findings_deduped = []
+for key, group in dedup_map.items():
+    # Aggregate found_by
+    all_agents = set()
+    for item in group:
+        all_agents.update(item.get("found_by", []))
+        if item.get("task_id"):
+            all_agents.add(f"task-{item['task_id']}")
+
+    # Severity reconciliation: majority vote with escalation bias
+    severity_votes = [item["severity"] for item in group]
+    severity_counts = defaultdict(int)
+    for s in severity_votes:
+        severity_counts[s] += 1
+
+    # Escalation bias: if any says critical, minimum is high
+    if "critical" in severity_counts:
+        reconciled = "critical"
+    else:
+        reconciled = max(severity_counts, key=lambda s: (severity_counts[s], -SEVERITY_ORDER[s]))
+
+    # Confidence: 3+ agents = high
+    agent_count = len(all_agents)
+    if agent_count >= 3:
+        confidence = "high"
+    elif agent_count >= 2:
+        confidence = "medium"
+    else:
+        confidence = group[0].get("confidence", "medium")
+
+    # Use the first finding as the canonical entry
+    canonical = group[0].copy()
+    canonical["severity"] = reconciled
+    canonical["confidence"] = confidence
+    canonical["found_by"] = sorted(all_agents)
+    canonical["agent_count"] = agent_count
+    canonical["duplicate_count"] = len(group) - 1
+
+    findings_deduped.append(canonical)
+
+# --- Ranking ---
+# Sort: severity -> agent_count DESC -> confidence -> category priority
+def sort_key(f):
+    return (
+        SEVERITY_ORDER.get(f["severity"], 3),
+        -f["agent_count"],
+        {"high": 0, "medium": 1, "low": 2}.get(f["confidence"], 1),
+        CATEGORY_PRIORITY.get(f["category"], 99),
+    )
+
+findings_deduped.sort(key=sort_key)
+
+# --- Assign IDs ---
+severity_counters = {"critical": 0, "high": 0, "medium": 0, "low": 0}
+for f in findings_deduped:
+    sev = f["severity"]
+    severity_counters[sev] += 1
+    prefix = sev[0].upper()
+    f["id"] = f"{prefix}{severity_counters[sev]}"
+
+total_deduped = len(findings_deduped)
+dedup_rate = round(1 - (total_deduped / total_raw), 2) if total_raw > 0 else 0
+
+# --- Summary ---
+summary = {
+    "critical": severity_counters["critical"],
+    "high": severity_counters["high"],
+    "medium": severity_counters["medium"],
+    "low": severity_counters["low"],
+    "total_raw": total_raw,
+    "total_deduped": total_deduped,
+    "dedup_rate": dedup_rate,
+}
+
+# --- Generate JSON ---
+if output_format in ("json", "both"):
+    report_json = {
+        "project": project,
+        "audit_date": datetime.now().strftime("%Y-%m-%d"),
+        "summary": summary,
+        "findings": []
+    }
+    for f in findings_deduped:
+        report_json["findings"].append({
+            "id": f["id"],
+            "severity": f["severity"],
+            "category": f["category"],
+            "location": {
+                "file": f["file"],
+                "line_start": f["line_start"],
+                "line_end": f["line_end"],
+            },
+            "problem": f["problem"],
+            "fix": f["fix"],
+            "impact": f["impact"],
+            "confidence": f["confidence"],
+            "found_by": f["found_by"],
+            "agent_count": f["agent_count"],
+        })
+
+    json_path = os.path.join(output_dir, "issues.json")
+    with open(json_path, "w") as out:
+        json.dump(report_json, out, indent=2)
+    print(f"JSON report: {json_path}", file=sys.stderr)
+
+# --- Generate Markdown ---
+if output_format in ("md", "both"):
+    lines = []
+    date = datetime.now().strftime("%Y-%m-%d")
+    agents = set()
+    for f in findings_deduped:
+        agents.update(f.get("found_by", []))
+    agent_list = ", ".join(sorted(agents)) if agents else "unknown"
+
+    lines.append(f"# Codebase Audit — {project} ({date})")
+    lines.append("")
+    lines.append(f"> {total_raw} raw findings, {total_deduped} after deduplication (dedup rate: {dedup_rate:.0%}).")
+    lines.append(f"> Agents: {agent_list}")
+    lines.append("")
+    lines.append("---")
+    lines.append("")
+
+    for severity in ["critical", "high", "medium", "low"]:
+        sev_findings = [f for f in findings_deduped if f["severity"] == severity]
+        if not sev_findings:
+            continue
+
+        lines.append(f"## {severity.upper()} ({len(sev_findings)})")
+        lines.append("")
+
+        for f in sev_findings:
+            lines.append(f"### {f['id']}. {f.get('subject', f['problem'][:60])}")
+            loc = f"{f['file']}:{f['line_start']}"
+            if f["line_end"] and f["line_end"] != f["line_start"]:
+                loc += f"-{f['line_end']}"
+            lines.append(f"- **File**: `{loc}`")
+            lines.append(f"- **Category**: {f['category']}")
+            lines.append(f"- **Problem**: {f['problem']}")
+            lines.append(f"- **Fix**: {f['fix']}")
+            found_by = ", ".join(f["found_by"]) if f["found_by"] else "unknown"
+            lines.append(f"- **Found by**: {found_by} (confidence: {f['confidence']})")
+            if f["duplicate_count"] > 0:
+                lines.append(f"- **Duplicates merged**: {f['duplicate_count']}")
+            lines.append("")
+
+        lines.append("---")
+        lines.append("")
+
+    # Summary table
+    lines.append("## Summary")
+    lines.append("")
+    lines.append("| Severity | Count |")
+    lines.append("|----------|-------|")
+    lines.append(f"| CRITICAL | {summary['critical']} |")
+    lines.append(f"| HIGH | {summary['high']} |")
+    lines.append(f"| MEDIUM | {summary['medium']} |")
+    lines.append(f"| LOW | {summary['low']} |")
+    lines.append(f"| **Total (deduped)** | **{total_deduped}** |")
+    lines.append(f"| Raw findings | {total_raw} |")
+    lines.append(f"| Dedup rate | {dedup_rate:.0%} |")
+    lines.append("")
+
+    md_path = os.path.join(output_dir, "issues.md")
+    with open(md_path, "w") as out:
+        out.write("\n".join(lines))
+    print(f"Markdown report: {md_path}", file=sys.stderr)
+
+# --- Print summary to stdout ---
+print(json.dumps(summary, indent=2))
+PYTHON_SCRIPT

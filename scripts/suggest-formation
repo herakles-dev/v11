@@ -1,0 +1,124 @@
+#!/bin/bash
+# V11 Script: suggest-formation
+# Difficulty-aware formation routing helper.
+# Suggests the optimal formation based on task complexity and scope.
+#
+# Usage: ./scripts/suggest-formation COMPLEXITY SCOPE
+#   COMPLEXITY: novel|complex|medium|routine
+#   SCOPE: small|medium|large
+#
+# Based on DAAO research (+11.21% accuracy, -36% compute)
+
+set -euo pipefail
+
+COMPLEXITY="${1:-}"
+SCOPE="${2:-}"
+
+if [ -z "$COMPLEXITY" ] || [ -z "$SCOPE" ]; then
+    echo "Usage: $0 COMPLEXITY SCOPE"
+    echo ""
+    echo "  COMPLEXITY: novel|complex|medium|routine"
+    echo "  SCOPE:      small|medium|large"
+    echo ""
+    echo "Examples:"
+    echo "  $0 routine small      → single-file"
+    echo "  $0 complex medium     → feature-impl"
+    echo "  $0 novel large        → new-project"
+    exit 1
+fi
+
+# Validate inputs
+case "$COMPLEXITY" in
+    novel|complex|medium|routine) ;;
+    *)
+        echo "ERROR: Invalid complexity '$COMPLEXITY' (must be novel|complex|medium|routine)"
+        exit 1
+        ;;
+esac
+
+case "$SCOPE" in
+    small|medium|large) ;;
+    *)
+        echo "ERROR: Invalid scope '$SCOPE' (must be small|medium|large)"
+        exit 1
+        ;;
+esac
+
+# Route based on complexity + scope
+FORMATION=""
+COST=""
+RATIONALE=""
+
+case "$COMPLEXITY:$SCOPE" in
+    routine:small)
+        FORMATION="single-file"
+        COST="1.2x"
+        RATIONALE="Boilerplate, bounded — minimal overhead"
+        ;;
+    routine:medium)
+        FORMATION="lightweight-feature"
+        COST="2-2.5x"
+        RATIONALE="Boilerplate but moderate scope — implementer + tester"
+        ;;
+    routine:large)
+        FORMATION="lightweight-feature"
+        COST="2-2.5x"
+        RATIONALE="Large boilerplate — consider splitting into multiple tasks"
+        ;;
+    medium:small)
+        FORMATION="single-file or lightweight-feature"
+        COST="1.2-2.5x"
+        RATIONALE="Standard pattern, bounded scope"
+        ;;
+    medium:medium)
+        FORMATION="lightweight-feature"
+        COST="2-2.5x"
+        RATIONALE="Standard implementation, moderate scope"
+        ;;
+    medium:large)
+        FORMATION="feature-impl"
+        COST="3.5-5x"
+        RATIONALE="Standard patterns but large scope needs multi-agent coordination"
+        ;;
+    complex:small)
+        FORMATION="lightweight-feature or feature-impl"
+        COST="2-5x"
+        RATIONALE="Intricate implementation but bounded — expertise matters more than parallelism"
+        ;;
+    complex:medium)
+        FORMATION="feature-impl"
+        COST="3.5-5x"
+        RATIONALE="Intricate + moderate scope — needs backend/frontend split"
+        ;;
+    complex:large)
+        FORMATION="feature-impl"
+        COST="3.5-5x"
+        RATIONALE="Intricate + large scope — full formation justified"
+        ;;
+    novel:small)
+        FORMATION="lightweight-feature (with architect consult)"
+        COST="2.5-3x"
+        RATIONALE="New problem but bounded — architect design first, then implement"
+        ;;
+    novel:medium)
+        FORMATION="new-project (with architect)"
+        COST="3-5x"
+        RATIONALE="New problem, moderate scope — needs architecture decisions"
+        ;;
+    novel:large)
+        FORMATION="new-project (with architect)"
+        COST="3-5x"
+        RATIONALE="New problem + large scope — full architecture pass required"
+        ;;
+esac
+
+echo "Formation Suggestion"
+echo "===================="
+echo "  Complexity: $COMPLEXITY"
+echo "  Scope:      $SCOPE"
+echo "  Formation:  $FORMATION"
+echo "  Cost:       $COST"
+echo "  Rationale:  $RATIONALE"
+echo ""
+echo "Override: Always allowed — this is advisory only."
+echo "Source: DAAO (Sept 2025) — +11.21% accuracy, -36% compute"

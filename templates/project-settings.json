@@ -1,0 +1,81 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Read",
+        "hooks": [{"type": "command", "command": "${V11_HOOKS}/detect-project"}]
+      },
+      {
+        "matcher": "Write|Edit",
+        "hooks": [
+          {"type": "command", "command": "${V11_HOOKS}/guard-write-gates"},
+          {"type": "command", "command": "${V11_HOOKS}/guard-enforcement"}
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {"type": "command", "command": "${V11_HOOKS}/guard-enforcement"},
+          {"type": "command", "command": "${V11_HOOKS}/enforce-test-coverage"},
+          {"type": "command", "command": "${V11_HOOKS}/require-producer-script"},
+          {"type": "command", "command": "${V11_HOOKS}/guard-validation-lint"}
+        ]
+      },
+      {
+        "matcher": "Task",
+        "hooks": [{"type": "command", "command": "${V11_HOOKS}/guard-effort"}]
+      },
+      {
+        "matcher": "TeamCreate|Agent",
+        "hooks": [{"type": "command", "command": "${V11_HOOKS}/fix-team-model"}]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Write|Edit",
+        "hooks": [
+          {"type": "command", "command": "${V11_HOOKS}/verify-syntax"},
+          {"type": "command", "command": "${V11_HOOKS}/track-autonomy"},
+          {"type": "command", "command": "${V11_HOOKS}/completion-hint"}
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [{"type": "command", "command": "${V11_HOOKS}/track-autonomy"}]
+      },
+      {
+        "matcher": "TaskCreate|TaskUpdate|TaskList|TaskGet",
+        "hooks": [{"type": "command", "command": "${V11_HOOKS}/sync-tasks"}]
+      },
+      {
+        "matcher": "TaskList",
+        "hooks": [
+          {"type": "command", "command": "${V11_HOOKS}/guard-agent-stall"},
+          {"type": "command", "command": "${V11_HOOKS}/guard-stale-task"}
+        ]
+      },
+      {
+        "matcher": "Task",
+        "hooks": [{"type": "command", "command": "${V11_HOOKS}/track-agents"}]
+      },
+      {
+        "matcher": "TeamCreate|Agent",
+        "hooks": [{"type": "command", "command": "${V11_HOOKS}/fix-team-model"}]
+      }
+    ],
+    "PostCompact": [
+      {
+        "hooks": [{"type": "command", "command": "${V11_HOOKS}/post-compact"}]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [{"type": "command", "command": "${V11_HOOKS}/session-end"}]
+      }
+    ]
+  },
+  "env": {
+    "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1"
+  }
+}

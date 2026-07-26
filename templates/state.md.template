@@ -1,0 +1,28 @@
+# State: ${PROJECT_NAME} (Auto-generated)
+
+## Phase
+${PHASE}
+
+## Active
+${ACTIVE_TASK}
+
+## Progress
+- Completed: ${COMPLETED} / ${TOTAL}
+- Pending: ${PENDING}
+- In Progress: ${IN_PROGRESS}
+- Blocked: ${BLOCKED}
+
+## Recent Completions
+${RECENT_COMPLETED}
+
+## Blocked
+${BLOCKED_TASKS}
+
+## Sprints
+${SPRINT_SUMMARY}
+
+---
+Generated: ${DATE}
+Source: TaskList via .task-state.json
+
+**Note**: This file is read-only. Use TaskCreate/TaskUpdate to modify tasks.

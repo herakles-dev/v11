@@ -1,0 +1,493 @@
+#!/bin/bash
+# V11 Script: validate-project-setup
+# Validates that a project is correctly set up for V11 protocol.
+#
+# Usage: ./scripts/validate-project-setup PROJECT_NAME [PROJECT_PATH]
+#
+# PROJECT_PATH search order (if not given):
+#   1. <project-root>/{PROJECT_NAME}
+#   2. <project-root>/sessions/{PROJECT_NAME}
+#
+# Exit codes:
+#   0 - No FAIL results
+#   1 - At least one FAIL
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+V11_HOME="$(cd "$SCRIPT_DIR/.." && pwd)"
+source "$SCRIPT_DIR/../hooks/lib/common.sh" 2>/dev/null || {
+  echo "ERROR: hooks/lib/common.sh not found — check V11_HOME ($V11_HOME)" >&2; exit 1
+}
+
+# ---------------------------------------------------------------------------
+# Args
+# ---------------------------------------------------------------------------
+
+if [ $# -lt 1 ]; then
+  echo "Usage: $(basename "$0") PROJECT_NAME [PROJECT_PATH]" >&2
+  exit 1
+fi
+
+PROJECT="$1"
+# Sanitize project name — reject path traversal and special chars
+if [[ "$PROJECT" == *".."* ]] || [[ "$PROJECT" == *"/"* ]] || [[ "$PROJECT" =~ [^a-zA-Z0-9._-] ]]; then
+  echo "ERROR: Invalid project name: $PROJECT" >&2; exit 1
+fi
+SESSION_DIR="$SESSIONS_ROOT/$PROJECT"
+
+# Resolve project path
+if [ $# -ge 2 ]; then
+  PROJECT_PATH="$2"
+else
+  if [ -d "$V11_WORKSPACE_ROOT/$PROJECT" ]; then
+    PROJECT_PATH="$V11_WORKSPACE_ROOT/$PROJECT"
+  elif [ -d "$SESSION_DIR" ]; then
+    PROJECT_PATH="$SESSION_DIR"
+  else
+    PROJECT_PATH="$V11_WORKSPACE_ROOT/$PROJECT"  # may not exist — checks will FAIL gracefully
+  fi
+fi
+
+# ---------------------------------------------------------------------------
+# Counters and result tracking
+# ---------------------------------------------------------------------------
+
+PASS_COUNT=0
+FAIL_COUNT=0
+WARN_COUNT=0
+SKIP_COUNT=0
+FAIL_MESSAGES=()
+
+# ---------------------------------------------------------------------------
+# Result helpers
+# ---------------------------------------------------------------------------
+
+result_pass() {
+  local msg="$1"
+  printf '  [PASS] %s\n' "$msg"
+  PASS_COUNT=$((PASS_COUNT + 1))
+}
+
+result_fail() {
+  local msg="$1"
+  printf '  [FAIL] %s\n' "$msg"
+  FAIL_COUNT=$((FAIL_COUNT + 1))
+  FAIL_MESSAGES+=("$msg")
+}
+
+result_warn() {
+  local msg="$1"
+  printf '  [WARN] %s\n' "$msg"
+  WARN_COUNT=$((WARN_COUNT + 1))
+}
+
+result_skip() {
+  local msg="$1"
+  printf '  [SKIP] %s\n' "$msg"
+  SKIP_COUNT=$((SKIP_COUNT + 1))
+}
+
+# ---------------------------------------------------------------------------
+# Check 1: V11 hooks — .claude/settings.json with v11/hooks/ paths
+# ---------------------------------------------------------------------------
+
+check_v11_hooks() {
+  local settings="$PROJECT_PATH/.claude/settings.json"
+
+  if [ ! -f "$settings" ]; then
+    result_fail "V11 hooks: .claude/settings.json missing at $settings"
+    return
+  fi
+
+  # Count hook entries pointing to v11/hooks/
+  local hook_count
+  hook_count=$(grep -o 'v11/hooks/' "$settings" 2>/dev/null | wc -l | tr -d ' ')
+
+  if [ "$hook_count" -ge 13 ]; then
+    result_pass "V11 hooks (${hook_count} entries wired)"
+  elif [ "$hook_count" -gt 0 ]; then
+    result_fail "V11 hooks: only $hook_count hook entries found (need at least 10) in $settings"
+  else
+    result_fail "V11 hooks: no v11/hooks/ entries in $settings"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Check 2: Session directory exists
+# ---------------------------------------------------------------------------
+
+check_session_dir() {
+  if [ -d "$SESSION_DIR" ]; then
+    result_pass "Session directory ($SESSION_DIR)"
+  else
+    result_fail "Session directory missing: $SESSION_DIR"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Check 3: Spec file exists
+# ---------------------------------------------------------------------------
+
+check_spec_file() {
+  local spec="$SESSION_DIR/spec.md"
+  if [ -f "$spec" ]; then
+    result_pass "Spec file ($spec)"
+  else
+    result_fail "Spec file missing — create it at: $spec"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Check 4: Autonomy state (WARN if missing, auto-create at A0)
+# ---------------------------------------------------------------------------
+
+check_autonomy_state() {
+  local state_file="$SESSION_DIR/.autonomy-state"
+
+  if [ -f "$state_file" ]; then
+    result_pass "Autonomy state ($state_file)"
+    return
+  fi
+
+  # Auto-create at A0 if session dir exists
+  if [ -d "$SESSION_DIR" ]; then
+    local now
+    now="$(date -Iseconds 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ)"
+    jq -n --arg t "$now" \
+      '{level:0, successful:0, errors:0, rollbacks:0,
+        approved_categories:[], grants:[],
+        high_risk_history:[], recent_errors:[], last_updated:$t}' \
+      > "$state_file"
+    result_warn "No .autonomy-state found — created at A0 ($state_file)"
+  else
+    result_warn "No .autonomy-state (will default to A0 once session dir is created)"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Check 5: CLAUDE.md references V11
+# ---------------------------------------------------------------------------
+
+check_claude_md() {
+  local claude_md="$PROJECT_PATH/CLAUDE.md"
+
+  if [ ! -f "$claude_md" ]; then
+    result_warn "CLAUDE.md not found at $claude_md"
+    return
+  fi
+
+  if grep -qi "v11\|V11" "$claude_md" 2>/dev/null; then
+    result_pass "CLAUDE.md references V11"
+  else
+    result_warn "CLAUDE.md exists but does not reference V11 ($claude_md)"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Check 6: .gitignore has .env exclusion
+# ---------------------------------------------------------------------------
+
+check_gitignore() {
+  local gitignore="$PROJECT_PATH/.gitignore"
+
+  if [ ! -f "$gitignore" ]; then
+    result_warn ".gitignore not found — .env files may be committed accidentally"
+    return
+  fi
+
+  if grep -q '^\s*\.env' "$gitignore" 2>/dev/null; then
+    result_pass ".gitignore has .env exclusion"
+  else
+    result_warn ".gitignore exists but missing .env exclusion ($gitignore)"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Check 7: docker-compose.yml healthcheck (SKIP if no compose file)
+# ---------------------------------------------------------------------------
+
+check_docker_health() {
+  local compose=""
+
+  # Try common filenames
+  for name in docker-compose.yml docker-compose.yaml compose.yml compose.yaml; do
+    if [ -f "$PROJECT_PATH/$name" ]; then
+      compose="$PROJECT_PATH/$name"
+      break
+    fi
+  done
+
+  if [ -z "$compose" ]; then
+    result_skip "No docker-compose.yml"
+    return
+  fi
+
+  if grep -q 'healthcheck' "$compose" 2>/dev/null; then
+    result_pass "Docker healthcheck defined ($compose)"
+  else
+    result_warn "docker-compose.yml missing healthcheck ($compose)"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Check 8: Agent definitions — adversarial-reviewer and spec agents exist
+# ---------------------------------------------------------------------------
+
+check_agent_definitions() {
+  local agents_dir="$HOME/.claude/agents"
+  if [ ! -d "$agents_dir" ]; then
+    result_warn "Agent directory missing: $agents_dir"
+    return
+  fi
+
+  local required_agents=("adversarial-reviewer" "spec-implementer-v11" "spec-reviewer-v11" "spec-tester-v11")
+  local missing=0
+  for agent in "${required_agents[@]}"; do
+    if [ ! -f "$agents_dir/${agent}.md" ]; then
+      missing=$((missing + 1))
+    fi
+  done
+
+  if [ "$missing" -eq 0 ]; then
+    result_pass "Agent definitions (${#required_agents[@]}/${#required_agents[@]} core agents found)"
+  else
+    result_warn "Missing $missing agent definitions in $agents_dir (${required_agents[*]})"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Check 9: Schema accessibility — required JSON schemas exist
+# ---------------------------------------------------------------------------
+
+check_schemas() {
+  local schema_dir="$V11_HOME/schemas"
+  if [ ! -d "$schema_dir" ]; then
+    result_warn "V11 schemas directory missing: $schema_dir"
+    return
+  fi
+
+  local count
+  count=$(find "$schema_dir" -name "*.schema.json" 2>/dev/null | wc -l | tr -d ' ')
+  if [ "$count" -ge 3 ]; then
+    result_pass "V11 schemas ($count .schema.json files accessible)"
+  else
+    result_warn "Only $count schemas found in $schema_dir (expected 3+)"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Check 15: Dark Code schema content — task-metadata has spec_test_requirements
+#            + api_contract_entry, module-manifest.schema.json exists
+# ---------------------------------------------------------------------------
+
+check_dark_code_schemas() {
+  local task_schema="$V11_HOME/schemas/task-metadata.schema.json"
+  local module_schema="$V11_HOME/schemas/module-manifest.schema.json"
+  local issues=()
+
+  if [ -f "$task_schema" ]; then
+    if ! jq -e '.properties.spec_test_requirements' "$task_schema" >/dev/null 2>&1; then
+      issues+=("task-metadata missing spec_test_requirements")
+    fi
+    if ! jq -e '."$defs".api_contract_entry' "$task_schema" >/dev/null 2>&1; then
+      issues+=("task-metadata missing api_contract_entry \$def")
+    fi
+  else
+    issues+=("task-metadata.schema.json missing")
+  fi
+  if [ ! -f "$module_schema" ]; then
+    issues+=("module-manifest.schema.json missing")
+  fi
+
+  if [ ${#issues[@]} -eq 0 ]; then
+    result_pass "Dark Code schemas (spec_test_requirements + api_contract_entry + module-manifest)"
+  else
+    result_warn "Dark Code schema gaps: ${issues[*]}"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Check 16: MODULE.md coverage — count source modules vs manifests (advisory)
+# ---------------------------------------------------------------------------
+
+check_module_manifests() {
+  # Walk PROJECT_PATH recursively to cover monorepos (client/src + server/src)
+  # and single-root layouts alike.
+  local total=0 manifested=0
+  while IFS= read -r dir; do
+    local code_count
+    code_count=$(find "$dir" -maxdepth 1 -type f \( -name "*.py" -o -name "*.ts" -o -name "*.tsx" -o -name "*.js" -o -name "*.jsx" -o -name "*.go" -o -name "*.rs" -o -name "*.java" \) 2>/dev/null | wc -l | tr -d ' ')
+    [ "$code_count" -lt 3 ] && continue
+    total=$((total + 1))
+    if [ -f "$dir/MODULE.md" ] || [ -f "$dir/MODULE.json" ]; then
+      manifested=$((manifested + 1))
+    fi
+  done < <(find "$PROJECT_PATH" \
+      \( -type d \( -name 'node_modules' -o -name '.git' -o -name '__pycache__' \
+                    -o -name 'target' -o -name 'dist' -o -name 'build' \
+                    -o -name '.venv' -o -name '.next' -o -name 'venv' \) -prune \) \
+      -o -type d -print \
+      2>/dev/null)
+
+  if [ "$total" -eq 0 ]; then
+    result_skip "No code modules detected (skeleton or non-code project)"
+    return
+  fi
+  if [ "$manifested" -eq "$total" ]; then
+    result_pass "MODULE.md coverage ($manifested/$total)"
+  else
+    local pct=$((manifested * 100 / total))
+    result_warn "MODULE.md coverage ${manifested}/${total} (${pct}%) — run validate-module-manifest"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Check 10: Task state directory writable
+# ---------------------------------------------------------------------------
+
+check_task_state_dir() {
+  local ts_dir="$V11_WORKSPACE_ROOT/.agent-metrics/task-state"
+  if [ -d "$ts_dir" ] && [ -w "$ts_dir" ]; then
+    result_pass "Task state directory ($ts_dir)"
+  elif [ -d "$ts_dir" ]; then
+    result_warn "Task state directory exists but not writable: $ts_dir"
+  else
+    result_warn "Task state directory missing: $ts_dir (hooks will create on first use)"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Check 11: Formation registry — validate JSON if exists
+# ---------------------------------------------------------------------------
+
+check_formation_registry() {
+  local reg="$SESSION_DIR/.formation-registry.json"
+  if [ ! -f "$reg" ]; then
+    result_skip "No formation registry (single-agent or no formation)"
+    return
+  fi
+
+  if jq -e '.formation' "$reg" > /dev/null 2>&1; then
+    local formation
+    formation=$(jq -r '.formation // "unknown"' "$reg" 2>/dev/null)
+    result_pass "Formation registry ($formation)"
+  else
+    result_warn "Formation registry exists but has invalid JSON: $reg"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Check 12: Legacy artifacts — warn if old protocol files detected
+# ---------------------------------------------------------------------------
+
+check_legacy_artifacts() {
+  local found=""
+  [ -f "$PROJECT_PATH/spec.yml" ] && found="spec.yml "
+  [ -f "$SESSION_DIR/spec.yml" ] && found="${found}sessions/spec.yml "
+  if [ -f "$PROJECT_PATH/.claude/settings.json" ]; then
+    grep -q 'v8/hooks\|v10/hooks' "$PROJECT_PATH/.claude/settings.json" 2>/dev/null && found="${found}legacy-hooks "
+  fi
+
+  if [ -n "$found" ]; then
+    result_warn "Legacy artifacts detected: $found— consider migration"
+  else
+    result_pass "No legacy artifacts"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Check 13: Hook executability — all 13 hook scripts are executable
+# ---------------------------------------------------------------------------
+
+check_hook_executability() {
+  local hooks_dir="$V11_HOME/hooks"
+  if [ ! -d "$hooks_dir" ]; then
+    result_warn "V11 hooks directory not found: $hooks_dir"
+    return
+  fi
+
+  local total=0 executable=0
+  for hook in detect-project guard-write-gates guard-enforcement guard-effort \
+              enforce-test-coverage verify-syntax track-autonomy sync-tasks \
+              guard-agent-stall track-agents fix-team-model post-compact session-end; do
+    total=$((total + 1))
+    if [ -x "$hooks_dir/$hook" ]; then
+      executable=$((executable + 1))
+    fi
+  done
+
+  if [ "$executable" -eq "$total" ]; then
+    result_pass "Hook executability ($executable/$total executable)"
+  else
+    result_warn "Only $executable/$total hooks are executable in $hooks_dir"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Check 14: Athenaeum connectivity (optional)
+# ---------------------------------------------------------------------------
+
+check_athenaeum() {
+  if [ ! -x "$V11_HOME/scripts/athenaeum-search" ]; then
+    result_skip "Athenaeum search script not found"
+    return
+  fi
+
+  local athenaeum_port="${ATHENAEUM_PORT:-8140}"
+  if curl -sf --max-time 3 "http://localhost:${athenaeum_port}/api/libraries" > /dev/null 2>&1; then
+    result_pass "Athenaeum reachable (localhost:${athenaeum_port})"
+  else
+    result_warn "Athenaeum not reachable (localhost:${athenaeum_port}) — research features unavailable"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Main output
+# ---------------------------------------------------------------------------
+
+echo ""
+echo "V11 Project Setup: $PROJECT"
+echo "  Path: $PROJECT_PATH"
+echo ""
+
+# Original checks (1-7)
+check_v11_hooks
+check_session_dir
+check_spec_file
+check_autonomy_state
+check_claude_md
+check_gitignore
+check_docker_health
+
+# V11.6 checks (8-14)
+check_agent_definitions
+check_schemas
+check_task_state_dir
+check_formation_registry
+check_legacy_artifacts
+check_hook_executability
+check_athenaeum
+
+# V11.7.2 Dark Code alignment checks (15-16)
+check_dark_code_schemas
+check_module_manifests
+
+echo ""
+echo "Result: $PASS_COUNT PASS, $FAIL_COUNT FAIL, $WARN_COUNT WARN, $SKIP_COUNT SKIP"
+
+if [ ${#FAIL_MESSAGES[@]} -gt 0 ]; then
+  echo ""
+  echo "Action needed:"
+  for msg in "${FAIL_MESSAGES[@]}"; do
+    echo "  - $msg"
+  done
+fi
+
+echo ""
+
+if [ "$FAIL_COUNT" -gt 0 ]; then
+  exit 1
+fi
+
+exit 0

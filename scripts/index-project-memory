@@ -1,0 +1,351 @@
+#!/usr/bin/env python3
+"""V11 Script: index-project-memory
+
+Build or update the memory index for a project.
+Uses SQLite FTS5 for keyword search and optional vector embeddings.
+
+Usage:
+    ./scripts/index-project-memory PROJECT [--full]
+    ./scripts/index-project-memory PROJECT --delta FILE_PATH
+
+Options:
+    --full      Force full reindex (default on first run)
+    --delta     Index only the specified file (incremental update)
+"""
+
+import json
+import os
+import sqlite3
+import sys
+import time
+from pathlib import Path
+
+# Add lib to path
+SCRIPT_DIR = Path(__file__).resolve().parent
+sys.path.insert(0, str(SCRIPT_DIR / "lib"))
+
+from chunker import chunk_markdown, content_hash
+
+SESSIONS_ROOT = os.environ.get("SESSIONS_ROOT", os.path.expanduser("~/sessions"))
+V11_WORKSPACE_ROOT = os.environ.get("V11_WORKSPACE_ROOT", os.path.expanduser("~"))
+TASK_STATE_DIR = os.environ.get(
+    "TASK_STATE_DIR",
+    os.path.join(V11_WORKSPACE_ROOT, ".agent-metrics", "task-state"),
+)
+
+# Source type mapping
+SOURCE_PATTERNS = {
+    "spec": ["spec.md"],
+    "state": ["state.md"],
+    "notes": ["notes/*.md", "notes/**/*.md"],
+    "claude_md": ["CLAUDE.md"],
+    "artifacts": [".artifacts/**/*"],
+}
+
+
+def get_project_dir(project: str) -> Path:
+    """Find the project directory."""
+    session_dir = Path(SESSIONS_ROOT) / project
+    if session_dir.is_dir():
+        return session_dir
+    project_dir = Path(V11_WORKSPACE_ROOT) / project
+    if project_dir.is_dir():
+        return project_dir
+    return session_dir  # Default to sessions even if not exists yet
+
+
+def get_index_dir(project: str) -> Path:
+    """Get or create the memory index directory."""
+    index_dir = get_project_dir(project) / ".memory-index"
+    index_dir.mkdir(parents=True, exist_ok=True)
+    return index_dir
+
+
+def init_database(db_path: Path) -> sqlite3.Connection:
+    """Initialize SQLite database with FTS5 and chunk tables."""
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+
+    # Main chunks table
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS chunks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_type TEXT NOT NULL,
+            file_path TEXT NOT NULL,
+            chunk_text TEXT NOT NULL,
+            chunk_index INTEGER NOT NULL,
+            line_start INTEGER,
+            line_end INTEGER,
+            heading TEXT DEFAULT '',
+            content_hash TEXT NOT NULL,
+            embedding BLOB,
+            indexed_at TEXT NOT NULL,
+            metadata TEXT DEFAULT '{}'
+        )
+    """)
+
+    # FTS5 virtual table for BM25 search
+    conn.execute("""
+        CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
+            chunk_text,
+            heading,
+            source_type,
+            content='chunks',
+            content_rowid='id',
+            tokenize='porter unicode61'
+        )
+    """)
+
+    # Triggers to keep FTS in sync
+    conn.execute("""
+        CREATE TRIGGER IF NOT EXISTS chunks_ai AFTER INSERT ON chunks BEGIN
+            INSERT INTO chunks_fts(rowid, chunk_text, heading, source_type)
+            VALUES (new.id, new.chunk_text, new.heading, new.source_type);
+        END
+    """)
+    conn.execute("""
+        CREATE TRIGGER IF NOT EXISTS chunks_ad AFTER DELETE ON chunks BEGIN
+            INSERT INTO chunks_fts(chunks_fts, rowid, chunk_text, heading, source_type)
+            VALUES ('delete', old.id, old.chunk_text, old.heading, old.source_type);
+        END
+    """)
+    conn.execute("""
+        CREATE TRIGGER IF NOT EXISTS chunks_au AFTER UPDATE ON chunks BEGIN
+            INSERT INTO chunks_fts(chunks_fts, rowid, chunk_text, heading, source_type)
+            VALUES ('delete', old.id, old.chunk_text, old.heading, old.source_type);
+            INSERT INTO chunks_fts(rowid, chunk_text, heading, source_type)
+            VALUES (new.id, new.chunk_text, new.heading, new.source_type);
+        END
+    """)
+
+    # Content hash index for deduplication
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_content_hash ON chunks(content_hash)
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_file_path ON chunks(file_path)
+    """)
+
+    # Metadata table
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS index_meta (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+    """)
+
+    conn.commit()
+    return conn
+
+
+def classify_source(file_path: str, project_dir: str) -> str:
+    """Classify a file into a source type."""
+    rel = os.path.relpath(file_path, project_dir)
+    basename = os.path.basename(file_path)
+
+    if basename == "spec.md":
+        return "spec"
+    elif basename == "state.md":
+        return "state"
+    elif basename == "CLAUDE.md":
+        return "claude_md"
+    elif "notes" in rel:
+        return "notes"
+    elif ".artifacts" in rel or "artifacts" in rel:
+        return "artifacts"
+    else:
+        return "custom"
+
+
+def collect_source_files(project_dir: Path) -> list:
+    """Collect all indexable files from a project directory."""
+    files = []
+    for pattern_name, patterns in SOURCE_PATTERNS.items():
+        for pattern in patterns:
+            for match in project_dir.glob(pattern):
+                if match.is_file() and match.suffix in (".md", ".txt", ".json"):
+                    files.append(str(match))
+
+    # Also look for task state with descriptions
+    return files
+
+
+def index_file(conn: sqlite3.Connection, file_path: str, project_dir: str, force: bool = False):
+    """Index a single file into the database."""
+    if not os.path.isfile(file_path):
+        return 0
+
+    # Read content
+    try:
+        with open(file_path, "r", encoding="utf-8", errors="replace") as f:
+            content = f.read()
+    except (OSError, IOError):
+        return 0
+
+    if not content.strip():
+        return 0
+
+    file_hash = content_hash(content)
+    source_type = classify_source(file_path, project_dir)
+
+    # Check if already indexed (skip if same hash and not forced)
+    if not force:
+        existing = conn.execute(
+            "SELECT content_hash FROM chunks WHERE file_path = ? LIMIT 1",
+            (file_path,),
+        ).fetchone()
+        if existing and existing[0] == file_hash:
+            return 0  # Already up to date
+
+    # Remove old chunks for this file
+    conn.execute("DELETE FROM chunks WHERE file_path = ?", (file_path,))
+
+    # Chunk the content
+    chunks = chunk_markdown(content)
+    now = time.strftime("%Y-%m-%dT%H:%M:%S")
+    count = 0
+
+    for chunk in chunks:
+        conn.execute(
+            """INSERT INTO chunks
+               (source_type, file_path, chunk_text, chunk_index,
+                line_start, line_end, heading, content_hash, indexed_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                source_type,
+                file_path,
+                chunk.text,
+                chunk.chunk_index,
+                chunk.line_start,
+                chunk.line_end,
+                chunk.heading,
+                chunk.content_hash,
+                now,
+            ),
+        )
+        count += 1
+
+    conn.commit()
+    return count
+
+
+def index_task_descriptions(conn: sqlite3.Connection, project: str):
+    """Index task descriptions from task state file."""
+    task_file = os.path.join(TASK_STATE_DIR, f"{project}.json")
+    if not os.path.isfile(task_file):
+        return 0
+
+    try:
+        with open(task_file, "r") as f:
+            task_data = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return 0
+
+    # Remove old task chunks
+    conn.execute("DELETE FROM chunks WHERE source_type = 'tasks'")
+
+    count = 0
+    now = time.strftime("%Y-%m-%dT%H:%M:%S")
+    tasks = task_data.get("tasks", [])
+
+    for i, task in enumerate(tasks):
+        subject = task.get("subject", "")
+        description = task.get("description", "")
+        status = task.get("status", "")
+        text = f"Task: {subject}\nStatus: {status}\n\n{description}"
+
+        if not text.strip():
+            continue
+
+        task_hash = content_hash(text)
+        metadata = json.dumps({"task_id": task.get("id", str(i)), "status": status})
+
+        conn.execute(
+            """INSERT INTO chunks
+               (source_type, file_path, chunk_text, chunk_index,
+                line_start, line_end, heading, content_hash, indexed_at, metadata)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            ("tasks", task_file, text, i, 0, 0, subject, task_hash, now, metadata),
+        )
+        count += 1
+
+    conn.commit()
+    return count
+
+
+def main():
+    if len(sys.argv) < 2:
+        print("Usage: index-project-memory PROJECT [--full|--delta FILE]")
+        sys.exit(1)
+
+    project = sys.argv[1]
+    force_full = "--full" in sys.argv
+    delta_file = None
+
+    if "--delta" in sys.argv:
+        idx = sys.argv.index("--delta")
+        if idx + 1 < len(sys.argv):
+            delta_file = sys.argv[idx + 1]
+
+    project_dir = get_project_dir(project)
+    index_dir = get_index_dir(project)
+    db_path = index_dir / "memory.sqlite"
+
+    start = time.time()
+    print(f"Memory Index: {project}")
+    print(f"  Project dir: {project_dir}")
+    print(f"  Index dir:   {index_dir}")
+
+    conn = init_database(db_path)
+    total_chunks = 0
+
+    if delta_file:
+        # Delta update: index only one file
+        count = index_file(conn, delta_file, str(project_dir), force=True)
+        total_chunks += count
+        print(f"  Delta indexed: {delta_file} ({count} chunks)")
+    else:
+        # Full or incremental index
+        source_files = collect_source_files(project_dir)
+        print(f"  Source files: {len(source_files)}")
+
+        for fpath in source_files:
+            count = index_file(conn, fpath, str(project_dir), force=force_full)
+            if count > 0:
+                rel = os.path.relpath(fpath, str(project_dir))
+                print(f"  Indexed: {rel} ({count} chunks)")
+            total_chunks += count
+
+        # Index task descriptions
+        task_count = index_task_descriptions(conn, project)
+        if task_count > 0:
+            print(f"  Indexed: tasks ({task_count} chunks)")
+        total_chunks += task_count
+
+    # Update metadata
+    now = time.strftime("%Y-%m-%dT%H:%M:%S")
+    conn.execute(
+        "INSERT OR REPLACE INTO index_meta (key, value) VALUES (?, ?)",
+        ("last_indexed", now),
+    )
+    conn.execute(
+        "INSERT OR REPLACE INTO index_meta (key, value) VALUES (?, ?)",
+        ("total_chunks", str(conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0])),
+    )
+    conn.commit()
+
+    elapsed = time.time() - start
+    db_size = db_path.stat().st_size / 1024
+
+    total_in_db = conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
+    conn.close()
+
+    print(f"\n  New chunks: {total_chunks}")
+    print(f"  Total in DB: {total_in_db}")
+    print(f"  DB size: {db_size:.1f} KB")
+    print(f"  Time: {elapsed:.2f}s")
+
+
+if __name__ == "__main__":
+    main()

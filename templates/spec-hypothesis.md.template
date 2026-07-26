@@ -1,0 +1,111 @@
+# Project: {{PROJECT}}
+
+> Living operational document. Updated at every gate review.
+> Protocol: V11 Deep Plan | Reference: `deep-plan/METHODOLOGY.md`
+
+## Intent
+
+{{INTENT}}
+
+**This is a research project.** Success is validated learning, not shipped code.
+
+## Core Hypothesis
+
+**"{{CORE_HYPOTHESIS}}"**
+
+| # | Sub-Hypothesis | Validated By | Prior |
+|---|---------------|-------------|-------|
+| H1 | {{H1_STATEMENT}} | {{H1_GATE}} | {{H1_PRIOR}} |
+| H2 | {{H2_STATEMENT}} | {{H2_GATE}} | {{H2_PRIOR}} |
+
+**P(all) = {{JOINT_PRIOR}}**
+
+## Architecture Decisions
+
+| Decision | Choice | Rationale | Locked? |
+|----------|--------|-----------|---------|
+| (populated during Phase 0) | | | |
+
+## Stack
+
+- Backend: {{BACKEND}}
+- Database: {{DATABASE}}
+- Frontend: {{FRONTEND}}
+
+## Constraints
+
+- {{CONSTRAINT_1}}
+- {{CONSTRAINT_2}}
+
+## V11 Integration
+
+| V11 Concept | Usage |
+|-------------|-------|
+| Tasks | Source of truth. TaskCreate before starting, TaskUpdate on completion. |
+| Agent Teams | For coordinated 3+ agent work. Background agents for independent tasks. |
+| Autonomy | Level 2 for early phases. Level 3 after trust gate. |
+| Hooks | PostToolUse on code changes. PreToolUse on cloud/external operations. |
+| Plan Context | `.plan-context.json` tracks hypotheses, decisions, bottleneck, kill conditions. |
+
+## Agents
+
+| Role | Agent | Owns | Formation Role |
+|------|-------|------|----------------|
+| (populated during formation selection) | | | |
+
+---
+
+## Phase 0: Validate or Kill
+
+> **Cynefin: {{CYNEFIN}}** | **Approach:** Probe -> Sense -> Respond
+
+### What This Phase Answers
+
+| Question | How | Kill Condition |
+|----------|-----|---------------|
+| (populated during Phase 3-DP) | | |
+
+### Gate 0: Go/No-Go
+
+| Criterion | Target | Measured |
+|-----------|--------|----------|
+| (populated during Phase 3-DP) | | |
+
+---
+
+## Belief Tracker
+
+| Belief | Prior | After G0 | After G1 | After G2 |
+|--------|-------|----------|----------|----------|
+| H1 | {{H1_PRIOR}} | | | |
+| H2 | {{H2_PRIOR}} | | | |
+
+## Constraint Map
+
+| Phase | Constraint | Exploit | Subordinate |
+|-------|-----------|---------|-------------|
+| (populated per Theory of Constraints) | | | |
+
+## Kill Conditions
+
+1. {{KILL_1}}
+2. {{KILL_2}}
+
+## Risk Register
+
+| # | Risk | Impact | P | Gate | Mitigation |
+|---|------|--------|---|------|------------|
+| (populated during Phase 3-DP) | | | | | |
+
+## Research Library
+
+{{LIBRARY_NOTE}}
+
+---
+
+## Notes
+
+Created: {{TIMESTAMP}}
+Mode: Deep Plan
+Protocol: V11
+Tasks: Use TaskList to view (created via TaskCreate)

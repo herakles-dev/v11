@@ -1,0 +1,321 @@
+#!/usr/bin/env python3
+# V11.21 Dispatch-Trace Append — atomic, capped JSONL writer for Phase 4 spawn records.
+#
+# Called by the orchestrator skill (playbooks/orchestrate.md) once per Phase 4 spawn.
+# Records routing reality (recommended vs spawned agent + reason) so V11.22 can
+# calibrate META_MAP / COMPLEXITY_ROUTING from real dogfood data.
+#
+# Usage (two equivalent forms):
+#
+#   scripts/dispatch-trace-append \
+#       --task-id 12 --project foo --sprint sprint-02-impl \
+#       --recommended-agent backend-architect --spawned-agent backend-architect \
+#       --model sonnet --mode acceptEdits --caller-kind orchestrator \
+#       [--override-reason "user override: legacy v10 codebase"] \
+#       [--self-review-omitted]
+#
+#   scripts/dispatch-trace-append --json '{...record fields...}'
+#
+# Output: appends one line to ~/.agent-metrics/dispatch-trace.jsonl.
+# Schema (frozen v1): see schemas/dispatch-trace.schema.json.
+#
+# Concurrency: FD-9 flock (LOCK_EX) on the trace file itself. Concurrent writers serialize.
+# Size guard: line capped to LINE_CAP bytes (default 4096); override_reason truncated first.
+# Rollback: V11_DISPATCH_TRACE=off short-circuits to no-op (exit 0).
+#
+# W3-T12 (per-spawn token capture): optional --tokens N --tool-uses N --duration-ms N
+# --event EVENT flags. Present only when the harness reported a task-notification with
+# subagent_tokens/tool_uses/duration_ms; absent flags -> byte-identical pre-W3-T12 line
+# shape. Rollback: V11_TOKEN_CAPTURE=off ignores the new flags silently (old shape only).
+#
+# V11.21 — gate-1 (T4). Authored by spec-implementer-v11.
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import json
+import os
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+LINE_CAP = 4096
+OVERRIDE_REASON_MAX = 1024  # mirrors schemas/dispatch-trace.schema.json maxLength
+METRICS_DIR = Path(os.environ.get("METRICS_DIR", Path.home() / ".agent-metrics"))
+TRACE_PATH = METRICS_DIR / "dispatch-trace.jsonl"
+
+REQUIRED_FIELDS = (
+    "task_id", "project", "sprint",
+    "recommended_agent", "spawned_agent",
+    "model", "mode", "caller_kind",
+)
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S+00:00")
+
+
+def _coerce_bool(v: Any) -> bool:
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, str):
+        return v.lower() in ("1", "true", "yes", "y")
+    return bool(v)
+
+
+def _parse_batch_review_ids(raw: str | None) -> list[str] | None:
+    """Parse a comma-separated --batch-review-ids arg into a list of task-id strings.
+
+    Returns None when raw is falsy (flag not passed — absence preserved, R6
+    backward-compat contract). Raises ValueError on malformed input (empty
+    string, or an id that is blank after stripping) so main() can surface a
+    clean, non-traceback error to the caller."""
+    if not raw:
+        return None
+    ids = [part.strip() for part in raw.split(",")]
+    if not ids or any(not part for part in ids):
+        raise ValueError(
+            f"--batch-review-ids must be a comma-separated list of non-empty ids, got {raw!r}"
+        )
+    return ids
+
+
+def _apply_token_capture_from_args(record: dict[str, Any], ns: argparse.Namespace) -> None:
+    """V11 loop-keystone follow-up (W3-T12): optional per-spawn token/cost capture.
+
+    Only touches the record when at least one of --tokens/--tool-uses/
+    --duration-ms/--event was actually passed AND V11_TOKEN_CAPTURE isn't
+    'off'. Absence of all four flags leaves the record byte-identical to the
+    pre-W3-T12 shape (backward-compat contract). Never fabricates a value —
+    each field is added only when its own flag was supplied.
+    """
+    if os.environ.get("V11_TOKEN_CAPTURE", "").lower() == "off":
+        return
+    tokens = getattr(ns, "tokens", None)
+    tool_uses = getattr(ns, "tool_uses", None)
+    duration_ms = getattr(ns, "duration_ms", None)
+    event = getattr(ns, "event", None)
+    if tokens is None and tool_uses is None and duration_ms is None and event is None:
+        return
+    record["event"] = event if event is not None else "dispatch"
+    if tokens is not None:
+        record["tokens"] = tokens
+    if tool_uses is not None:
+        record["tool_uses"] = tool_uses
+    if duration_ms is not None:
+        record["duration_ms"] = duration_ms
+
+
+def _apply_token_capture_from_json(record: dict[str, Any], obj: dict[str, Any]) -> None:
+    """--json blob equivalent of _apply_token_capture_from_args."""
+    if os.environ.get("V11_TOKEN_CAPTURE", "").lower() == "off":
+        return
+    tokens = obj.get("tokens")
+    tool_uses = obj.get("tool_uses")
+    duration_ms = obj.get("duration_ms")
+    event = obj.get("event")
+    if tokens is None and tool_uses is None and duration_ms is None and event is None:
+        return
+    record["event"] = event if event is not None else "dispatch"
+    if tokens is not None:
+        record["tokens"] = tokens
+    if tool_uses is not None:
+        record["tool_uses"] = tool_uses
+    if duration_ms is not None:
+        record["duration_ms"] = duration_ms
+
+
+def _build_record_from_args(ns: argparse.Namespace) -> dict[str, Any]:
+    record: dict[str, Any] = {
+        "ts": _now_iso(),
+        "task_id": ns.task_id,
+        "project": ns.project,
+        "sprint": ns.sprint,
+        "recommended_agent": ns.recommended_agent,
+        "spawned_agent": ns.spawned_agent,
+        "override_reason": ns.override_reason or "",
+        "model": ns.model,
+        "mode": ns.mode,
+        "caller_kind": ns.caller_kind,
+        "self_review_omitted": _coerce_bool(ns.self_review_omitted),
+    }
+    batch_ids = _parse_batch_review_ids(ns.batch_review_ids)
+    if batch_ids is not None:
+        record["batch_review_ids"] = batch_ids
+    _apply_token_capture_from_args(record, ns)
+    return record
+
+
+def _build_record_from_json(blob: str) -> dict[str, Any]:
+    obj = json.loads(blob)
+    if not isinstance(obj, dict):
+        raise ValueError("--json must be a JSON object")
+    record = {
+        "ts": obj.get("ts") or _now_iso(),
+        "task_id": obj.get("task_id"),
+        "project": obj.get("project"),
+        "sprint": obj.get("sprint"),
+        "recommended_agent": obj.get("recommended_agent"),
+        "spawned_agent": obj.get("spawned_agent"),
+        "override_reason": obj.get("override_reason") or "",
+        "model": obj.get("model"),
+        "mode": obj.get("mode"),
+        "caller_kind": obj.get("caller_kind"),
+        "self_review_omitted": _coerce_bool(obj.get("self_review_omitted")),
+    }
+    if "batch_review_ids" in obj and obj["batch_review_ids"] is not None:
+        bri = obj["batch_review_ids"]
+        if not isinstance(bri, list) or not bri or any(not isinstance(x, str) or not x for x in bri):
+            raise ValueError(
+                f"batch_review_ids must be a non-empty list of non-empty strings, got {bri!r}"
+            )
+        record["batch_review_ids"] = bri
+    _apply_token_capture_from_json(record, obj)
+    return record
+
+
+def _enforce_cap(record: dict[str, Any]) -> tuple[str, bool]:
+    """Return (line_with_newline, truncated_flag). Shrinks override_reason iteratively
+    until the JSON-encoded line + newline fits within LINE_CAP bytes. Never produces
+    unparseable JSON — if even an empty override_reason can't fit, we surrender
+    override_reason to the ellipsis marker and accept that the line stays valid."""
+
+    def _encode(r):
+        return json.dumps(r, separators=(",", ":"))
+
+    # Pre-truncate override_reason to its declared maxLength (schema contract)
+    reason_initial = record.get("override_reason") or ""
+    truncated_by_max = False
+    if len(reason_initial) > OVERRIDE_REASON_MAX:
+        # Reserve 1 char for the U+2026 marker
+        record["override_reason"] = reason_initial[:OVERRIDE_REASON_MAX - 1] + "…"
+        truncated_by_max = True
+
+    line = _encode(record)
+    if len(line.encode("utf-8")) + 1 <= LINE_CAP:  # +1 for trailing newline
+        return line + "\n", truncated_by_max
+
+    reason = record.get("override_reason") or ""
+    # Binary search the largest kept-prefix that keeps the WHOLE record under cap.
+    # We always end the truncated reason with the U+2026 marker.
+    MARKER = "…"
+    lo, hi = 0, len(reason)
+    best = -1
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        candidate = reason[:mid] + MARKER
+        record["override_reason"] = candidate
+        if len(_encode(record).encode("utf-8")) + 1 <= LINE_CAP:
+            best = mid
+            lo = mid + 1
+        else:
+            hi = mid - 1
+
+    if best >= 0:
+        record["override_reason"] = reason[:best] + MARKER
+    else:
+        # Couldn't fit any portion of reason; just keep the marker
+        record["override_reason"] = MARKER
+        # If even THAT doesn't fit, the other fields are already too big — caller's
+        # required-field set is small enough that this is unreachable in practice.
+        # We never produce broken JSON: keep the line valid and let the caller see oversize.
+    line = _encode(record)
+    return line + "\n", True
+
+
+def _validate(record: dict[str, Any]) -> str | None:
+    for f in REQUIRED_FIELDS:
+        if not record.get(f):
+            return f"missing required field {f!r}"
+    if record["caller_kind"] not in ("orchestrator", "subagent", "unknown", "daemon"):
+        return f"caller_kind must be one of orchestrator|subagent|unknown|daemon, got {record['caller_kind']!r}"
+    return None
+
+
+def _append(line: str) -> None:
+    METRICS_DIR.mkdir(parents=True, exist_ok=True)
+    # FD-9 flock for serialization. Use a separate write FD held under lock.
+    with open(TRACE_PATH, "a", encoding="utf-8") as fh:
+        fd = fh.fileno()
+        # Retry briefly if contended — keeps the writer cooperative under burst.
+        deadline = time.time() + 5.0
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.time() >= deadline:
+                    # Last-ditch blocking flock (waits up to OS limit; usually <1s)
+                    fcntl.flock(fd, fcntl.LOCK_EX)
+                    break
+                time.sleep(0.02)
+        try:
+            fh.write(line)
+            fh.flush()
+            os.fsync(fd)
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+
+
+def main() -> int:
+    if os.environ.get("V11_DISPATCH_TRACE", "").lower() == "off":
+        return 0
+
+    p = argparse.ArgumentParser(description="Append a V11.21 dispatch-trace.jsonl line.")
+    p.add_argument("--json", help="JSON blob containing the record fields.")
+    p.add_argument("--task-id", help="V11 task ID.")
+    p.add_argument("--project", help="V11 project slug.")
+    p.add_argument("--sprint", help="Sprint identifier, e.g. sprint-02-impl.")
+    p.add_argument("--recommended-agent", help="Agent the orchestrator recommended.")
+    p.add_argument("--spawned-agent", help="Agent actually spawned (may differ on override).")
+    p.add_argument("--override-reason", default="", help="Why spawned != recommended (free text).")
+    p.add_argument("--model", help="Agent model (e.g. sonnet, opus).")
+    p.add_argument("--mode", help="Spawn mode: default | acceptEdits | bypassPermissions.")
+    p.add_argument("--caller-kind", help="orchestrator | subagent | unknown")
+    p.add_argument("--self-review-omitted", action="store_true",
+                   help="Set when the spawned agent's prompt lacks a self_review postamble (V11.22 phased rollout).")
+    p.add_argument("--batch-review-ids", default=None,
+                   help="R6: comma-separated task-id list, e.g. '12,13,14'. Set when one reviewer "
+                        "spawn covers K review tasks (batch-claim mode). Omit for single-review "
+                        "dispatch (default, backward compatible).")
+    p.add_argument("--tokens", type=int, default=None,
+                   help="W3-T12: total tokens reported for this spawn (harness task-notification "
+                        "subagent_tokens). Optional — omit for byte-identical pre-W3-T12 lines.")
+    p.add_argument("--tool-uses", type=int, default=None,
+                   help="W3-T12: tool-use count reported for this spawn. Optional.")
+    p.add_argument("--duration-ms", type=int, default=None,
+                   help="W3-T12: wall-clock duration in ms reported for this spawn. Optional.")
+    p.add_argument("--event", default=None,
+                   help="W3-T12: record event shape, e.g. 'completion'. Defaults to 'dispatch' "
+                        "whenever any of --tokens/--tool-uses/--duration-ms/--event is supplied; "
+                        "entirely absent when none are (backward compatible).")
+    args = p.parse_args()
+
+    try:
+        record = _build_record_from_json(args.json) if args.json else _build_record_from_args(args)
+    except (json.JSONDecodeError, ValueError) as e:
+        print(f"[dispatch-trace] bad input: {e}", file=sys.stderr)
+        return 2
+
+    err = _validate(record)
+    if err:
+        print(f"[dispatch-trace] {err}", file=sys.stderr)
+        return 2
+
+    line, truncated = _enforce_cap(record)
+    try:
+        _append(line)
+    except OSError as e:
+        print(f"[dispatch-trace] write failed: {e}", file=sys.stderr)
+        return 1
+
+    if truncated:
+        print("[dispatch-trace] override_reason truncated to fit 4096-byte cap", file=sys.stderr)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

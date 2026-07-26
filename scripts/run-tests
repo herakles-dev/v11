@@ -1,0 +1,251 @@
+#!/bin/bash
+# V11 CI Test Runner
+# Runs the full V11 test suite with structured output.
+#
+# Usage:
+#   ./scripts/run-tests [OPTIONS]
+#
+# Options:
+#   --fast          Skip benchmarks and slow tests (parallel, default)
+#   --full          Include slow tests (TestTier0Integration, TestLiveCLI) — much slower
+#   --serial        Disable parallel workers (useful for debugging)
+#   --regression    Run deterministic fast-core regression tests (<30s)
+#   --regression-extended  Run full repeat-breakage regression set (incl. slow/hypothesis)
+#   --swebench      Run only SWE-bench mini harness
+#   --coverage      Require ≥80% coverage (fails if not met)
+#   --report PATH   Write JSON report to PATH (default: tests/.reports/results.json)
+#   --quiet / -q    Minimal output
+#   --help          Show this message
+#
+# Exit codes:
+#   0  All tests passed
+#   1  One or more tests failed
+#   2  Coverage below threshold
+#   3  Setup error (missing deps, bad args)
+
+set -euo pipefail
+
+V11_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+REPORT_DIR="$V11_ROOT/tests/.reports"
+REPORT_FILE="$REPORT_DIR/results.json"
+COVERAGE=false
+FAST=false
+FULL=false
+SERIAL=false
+REGRESSION=false
+REGRESSION_EXTENDED=false
+SWEBENCH=false
+QUIET=false
+EXTRA_ARGS=()
+
+# Parse args
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --fast)          FAST=true ;;
+        --full)          FULL=true ;;
+        --serial)        SERIAL=true ;;
+        --regression)    REGRESSION=true ;;
+        --regression-extended) REGRESSION_EXTENDED=true ;;
+        --swebench)      SWEBENCH=true ;;
+        --coverage)      COVERAGE=true ;;
+        --report)        REPORT_FILE="$2"; shift ;;
+        --quiet|-q)      QUIET=true ;;
+        --help|-h)
+            sed -n '2,/^set/p' "$0" | grep '^#' | sed 's/^# \?//'
+            exit 0
+            ;;
+        *)
+            EXTRA_ARGS+=("$1")
+            ;;
+    esac
+    shift
+done
+
+# Change to V11 root
+cd "$V11_ROOT"
+
+# Verify dependencies
+if ! python3 -c "import pytest" 2>/dev/null; then
+    echo "ERROR: pytest not installed. Run: pip install -r requirements-test.txt" >&2
+    exit 3
+fi
+
+mkdir -p "$(dirname "$REPORT_FILE")"
+
+# Build pytest command
+PYTEST_ARGS=(
+    "tests/"
+    "--json-report"
+    "--json-report-file=$REPORT_FILE"
+)
+
+if $FULL; then
+    # Override pytest.ini default (-m "not slow") to include slow tests.
+    # Empty -m clears the marker filter.
+    PYTEST_ARGS+=("-m" "")
+elif $FAST; then
+    # Default is already -m "not slow" in pytest.ini; be explicit about benchmark too.
+    PYTEST_ARGS+=("-m" "not slow and not benchmark")
+elif $REGRESSION_EXTENDED; then
+    # W4-1c: two-phase run. The first-ever extended run (v11.32) showed the
+    # slow tier is xdist-hostile: 20/24 failures were state pollution + load
+    # under -n 8 and vanished at -n0. Phase 1 keeps the non-slow bulk parallel;
+    # phase 2 runs the slow tier serially. Benchmarks stay excluded (M3 W3-1).
+    PYTEST_ARGS+=("-m" "not slow and not benchmark")
+    SLOW_REPORT_FILE="${REPORT_FILE%.json}-slow.json"
+elif $REGRESSION; then
+    PYTEST_ARGS+=("-m" "regression" "-v")
+elif $SWEBENCH; then
+    PYTEST_ARGS=("tests/test_swebench.py" "-v")
+fi
+
+# Serial mode: override pytest.ini -n 8 default
+if $SERIAL; then
+    PYTEST_ARGS+=("-p" "no:xdist")
+fi
+
+if $COVERAGE; then
+    # .coveragerc sets branch=True + source=scripts/lib,benchmarks automatically.
+    # Fast mode ~61.5% (benchmarks/runner excluded by @slow marker).
+    # Full mode ~76% (includes TestTier0Integration which exercises runner.py).
+    # Threshold 60 = current fast-mode floor; --full bumps it significantly.
+    PYTEST_ARGS+=(
+        "--cov"
+        "--cov-report=term-missing"
+        "--cov-report=html"
+        "--cov-fail-under=60"
+    )
+fi
+
+if $QUIET; then
+    PYTEST_ARGS+=("-q")
+else
+    PYTEST_ARGS+=("-v")
+fi
+
+PYTEST_ARGS+=("${EXTRA_ARGS[@]}")
+
+# Run tests
+echo "V11 Test Runner — $(date '+%Y-%m-%d %H:%M:%S')"
+echo "Root: $V11_ROOT"
+echo "Mode: $([ $FAST = true ] && echo fast || [ $REGRESSION_EXTENDED = true ] && echo regression-extended || [ $REGRESSION = true ] && echo regression || [ $SWEBENCH = true ] && echo swebench || echo full)"
+echo "---"
+
+set +e
+python3 -m pytest "${PYTEST_ARGS[@]}"
+PYTEST_EXIT=$?
+
+# W4-1c: extended-tier phase 2 — slow tests serial (-n0). Deterministic by
+# construction: no xdist worker state-pollution, no 8-way load on the
+# subprocess timeouts these tests carry. --timeout=120 matches the nested
+# meta-test's own inner budget.
+if $REGRESSION_EXTENDED; then
+    echo "---"
+    echo "Phase 2/2: slow tier, serial (-n0)"
+    python3 -m pytest "tests/" \
+        "--json-report" "--json-report-file=$SLOW_REPORT_FILE" \
+        "-m" "slow and not benchmark" "-n0" "--timeout=120" \
+        $($QUIET && echo "-q" || echo "-v") "${EXTRA_ARGS[@]}"
+    SLOW_EXIT=$?
+    [ "$PYTEST_EXIT" -eq 0 ] && PYTEST_EXIT="$SLOW_EXIT"
+fi
+
+# V11.26 — test-honesty lint runs alongside the regression suite.
+# Catches the false-green patterns shipped in V11.18/V11.25.1/V11.25.2 before
+# they recur. Soft-block: lint failure surfaces but does NOT clobber a pytest
+# failure for the operator. Rollback: V11_LINT_TEST_HONESTY=off.
+if [ "$REGRESSION" = true ] || [ "$REGRESSION_EXTENDED" = true ] || [ "$FAST" != true ]; then
+    LINT_SCRIPT="$V11_ROOT/scripts/lint-test-honesty"
+    if [ -x "$LINT_SCRIPT" ]; then
+        echo "---"
+        echo "V11.26 lint-test-honesty:"
+        if "$LINT_SCRIPT"; then
+            echo "  PASS — no false-green test patterns detected"
+        else
+            LINT_EXIT=$?
+            echo "  FAIL — see violations above"
+            # Surface lint failure only if pytest itself passed (don't shadow real test errors)
+            [ "$PYTEST_EXIT" -eq 0 ] && PYTEST_EXIT="$LINT_EXIT"
+        fi
+    fi
+
+    # V11.28.1 — changelog-drift guard runs alongside regression. Catches the CLAUDE.md §17
+    # inline-changelog refill + stale docs/CHANGELOG.md that this sprint just cleaned, so they
+    # don't recur. Soft-block: never shadows a real pytest failure. Rollback: V11_CHECK_CHANGELOG_DRIFT=off.
+    DRIFT_SCRIPT="$V11_ROOT/scripts/check-changelog-drift"
+    if [ -x "$DRIFT_SCRIPT" ]; then
+        echo "---"
+        echo "V11.28.1 check-changelog-drift:"
+        if "$DRIFT_SCRIPT"; then
+            :
+        else
+            DRIFT_EXIT=$?
+            echo "  FAIL — see drift above"
+            [ "$PYTEST_EXIT" -eq 0 ] && PYTEST_EXIT="$DRIFT_EXIT"
+        fi
+    fi
+
+    # W2-T6 — stamp-drift guard runs alongside regression. Catches version-stamp drift
+    # across the agent registry, README, VERSION.md, and CLAUDE.md against a git-derived
+    # anchor (never an in-repo string). Soft-block: never shadows a real pytest failure.
+    # Rollback: V11_STAMP_DRIFT=off.
+    STAMP_SCRIPT="$V11_ROOT/scripts/check-stamp-drift"
+    if [ -x "$STAMP_SCRIPT" ]; then
+        echo "---"
+        echo "W2-T6 check-stamp-drift:"
+        if "$STAMP_SCRIPT"; then
+            :
+        else
+            STAMP_EXIT=$?
+            echo "  FAIL — see drift above"
+            [ "$PYTEST_EXIT" -eq 0 ] && PYTEST_EXIT="$STAMP_EXIT"
+        fi
+    fi
+fi
+set -e
+
+# Summary from JSON report
+if [[ -f "$REPORT_FILE" ]] && command -v python3 &>/dev/null; then
+    python3 - "$REPORT_FILE" ${SLOW_REPORT_FILE:+"$SLOW_REPORT_FILE"} <<'PYEOF'
+import sys, json
+# Aggregate across all report files (extended tier writes a second,
+# phase-2 slow-tier report — W4-1c).
+total = passed = failed = skipped = 0
+duration = 0.0
+for path in sys.argv[1:]:
+    try:
+        data = json.load(open(path))
+    except Exception:
+        continue
+    summary = data.get("summary", {})
+    total += summary.get("total", 0)
+    passed += summary.get("passed", 0)
+    failed += summary.get("failed", 0)
+    skipped += summary.get("skipped", 0)
+    duration += data.get("duration", 0)
+print(f"\nResults: {passed}/{total} passed"
+      + (f", {failed} failed" if failed else "")
+      + (f", {skipped} skipped" if skipped else "")
+      + f" in {duration:.2f}s")
+PYEOF
+fi
+
+# Show failed tests if any
+if [[ $PYTEST_EXIT -ne 0 ]] && [[ -f "$REPORT_FILE" ]]; then
+    python3 - "$REPORT_FILE" ${SLOW_REPORT_FILE:+"$SLOW_REPORT_FILE"} <<'PYEOF'
+import sys, json
+failed = []
+for path in sys.argv[1:]:
+    try:
+        data = json.load(open(path))
+    except Exception:
+        continue
+    failed += [t for t in data.get("tests", []) if t.get("outcome") == "failed"]
+if failed:
+    print("\nFailed tests:")
+    for t in failed:
+        print(f"  FAIL  {t['nodeid']}")
+PYEOF
+fi
+
+exit $PYTEST_EXIT

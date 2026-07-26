@@ -1,0 +1,72 @@
+#!/bin/bash
+# V11 commit-msg hook shim — git surface for validation tag linting.
+# Install per-repo with:
+#   git config core.hooksPath /path/to/v11/hooks/git-hooks
+# Or symlink directly:
+#   ln -sf /path/to/v11/hooks/commit-msg-validation .git/hooks/commit-msg
+#
+# This script receives the commit message file path as $1 (standard git hook interface).
+#
+# Rollback:
+#   V11_VALIDATION_LINT=off           — exits 0 immediately (full kill switch)
+#   V11_VALIDATION_LINT_STRICT=on     — upgrades HYPOTHESIZED failures to exit 1
+#   V11_VALIDATION_LINT_HEURISTIC=off — disables causal-language heuristic
+
+set -euo pipefail
+
+# Resolve through symlinks (git invokes hooks by their on-disk path, which for a
+# repo installed via `install-validation-lint-hook`'s direct/symlink method is a
+# symlink in .git/hooks/ — BASH_SOURCE would otherwise resolve relative to that
+# symlink's directory instead of this script's real location).
+_SELF="$(realpath "${BASH_SOURCE[0]}")"
+VALIDATOR="$(dirname "$_SELF")/lib/validation_lint.py"
+
+# Full kill switch
+if [ "${V11_VALIDATION_LINT:-}" = "off" ]; then
+    exit 0
+fi
+
+# Self-test
+if [ "${1:-}" = "--test" ]; then
+    echo "commit-msg-validation v1.0 (V11.25: validation tag linter, commit-msg surface)"
+    exit 0
+fi
+
+# $1 is the path to the file containing the commit message
+MSG_FILE="${1:-}"
+if [ -z "$MSG_FILE" ] || [ ! -f "$MSG_FILE" ]; then
+    # No file path — try stdin
+    MSG_FILE=""
+fi
+
+# Collect staged files for doc-only exemption
+STAGED_FILES=""
+if command -v git &>/dev/null && git rev-parse --git-dir &>/dev/null 2>&1; then
+    STAGED_FILES="$(git diff --cached --name-only 2>/dev/null || true)"
+fi
+
+# Collect author for bot-commit exemption
+AUTHOR=""
+if command -v git &>/dev/null; then
+    AUTHOR="$(git config user.name 2>/dev/null || true)"
+fi
+
+# Dispatch to shared Python validator
+LINT_EXIT=0
+if [ -n "$MSG_FILE" ]; then
+    if [ -n "$STAGED_FILES" ]; then
+        V11_STAGED_FILES="$STAGED_FILES" \
+            python3 "$VALIDATOR" --msg-file "$MSG_FILE" ${AUTHOR:+--author "$AUTHOR"} || LINT_EXIT=$?
+    else
+        python3 "$VALIDATOR" --msg-file "$MSG_FILE" ${AUTHOR:+--author "$AUTHOR"} || LINT_EXIT=$?
+    fi
+else
+    if [ -n "$STAGED_FILES" ]; then
+        V11_STAGED_FILES="$STAGED_FILES" \
+            python3 "$VALIDATOR" ${AUTHOR:+--author "$AUTHOR"} || LINT_EXIT=$?
+    else
+        python3 "$VALIDATOR" ${AUTHOR:+--author "$AUTHOR"} || LINT_EXIT=$?
+    fi
+fi
+
+exit "$LINT_EXIT"

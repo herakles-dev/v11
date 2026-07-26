@@ -1,0 +1,292 @@
+#!/bin/bash
+# V11 Recovery Script — Reconstruct session context after a cut-off conversation.
+# Usage: ./scripts/recover-session [project]
+#
+# Reads all available disk state and produces a structured recovery prompt so
+# the user can immediately resume work without re-discovery.
+#
+# Gracefully handles missing files — the whole point is recovery from partial state.
+
+set -euo pipefail
+
+V11_WORKSPACE_ROOT="${V11_WORKSPACE_ROOT:-$HOME/.v11}"
+SESSIONS_ROOT="${SESSIONS_ROOT:-$V11_WORKSPACE_ROOT/sessions}"
+V11_HOME="${V11_HOME:-$V11_WORKSPACE_ROOT/v11}"
+METRICS_DIR="$V11_WORKSPACE_ROOT/.agent-metrics"
+TASK_STATE_DIR="$METRICS_DIR/task-state"
+ACTIVE_PROJECT_FILE="$METRICS_DIR/active-project"
+PLANS_DIR="$HOME/.claude/plans"
+
+# Help
+if [ "${1:-}" == "--help" ] || [ "${1:-}" == "-h" ]; then
+    echo "V11 Recovery — Reconstruct session context after a cut-off conversation"
+    echo ""
+    echo "Usage: ./scripts/recover-session [project]"
+    echo ""
+    echo "Auto-detects project from active-project file if not specified."
+    echo "Reads all available disk state and outputs a recovery prompt."
+    exit 0
+fi
+
+# --- Sanitize + detect project ---
+sanitize_name() {
+  local name="$1"
+  if [[ "$name" == *".."* ]] || [[ "$name" == *"/"* ]] || [[ "$name" =~ [^a-zA-Z0-9._-] ]]; then
+    echo "ERROR: Invalid project name: $name" >&2; exit 1
+  fi
+}
+
+# SEC-C-02: safe read of the active-project signal file.
+# Inline sanitizer (avoids sourcing common.sh in a script with `set -euo pipefail`).
+# Returns sanitized project name or empty string. Never leaks attacker-controlled content.
+_v11_read_active_project_safe() {
+    local raw
+    [ -f "$ACTIVE_PROJECT_FILE" ] || return 0
+    [ -s "$ACTIVE_PROJECT_FILE" ] || return 0
+    raw=$(head -n 1 "$ACTIVE_PROJECT_FILE" 2>/dev/null | tr -d '[:space:]')
+    if printf '%s' "$raw" | grep -qE '^[a-zA-Z0-9._-]{1,64}$'; then
+        printf '%s' "$raw"
+    else
+        echo "recover-session: rejected invalid content in $ACTIVE_PROJECT_FILE" >&2
+        return 0
+    fi
+}
+
+PROJECT="${1:-}"
+[ -n "$PROJECT" ] && sanitize_name "$PROJECT"
+
+if [ -z "$PROJECT" ]; then
+    PROJECT="$(_v11_read_active_project_safe)"
+fi
+
+if [ -z "$PROJECT" ]; then
+    # Last-ditch: find the most recently modified task-state file
+    LATEST_STATE=$(ls -t "$TASK_STATE_DIR"/*.json 2>/dev/null | grep -v '\.lock$' | head -1 || true)
+    if [ -n "$LATEST_STATE" ]; then
+        PROJECT=$(basename "$LATEST_STATE" .json)
+        echo "(Auto-detected project from most recent task-state: $PROJECT)" >&2
+    fi
+fi
+
+if [ -z "$PROJECT" ]; then
+    echo "Error: No project specified and no active project detected." >&2
+    echo "Usage: ./scripts/recover-session <project>" >&2
+    exit 1
+fi
+
+SESSION_DIR="$SESSIONS_ROOT/$PROJECT"
+STATE_FILE="$TASK_STATE_DIR/${PROJECT}.json"
+SPEC_FILE="$SESSION_DIR/spec.md"
+AUTONOMY_FILE="$SESSION_DIR/.autonomy-state"
+FORMATION_FILE="$SESSION_DIR/.formation-registry.json"
+PLAN_CONTEXT_FILE="$SESSION_DIR/.plan-context.json"
+LAST_SESSION_FILE="$SESSION_DIR/last-session.json"
+HANDOFF_FILE="$SESSION_DIR/handoff.md"
+
+TIMESTAMP=$(date -Iseconds)
+
+# --- Gather: Task state ---
+TOTAL=0; COMPLETED=0; PENDING=0; IN_PROGRESS=0; BLOCKED=0
+ACTIVE_TASKS="none"
+LAST_COMPLETED_SUBJECT=""
+RECENT_COMPLETED=""
+HAS_STATE=0
+
+if [ -f "$STATE_FILE" ] && [ -s "$STATE_FILE" ]; then
+    HAS_STATE=1
+    TOTAL=$(jq -r '.total // 0' "$STATE_FILE" 2>/dev/null || echo "0")
+    COMPLETED=$(jq -r '.completed // 0' "$STATE_FILE" 2>/dev/null || echo "0")
+    PENDING=$(jq -r '.pending // 0' "$STATE_FILE" 2>/dev/null || echo "0")
+    IN_PROGRESS=$(jq -r '.in_progress // 0' "$STATE_FILE" 2>/dev/null || echo "0")
+    BLOCKED=$(jq -r '.blocked // 0' "$STATE_FILE" 2>/dev/null || echo "0")
+    # Ensure numeric values (jq can return "null")
+    TOTAL=${TOTAL:-0}; COMPLETED=${COMPLETED:-0}; PENDING=${PENDING:-0}
+    IN_PROGRESS=${IN_PROGRESS:-0}; BLOCKED=${BLOCKED:-0}
+    [[ "$TOTAL" =~ ^[0-9]+$ ]] || TOTAL=0
+    [[ "$COMPLETED" =~ ^[0-9]+$ ]] || COMPLETED=0
+
+    # Active task IDs with subjects if available
+    ACTIVE_TASKS=$(jq -r '
+        (.active_task_ids // []) |
+        if length == 0 then "none"
+        else map("#\(.)") | join(", ")
+        end
+    ' "$STATE_FILE" 2>/dev/null || echo "none")
+
+    # Fallback: active_task_id (singular, older format)
+    if [ "$ACTIVE_TASKS" == "none" ]; then
+        ACTIVE_TASK_SINGLE=$(jq -r '.active_task_id // empty' "$STATE_FILE" 2>/dev/null || true)
+        [ -n "$ACTIVE_TASK_SINGLE" ] && ACTIVE_TASKS="#${ACTIVE_TASK_SINGLE}"
+    fi
+
+    # Most recent completed task subject (handles string or object entries)
+    LAST_COMPLETED_SUBJECT=$(jq -r '
+        (.recent_completed // .recently_completed // []) |
+        map(select(. != "unknown" and . != null)) |
+        last |
+        if . == null then "none"
+        elif (. | type) == "object" then
+            if (.id // "") != "" then "Task \(.id): \(.subject // "untitled")"
+            else .subject // "untitled"
+            end
+        else "Task \(.)"
+        end
+    ' "$STATE_FILE" 2>/dev/null || echo "none")
+
+    # Up to 3 recently completed (handles string or object entries)
+    RECENT_COMPLETED=$(jq -r '
+        (.recent_completed // .recently_completed // []) |
+        map(select(. != "unknown" and . != null)) |
+        .[-3:] | reverse[] |
+        if (. | type) == "object" then "  - Task \(.id // "?"): \(.subject // "untitled")"
+        else "  - \(.)"
+        end
+    ' "$STATE_FILE" 2>/dev/null || true)
+fi
+
+# Percent complete
+if [ "$TOTAL" -gt 0 ]; then
+    PERCENT=$(( (COMPLETED * 100) / TOTAL ))
+else
+    PERCENT=0
+fi
+
+# --- Gather: Spec ---
+SPEC_FIRST_LINE="(no spec.md found)"
+SPEC_INTENT=""
+if [ -f "$SPEC_FILE" ]; then
+    SPEC_FIRST_LINE=$(head -1 "$SPEC_FILE" 2>/dev/null | sed 's/^#\+[[:space:]]*//' || echo "(unreadable)")
+    # Find first non-heading, non-empty content line
+    SPEC_INTENT=$(grep -v '^#' "$SPEC_FILE" 2>/dev/null | grep -v '^[[:space:]]*$' | head -1 | sed 's/^[>*[:space:]-]*//' | cut -c1-120 || true)
+fi
+
+# --- Gather: Autonomy ---
+AUTONOMY_LEVEL=0; AUTONOMY_NAME="Manual"
+if [ -f "$AUTONOMY_FILE" ]; then
+    AUTONOMY_LEVEL=$(jq -r '.level // 0' "$AUTONOMY_FILE" 2>/dev/null || echo "0")
+    case "$AUTONOMY_LEVEL" in
+        0) AUTONOMY_NAME="Manual" ;;
+        1) AUTONOMY_NAME="Guided" ;;
+        2) AUTONOMY_NAME="Supervised" ;;
+        3) AUTONOMY_NAME="Trusted" ;;
+        4) AUTONOMY_NAME="Autonomous" ;;
+        *) AUTONOMY_NAME="Unknown" ;;
+    esac
+fi
+
+# --- Gather: Formation ---
+FORMATION_NAME="none"
+if [ -f "$FORMATION_FILE" ]; then
+    FORMATION_NAME=$(jq -r '.formation // "unknown"' "$FORMATION_FILE" 2>/dev/null || echo "unknown")
+fi
+
+# --- Gather: Plan context ---
+PC_DOMAIN=""; PC_BOTTLENECK=""
+if [ -f "$PLAN_CONTEXT_FILE" ]; then
+    PC_DOMAIN=$(jq -r '.domain.cynefin // empty' "$PLAN_CONTEXT_FILE" 2>/dev/null || true)
+    PC_BOTTLENECK=$(jq -r '.bottleneck.current // empty' "$PLAN_CONTEXT_FILE" 2>/dev/null || true)
+    [ "$PC_DOMAIN" = "null" ] && PC_DOMAIN=""
+    [ "$PC_BOTTLENECK" = "null" ] && PC_BOTTLENECK=""
+fi
+
+# --- Gather: Last session ---
+LAST_SESSION_SUMMARY=""
+if [ -f "$LAST_SESSION_FILE" ]; then
+    LAST_SESSION_SUMMARY=$(jq -r '.summary // empty' "$LAST_SESSION_FILE" 2>/dev/null || true)
+    [ "$LAST_SESSION_SUMMARY" = "null" ] && LAST_SESSION_SUMMARY=""
+fi
+
+# --- Gather: Handoff.md ---
+HANDOFF_EXISTS=0
+[ -f "$HANDOFF_FILE" ] && HANDOFF_EXISTS=1
+
+# --- Gather: Plan file (from ~/.claude/plans/) ---
+PLAN_FILE=""
+if [ -d "$PLANS_DIR" ]; then
+    PLAN_FILE=$(grep -rl "<!-- v11-plan: ${PROJECT} -->" "$PLANS_DIR" 2>/dev/null | head -1 || true)
+fi
+
+# --- Build state files list ---
+STATE_FILES_LIST="1. $SPEC_FILE"
+FILE_IDX=2
+STATE_FILES_LIST="${STATE_FILES_LIST}
+${FILE_IDX}. TaskList (run this to verify live task state)"
+FILE_IDX=$(( FILE_IDX + 1 ))
+if [ -f "$FORMATION_FILE" ]; then
+    STATE_FILES_LIST="${STATE_FILES_LIST}
+${FILE_IDX}. $FORMATION_FILE"
+    FILE_IDX=$(( FILE_IDX + 1 ))
+fi
+if [ -f "$AUTONOMY_FILE" ]; then
+    STATE_FILES_LIST="${STATE_FILES_LIST}
+${FILE_IDX}. $AUTONOMY_FILE"
+    FILE_IDX=$(( FILE_IDX + 1 ))
+fi
+if [ -n "$PLAN_FILE" ]; then
+    STATE_FILES_LIST="${STATE_FILES_LIST}
+${FILE_IDX}. $PLAN_FILE (V11 plan snapshot)"
+    FILE_IDX=$(( FILE_IDX + 1 ))
+fi
+if [ "$HANDOFF_EXISTS" -eq 1 ]; then
+    STATE_FILES_LIST="${STATE_FILES_LIST}
+${FILE_IDX}. $HANDOFF_FILE (last handoff)"
+fi
+
+# --- Build optional lines ---
+RECENT_SECTION=""
+[ -n "$RECENT_COMPLETED" ] && RECENT_SECTION="- Recently completed:
+$RECENT_COMPLETED"
+
+INTENT_LINE=""
+[ -n "$SPEC_INTENT" ] && INTENT_LINE="- Intent: $SPEC_INTENT"
+
+DOMAIN_LINE=""
+[ -n "$PC_DOMAIN" ] && DOMAIN_LINE="- Domain: $PC_DOMAIN (Cynefin)"
+
+BOTTLENECK_LINE=""
+[ -n "$PC_BOTTLENECK" ] && BOTTLENECK_LINE="- Bottleneck: $PC_BOTTLENECK"
+
+LAST_SESSION_LINE=""
+[ -n "$LAST_SESSION_SUMMARY" ] && LAST_SESSION_LINE="- Last session: $LAST_SESSION_SUMMARY"
+
+# Normalise "none" from jq to a cleaner display value
+[ "$LAST_COMPLETED_SUBJECT" = "none" ] && LAST_COMPLETED_SUBJECT="(none yet)"
+
+# --- Generate recovery prompt ---
+cat << RECOVERY
+V11 SESSION RECOVERY: $PROJECT
+
+## What You Were Working On
+- Active tasks: $ACTIVE_TASKS
+- Last completed: $LAST_COMPLETED_SUBJECT
+- Progress: $COMPLETED/$TOTAL tasks ($PERCENT%)
+$RECENT_SECTION
+
+## Project Context
+- Spec: $SPEC_FIRST_LINE
+$INTENT_LINE
+- Formation: $FORMATION_NAME
+- Autonomy: A${AUTONOMY_LEVEL} ($AUTONOMY_NAME)
+$DOMAIN_LINE
+$BOTTLENECK_LINE
+$LAST_SESSION_LINE
+
+## State Files
+$STATE_FILES_LIST
+
+## Resume Instructions
+1. Read spec.md for full context
+2. Run TaskList to see current state
+3. TaskUpdate(status="in_progress") on next pending task
+4. Continue work
+
+---
+V11 Recovery | Generated: $TIMESTAMP
+RECOVERY
+
+# Warn if no task-state was found — guide user to fallback
+if [ "$HAS_STATE" -eq 0 ]; then
+    echo ""
+    echo "WARNING: No task-state found at $STATE_FILE"
+    echo "         Fallback: check $HANDOFF_FILE and $SPEC_FILE for prior context."
+fi

@@ -1,0 +1,150 @@
+#!/bin/bash
+# V11 Hook: guard-agent-stall (PostToolUse — TaskList)
+# Detects stalled background agents via task-state timestamps.
+# Replaces guard-teammate-timeout (V11.11: per-task agents, no formations).
+# Risk: Advisory only (never blocks)
+
+source "$(dirname "${BASH_SOURCE[0]}")/lib/common.sh"
+
+# Test mode
+if [ "$1" == "--test" ]; then
+    echo "guard-agent-stall v1.0 (V11.11 — per-task agent stall detection)"
+    exit 0
+fi
+
+# Parse input
+v11_parse_input
+
+# Only run on TaskList invocations (periodic check point)
+if [ "$V11_TOOL_NAME" != "TaskList" ]; then
+    exit 0
+fi
+
+# Load configuration (with defaults)
+STALL_WARNING_MINUTES=${STALL_WARNING_MINUTES:-15}
+STALL_TIMEOUT_MINUTES=${STALL_TIMEOUT_MINUTES:-30}
+STALL_CRITICAL_MINUTES=${STALL_CRITICAL_MINUTES:-45}
+MAX_STALL_ALERTS_PER_TASK=${MAX_STALL_ALERTS_PER_TASK:-3}
+DEBUG_STALL=${DEBUG_STALL:-false}
+
+# Detect active project
+PROJECT="$(v11_read_active_project)"
+[ -z "$PROJECT" ] && exit 0
+
+# Find task state file
+STATE_FILE=""
+if [ -f "$TASK_STATE_DIR/${PROJECT}.json" ]; then
+    STATE_FILE="$TASK_STATE_DIR/${PROJECT}.json"
+elif [ -f "$SESSIONS_ROOT/$PROJECT/.task-state.json" ]; then
+    STATE_FILE="$SESSIONS_ROOT/$PROJECT/.task-state.json"
+fi
+[ -z "$STATE_FILE" ] || [ ! -f "$STATE_FILE" ] && exit 0
+
+# Check if any tasks are in_progress
+IN_PROGRESS=$(jq -r '.in_progress // 0' "$STATE_FILE" 2>/dev/null)
+[ "$IN_PROGRESS" -eq 0 ] 2>/dev/null && exit 0
+
+# Read last_updated from state file
+LAST_UPDATED=$(jq -r '.last_updated // ""' "$STATE_FILE" 2>/dev/null)
+[ -z "$LAST_UPDATED" ] && exit 0
+
+# Portable ISO 8601 → epoch conversion
+_to_epoch() {
+    date -d "$1" +%s 2>/dev/null \
+        || date -j -f "%Y-%m-%dT%H:%M:%S" "$1" +%s 2>/dev/null \
+        || python3 -c "import datetime; print(int(datetime.datetime.fromisoformat('$1'.replace('Z','+00:00')).timestamp()))" 2>/dev/null \
+        || echo 0
+}
+
+# Calculate minutes since last update
+LAST_TIMESTAMP=$(_to_epoch "$LAST_UPDATED")
+NOW=$(date +%s)
+MINUTES_ELAPSED=$(( (NOW - LAST_TIMESTAMP) / 60 ))
+
+# Determine severity
+SEVERITY=""
+if [ "$MINUTES_ELAPSED" -ge "$STALL_CRITICAL_MINUTES" ]; then
+    SEVERITY="CRITICAL"
+elif [ "$MINUTES_ELAPSED" -ge "$STALL_TIMEOUT_MINUTES" ]; then
+    SEVERITY="ALERT"
+elif [ "$MINUTES_ELAPSED" -ge "$STALL_WARNING_MINUTES" ]; then
+    SEVERITY="WARNING"
+fi
+
+# No stall detected
+[ -z "$SEVERITY" ] && exit 0
+
+# Check stall alert tracking to prevent spam
+STALL_TRACKER="$METRICS_DIR/stall-alerts-${PROJECT}.json"
+ALERT_COUNT=0
+if [ -f "$STALL_TRACKER" ]; then
+    ALERT_COUNT=$(jq -r '.alert_count // 0' "$STALL_TRACKER" 2>/dev/null)
+    LAST_ALERT=$(jq -r '.last_alerted_at // ""' "$STALL_TRACKER" 2>/dev/null)
+
+    # Cooldown (60 min between alerts)
+    if [ -n "$LAST_ALERT" ]; then
+        ALERT_TS=$(_to_epoch "$LAST_ALERT")
+        ALERT_AGO=$(( (NOW - ALERT_TS) / 60 ))
+        if [ "$ALERT_AGO" -lt 60 ]; then
+            [ "$DEBUG_STALL" == "true" ] && echo "[guard-agent-stall] Cooldown active ($ALERT_AGO min since last alert)" >&2
+            exit 0
+        fi
+    fi
+
+    # Max alerts
+    if [ "$ALERT_COUNT" -ge "$MAX_STALL_ALERTS_PER_TASK" ]; then
+        [ "$DEBUG_STALL" == "true" ] && echo "[guard-agent-stall] Max alerts reached ($ALERT_COUNT)" >&2
+        exit 0
+    fi
+fi
+
+# Gather context for advisory
+ACTIVE_TASK_ID=$(jq -r '(.active_task_ids // []) | map(select(. != "")) | join(", #") | if . == "" then "none" else "#" + . end' "$STATE_FILE" 2>/dev/null)
+TOTAL=$(jq -r '.total // 0' "$STATE_FILE" 2>/dev/null)
+COMPLETED=$(jq -r '.completed // 0' "$STATE_FILE" 2>/dev/null)
+ACTIVE_AGENT=$(jq -r '.active_agent_id // "unknown"' "$STATE_FILE" 2>/dev/null)
+
+# Emit advisory warning
+case "$SEVERITY" in
+    WARNING)
+        cat <<EOF
+
+STALL WARNING: No task progress for ${MINUTES_ELAPSED}m
+  Project: $PROJECT | Progress: $COMPLETED/$TOTAL | Active tasks: $ACTIVE_TASK_ID
+  Agent: $ACTIVE_AGENT
+  Consider checking if the background agent is still running.
+EOF
+        ;;
+    ALERT)
+        cat <<EOF
+
+STALL ALERT: No task progress for ${MINUTES_ELAPSED}m
+  Project: $PROJECT | Progress: $COMPLETED/$TOTAL | Active tasks: $ACTIVE_TASK_ID
+  Agent: $ACTIVE_AGENT
+  Check agent status or prepare to reassign the task.
+EOF
+        ;;
+    CRITICAL)
+        cat <<EOF
+
+STALL CRITICAL: No task progress for ${MINUTES_ELAPSED}m
+  Project: $PROJECT | Progress: $COMPLETED/$TOTAL | Active tasks: $ACTIVE_TASK_ID
+  Agent: $ACTIVE_AGENT
+  Task likely stalled. Options: 1) Check agent  2) Reassign  3) Mark complete  4) Create blocker
+EOF
+        ;;
+esac
+
+# Update stall tracker
+mkdir -p "$METRICS_DIR"
+jq -n \
+    --arg project "$PROJECT" \
+    --argjson count "$((ALERT_COUNT + 1))" \
+    --arg ts "$(date -Iseconds)" \
+    --arg severity "$SEVERITY" \
+    '{project: $project, alert_count: $count, last_alerted_at: $ts, last_severity: $severity}' \
+    > "$STALL_TRACKER"
+
+[ "$DEBUG_STALL" == "true" ] && echo "[guard-agent-stall] Stall $SEVERITY alert #$((ALERT_COUNT + 1)) emitted" >&2
+
+exit 0

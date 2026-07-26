@@ -1,0 +1,689 @@
+#!/usr/bin/env bash
+# V11 ledger-archive — segment completed-sprint history out of the live ledger.
+#
+# OPERATOR-ON-DEMAND ONLY — never invoked from a hook or DETECT path.
+#
+# Purpose (R7): moves lines whose task history is fully "closed" for a sprint
+# (or, under --before, fully closed and predating a cutoff date for untagged
+# legacy events) out of the live per-project ledger into an archive file, so
+# the live ledger stays small while history is never lost.
+#
+# Usage:
+#   ledger-archive PROJECT --list [--json]
+#   ledger-archive PROJECT --sprint S [--dry-run] [--json]
+#   ledger-archive PROJECT --sprint S --apply
+#   ledger-archive PROJECT --before DATE [--dry-run] [--json]
+#   ledger-archive PROJECT --before DATE --apply
+#
+# Archivability rule:
+#   1. A sprint S is archivable iff every task_id with a `created` event
+#      tagged metadata.sprint==S has a terminal (completed|deleted) event as
+#      its most recent event.
+#   2. Untagged legacy events (no metadata.sprint anywhere in that task's
+#      history) are archivable ONLY under --before DATE: all events for
+#      task_ids whose latest event predates DATE and is terminal.
+#
+# Mutation is propose-only by default (V11.27 pattern) — printing counts and
+# the archive target without touching any file. --apply is required to
+# actually move lines. FD-207 (the same lock v11_ledger_append uses) is held
+# for the entire read-recompute-write of the live ledger; the ledger is never
+# rewritten without a timestamped .bak of the pre-archive state; the final
+# in-ledger state is committed via temp-file + atomic mv.
+#
+# TOCTOU note: the PLAN step below (unlocked) is purely informational/UX —
+# it drives --list output and the early "not archivable" fast-fail message.
+# The APPLY step never trusts PLAN's line indices; it re-reads the ledger and
+# recomputes the archivable set from scratch under lock (see Step 4).
+#
+# Rollback: V11_LEDGER_ARCHIVE=off disables the entire script (exit 0).
+#
+# V11 ledger-integrity spec R7.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+V11_HOME="${V11_HOME:-$(dirname "$SCRIPT_DIR")}"
+V11_WORKSPACE_ROOT="${V11_WORKSPACE_ROOT:-$HOME/.v11}"
+# shellcheck source=../hooks/lib/common.sh
+source "$V11_HOME/hooks/lib/common.sh"
+
+# --- Kill switch: full off, checked before any other work -------------------
+if [ "${V11_LEDGER_ARCHIVE:-on}" = "off" ]; then
+    echo "ledger-archive: disabled — V11_LEDGER_ARCHIVE=off" >&2
+    exit 0
+fi
+
+usage() {
+    cat <<EOF
+Usage: ledger-archive PROJECT --list [--json]
+       ledger-archive PROJECT --sprint S [--dry-run] [--json]
+       ledger-archive PROJECT --sprint S --apply
+       ledger-archive PROJECT --before DATE [--dry-run] [--json]
+       ledger-archive PROJECT --before DATE --apply
+
+Options:
+  --sprint S      Target a tagged sprint (metadata.sprint==S) for archiving.
+  --before DATE   Target untagged legacy events with latest activity < DATE
+                   (YYYY-MM-DD). Only mode that touches untagged events.
+  --list          Show archivable sprints (and untagged count) with counts.
+                   No mutation regardless of --apply.
+  --dry-run       (default when neither --list nor --apply given) PROPOSE
+                   only — prints what would move, writes nothing.
+  --apply         Actually move the archivable lines. Requires the target
+                   (--sprint or --before) to be archivable.
+  --json          Emit machine-readable JSON instead of prose.
+  -h, --help      Show this help.
+
+Rollback: V11_LEDGER_ARCHIVE=off disables the entire script (exit 0).
+
+OPERATOR-ON-DEMAND ONLY — never invoked from a hook or DETECT path.
+EOF
+}
+
+PROJECT=""
+SPRINT=""
+BEFORE_DATE=""
+DO_LIST=0
+DO_APPLY=0
+JSON_OUT=0
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --sprint)   SPRINT="${2:-}"; shift 2 ;;
+        --before)   BEFORE_DATE="${2:-}"; shift 2 ;;
+        --list)     DO_LIST=1; shift ;;
+        --dry-run)  shift ;; # default mode, accepted for symmetry with other scripts
+        --apply)    DO_APPLY=1; shift ;;
+        --json)     JSON_OUT=1; shift ;;
+        -h|--help)  usage; exit 0 ;;
+        -*)
+            echo "ledger-archive: unknown option: $1" >&2
+            usage >&2
+            exit 1
+            ;;
+        *)
+            if [ -z "$PROJECT" ]; then
+                PROJECT="$1"
+            else
+                echo "ledger-archive: unexpected argument: $1" >&2
+                exit 1
+            fi
+            shift
+            ;;
+    esac
+done
+
+if [ -z "$PROJECT" ]; then
+    echo "ledger-archive: project name required" >&2
+    usage >&2
+    exit 1
+fi
+
+# SEC-C-02: same project-name validation v11_ledger_append enforces.
+if ! printf '%s' "$PROJECT" | grep -qE '^[a-zA-Z0-9._-]{1,64}$'; then
+    echo "ledger-archive: invalid project name '$PROJECT'" >&2
+    exit 1
+fi
+
+if [ "$DO_LIST" = "0" ] && [ -z "$SPRINT" ] && [ -z "$BEFORE_DATE" ]; then
+    echo "ledger-archive: one of --list, --sprint S, or --before DATE is required" >&2
+    usage >&2
+    exit 1
+fi
+
+if [ -n "$SPRINT" ] && [ -n "$BEFORE_DATE" ]; then
+    echo "ledger-archive: --sprint and --before are mutually exclusive" >&2
+    exit 1
+fi
+
+if [ -n "$BEFORE_DATE" ] && ! printf '%s' "$BEFORE_DATE" | grep -qE '^[0-9]{4}-[0-9]{2}-[0-9]{2}'; then
+    echo "ledger-archive: --before DATE must be YYYY-MM-DD" >&2
+    exit 1
+fi
+
+LEDGER_DIR="${METRICS_DIR}/ledger"
+LEDGER_FILE="${LEDGER_DIR}/${PROJECT}.jsonl"
+LOCK_FILE="${LEDGER_DIR}/${PROJECT}.jsonl.lock"
+ARCHIVE_DIR="${LEDGER_DIR}/archive"
+
+if [ ! -f "$LEDGER_FILE" ]; then
+    echo "ledger-archive: no ledger found for project '$PROJECT' at $LEDGER_FILE" >&2
+    exit 1
+fi
+
+# -----------------------------------------------------------------------------
+# Step 1: PLAN (read-only, UNLOCKED). Parses the ledger, groups events by
+# task_id, and emits a JSON plan describing what --list / --sprint / --before
+# would do. Never touches disk. Used for --list output and the early
+# "not archivable" fast-fail message only — APPLY (Step 4) never trusts this
+# plan's line indices, since the ledger can change between PLAN and APPLY.
+# -----------------------------------------------------------------------------
+_PLAN_JSON=$(
+    V11_LA_PROJECT="$PROJECT" \
+    V11_LA_LEDGER="$LEDGER_FILE" \
+    V11_LA_MODE="$([ "$DO_LIST" = "1" ] && echo list || { [ -n "$SPRINT" ] && echo sprint || echo before; })" \
+    V11_LA_SPRINT="$SPRINT" \
+    V11_LA_BEFORE="$BEFORE_DATE" \
+    python3 - <<'PYEOF'
+import os, sys, json
+
+project = os.environ["V11_LA_PROJECT"]
+ledger_path = os.environ["V11_LA_LEDGER"]
+mode = os.environ["V11_LA_MODE"]
+target_sprint = os.environ.get("V11_LA_SPRINT", "")
+before_date = os.environ.get("V11_LA_BEFORE", "")
+
+TERMINAL = {"completed", "deleted"}
+
+try:
+    with open(ledger_path, "r", encoding="utf-8", errors="replace") as fh:
+        raw_lines = fh.read().split("\n")
+except OSError as exc:
+    print(json.dumps({"error": f"cannot read ledger: {exc}"}))
+    sys.exit(1)
+
+# Drop a single trailing empty element from the final newline; tolerate a
+# torn/incomplete final line by simply failing to parse it below (harmless —
+# it never gets selected as archivable since it can't be a terminal event).
+if raw_lines and raw_lines[-1] == "":
+    raw_lines = raw_lines[:-1]
+
+# idk (project+subject_norm+create_seq) -> {sprint(s) seen, last_ev, last_ts,
+# first_ts, line_idx: [...], task_id (last-seen, display only)}
+#
+# Keyed by idk, NOT task_id: task_ids are reused across sprints/sessions (the
+# same task_id "5" can back a wholly different task in sprint-3 and again in
+# sprint-18), so grouping by task_id alone silently merges distinct task
+# histories and undercounts tasks_total/tasks_completed in the summary event
+# below. idk is the same identity key v11_replay_ledger's idk() uses, so
+# archive summary counts stay consistent with what a ledger replay derives.
+tasks = {}
+
+for idx, line in enumerate(raw_lines):
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        ev = json.loads(line)
+    except json.JSONDecodeError:
+        continue
+    if not isinstance(ev, dict) or ev.get("project") != project:
+        continue
+
+    task_id = ev.get("task_id") or ""
+    if not task_id:
+        continue
+    idk = (ev.get("subject_norm") or "") + "\x00" + str(ev.get("create_seq") or 0)
+    ev_type = ev.get("ev", "")
+    ts = ev.get("ts", "")
+    md = ev.get("metadata") or {}
+    sprint = md.get("sprint") if isinstance(md, dict) else None
+
+    rec = tasks.setdefault(idk, {
+        "sprint": None,
+        "last_ev": None,
+        "last_ts": None,
+        "first_ts": ts,
+        "line_idx": [],
+        "task_id": task_id,
+    })
+    rec["line_idx"].append(idx)
+    rec["task_id"] = task_id
+    # Sprint tag: first non-null value wins (created event is written first
+    # in ledger order, so this naturally prefers it); later events rarely
+    # carry a different sprint but if they do we keep the earliest tag.
+    if rec["sprint"] is None and sprint is not None:
+        rec["sprint"] = str(sprint)
+    # Track most-recent status/ts by ledger (append) order — the file is
+    # append-only, so last-seen in iteration order == most recent.
+    rec["last_ev"] = ev_type
+    rec["last_ts"] = ts
+
+def is_terminal(rec):
+    return rec["last_ev"] in TERMINAL
+
+result = {"mode": mode}
+
+if mode == "list":
+    by_sprint = {}
+    untagged_count = 0
+    for tid, rec in tasks.items():
+        if rec["sprint"] is None:
+            untagged_count += 1
+            continue
+        s = rec["sprint"]
+        bucket = by_sprint.setdefault(s, {"task_count": 0, "terminal_count": 0})
+        bucket["task_count"] += 1
+        if is_terminal(rec):
+            bucket["terminal_count"] += 1
+    sprints_out = []
+    for s, b in sorted(by_sprint.items()):
+        sprints_out.append({
+            "sprint": s,
+            "task_count": b["task_count"],
+            "terminal_count": b["terminal_count"],
+            "archivable": b["task_count"] > 0 and b["task_count"] == b["terminal_count"],
+        })
+    result["sprints"] = sprints_out
+    result["untagged"] = {"task_count": untagged_count, "note": "archivable only via --before DATE"}
+
+elif mode == "sprint":
+    matching = {idk: rec for idk, rec in tasks.items() if rec["sprint"] == target_sprint}
+    non_terminal = [idk for idk, rec in matching.items() if not is_terminal(rec)]
+    archivable = len(matching) > 0 and len(non_terminal) == 0
+    line_idx = sorted(i for rec in matching.values() for i in rec["line_idx"]) if archivable else []
+    task_ids = sorted(set(rec["task_id"] for rec in matching.values()))
+    non_terminal_task_ids = sorted(set(matching[k]["task_id"] for k in non_terminal))
+    completed_count = sum(1 for rec in matching.values() if rec["last_ev"] == "completed")
+    result.update({
+        "sprint": target_sprint,
+        "task_count": len(matching),
+        "archivable": archivable,
+        "task_ids": task_ids,
+        "non_terminal_task_ids": non_terminal_task_ids,
+        "line_idx": line_idx,
+        "line_count": len(line_idx),
+        "min_task": min(task_ids) if task_ids else None,
+        "max_task": max(task_ids) if task_ids else None,
+        "tasks_total": len(matching),
+        "tasks_completed": completed_count,
+    })
+
+elif mode == "before":
+    # Only untagged tasks are eligible under --before.
+    candidates = {idk: rec for idk, rec in tasks.items() if rec["sprint"] is None}
+    eligible = {
+        idk: rec for idk, rec in candidates.items()
+        if is_terminal(rec) and rec["last_ts"] and rec["last_ts"] < before_date
+    }
+    line_idx = sorted(i for rec in eligible.values() for i in rec["line_idx"])
+    task_ids = sorted(set(rec["task_id"] for rec in eligible.values()))
+    completed_count = sum(1 for rec in eligible.values() if rec["last_ev"] == "completed")
+    result.update({
+        "before": before_date,
+        "task_count": len(eligible),
+        "archivable": len(eligible) > 0,
+        "task_ids": task_ids,
+        "line_idx": line_idx,
+        "line_count": len(line_idx),
+        "min_task": min(task_ids) if task_ids else None,
+        "max_task": max(task_ids) if task_ids else None,
+        "tasks_total": len(eligible),
+        "tasks_completed": completed_count,
+    })
+
+print(json.dumps(result))
+PYEOF
+) || {
+    echo "ledger-archive: plan step failed" >&2
+    exit 1
+}
+
+if printf '%s' "$_PLAN_JSON" | jq -e 'has("error")' >/dev/null 2>&1; then
+    echo "ledger-archive: $(printf '%s' "$_PLAN_JSON" | jq -r '.error')" >&2
+    exit 1
+fi
+
+# -----------------------------------------------------------------------------
+# Step 2: --list — report only, never mutates, ignores --apply.
+# -----------------------------------------------------------------------------
+if [ "$DO_LIST" = "1" ]; then
+    if [ "$JSON_OUT" = "1" ]; then
+        printf '%s\n' "$_PLAN_JSON"
+        exit 0
+    fi
+    echo "ledger-archive: project=${PROJECT} archivable sprints"
+    printf '%s' "$_PLAN_JSON" | jq -r '
+        .sprints[] |
+        "  sprint=\(.sprint)  tasks=\(.task_count)  terminal=\(.terminal_count)  archivable=\(.archivable)"
+    '
+    printf '%s' "$_PLAN_JSON" | jq -r '
+        "  untagged tasks=\(.untagged.task_count)  (\(.untagged.note))"
+    '
+    exit 0
+fi
+
+# -----------------------------------------------------------------------------
+# Step 3: PROPOSE (default) or APPLY for --sprint / --before.
+# -----------------------------------------------------------------------------
+_ARCHIVABLE=$(printf '%s' "$_PLAN_JSON" | jq -r '.archivable')
+_LINE_COUNT=$(printf '%s' "$_PLAN_JSON" | jq -r '.line_count')
+_TASK_COUNT=$(printf '%s' "$_PLAN_JSON" | jq -r '.task_count')
+_MIN_TASK=$(printf '%s' "$_PLAN_JSON" | jq -r '.min_task // "null"')
+_MAX_TASK=$(printf '%s' "$_PLAN_JSON" | jq -r '.max_task // "null"')
+
+if [ -n "$SPRINT" ]; then
+    _ARCHIVE_BASENAME="${PROJECT}.${SPRINT}.jsonl"
+    _SUMMARY_SPRINT="$SPRINT"
+else
+    _ARCHIVE_BASENAME="${PROJECT}.pre-${BEFORE_DATE}.jsonl"
+    _SUMMARY_SPRINT="pre-${BEFORE_DATE}"
+fi
+_ARCHIVE_PATH="${ARCHIVE_DIR}/${_ARCHIVE_BASENAME}"
+
+if [ "$JSON_OUT" = "1" ] && [ "$DO_APPLY" = "0" ]; then
+    printf '%s' "$_PLAN_JSON" | jq --arg path "$_ARCHIVE_PATH" '. + {archive_path: $path, applied: false}'
+    exit 0
+fi
+
+echo "ledger-archive: project=${PROJECT} target=${_SUMMARY_SPRINT} tasks=${_TASK_COUNT} archivable=${_ARCHIVABLE} lines=${_LINE_COUNT}"
+
+if [ "$_ARCHIVABLE" != "true" ]; then
+    if [ -n "$SPRINT" ]; then
+        echo "ledger-archive: sprint '${SPRINT}' is NOT archivable — non-terminal task_ids:" >&2
+        printf '%s' "$_PLAN_JSON" | jq -r '.non_terminal_task_ids[]' 2>/dev/null | sed 's/^/    /' >&2
+    else
+        echo "ledger-archive: no untagged task_ids qualify before ${BEFORE_DATE}" >&2
+    fi
+    exit 1
+fi
+
+if [ "$DO_APPLY" = "0" ]; then
+    echo ""
+    echo "--- PROPOSE (dry-run — 0 ledger writes) ---"
+    echo "  Would move ${_LINE_COUNT} lines (task_ids ${_MIN_TASK}..${_MAX_TASK}) to:"
+    echo "    ${_ARCHIVE_PATH}"
+    echo ""
+    echo "ledger-archive: propose-only complete — 0 ledger writes. Re-run with --apply to mutate."
+    exit 0
+fi
+
+# -----------------------------------------------------------------------------
+# Step 4: APPLY.
+#
+# TOCTOU fix: PLAN's line_idx (computed unlocked, above) is purely informational
+# from here on — it is NEVER trusted for the actual mutation. Under lock we
+# re-read the ledger from disk and RECOMPUTE the archivable set with the same
+# selection logic, so a task that transitioned out of "archivable" between
+# PLAN and APPLY (e.g. reopened) is caught instead of silently archived.
+#
+# Two locks, acquired in this order, both spanning the entire apply:
+#   1. ARCHIVE_LOCK (${LEDGER_FILE}.archive.lock, flock -n, non-blocking) —
+#      dedicated to this script; prevents two `ledger-archive --apply` runs
+#      against the same project from interleaving. Fails fast with a clear
+#      message rather than blocking or racing.
+#   2. FD-207 (the SAME lock v11_ledger_append uses) — held for the entire
+#      read-recompute-write of the live jsonl file.
+#
+# The sprint_archived summary line is appended DIRECTLY (printf, matching
+# v11_ledger_append's line shape) in the SAME critical section as the .bak +
+# atomic mv, closing the crash window where a process could die between the
+# mv and a summary append that happened later under a separate lock
+# acquisition. v11_ledger_append itself is NEVER called from inside this
+# lock — nesting a second flock acquisition on the same lock file within one
+# process would self-deadlock.
+# -----------------------------------------------------------------------------
+mkdir -p "$ARCHIVE_DIR" 2>/dev/null || {
+    echo "ledger-archive: failed to create archive dir '$ARCHIVE_DIR'" >&2
+    exit 1
+}
+
+_ARCHIVE_LOCK_FILE="${LEDGER_FILE}.archive.lock"
+_TMP_LEDGER="${LEDGER_FILE}.tmp.$$"
+_APPLY_RESULT_FILE="${_TMP_LEDGER}.result"
+rm -f "$_APPLY_RESULT_FILE" 2>/dev/null
+_APPLY_ERR=0
+
+(
+    exec 208>"$_ARCHIVE_LOCK_FILE"
+    if ! flock -n 208; then
+        echo "ledger-archive: another archive run is already in progress for project=${PROJECT} (${_ARCHIVE_LOCK_FILE}) — aborting, try again shortly" >&2
+        exit 1
+    fi
+
+    exec 207>"$LOCK_FILE"
+    flock -w 5 207 || {
+        echo "ledger-archive: FD-207 flock timeout for project=${PROJECT} — aborting apply" >&2
+        exit 1
+    }
+
+    # --- Recompute selection fresh under lock (TOCTOU fix) ------------------
+    _APPLY_JSON=$(
+        V11_LA_MODE="$([ -n "$SPRINT" ] && echo sprint || echo before)" \
+        V11_LA_SPRINT="$SPRINT" \
+        V11_LA_BEFORE="$BEFORE_DATE" \
+        V11_LA_LEDGER="$LEDGER_FILE" \
+        V11_LA_ARCHIVE_OUT="$_ARCHIVE_PATH" \
+        V11_LA_LEDGER_TMP="$_TMP_LEDGER" \
+        V11_LA_PROJECT="$PROJECT" \
+        python3 - <<'PYEOF'
+import os, sys, json
+
+mode = os.environ["V11_LA_MODE"]
+target_sprint = os.environ.get("V11_LA_SPRINT", "")
+before_date = os.environ.get("V11_LA_BEFORE", "")
+ledger_path = os.environ["V11_LA_LEDGER"]
+archive_out = os.environ["V11_LA_ARCHIVE_OUT"]
+ledger_tmp = os.environ["V11_LA_LEDGER_TMP"]
+project = os.environ["V11_LA_PROJECT"]
+
+TERMINAL = {"completed", "deleted"}
+
+with open(ledger_path, "r", encoding="utf-8", errors="replace") as fh:
+    raw_lines = fh.read().split("\n")
+if raw_lines and raw_lines[-1] == "":
+    raw_lines = raw_lines[:-1]
+
+# Keyed by idk (project+subject_norm+create_seq), NOT task_id — see matching
+# comment in the PLAN block above. task_ids get reused across sprints, so
+# grouping by task_id alone merges distinct task histories and undercounts
+# tasks_total/tasks_completed in the summary event.
+tasks = {}
+for idx, line in enumerate(raw_lines):
+    stripped = line.strip()
+    if not stripped:
+        continue
+    try:
+        ev = json.loads(stripped)
+    except json.JSONDecodeError:
+        continue
+    if not isinstance(ev, dict) or ev.get("project") != project:
+        continue
+    task_id = ev.get("task_id") or ""
+    if not task_id:
+        continue
+    idk = (ev.get("subject_norm") or "") + "\x00" + str(ev.get("create_seq") or 0)
+    md = ev.get("metadata") or {}
+    sprint = md.get("sprint") if isinstance(md, dict) else None
+    rec = tasks.setdefault(idk, {
+        "sprint": None, "last_ev": None, "last_ts": None, "line_idx": [], "task_id": task_id,
+    })
+    rec["line_idx"].append(idx)
+    rec["task_id"] = task_id
+    if rec["sprint"] is None and sprint is not None:
+        rec["sprint"] = str(sprint)
+    rec["last_ev"] = ev.get("ev", "")
+    rec["last_ts"] = ev.get("ts", "")
+
+def is_terminal(rec):
+    return rec["last_ev"] in TERMINAL
+
+if mode == "sprint":
+    matching = {idk: rec for idk, rec in tasks.items() if rec["sprint"] == target_sprint}
+    non_terminal = sorted(set(matching[k]["task_id"] for k in matching if not is_terminal(matching[k])))
+    archivable = len(matching) > 0 and len(non_terminal) == 0
+    selected = matching
+    if not archivable:
+        print(json.dumps({
+            "error": "sprint '%s' is no longer archivable (recomputed under lock) — non-terminal task_ids: %s"
+                     % (target_sprint, ", ".join(non_terminal) if non_terminal else "<none: 0 matching tasks>")
+        }))
+        sys.exit(1)
+else:
+    candidates = {idk: rec for idk, rec in tasks.items() if rec["sprint"] is None}
+    eligible = {
+        idk: rec for idk, rec in candidates.items()
+        if is_terminal(rec) and rec["last_ts"] and rec["last_ts"] < before_date
+    }
+    archivable = len(eligible) > 0
+    selected = eligible
+    if not archivable:
+        print(json.dumps({
+            "error": "no untagged task_ids qualify before %s (recomputed under lock)" % before_date
+        }))
+        sys.exit(1)
+
+line_idx = sorted(i for rec in selected.values() for i in rec["line_idx"])
+line_idx_set = set(line_idx)
+task_ids = sorted(set(rec["task_id"] for rec in selected.values()))
+
+archived_lines = [raw_lines[i] for i in line_idx if 0 <= i < len(raw_lines)]
+remaining_lines = [ln for i, ln in enumerate(raw_lines) if i not in line_idx_set]
+
+# Count-mismatch guard: abort BEFORE writing anything if the partition doesn't
+# reconstruct the original line count exactly (off-by-one / duplicate-index
+# safety net — leaves the live ledger untouched on failure).
+if len(archived_lines) + len(remaining_lines) != len(raw_lines):
+    print(json.dumps({
+        "error": "count mismatch: archived=%d remaining=%d original=%d — aborting, live ledger untouched"
+                 % (len(archived_lines), len(remaining_lines), len(raw_lines))
+    }))
+    sys.exit(1)
+
+tasks_total = len(selected)
+tasks_completed = sum(1 for rec in selected.values() if rec["last_ev"] == "completed")
+events_count = len(archived_lines)
+
+# Preserve order: append (not overwrite) to the archive file — repeated runs
+# against the same sprint/cutoff accumulate rather than clobber.
+with open(archive_out, "a", encoding="utf-8") as fh:
+    for ln in archived_lines:
+        fh.write(ln + "\n")
+
+with open(ledger_tmp, "w", encoding="utf-8") as fh:
+    for ln in remaining_lines:
+        fh.write(ln + "\n")
+
+print(json.dumps({
+    "task_count": len(selected),
+    "task_ids": task_ids,
+    "line_count": events_count,
+    "events_count": events_count,
+    "tasks_total": tasks_total,
+    "tasks_completed": tasks_completed,
+    "min_task": min(task_ids) if task_ids else None,
+    "max_task": max(task_ids) if task_ids else None,
+}))
+PYEOF
+    )
+    _PY_RC=$?
+
+    if [ "$_PY_RC" != "0" ] || [ -z "$_APPLY_JSON" ]; then
+        echo "ledger-archive: recompute-under-lock failed — aborting apply, live ledger untouched" >&2
+        rm -f "$_TMP_LEDGER" 2>/dev/null
+        exit 1
+    fi
+
+    if printf '%s' "$_APPLY_JSON" | jq -e 'has("error")' >/dev/null 2>&1; then
+        echo "ledger-archive: $(printf '%s' "$_APPLY_JSON" | jq -r '.error')" >&2
+        rm -f "$_TMP_LEDGER" 2>/dev/null
+        exit 1
+    fi
+
+    # --- Timestamped .bak of the pre-archive live ledger (still untouched) --
+    _BAK_TS=$(date -u +%Y%m%d-%H%M%S 2>/dev/null || date +%Y%m%d-%H%M%S)
+    _BAK_PATH="${LEDGER_FILE}.bak.${_BAK_TS}"
+    if ! cp "$LEDGER_FILE" "$_BAK_PATH"; then
+        echo "ledger-archive: failed to write timestamped .bak — aborting apply, live ledger untouched" >&2
+        rm -f "$_TMP_LEDGER" 2>/dev/null
+        exit 1
+    fi
+    # Prune: keep only the 3 most recent .bak.* files for this project ledger.
+    # shellcheck disable=SC2012
+    ls -t "${LEDGER_FILE}".bak.* 2>/dev/null | tail -n +4 | xargs -r rm -f -- 2>/dev/null
+
+    # --- Atomic mv of the filtered live ledger ------------------------------
+    if ! mv "$_TMP_LEDGER" "$LEDGER_FILE"; then
+        echo "ledger-archive: atomic mv of filtered ledger failed — aborting apply" >&2
+        rm -f "$_TMP_LEDGER" 2>/dev/null
+        exit 1
+    fi
+
+    # --- Direct summary append, SAME locked step as the mv above -----------
+    # No v11_ledger_append call here (self-deadlock risk); bump the shared
+    # .seq counter's __seqno__ inline so the summary line still gets a real,
+    # monotonically-increasing seqno consistent with the rest of the ledger.
+    _SEQ_FILE="${LEDGER_DIR}/${PROJECT}.seq"
+    _SEQ_JSON='{"__seqno__":0,"subjects":{}}'
+    if [ -f "$_SEQ_FILE" ] && [ -s "$_SEQ_FILE" ] && jq empty "$_SEQ_FILE" 2>/dev/null; then
+        _SEQ_JSON=$(cat "$_SEQ_FILE" 2>/dev/null)
+    fi
+    _NEW_SEQNO=$(printf '%s' "$_SEQ_JSON" | jq '(.["__seqno__"] // 0) + 1' 2>/dev/null)
+    case "$_NEW_SEQNO" in ''|*[!0-9]*) _NEW_SEQNO=1 ;; esac
+    _SEQ_TMP="${_SEQ_FILE}.tmp.$$"
+    if printf '%s' "$_SEQ_JSON" | jq --argjson s "$_NEW_SEQNO" '.["__seqno__"] = $s' > "$_SEQ_TMP" 2>/dev/null; then
+        mv "$_SEQ_TMP" "$_SEQ_FILE" 2>/dev/null
+    else
+        rm -f "$_SEQ_TMP" 2>/dev/null
+    fi
+
+    NOW=$(date -Iseconds 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%S+00:00)
+    _AP_LINE_COUNT=$(printf '%s' "$_APPLY_JSON" | jq -r '.line_count')
+    _AP_TASKS_TOTAL=$(printf '%s' "$_APPLY_JSON" | jq -r '.tasks_total')
+    _AP_TASKS_COMPLETED=$(printf '%s' "$_APPLY_JSON" | jq -r '.tasks_completed')
+    _AP_EVENTS_COUNT=$(printf '%s' "$_APPLY_JSON" | jq -r '.events_count')
+    _AP_MIN_TASK=$(printf '%s' "$_APPLY_JSON" | jq -r '.min_task // "null"')
+    _AP_MAX_TASK=$(printf '%s' "$_APPLY_JSON" | jq -r '.max_task // "null"')
+
+    _SUMMARY_EVENT=$(jq -cn \
+        --arg project         "$PROJECT" \
+        --arg ts              "$NOW" \
+        --arg sprint          "$_SUMMARY_SPRINT" \
+        --argjson count       "$_AP_LINE_COUNT" \
+        --arg archive_path    "$_ARCHIVE_PATH" \
+        --arg min_task        "$_AP_MIN_TASK" \
+        --arg max_task        "$_AP_MAX_TASK" \
+        --argjson seqno       "$_NEW_SEQNO" \
+        --argjson tasks_total     "$_AP_TASKS_TOTAL" \
+        --argjson tasks_completed "$_AP_TASKS_COMPLETED" \
+        --argjson events_count   "$_AP_EVENTS_COUNT" '
+        {
+            v:               1,
+            ev:              "sprint_archived",
+            ts:              $ts,
+            project:         $project,
+            subject_norm:    ("sprint_archived:" + $sprint),
+            task_id:         "_archive_summary",
+            session_uuid:    "ledger-archive",
+            seqno:           $seqno,
+            create_seq:      0,
+            sprint:          $sprint,
+            count:           $count,
+            task_ids_range:  [$min_task, $max_task],
+            archive_path:    $archive_path,
+            source:          "ledger-archive",
+            tasks_total:     $tasks_total,
+            tasks_completed: $tasks_completed,
+            events_count:    $events_count
+        }
+    ' 2>/dev/null)
+
+    if [ -z "$_SUMMARY_EVENT" ]; then
+        echo "ledger-archive: WARN failed to build summary event JSON — archive applied but ledger has no sprint_archived marker" >&2
+        exit 1
+    fi
+    case "$_SUMMARY_EVENT" in
+        *$'\n'*)
+            echo "ledger-archive: summary event contains embedded newline — aborting" >&2
+            exit 1
+            ;;
+    esac
+
+    printf '%s\n' "$_SUMMARY_EVENT" >> "$LEDGER_FILE"
+
+    printf '%s' "$_APPLY_JSON" > "$_APPLY_RESULT_FILE"
+) || _APPLY_ERR=1
+
+if [ "$_APPLY_ERR" = "1" ]; then
+    rm -f "$_TMP_LEDGER" "$_APPLY_RESULT_FILE" 2>/dev/null
+    echo "ledger-archive: apply FAILED" >&2
+    exit 1
+fi
+
+_APPLY_JSON=$(cat "$_APPLY_RESULT_FILE" 2>/dev/null)
+rm -f "$_APPLY_RESULT_FILE" 2>/dev/null
+
+_FINAL_COUNT=$(printf '%s' "$_APPLY_JSON" | jq -r '.events_count // "?"')
+_FINAL_TASKS_TOTAL=$(printf '%s' "$_APPLY_JSON" | jq -r '.tasks_total // "?"')
+_FINAL_TASKS_COMPLETED=$(printf '%s' "$_APPLY_JSON" | jq -r '.tasks_completed // "?"')
+echo "ledger-archive: applied — moved ${_FINAL_COUNT} lines to ${_ARCHIVE_PATH}, summary event appended (tasks_total=${_FINAL_TASKS_TOTAL} tasks_completed=${_FINAL_TASKS_COMPLETED})"

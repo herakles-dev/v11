@@ -1,0 +1,200 @@
+#!/bin/bash
+# V11 Hook: guard-validation-lint (PreToolUse — Bash)
+# Fires on Bash tool calls that issue a `git commit` command.
+# Extracts the commit message and dispatches to the shared Python validator.
+#
+# CRITICAL RISKS addressed:
+# 1. Bash regex brittleness — grep word-boundary \bgit\b first, then confirm
+#    `commit` is the git subcommand (not `git log --grep=commit` etc.)
+# 2. Heuristic FP unknown — default mode is warn-only (STRICT is opt-in)
+#
+# Rollback:
+#   V11_VALIDATION_LINT=off            — skip entirely
+#   V11_VALIDATION_LINT_STRICT=off     — default (warn-only on HYPOTHESIZED failures)
+#   V11_VALIDATION_LINT_STRICT=on      — upgrade HYPOTHESIZED failures to BLOCK
+#   V11_VALIDATION_LINT_HEURISTIC=off  — skip causal language check
+
+set -euo pipefail
+
+VALIDATOR="$(dirname "${BASH_SOURCE[0]}")/lib/validation_lint.py"
+
+# Full kill switch
+if [ "${V11_VALIDATION_LINT:-}" = "off" ]; then
+    exit 0
+fi
+
+# Quick self-test
+if [ "${1:-}" = "--test" ]; then
+    echo "guard-validation-lint v1.0 (V11.25: validation tag linter, PreToolUse surface)"
+    exit 0
+fi
+
+# Read hook input from stdin (Claude Code passes JSON on fd 0)
+HOOK_INPUT="$(cat)"
+
+# Only process Bash tool calls
+TOOL_NAME="$(printf '%s' "$HOOK_INPUT" | jq -r '.tool_name // empty' 2>/dev/null)"
+if [ "$TOOL_NAME" != "Bash" ]; then
+    exit 0
+fi
+
+COMMAND="$(printf '%s' "$HOOK_INPUT" | jq -r '.tool_input.command // empty' 2>/dev/null)"
+if [ -z "$COMMAND" ]; then
+    exit 0
+fi
+
+# -----------------------------------------------------------------------
+# Step 1: Quick pre-filter — does the command contain the word "git"?
+# Use word-boundary awareness: grep for \bgit\b to avoid matching
+# "digital", "git-lfs-install", etc.
+# -----------------------------------------------------------------------
+if ! printf '%s' "$COMMAND" | grep -qwE 'git'; then
+    exit 0
+fi
+
+# -----------------------------------------------------------------------
+# Step 2: Confirm git's subcommand is `commit` (not `log`, `diff`, etc.)
+# Walk the token list to find the first non-flag arg after "git".
+# This handles: git commit, git -C /path commit, git --no-pager commit, etc.
+# -----------------------------------------------------------------------
+# Extract the git subcommand by:
+#   1. Remove the "git" command itself and any leading flags (--word / -C PATH).
+#   2. The first remaining non-flag token is the subcommand.
+_is_git_commit=0
+_past_git=0
+_skip_next=0
+for _tok in $COMMAND; do
+    if [ "$_skip_next" = "1" ]; then
+        _skip_next=0
+        continue
+    fi
+    if [ "$_past_git" = "0" ]; then
+        case "$_tok" in
+            git) _past_git=1 ;;
+        esac
+        continue
+    fi
+    # We're past "git". Skip flags.
+    case "$_tok" in
+        --no-pager|--no-optional-locks|--literal-pathspecs|--noglob-pathspecs) ;;
+        -C|-c|--exec-path|--html-path|--man-path|--info-path|--work-tree|--git-dir|--namespace) _skip_next=1 ;;
+        -*) ;; # other flags, skip
+        commit) _is_git_commit=1; break ;;
+        *) break ;;  # non-commit subcommand
+    esac
+done
+
+if [ "$_is_git_commit" = "0" ]; then
+    exit 0
+fi
+
+# -----------------------------------------------------------------------
+# Step 3: Extract commit message from the command.
+# Supported patterns:
+#   git commit -m "msg"
+#   git commit -m 'msg'
+#   git commit -m "$(cat <<'EOF'\n...\nEOF\n)"
+#   git commit -F <file>
+#   git commit (no -m) — editor commit; skip (covered by commit-msg hook)
+# -----------------------------------------------------------------------
+
+_extract_commit_message() {
+    local cmd="$1"
+
+    # Pattern A: heredoc via -m "$(cat <<'EOF'...EOF)"
+    # The shell has already expanded the heredoc before this hook sees it,
+    # so we see the expanded string in $COMMAND. We just need to parse -m <value>.
+
+    # Pattern B: -m "..." or -m '...'
+    # Use python3 for reliable multi-line / quoting extraction.
+    python3 - <<'PYEOF'
+import sys, re, os
+
+cmd = os.environ.get('_V11_LINT_CMD', '')
+
+# Try to find -m <message> — handles both quote styles and multi-line
+# After shell expansion, heredocs appear as literal newlines inside the -m value.
+# Approach: find -m then extract the next shell token (respecting quotes).
+
+import shlex
+try:
+    tokens = shlex.split(cmd)
+except ValueError:
+    # Fallback: regex for -m "..." or -m '...'
+    m = re.search(r'-m\s+(["\'])(.*?)\1', cmd, re.DOTALL)
+    if m:
+        print(m.group(2))
+    sys.exit(0)
+
+skip_next = False
+found_m = False
+for i, tok in enumerate(tokens):
+    if skip_next:
+        skip_next = False
+        continue
+    if tok in ('-m', '--message'):
+        # Next token is the message
+        if i + 1 < len(tokens):
+            print(tokens[i + 1])
+            found_m = True
+            break
+        # -m stuck to value? try regex
+        break
+    if tok.startswith('-m') and len(tok) > 2:
+        print(tok[2:])
+        found_m = True
+        break
+    if tok.startswith('--message='):
+        print(tok[len('--message='):])
+        found_m = True
+        break
+
+PYEOF
+}
+
+# Pass command via env to avoid shell quoting nightmares
+MSG="$(_V11_LINT_CMD="$COMMAND" _extract_commit_message "$COMMAND")"
+
+if [ -z "$MSG" ]; then
+    # No -m flag — could be -F <file> or editor commit
+    # For -F <file>, try to read the file
+    _F_FILE=""
+    _prev=""
+    for _tok in $COMMAND; do
+        if [ "$_prev" = "-F" ] || [ "$_prev" = "--file" ]; then
+            _F_FILE="$_tok"
+            break
+        fi
+        _prev="$_tok"
+    done
+
+    if [ -n "$_F_FILE" ] && [ -f "$_F_FILE" ]; then
+        MSG="$(cat "$_F_FILE")"
+    else
+        # No extractable message — let commit-msg hook handle it
+        exit 0
+    fi
+fi
+
+# -----------------------------------------------------------------------
+# Step 4: Collect staged files for doc-only exemption check
+# -----------------------------------------------------------------------
+STAGED_FILES=""
+if command -v git &>/dev/null && git rev-parse --git-dir &>/dev/null 2>&1; then
+    STAGED_FILES="$(git diff --cached --name-only 2>/dev/null || true)"
+fi
+
+# -----------------------------------------------------------------------
+# Step 5: Dispatch to shared Python validator
+# -----------------------------------------------------------------------
+if [ -n "$STAGED_FILES" ]; then
+    LINT_EXIT=0
+    printf '%s' "$MSG" | \
+        V11_STAGED_FILES="$STAGED_FILES" \
+        python3 "$VALIDATOR" || LINT_EXIT=$?
+else
+    LINT_EXIT=0
+    printf '%s' "$MSG" | python3 "$VALIDATOR" || LINT_EXIT=$?
+fi
+
+exit "$LINT_EXIT"

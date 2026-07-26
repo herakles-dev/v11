@@ -1,0 +1,264 @@
+#!/bin/bash
+# V11 Hook: track-agents (PostToolUse — Task)
+# Logs agent metrics to JSONL and suggests escalation after consecutive failures.
+# Replaces V8 track-agent-metrics (120L) + detect-model-escalation (133L) = 253L merged.
+# Never blocks (exit 0 always).
+
+source "$(dirname "${BASH_SOURCE[0]}")/lib/common.sh"
+
+if [ "$1" == "--test" ]; then
+    echo "track-agents v1 (merged metrics+escalation)"
+    exit 0
+fi
+
+v11_parse_input
+
+# Only track agent-spawn tool invocations (Task or Agent — modern Claude Code uses Agent)
+case "$V11_TOOL_NAME" in
+    Task|Agent) ;;
+    *) exit 0 ;;
+esac
+
+mkdir -p "$METRICS_DIR"
+
+# Extract agent info from tool input
+SUBAGENT_TYPE=$(printf '%s' "$V11_RAW_INPUT" | jq -r '.tool_input.subagent_type // "unknown"')
+DESCRIPTION=$(printf '%s' "$V11_RAW_INPUT" | jq -r '.tool_input.description // ""')
+PROMPT=$(printf '%s' "$V11_RAW_INPUT" | jq -r '.tool_input.prompt // ""' | head -c 200)
+MODEL=$(printf '%s' "$V11_RAW_INPUT" | jq -r '.tool_input.model // ""')
+
+# ── W3-T12: per-spawn token capture (probe-only, never fabricate) ──────────
+# The harness reports per-agent usage on the tool_response of a *synchronous*
+# (foreground) Task/Agent completion. S1-D1 fix (2026-07-14): the original
+# probe paths (tool_response.subagent_tokens / .usage.subagent_tokens /
+# .usage.total_tokens) were HYPOTHESIZED and never matched real output --
+# confirmed via this session's own Claude Code transcripts
+# (~/.claude/projects/<slugified-project-path>/*.jsonl), where a completed
+# foreground Agent/Task tool_response actually looks like:
+#   { status, agentId, agentType, totalDurationMs, totalTokens,
+#     totalToolUseCount, usage: {input_tokens, output_tokens, ...}, toolStats }
+# i.e. camelCase top-level fields, not the snake_case shape this hook probed
+# for. That mismatch is why 2294/2299 dispatch-trace rows carry no tokens --
+# the jq paths simply never matched anything in real payloads. Real field
+# names are now probed FIRST; the original snake_case paths are kept as
+# fallbacks (defensive -- schema may vary by harness version) and are also
+# still exercised by tests/test_track_agents_token_capture.py.
+#
+# Background/async spawns (isAsync:true launch acknowledgment -- agentId,
+# status, description, resolvedModel, prompt, outputFile, canReadOutputFile)
+# carry NO usage data at PostToolUse:Task fire time -- the agent hasn't run
+# yet. That's not a bug to fix here: the probe correctly resolves to `empty`
+# for that shape and the field is omitted (never fabricated as 0). Token
+# capture is only possible for foreground/synchronous spawns; the majority of
+# V11 background-agent dispatches will continue to have no token row.
+#
+# When none of the probes resolve, the field is omitted entirely from the
+# usage.jsonl record below -- NEVER written as 0 or a guessed value.
+# Rollback: V11_TOKEN_CAPTURE=off skips the probe and the jq record omits
+# these keys unconditionally (byte-identical pre-W3-T12 usage.jsonl shape).
+V11_TOKENS=""
+V11_TOOL_USES=""
+V11_DURATION_MS=""
+if [ "${V11_TOKEN_CAPTURE:-on}" != "off" ]; then
+    V11_TOKENS=$(printf '%s' "$V11_RAW_INPUT" | jq -r \
+        '.tool_response.totalTokens // .tool_response.usage.output_tokens // .tool_response.subagent_tokens // .tool_response.usage.subagent_tokens // .tool_response.usage.total_tokens // .subagent_tokens // empty' 2>/dev/null)
+    V11_TOOL_USES=$(printf '%s' "$V11_RAW_INPUT" | jq -r \
+        '.tool_response.totalToolUseCount // .tool_response.tool_uses // .tool_response.usage.tool_uses // .tool_uses // empty' 2>/dev/null)
+    V11_DURATION_MS=$(printf '%s' "$V11_RAW_INPUT" | jq -r \
+        '.tool_response.totalDurationMs // .tool_response.duration_ms // .tool_response.usage.duration_ms // .duration_ms // empty' 2>/dev/null)
+    # Defensive schema guard: only accept clean non-negative integers. Anything
+    # else (non-numeric junk, unexpected shape) is treated as absent rather
+    # than fabricated or coerced.
+    [[ "$V11_TOKENS" =~ ^[0-9]+$ ]] || V11_TOKENS=""
+    [[ "$V11_TOOL_USES" =~ ^[0-9]+$ ]] || V11_TOOL_USES=""
+    [[ "$V11_DURATION_MS" =~ ^[0-9]+$ ]] || V11_DURATION_MS=""
+fi
+
+# Determine success/failure from tool output (heuristic)
+SUCCESS="unknown"
+if [ -n "$V11_TOOL_OUTPUT" ] && [ "$V11_TOOL_OUTPUT" != "null" ]; then
+    OUTPUT_LOWER=$(printf '%s' "$V11_TOOL_OUTPUT" | tr '[:upper:]' '[:lower:]')
+    if printf '%s' "$OUTPUT_LOWER" | grep -qE '(error|failed|exception|traceback)'; then
+        SUCCESS="false"
+    elif printf '%s' "$OUTPUT_LOWER" | grep -qE '(success|complete|done|finished)'; then
+        SUCCESS="true"
+    fi
+fi
+# Error field from hook input also means failure
+if [ -n "$V11_ERROR" ] && [ "$V11_ERROR" != "null" ]; then
+    SUCCESS="false"
+fi
+
+# Detect task category from description+prompt keywords
+COMBINED=$(printf '%s %s' "$DESCRIPTION" "$PROMPT" | tr '[:upper:]' '[:lower:]')
+CATEGORY="unknown"
+if printf '%s' "$COMBINED" | grep -qE '(database|schema|migration|sql)'; then
+    CATEGORY="database"
+elif printf '%s' "$COMBINED" | grep -qE '(backend|api|endpoint|server)'; then
+    CATEGORY="backend"
+elif printf '%s' "$COMBINED" | grep -qE '(frontend|react|component|ui)'; then
+    CATEGORY="frontend"
+elif printf '%s' "$COMBINED" | grep -qE '(test|coverage|unit|integration)'; then
+    CATEGORY="testing"
+elif printf '%s' "$COMBINED" | grep -qE '(deploy|deployment|production)'; then
+    CATEGORY="deployment"
+elif printf '%s' "$COMBINED" | grep -qE '(security|auth|owasp)'; then
+    CATEGORY="security"
+elif printf '%s' "$COMBINED" | grep -qE '(debug|error|fix)'; then
+    CATEGORY="debugging"
+elif printf '%s' "$COMBINED" | grep -qE '(refactor|clean|optimize)'; then
+    CATEGORY="refactoring"
+fi
+
+# Resolve project and formation context
+V11_PROJECT="$(v11_read_active_project)"
+FORMATION_NAME=""
+if [ -n "$V11_PROJECT" ]; then
+    _FORM_FILE="$SESSIONS_ROOT/$V11_PROJECT/.formation-registry.json"
+    if [ -f "$_FORM_FILE" ]; then
+        FORMATION_NAME=$(jq -r '.formation // empty' "$_FORM_FILE" 2>/dev/null || true)
+        [ "$FORMATION_NAME" = "null" ] && FORMATION_NAME=""
+    fi
+fi
+
+# Write metric entry to JSONL
+jq -nc \
+    --arg timestamp "$(date -Iseconds)" \
+    --arg agent "$SUBAGENT_TYPE" \
+    --arg description "$DESCRIPTION" \
+    --arg prompt "$PROMPT" \
+    --arg model "$MODEL" \
+    --arg success "$SUCCESS" \
+    --arg category "$CATEGORY" \
+    --arg proj "$V11_PROJECT" \
+    --arg formation "$FORMATION_NAME" \
+    --arg tokens "$V11_TOKENS" \
+    --arg tool_uses "$V11_TOOL_USES" \
+    --arg duration_ms "$V11_DURATION_MS" \
+    '{
+        timestamp: $timestamp,
+        agent: $agent,
+        description: $description,
+        prompt: $prompt,
+        model: $model,
+        success: $success,
+        category: $category,
+        project: (if $proj == "" then null else $proj end),
+        formation: (if $formation == "" then null else $formation end),
+        version: "v11.12"
+    }
+    + (if $tokens == "" then {} else {tokens: ($tokens | tonumber)} end)
+    + (if $tool_uses == "" then {} else {tool_uses: ($tool_uses | tonumber)} end)
+    + (if $duration_ms == "" then {} else {duration_ms: ($duration_ms | tonumber)} end)
+    ' >> "$METRICS_DIR/usage.jsonl"
+
+# Escalation detection (merged from detect-model-escalation)
+COUNTER_FILE="$METRICS_DIR/.agent-failure-count"
+
+if [ "$SUCCESS" == "false" ]; then
+    COUNT=0
+    [ -f "$COUNTER_FILE" ] && COUNT=$(cat "$COUNTER_FILE" 2>/dev/null)
+    COUNT=$((COUNT + 1))
+    printf '%s\n' "$COUNT" > "$COUNTER_FILE"
+
+    if [ "$COUNT" -ge 2 ]; then
+        echo ""
+        echo "ESCALATION ADVISORY: $SUBAGENT_TYPE has failed $COUNT consecutive times"
+        echo "Last task: $DESCRIPTION"
+        echo "Recommendation: Try with higher effort level or Opus model"
+        echo ""
+        printf '0\n' > "$COUNTER_FILE"
+    fi
+elif [ "$SUCCESS" == "true" ]; then
+    printf '0\n' > "$COUNTER_FILE"
+fi
+
+# ── V11.22: dispatch-trace for routing calibration ─────────────────────
+# Records routing reality (recommended vs spawned agent + mode + caller_kind)
+# so the V11.22 calibration loop has data. Side-effect-never-fails: any error
+# is swallowed; the metric write above is the source of truth for usage.jsonl.
+# Rollback: V11_DISPATCH_TRACE=off (the dispatch-trace-append script also
+# honors this flag, so we have belt-and-suspenders).
+if [ "${V11_DISPATCH_TRACE:-on}" != "off" ] \
+   && [ -n "$V11_PROJECT" ] \
+   && [ -n "$SUBAGENT_TYPE" ] \
+   && [ "$SUBAGENT_TYPE" != "unknown" ]; then
+    _DT_STATE_FILE="$SESSIONS_ROOT/$V11_PROJECT/.task-state.json"
+    if [ -f "$_DT_STATE_FILE" ]; then
+        _DT_TID=$(jq -r '.active_task_ids[0] // ""' "$_DT_STATE_FILE" 2>/dev/null)
+        if [ -n "$_DT_TID" ]; then
+            _DT_REC=$(jq -r --arg id "$_DT_TID" '.recommended_agents[$id] // ""' "$_DT_STATE_FILE" 2>/dev/null)
+            _DT_SPRINT=$(jq -r --arg id "$_DT_TID" '.open_tasks[$id].metadata.sprint // ""' "$_DT_STATE_FILE" 2>/dev/null)
+            # .autonomy-state stores level as numeric (0-5), not "A0"-"A5"
+            _DT_AUTONOMY=$(jq -r '.level // 0' "$SESSIONS_ROOT/$V11_PROJECT/.autonomy-state" 2>/dev/null)
+            case "$_DT_AUTONOMY" in
+                3)     _DT_MODE="acceptEdits" ;;
+                4|5)   _DT_MODE="bypassPermissions" ;;
+                *)     _DT_MODE="default" ;;
+            esac
+            # V11 loop-keystone Fix 3 (step 1, corrected post-adversarial-review
+            # 2026-07-01 — see task #7/original-#3 review): this hook fires as
+            # a PostToolUse hook scoped to Task|Agent — i.e. exactly when the
+            # Task tool was just invoked to spawn an agent. Per CLAUDE.md,
+            # subagents cannot spawn sub-subagents, so the ENTITY THAT CALLED
+            # the Task tool at this firing is overwhelmingly the top-level
+            # orchestrator, not a subagent. The no-signal case therefore maps
+            # to "orchestrator", not "subagent" — an earlier version of this
+            # fix had this inverted, mislabeling the dominant real case as the
+            # opposite of ground truth.
+            #
+            # v11_caller_kind() returns the LITERAL STRING "unknown" (not an
+            # empty string) when neither env var (V11_SUBAGENT/
+            # V11_PARENT_SESSION_ID, which the Claude Code Agent-tool launcher
+            # never sets in practice — 99.48% "unknown" in live
+            # dispatch-trace.jsonl, confirmed 2026-07-01 audit) resolves a
+            # signal. The PRE-FIX code here only special-cased a truly-empty
+            # result (`[ -z "$_DT_CK" ] && _DT_CK="orchestrator"`), which never
+            # fired against the literal "unknown" string — that dead branch is
+            # the original bug: "unknown" flowed straight through, unresolved,
+            # 99.48% of the time.
+            #
+            # Fix: treat "unknown" the same as empty and infer "orchestrator"
+            # (this hook's trigger context deterministically implies the
+            # top-level session made the call). Any OTHER explicit non-empty
+            # result is preserved unchanged — only the no-signal case changes.
+            #
+            # Rollback (V11_CALLER_KIND_INFERENCE=off): reproduce the ORIGINAL
+            # pre-loop-keystone logic byte-for-byte (only true-empty maps to
+            # "orchestrator"; "unknown" passes through as "unknown", exactly as
+            # it did before this fix) — for honest A/B comparison.
+            _DT_CK=$(v11_caller_kind 2>/dev/null)
+            if [ "${V11_CALLER_KIND_INFERENCE:-on}" != "off" ]; then
+                if [ -z "$_DT_CK" ] || [ "$_DT_CK" = "unknown" ]; then
+                    _DT_CK="orchestrator"
+                fi
+            else
+                [ -z "$_DT_CK" ] && _DT_CK="orchestrator"
+            fi
+            _DT_REC_FINAL="${_DT_REC:-$SUBAGENT_TYPE}"
+            _DT_OVERRIDE=""
+            if [ -n "$_DT_REC" ] && [ "$_DT_REC" != "$SUBAGENT_TYPE" ]; then
+                _DT_OVERRIDE="recommended=$_DT_REC, spawned=$SUBAGENT_TYPE"
+            fi
+            # sprint is required by the schema — fall back to "unknown" if absent
+            # so the trace line still writes (orchestrator-spawned ad-hoc agents).
+            [ -z "$_DT_SPRINT" ] && _DT_SPRINT="unknown"
+            "$V11_HOME/scripts/dispatch-trace-append" \
+                --task-id "$_DT_TID" \
+                --project "$V11_PROJECT" \
+                --sprint "$_DT_SPRINT" \
+                --recommended-agent "$_DT_REC_FINAL" \
+                --spawned-agent "$SUBAGENT_TYPE" \
+                ${_DT_OVERRIDE:+--override-reason "$_DT_OVERRIDE"} \
+                --model "${MODEL:-inherit}" \
+                --mode "$_DT_MODE" \
+                --caller-kind "$_DT_CK" \
+                ${V11_TOKENS:+--tokens "$V11_TOKENS"} \
+                ${V11_TOOL_USES:+--tool-uses "$V11_TOOL_USES"} \
+                ${V11_DURATION_MS:+--duration-ms "$V11_DURATION_MS"} \
+                --event completion 2>/dev/null || true
+        fi
+    fi
+fi
+
+exit 0

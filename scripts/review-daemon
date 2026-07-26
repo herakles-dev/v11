@@ -1,0 +1,274 @@
+#!/bin/bash
+# V11 R3.1 Script: review-daemon
+# Headless review-queue consumer. Non-interactive counterpart to the
+# orchestrator draining the review queue by hand: for each drainable pending
+# entry, spawn the adversarial-lite-reviewer prompt headlessly via
+# `claude -p ... --model sonnet`, capture the JSON verdict, and fold it into
+# the review ledger (best-effort, mirroring hooks/sync-tasks' agent-errors.jsonl
+# shape) + mark the queue entry done.
+#
+# USAGE:
+#   review-daemon PROJECT [--limit N] [--dry-run]
+#
+# Env:
+#   V11_REVIEW_CADENCE=off   Kill switch — exit 0 immediately, no work done.
+#
+# Identity: uses a stable synthetic session uuid "review-daemon@$(hostname)"
+# for all claim/ownership calls, so drain-review-queue --safe semantics
+# (concurrent live-session ownership skip) hold exactly as they do for any
+# other caller. This identity is NEVER treated as "live" by
+# v11_session_is_live (no real sessions/<uuid>/ dir gets written for it),
+# which is intentional: the daemon's claims are meant to be reclaimable by a
+# live orchestrator session if it needs the entry back.
+#
+# This script does NOT wire cron, does NOT create tests. Those are siblings'
+# jobs (see W2-S4 spec).
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+V11_HOME="${V11_HOME:-$(dirname "$SCRIPT_DIR")}"
+# shellcheck source=../hooks/lib/common.sh
+source "$V11_HOME/hooks/lib/common.sh"
+
+if [ "${1:-}" = "--test" ]; then
+    echo "review-daemon v1.0 (V11 R3.1)"
+    exit 0
+fi
+
+if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
+    sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//'
+    exit 0
+fi
+
+LOG_FILE="$METRICS_DIR/review-daemon.log"
+mkdir -p "$METRICS_DIR" 2>/dev/null || true
+
+_log() {
+    # One summary line per run — never let logging failures kill the daemon.
+    printf '%s\n' "$1" >> "$LOG_FILE" 2>/dev/null || true
+}
+
+# ── Kill switch ──────────────────────────────────────────────────────────
+if [ "${V11_REVIEW_CADENCE:-on}" = "off" ]; then
+    _log "$(date -u +%Y-%m-%dT%H:%M:%S+00:00) project=- skipped=kill-switch-off"
+    exit 0
+fi
+
+# ── Args ─────────────────────────────────────────────────────────────────
+PROJECT=""
+LIMIT=10
+DRY_RUN=false
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --limit) LIMIT="${2:-10}"; shift ;;
+        --dry-run) DRY_RUN=true ;;
+        -*) echo "review-daemon: unknown flag '$1'" >&2; exit 2 ;;
+        *) [ -z "$PROJECT" ] && PROJECT="$1" ;;
+    esac
+    shift
+done
+
+if [ -z "$PROJECT" ]; then
+    PROJECT="$(v11_read_active_project 2>/dev/null || true)"
+fi
+if [ -z "$PROJECT" ]; then
+    echo "review-daemon: PROJECT required (no active-project set)" >&2
+    exit 1
+fi
+if ! printf '%s' "$PROJECT" | grep -qE '^[a-zA-Z0-9._-]{1,64}$'; then
+    echo "review-daemon: invalid project name '$PROJECT'" >&2
+    exit 1
+fi
+
+# Stable synthetic identity for claim/ownership fields — never a "live" session
+# (v11_session_is_live rejects it: no sessions/<uuid>/ dir is ever created for
+# this identity), so a live orchestrator session can always reclaim an entry.
+DAEMON_HOST="$(hostname 2>/dev/null || echo "unknown-host")"
+DAEMON_SESSION="review-daemon@${DAEMON_HOST}"
+
+RUN_TS="$(date -u +%Y-%m-%dT%H:%M:%S+00:00)"
+
+# ── Dry-run: claim-free listing only, never call the claiming drain path ──
+if [ "$DRY_RUN" = "true" ]; then
+    PENDING_JSON=$("$V11_HOME/scripts/review-queue" pending "$PROJECT" --json 2>>"$LOG_FILE" || echo '[]')
+    PENDING_COUNT=$(printf '%s' "$PENDING_JSON" | jq 'length' 2>/dev/null || echo 0)
+    if [ "$PENDING_COUNT" = "0" ] || [ -z "$PENDING_COUNT" ]; then
+        _log "$RUN_TS project=$PROJECT drained=0 processed=0 dry_run=true"
+        echo "review-daemon: no drainable pending reviews for '$PROJECT'."
+        exit 0
+    fi
+    echo "review-daemon: --dry-run — would process $PENDING_COUNT review(s) for '$PROJECT':"
+    printf '%s' "$PENDING_JSON" | jq -r '.[] | "  - task #\(.task_id): \(.subject) (agent: \(.agent_id))"'
+    _log "$RUN_TS project=$PROJECT drained=$PENDING_COUNT processed=0 dry_run=true"
+    exit 0
+fi
+
+# ── Drain (--safe: never touch entries owned by a live session) ───────────
+DRAIN_JSON=$("$V11_HOME/scripts/drain-review-queue" "$PROJECT" --limit "$LIMIT" --json --safe \
+             --session "$DAEMON_SESSION" 2>>"$LOG_FILE" || echo '[]')
+
+COUNT=$(printf '%s' "$DRAIN_JSON" | jq 'length' 2>/dev/null || echo 0)
+
+if [ "$COUNT" = "0" ] || [ -z "$COUNT" ]; then
+    _log "$RUN_TS project=$PROJECT drained=0 processed=0 dry_run=$DRY_RUN"
+    echo "review-daemon: no drainable pending reviews for '$PROJECT'."
+    exit 0
+fi
+
+ERR_LOG="$METRICS_DIR/agent-errors.jsonl"
+ERR_LOCK="$METRICS_DIR/agent-errors.jsonl.lock"
+mkdir -p "$METRICS_DIR" 2>/dev/null || true
+
+PROCESSED=0
+FAILED=0
+
+# Iterate entries one-by-one (jq -c '.[]' + a subshell-free while-read to keep
+# PROCESSED/FAILED counters visible outside the loop).
+while IFS= read -r ENTRY; do
+    [ -z "$ENTRY" ] && continue
+    TID=$(printf '%s' "$ENTRY" | jq -r '.task_id')
+    AGENT=$(printf '%s' "$ENTRY" | jq -r '.agent_id // "unknown"')
+    PROMPT=$(printf '%s' "$ENTRY" | jq -r '.prompt // empty')
+
+    if [ -z "$PROMPT" ]; then
+        _log "$RUN_TS project=$PROJECT task=$TID skip=empty-prompt"
+        FAILED=$((FAILED + 1))
+        continue
+    fi
+
+    # Sanity length cap — queue prompts are internally generated (orchestrator /
+    # task-review builds them, never raw external/user input), but a runaway
+    # prompt still shouldn't be handed to a headless `claude -p` invocation
+    # unbounded. Skip and log rather than burn a claim on it.
+    PROMPT_LEN=$(printf '%s' "$PROMPT" | wc -c)
+    if [ "$PROMPT_LEN" -gt 102400 ]; then
+        _log "$RUN_TS project=$PROJECT task=$TID skip=prompt-too-large bytes=$PROMPT_LEN"
+        FAILED=$((FAILED + 1))
+        continue
+    fi
+
+    # Headless review invocation. Two-attempt cap per V11 protocol.
+    # Trust boundary: PROMPT originates from the review queue, which is
+    # populated internally by the orchestrator / task-review flow (never raw
+    # external/user input) — but the CLI itself can still hang (network,
+    # model stall, etc.), so it's wrapped in `timeout` to protect the
+    # unattended cadence run from stalling indefinitely.
+    VERDICT_RAW=""
+    ATTEMPT=1
+    while [ "$ATTEMPT" -le 2 ]; do
+        RC=0
+        VERDICT_RAW=$(timeout "${V11_REVIEW_DAEMON_TIMEOUT:-180}" claude -p "$PROMPT" --model sonnet 2>>"$LOG_FILE") || RC=$?
+        if [ "$RC" -eq 124 ]; then
+            _log "$RUN_TS project=$PROJECT task=$TID attempt=$ATTEMPT error=timeout"
+            VERDICT_RAW=""
+        fi
+        if printf '%s' "$VERDICT_RAW" | jq -e '.verdict' >/dev/null 2>&1; then
+            break
+        fi
+        # Some CLI configs wrap the model's text output; try to extract the
+        # first {...} JSON object from stdout before giving up.
+        EXTRACTED=$(printf '%s' "$VERDICT_RAW" | python3 -c '
+import sys, json, re
+text = sys.stdin.read()
+m = re.search(r"\{.*\}", text, re.DOTALL)
+if not m:
+    sys.exit(1)
+try:
+    obj = json.loads(m.group(0))
+except Exception:
+    sys.exit(1)
+print(json.dumps(obj))
+' 2>/dev/null || true)
+        if [ -n "$EXTRACTED" ] && printf '%s' "$EXTRACTED" | jq -e '.verdict' >/dev/null 2>&1; then
+            VERDICT_RAW="$EXTRACTED"
+            break
+        fi
+        ATTEMPT=$((ATTEMPT + 1))
+    done
+
+    if ! printf '%s' "$VERDICT_RAW" | jq -e '.verdict' >/dev/null 2>&1; then
+        _log "$RUN_TS project=$PROJECT task=$TID error=no-json-verdict"
+        FAILED=$((FAILED + 1))
+        continue
+    fi
+
+    # Max severity from the verdict's errors[], for the queue's mark-done arg
+    # and the ledger lines below.
+    MAX_SEV=$(printf '%s' "$VERDICT_RAW" | jq -r '
+        [(.errors // [])[].severity] as $sevs
+        | if ($sevs | index("CRITICAL")) then "CRITICAL"
+          elif ($sevs | index("HIGH")) then "HIGH"
+          elif ($sevs | index("MEDIUM")) then "MEDIUM"
+          elif ($sevs | index("LOW")) then "LOW"
+          else "NONE" end')
+
+    # Fold each error into agent-errors.jsonl in the same shape sync-tasks
+    # uses for the V11.15/20 per-agent ledger (found_by_layer="lite", the
+    # normal non-sibling in-flight-review layer; caller_kind="daemon" so
+    # scorecards can distinguish headless drains from live sessions).
+    NOW="$(date -u +%Y-%m-%dT%H:%M:%S+00:00)"
+    ERR_COUNT=$(printf '%s' "$VERDICT_RAW" | jq '(.errors // []) | length' 2>/dev/null || echo 0)
+    LINES=""
+    if [ "$ERR_COUNT" -gt 0 ] 2>/dev/null; then
+        i=0
+        while [ "$i" -lt "$ERR_COUNT" ]; do
+            E_JSON=$(printf '%s' "$VERDICT_RAW" | jq -c ".errors[$i]" 2>/dev/null || echo '{}')
+            E_FILE=$(printf '%s' "$E_JSON" | jq -r '.file // ""')
+            E_LINE=$(printf '%s' "$E_JSON" | jq -r '.line // ""')
+            E_ID=$(printf '%s' "$E_JSON" | jq -r '.id // ""')
+            E_KEY=$(v11_compute_attribution_key "$PROJECT" "$TID" "$E_FILE" "$E_LINE" "$E_ID")
+            LINE=$(printf '%s' "$E_JSON" | jq -c \
+                --arg ts "$NOW" --arg tid "$TID" --arg agent "$AGENT" --arg proj "$PROJECT" --arg key "$E_KEY" '{
+                    timestamp: $ts,
+                    task_id: $tid,
+                    agent_id: $agent,
+                    error_type: (.type // "completeness"),
+                    severity: (.severity // "MEDIUM"),
+                    error_message: ((.detail // "") | .[0:500]),
+                    found_by: "adversarial-lite-reviewer",
+                    fix_suggested: ((.fix_hint // "") | .[0:300]),
+                    fixed: false,
+                    escalated: (.severity == "CRITICAL"),
+                    trace_id: null,
+                    project: $proj,
+                    found_by_layer: "lite",
+                    task_id_inferred: false,
+                    attribution_key: $key,
+                    executor_kind: "headless",
+                    caller_kind: "daemon"
+                }' 2>/dev/null || true)
+            [ -n "$LINE" ] && LINES="${LINES}${LINE}"$'\n'
+            i=$((i + 1))
+        done
+    fi
+
+    if [ -n "$LINES" ]; then
+        (
+            flock -x 210
+            printf '%s' "$LINES" >> "$ERR_LOG"
+        ) 210>"$ERR_LOCK" 2>/dev/null || true
+    fi
+
+    # Fold into the review queue's done event, attributed to this daemon session.
+    # B5 (improvements/09, W5-T16): write the full verdict to a temp file and
+    # pass --verdict-file so mark-done can fold it into a durable verdict
+    # store + ev:"review" ledger event (B1/B2) instead of evaporating to just
+    # MAX_SEV. Best-effort: a write failure just falls back to severity-only.
+    VERDICT_TMP=$(mktemp "${METRICS_DIR}/review-daemon-verdict.XXXXXX" 2>/dev/null || true)
+    if [ -n "$VERDICT_TMP" ] && printf '%s' "$VERDICT_RAW" > "$VERDICT_TMP" 2>/dev/null; then
+        "$V11_HOME/scripts/review-queue" mark-done "$PROJECT" "$TID" "$MAX_SEV" "$DAEMON_SESSION" \
+            --verdict-file "$VERDICT_TMP" >/dev/null 2>>"$LOG_FILE" || true
+        rm -f "$VERDICT_TMP" 2>/dev/null || true
+    else
+        rm -f "$VERDICT_TMP" 2>/dev/null || true
+        "$V11_HOME/scripts/review-queue" mark-done "$PROJECT" "$TID" "$MAX_SEV" "$DAEMON_SESSION" \
+            >/dev/null 2>>"$LOG_FILE" || true
+    fi
+
+    _log "$RUN_TS project=$PROJECT task=$TID verdict=$(printf '%s' "$VERDICT_RAW" | jq -r '.verdict // "unknown"') severity=$MAX_SEV claimed_by=$DAEMON_SESSION"
+    PROCESSED=$((PROCESSED + 1))
+done < <(printf '%s' "$DRAIN_JSON" | jq -c '.[]')
+
+_log "$RUN_TS project=$PROJECT drained=$COUNT processed=$PROCESSED failed=$FAILED dry_run=false"
+echo "review-daemon: processed $PROCESSED/$COUNT review(s) for '$PROJECT' ($FAILED failed)."

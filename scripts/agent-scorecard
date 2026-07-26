@@ -1,0 +1,1007 @@
+#!/bin/bash
+# V11.20 Script: agent-scorecard
+# Per-agent deep-dive across ALL FOUR audit layers (runtime / lite / wave / swarm)
+# with orchestrator-vs-subagent split. Companion to agent-effectiveness (fleet
+# view). Reads the same ledgers — no schema invention.
+#
+# Sources:
+#   ~/.agent-metrics/autonomy-audit.jsonl   Layer 1 — runtime Write/Edit/Bash
+#   ~/.agent-metrics/agent-errors.jsonl     Layers 2/3/4 — lite/wave/swarm errors
+#   ~/.agent-metrics/dispatch-trace.jsonl   W3-T13 — completion-event tokens (avg/spawn)
+#   ~/.agent-metrics/ledger/<project>.jsonl S1-D7 — artifacts.tokens on async task closes
+#
+# Usage:
+#   agent-scorecard AGENT                          # all layers, all callers, all time
+#   agent-scorecard AGENT --json                   # machine-readable
+#   agent-scorecard AGENT --since 2026-01-01       # ISO date lower bound
+#   agent-scorecard AGENT --project P              # restrict to project P
+#   agent-scorecard AGENT --layer wave             # one layer only
+#   agent-scorecard AGENT --caller-kind subagent   # orchestrator | subagent | unknown | daemon | all
+#   agent-scorecard --routing                      # V11.32: per-agent override rate report (no AGENT needed)
+#   agent-scorecard --routing --project P --since D --json
+#   agent-scorecard --test                         # self-test
+#   agent-scorecard --help
+#
+# ADVISORY ONLY (V11.20 inherits V11.15 constraint): does NOT feed DAAO routing.
+#
+# Exit codes:
+#   0    Success (including no-data case — empty scorecard rendered)
+#   2    Bad arguments
+
+set -euo pipefail
+
+V11_WORKSPACE_ROOT="${V11_WORKSPACE_ROOT:-$HOME/.v11}"
+METRICS_DIR="${METRICS_DIR:-$V11_WORKSPACE_ROOT/.agent-metrics}"
+
+if [ "${1:-}" == "--test" ]; then
+    echo "agent-scorecard v1.0 (V11.20)"
+    exit 0
+fi
+
+if [ "${1:-}" == "--help" ] || [ "${1:-}" == "-h" ]; then
+    sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//'
+    exit 0
+fi
+
+AGENT="" JSON=false SINCE="" PROJECT="" LAYER="all" CALLER_KIND="all" ROUTING=false
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --json) JSON=true ;;
+        --since) SINCE="${2:-}"; shift ;;
+        --project) PROJECT="${2:-}"; shift ;;
+        --layer) LAYER="${2:-all}"; shift ;;
+        --caller-kind) CALLER_KIND="${2:-all}"; shift ;;
+        --routing) ROUTING=true ;;
+        --help|-h) sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        --*) echo "agent-scorecard: unknown flag '$1'" >&2; exit 2 ;;
+        *)
+            if [ -z "$AGENT" ]; then AGENT="$1"
+            else echo "agent-scorecard: unexpected arg '$1'" >&2; exit 2
+            fi ;;
+    esac
+    shift
+done
+
+# --routing is a standalone fleet-wide report and does not need an AGENT.
+if [ -z "$AGENT" ] && [ "$ROUTING" != "true" ]; then
+    echo "agent-scorecard: AGENT name required (try: agent-scorecard --help)" >&2
+    exit 2
+fi
+
+case "$LAYER" in
+    all|runtime|lite|wave|swarm) ;;
+    *) echo "agent-scorecard: --layer must be all|runtime|lite|wave|swarm (got: $LAYER)" >&2; exit 2 ;;
+esac
+
+case "$CALLER_KIND" in
+    all|orchestrator|subagent|unknown|daemon) ;;
+    *) echo "agent-scorecard: --caller-kind must be all|orchestrator|subagent|unknown|daemon (got: $CALLER_KIND)" >&2; exit 2 ;;
+esac
+
+V11_AS_AGENT="$AGENT" V11_AS_JSON="$JSON" V11_AS_SINCE="$SINCE" \
+V11_AS_PROJECT="$PROJECT" V11_AS_LAYER="$LAYER" V11_AS_CALLER_KIND="$CALLER_KIND" \
+V11_AS_ROUTING="$ROUTING" \
+V11_AS_AUDIT="$METRICS_DIR/autonomy-audit.jsonl" \
+V11_AS_ERRORS="$METRICS_DIR/agent-errors.jsonl" \
+V11_AS_TASK_STATE_DIR="$METRICS_DIR/task-state" \
+V11_AS_TRACE="$METRICS_DIR/dispatch-trace.jsonl" \
+V11_AS_LEDGER_DIR="$METRICS_DIR/ledger" \
+python3 - <<'PYEOF'
+import os, sys, json, datetime, re
+from collections import Counter
+
+def env(k, d=""):
+    return os.environ.get(k, d)
+
+agent       = env("V11_AS_AGENT")
+as_json     = env("V11_AS_JSON") == "true"
+since_raw   = env("V11_AS_SINCE") or None
+only_proj   = env("V11_AS_PROJECT") or None
+only_layer  = env("V11_AS_LAYER")
+only_caller = env("V11_AS_CALLER_KIND")
+audit_path  = env("V11_AS_AUDIT")
+errors_path = env("V11_AS_ERRORS")
+task_state_dir = env("V11_AS_TASK_STATE_DIR")
+trace_path  = env("V11_AS_TRACE")   # W3-T13
+
+LAYERS = ["runtime", "lite", "wave", "swarm"]
+SEV_ORDER = ["CRITICAL", "HIGH", "MEDIUM", "LOW"]
+
+def parse_ts(s):
+    try:
+        dt = datetime.datetime.fromisoformat(str(s).replace("Z", "+00:00"))
+    except Exception:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=datetime.timezone.utc)
+    return dt
+
+now = datetime.datetime.now(datetime.timezone.utc)
+
+since_dt = None
+if since_raw:
+    since_dt = parse_ts(since_raw) or parse_ts(since_raw + "T00:00:00")
+    if since_dt is None:
+        print(f"agent-scorecard: bad --since '{since_raw}' (use ISO date)", file=sys.stderr)
+        sys.exit(2)
+
+def in_window(rec, ts_key="timestamp"):
+    if since_dt is None:
+        return True
+    ts = parse_ts(rec.get(ts_key))
+    return True if ts is None else ts >= since_dt
+
+def read_jsonl(path):
+    if not path or not os.path.exists(path):
+        return []
+    out = []
+    with open(path, "r", encoding="utf-8") as fh:
+        for ln in fh:
+            ln = ln.strip()
+            if not ln:
+                continue
+            try:
+                out.append(json.loads(ln))
+            except Exception:
+                continue
+    return out
+
+# ---------------------------------------------------------------------------
+# V11.32 (H2) — --routing: dispatch-trace routing-field consumer.
+#
+# dispatch-trace.jsonl has carried recommended_agent/spawned_agent/
+# override_reason since W1-2 but nothing ever read them back (write-only
+# fields). This is the missing consumer: a fleet-wide override-rate report,
+# independent of the AGENT positional (dispatch decisions aren't scoped to
+# one agent — they're scoped to the recommendation). Reuses the exact
+# iteration idiom the token-capture blocks below use against this same file:
+# read_jsonl(trace_path) + only_proj filter + in_window(rec, ts_key="ts").
+# Null-safe field access (`rec.get(...)` — the jq `// empty` idiom's python
+# equivalent) even though every row currently carries both fields, so a
+# future dispatch-trace-append change that omits one doesn't crash this.
+# ---------------------------------------------------------------------------
+routing_mode = env("V11_AS_ROUTING") == "true"
+
+if routing_mode:
+    per_agent = {}  # recommended_agent -> {"total", "diverged", "reasons": Counter}
+    total_all = 0
+    diverged_all = 0
+    for rec in read_jsonl(trace_path):
+        if rec.get("event") == "completion":
+            continue  # completion lines are a supplementary record of an
+                       # existing dispatch (same recommended_agent/spawned_agent),
+                       # not a new spawn — counting both would double-count.
+        ra = rec.get("recommended_agent") or None
+        sa = rec.get("spawned_agent") or None
+        if not ra or not sa:
+            continue
+        if only_proj and rec.get("project") != only_proj:
+            continue
+        if not in_window(rec, ts_key="ts"):
+            continue
+        bucket = per_agent.setdefault(ra, {"total": 0, "diverged": 0, "reasons": Counter()})
+        bucket["total"] += 1
+        total_all += 1
+        if sa != ra:
+            bucket["diverged"] += 1
+            diverged_all += 1
+            reason = rec.get("override_reason") or ""
+            if reason:
+                bucket["reasons"][reason] += 1
+
+    routing_rows = []
+    for ra, b in per_agent.items():
+        rate = (b["diverged"] / b["total"] * 100.0) if b["total"] > 0 else 0.0
+        top3 = b["reasons"].most_common(3)
+        routing_rows.append({
+            "recommended_agent": ra,
+            "total_spawns": b["total"],
+            "diverged": b["diverged"],
+            "rate_pct": round(rate, 1),
+            "top_override_reasons": [{"reason": r, "count": c} for r, c in top3],
+        })
+    routing_rows.sort(key=lambda r: (-r["diverged"], -r["total_spawns"], r["recommended_agent"]))
+
+    overall_rate = (diverged_all / total_all * 100.0) if total_all > 0 else 0.0
+
+    if as_json:
+        print(json.dumps({
+            "generated_at": now.isoformat(),
+            "filters": {"since": since_raw, "project": only_proj},
+            "advisory_only": True,
+            "source": trace_path,
+            "agents": routing_rows,
+            "overall": {
+                "total_spawns": total_all,
+                "diverged": diverged_all,
+                "rate_pct": round(overall_rate, 1),
+            },
+        }, indent=2))
+        sys.exit(0)
+
+    print("V11.32 Agent Scorecard — Routing Override Report   (ADVISORY ONLY — does not drive DAAO)")
+    filt = []
+    if since_raw: filt.append(f"since={since_raw}")
+    if only_proj: filt.append(f"project={only_proj}")
+    if filt:
+        print("  filters: " + "  ".join(filt))
+    print("=" * 96)
+    print(f"  {'RECOMMENDED':<28}  {'SPAWNS':>7}  {'DIVERGED':>8}  {'RATE':>7}  TOP OVERRIDE REASONS")
+    print("  " + "-" * 92)
+    for r in routing_rows:
+        top_s = "; ".join(f"{x['reason']} ({x['count']})" for x in r["top_override_reasons"]) if r["top_override_reasons"] else "—"
+        print(f"  {r['recommended_agent']:<28}  {r['total_spawns']:>7}  {r['diverged']:>8}  {r['rate_pct']:>6.1f}%  {top_s}")
+    print("  " + "-" * 92)
+    print(f"  {'OVERALL':<28}  {total_all:>7}  {diverged_all:>8}  {overall_rate:>6.1f}%   ({diverged_all}/{total_all} diverged)")
+    print()
+    if total_all == 0:
+        print("  No dispatch-trace data found under the current filters.")
+        print(f"  Ledger: {trace_path}  ({'present' if os.path.exists(trace_path) else 'absent'})")
+    sys.exit(0)
+
+# ---------------------------------------------------------------------------
+# Per-layer aggregation
+# ---------------------------------------------------------------------------
+
+def empty_layer():
+    return {
+        "actions": 0,        # autonomy-audit: total events for Layer 1; lite/wave/swarm: error count
+        "errors": 0,         # actual errors (outcome=="error" for Layer 1; all lines for L2/3/4)
+        "by_severity": {s: 0 for s in SEV_ORDER},
+        "error_types": Counter(),
+        "caller_kind": Counter(),
+        "trend": "no_data",
+        "recent": [],        # last 5 errors with timestamps
+    }
+
+layers = {l: empty_layer() for l in LAYERS}
+
+def caller_kind_pass(rec_kind):
+    """Filter helper. only_caller='all' accepts everything (including missing field)."""
+    if only_caller == "all":
+        return True
+    if rec_kind is None:  # field absent → "unknown" semantics
+        return only_caller == "unknown"
+    return rec_kind == only_caller
+
+# --- Layer 1: runtime from autonomy-audit ---
+if only_layer in ("all", "runtime"):
+    sl = layers["runtime"]
+    for rec in read_jsonl(audit_path):
+        if rec.get("agent_id") != agent:
+            continue
+        if not in_window(rec):
+            continue
+        if only_proj and rec.get("project") != only_proj:
+            continue
+        if not caller_kind_pass(rec.get("caller_kind")):
+            continue
+        sl["actions"] += 1
+        if rec.get("outcome") == "error":
+            sl["errors"] += 1
+            # Layer 1 has no severity per-se; use risk_level as a proxy
+            risk = (rec.get("risk_level") or "").upper()
+            sev = "HIGH" if risk == "HIGH" else ("MEDIUM" if risk == "MEDIUM" else "LOW")
+            sl["by_severity"][sev] += 1
+            sl["error_types"][rec.get("action") or "unknown"] += 1
+            sl["recent"].append({
+                "timestamp": rec.get("timestamp"),
+                "severity": sev,
+                "type": rec.get("action"),
+                "message": (rec.get("error") or "")[:120],
+                "project": rec.get("project"),
+            })
+        ck = rec.get("caller_kind")
+        sl["caller_kind"][ck if ck else "unknown"] += 1
+
+# --- Layers 2/3/4: lite/wave/swarm from agent-errors ---
+for rec in read_jsonl(errors_path):
+    if rec.get("agent_id") != agent:
+        continue
+    if not in_window(rec):
+        continue
+    if only_proj and rec.get("project") != only_proj:
+        continue
+    layer_val = rec.get("found_by_layer") or "lite"  # legacy V11.15 entries → lite
+    if layer_val not in LAYERS:
+        continue
+    if only_layer != "all" and only_layer != layer_val:
+        continue
+    if not caller_kind_pass(rec.get("caller_kind")):
+        continue
+    sl = layers[layer_val]
+    sl["errors"] += 1
+    sl["actions"] += 1  # for review-derived layers, "actions" == reviewed errors
+    sev = (rec.get("severity") or "LOW").upper()
+    if sev in sl["by_severity"]:
+        sl["by_severity"][sev] += 1
+    et = rec.get("error_type") or "unknown"
+    sl["error_types"][et] += 1
+    ck = rec.get("caller_kind")
+    sl["caller_kind"][ck if ck else "unknown"] += 1
+    sl["recent"].append({
+        "timestamp": rec.get("timestamp"),
+        "severity": sev,
+        "type": et,
+        "message": (rec.get("error_message") or "")[:120],
+        "project": rec.get("project"),
+    })
+
+# --- Trend computation: last 30d vs prior 30d (per layer) ---
+W = 30  # days
+window_a_start = now - datetime.timedelta(days=W)
+window_b_start = now - datetime.timedelta(days=2 * W)
+
+def in_period(ts_str, start, end):
+    ts = parse_ts(ts_str)
+    if ts is None:
+        return False
+    return start <= ts < end
+
+def count_in(records, start, end, ts_key="timestamp"):
+    return sum(1 for r in records if in_period(r.get(ts_key), start, end))
+
+# Layer 1 trend from autonomy-audit
+audit_for_agent = [
+    r for r in read_jsonl(audit_path)
+    if r.get("agent_id") == agent
+    and r.get("outcome") == "error"
+    and (not only_proj or r.get("project") == only_proj)
+    and caller_kind_pass(r.get("caller_kind"))
+]
+# L2-L4 trend from agent-errors
+errors_for_agent = [
+    r for r in read_jsonl(errors_path)
+    if r.get("agent_id") == agent
+    and (not only_proj or r.get("project") == only_proj)
+    and caller_kind_pass(r.get("caller_kind"))
+]
+
+def trend_label(records, layer_filter=None):
+    if layer_filter and layer_filter != "runtime":
+        filtered = [r for r in records if (r.get("found_by_layer") or "lite") == layer_filter]
+    elif layer_filter == "runtime":
+        filtered = records  # already filtered to error events
+    else:
+        filtered = records
+    a = count_in(filtered, window_a_start, now)
+    b = count_in(filtered, window_b_start, window_a_start)
+    if a == 0 and b == 0:
+        return "no_data"
+    if b == 0:
+        return "no_baseline"  # we have current activity but no prior baseline
+    delta_pct = (a - b) / max(b, 1)
+    if delta_pct <= -0.10:
+        return "improving"
+    if delta_pct >= 0.10:
+        return "degrading"
+    return "stable"
+
+if only_layer in ("all", "runtime"):
+    layers["runtime"]["trend"] = trend_label(audit_for_agent, "runtime")
+for l in ("lite", "wave", "swarm"):
+    if only_layer in ("all", l):
+        layers[l]["trend"] = trend_label(errors_for_agent, l)
+
+# --- Cross-layer caller_kind split (errors only) ---
+caller_split = Counter()
+for l in LAYERS:
+    if only_layer != "all" and only_layer != l:
+        continue
+    sl = layers[l]
+    for k, v in sl["caller_kind"].items():
+        caller_split[k] += v
+
+# ---------------------------------------------------------------------------
+# V11.21 T16 — self_review_miss calibration (INV-3 falsifiability)
+#
+# A "miss" is a parent task where:
+#   - the executor's self_review.severity ∈ {NONE, LOW} (executor optimistic), AND
+#   - the paired adversarial review's max severity ∈ {HIGH, CRITICAL} (reality bites)
+#
+# Calibration miss rate makes Layer A (self-review) falsifiable. Without it
+# self-review is ceremony — agents could always emit severity=NONE and the
+# framework would have no way to surface the dishonesty.
+#
+# Data sources (idempotent reads, never writes):
+#   1. ~/.agent-metrics/task-state/<project>.json  task_artifacts.<id>.self_review
+#      → per (project, task_id, executor agent) extract self_severity.
+#   2. agent-errors.jsonl  found_by_layer="lite_adversarial"  task_id=<parent>
+#      → per (project, task_id) extract MAX adversarial severity across entries.
+#
+# Pairing key: (project, task_id). Executor agent comes from task_artifacts
+# field (preferred) or recommended_agents[task_id] (fallback).
+# ---------------------------------------------------------------------------
+
+SELF_LOW_SET = {"NONE", "LOW"}
+ADV_HIGH_SET = {"HIGH", "CRITICAL"}
+
+def _read_task_state_aggregates(dir_path):
+    """Yield (project, state_dict) for each *.json in the task-state dir."""
+    if not dir_path or not os.path.isdir(dir_path):
+        return
+    for name in os.listdir(dir_path):
+        if not name.endswith(".json"):
+            continue
+        path = os.path.join(dir_path, name)
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+        except Exception:
+            continue
+        project = data.get("project") or name[:-5]
+        yield project, data
+
+def _self_review_records_for_agent():
+    """Collect (project, task_id, executor_agent, self_severity, completed_at) tuples
+    for the agent under analysis. Filter by project / since_dt up front."""
+    out = []
+    for project, state in _read_task_state_aggregates(task_state_dir):
+        if only_proj and project != only_proj:
+            continue
+        artifacts = state.get("task_artifacts") or {}
+        rec_agents = state.get("recommended_agents") or {}
+        # recent_completed gives completion timestamps per task_id
+        completed_ts = {}
+        for rc in state.get("recent_completed") or []:
+            if not isinstance(rc, dict):
+                continue
+            tid = str(rc.get("id") or rc.get("task_id") or "")
+            ts = rc.get("at") or rc.get("completed_at")
+            if tid and ts:
+                completed_ts.setdefault(tid, ts)
+        for tid, arts in artifacts.items():
+            if not isinstance(arts, dict):
+                continue
+            sr = arts.get("self_review")
+            if not isinstance(sr, dict):
+                continue
+            sev = (sr.get("severity") or "").upper()
+            if sev not in (SEV_ORDER + ["NONE"]):  # accept NONE too
+                continue
+            # Executor agent: self_review.agent_id → artifacts.agent_id → recommended_agents
+            exec_agent = (
+                sr.get("agent_id")
+                or arts.get("agent_id")
+                or rec_agents.get(str(tid))
+                or "unknown"
+            )
+            if exec_agent != agent:
+                continue
+            ts = completed_ts.get(str(tid))
+            if since_dt is not None:
+                ts_parsed = parse_ts(ts)
+                if ts_parsed is None or ts_parsed < since_dt:
+                    continue
+            out.append({
+                "project": project,
+                "task_id": str(tid),
+                "executor_agent": exec_agent,
+                "self_severity": sev,
+                "completed_at": ts,
+            })
+    return out
+
+def _adversarial_max_severity_by_task():
+    """Walk agent-errors.jsonl, return {(project, task_id): max_severity}
+    for lite_adversarial entries. NONE>LOW<MEDIUM<HIGH<CRITICAL."""
+    rank = {"NONE": 0, "LOW": 1, "MEDIUM": 2, "HIGH": 3, "CRITICAL": 4}
+    out = {}
+    for rec in read_jsonl(errors_path):
+        layer_val = rec.get("found_by_layer")
+        # Treat legacy "lite" as adversarial for backward compat — that was the
+        # only review layer pre-V11.21. lite_self is explicitly self, skip.
+        if layer_val == "lite_self":
+            continue
+        if layer_val not in ("lite_adversarial", "lite", None):
+            continue
+        tid = rec.get("task_id")
+        if tid is None:
+            continue
+        project = rec.get("project")
+        if only_proj and project != only_proj:
+            continue
+        sev = (rec.get("severity") or "LOW").upper()
+        key = (project, str(tid))
+        cur = out.get(key, "NONE")
+        if rank.get(sev, 0) > rank.get(cur, 0):
+            out[key] = sev
+    return out
+
+self_records = _self_review_records_for_agent()
+adv_severity = _adversarial_max_severity_by_task()
+
+# Compute pairs
+paired_total = 0
+misses = []  # list of dicts for trend computation
+for sr in self_records:
+    adv_sev = adv_severity.get((sr["project"], sr["task_id"]))
+    if adv_sev is None:
+        # Self emitted but no adversarial verdict — un-paired; not a calibration
+        # data point either way (Layer A absent or in flight).
+        continue
+    paired_total += 1
+    if sr["self_severity"] in SELF_LOW_SET and adv_sev in ADV_HIGH_SET:
+        misses.append({**sr, "adversarial_severity": adv_sev})
+
+miss_count = len(misses)
+miss_rate = (miss_count / paired_total) if paired_total > 0 else 0.0
+
+# 30-day trend on misses
+def _miss_in_window(start, end):
+    n = 0
+    for m in misses:
+        ts = parse_ts(m.get("completed_at"))
+        if ts and start <= ts < end:
+            n += 1
+    return n
+
+trend_30 = "no_data"
+last30 = _miss_in_window(window_a_start, now)
+prior30 = _miss_in_window(window_b_start, window_a_start)
+if last30 == 0 and prior30 == 0:
+    trend_30 = "no_data"
+elif prior30 == 0:
+    trend_30 = "no_baseline"
+else:
+    delta = (last30 - prior30) / max(prior30, 1)
+    if delta <= -0.10:
+        trend_30 = "improving"
+    elif delta >= 0.10:
+        trend_30 = "degrading"
+    else:
+        trend_30 = "stable"
+
+# Calibration advisory (>50% miss rate over 30 days)
+# Use last30 misses + only-last-30d paired count for the advisory.
+paired_last30 = 0
+for sr in self_records:
+    adv_sev = adv_severity.get((sr["project"], sr["task_id"]))
+    if adv_sev is None:
+        continue
+    ts = parse_ts(sr.get("completed_at"))
+    if ts and window_a_start <= ts < now:
+        paired_last30 += 1
+miss_rate_30 = (last30 / paired_last30) if paired_last30 > 0 else 0.0
+calibration_advisory = miss_rate_30 > 0.50 and paired_last30 >= 4  # noise floor
+
+calibration_block = {
+    "miss_count_total": miss_count,
+    "miss_count_last30": last30,
+    "paired_count_total": paired_total,
+    "paired_count_last30": paired_last30,
+    "miss_rate_total": round(miss_rate, 3),
+    "miss_rate_last30": round(miss_rate_30, 3),
+    "trend": trend_30,
+    "advisory": calibration_advisory,
+    "advisory_threshold": "> 50% over last 30d with ≥4 paired data points",
+    "miss_examples": misses[:5],
+}
+
+# ---------------------------------------------------------------------------
+# W3-T13 — avg tokens/spawn from dispatch-trace.jsonl completion events.
+# Layer-independent (a spawn isn't scoped to runtime/lite/wave/swarm), so
+# --layer does not filter this block — matches the self-review calibration
+# block's pattern of always-shown regardless of --layer. Never fabricated:
+# absent entirely unless at least one completion-event line with a numeric
+# tokens field exists for this agent under the active --project/--since.
+# ---------------------------------------------------------------------------
+_token_total = 0
+_token_count = 0
+for t in read_jsonl(trace_path):
+    if t.get("event") != "completion":
+        continue
+    if t.get("spawned_agent") != agent:
+        continue
+    tok = t.get("tokens")
+    if not isinstance(tok, (int, float)) or isinstance(tok, bool):
+        continue
+    if only_proj and t.get("project") != only_proj:
+        continue
+    if not in_window(t, ts_key="ts"):
+        continue
+    _token_total += tok
+    _token_count += 1
+
+avg_tokens = round(_token_total / _token_count, 1) if _token_count > 0 else None
+
+# ---------------------------------------------------------------------------
+# S1-D2 — tokens-per-task: min/median/max output tokens per spawn + an honest
+# capture-rate label. Builds on W3-T13's completion-event tokens but reports
+# distribution (not just avg) and states the denominator explicitly — total
+# spawns for this agent — so a small numerator never reads as "the agent's
+# overall token usage." Additive to W3-T13's avg_tokens/token_samples fields
+# (left untouched for back-compat); unlike that block, this one is ALWAYS
+# present in --json output (nulls when no data) rather than omitted, per the
+# "never fabricate or omit silently" requirement. Layer-independent, same as
+# W3-T13 — a spawn isn't scoped to runtime/lite/wave/swarm, so --layer does
+# not filter this block. Sibling task D1 owns wiring more completion events
+# to carry tokens; this block only ever reads what's already on disk.
+# ---------------------------------------------------------------------------
+_total_spawns = 0
+for t in read_jsonl(trace_path):
+    if t.get("spawned_agent") != agent:
+        continue
+    if t.get("event") == "completion":
+        continue  # completion lines are a supplementary record of an
+                   # existing dispatch, not a new spawn — counting both
+                   # would double the denominator.
+    if only_proj and t.get("project") != only_proj:
+        continue
+    if not in_window(t, ts_key="ts"):
+        continue
+    _total_spawns += 1
+
+_token_values = []
+for t in read_jsonl(trace_path):
+    if t.get("event") != "completion":
+        continue
+    if t.get("spawned_agent") != agent:
+        continue
+    tok = t.get("tokens")
+    if not isinstance(tok, (int, float)) or isinstance(tok, bool):
+        continue
+    if only_proj and t.get("project") != only_proj:
+        continue
+    if not in_window(t, ts_key="ts"):
+        continue
+    _token_values.append(tok)
+
+def _median(vals):
+    s = sorted(vals)
+    n = len(s)
+    mid = n // 2
+    if n % 2 == 1:
+        return float(s[mid])
+    return (s[mid - 1] + s[mid]) / 2.0
+
+def _fmt_tok(v):
+    if v is None:
+        return None
+    return f"{v/1000:.0f}k" if v >= 1000 else f"{v:.0f}"
+
+# ---------------------------------------------------------------------------
+# S1-D7 — tokens_per_task, second capture source: durable ledger completed
+# events carrying numeric artifacts.tokens. Context: dispatch-trace completion
+# tokens (S1-D2 above) only ever cover FOREGROUND spawns — the harness has no
+# PostToolUse hook firing for an async/background spawn's own token usage.
+# Instead the orchestrator records `artifacts.tokens` on the TaskUpdate that
+# CLOSES an async task, and sync-tasks folds that straight into the
+# ev:"completed" durable ledger row (hooks/sync-tasks ~L2044-2077,
+# `--argjson arts "${ARTIFACTS:-null}"`). This block reads those rows as a
+# second source and MERGES them into the same min/median/max distribution
+# S1-D2 built from dispatch-trace alone.
+#
+# Agent attribution: a ledger row does not carry a fully reliable per-row
+# agent field on its own (scripts/backfill-reviews L164: "ledger doesn't
+# carry agent reliably"). Reused, not invented — this is the exact cascade
+# this same script already trusts for self_review attribution in
+# _self_review_records_for_agent() above (self_review.agent_id first, then
+# artifacts.agent_id, then recommended_agents). Extended with one additional
+# rung specific to ledger rows: the row's own top-level `executor` field
+# (V11.22), which is a legitimate agent name across the fleet (spot-checked:
+# spec-implementer-v11, backend-architect, Explore, ... in
+# ~/.agent-metrics/ledger/*.jsonl) but which ALSO defaults to a generic
+# "orchestrator"/"orchestrator-self"/"orchestrator-direct" sentinel when no
+# TaskUpdate owner / recommended_agents was set at completion time (hooks/
+# sync-tasks L2027-2040) — so those sentinel values are excluded here rather
+# than trusted. Full cascade: self_review.agent_id -> artifacts.agent_id ->
+# executor (sentinels excluded) -> recommended_agents[task_id] from
+# task-state (LOWEST priority — the durable ledger is explicitly designed to
+# survive task-state wipes per V11.30, so depending on task-state here is
+# deliberately a last resort, never the only source). A row that resolves to
+# no agent at all is skipped and counted as unattributed (_artifacts_unattributed)
+# — never guessed, and never silently folded into someone else's count.
+#
+# Dedup: a ledger completed-event and a dispatch-trace completion event can
+# describe the SAME spawn when they share a task_id. Correlated via
+# (project, task_id): any ledger row whose key already produced a
+# dispatch-trace-captured token sample for this agent is skipped so one spawn
+# is never double-counted across both sources. Rows that can't be correlated
+# this way (task_id missing on either side) are kept from both sources rather
+# than dropped — per spec, prefer keeping both over silently losing data when
+# correlation isn't possible.
+# ---------------------------------------------------------------------------
+_ORCH_SENTINELS = {"orchestrator", "orchestrator-self", "orchestrator-direct",
+                    "unknown", "claude", ""}
+
+_rec_agents_by_project = {}
+for _rap_proj, _rap_state in _read_task_state_aggregates(task_state_dir):
+    _rec_agents_by_project[_rap_proj] = _rap_state.get("recommended_agents") or {}
+
+def _resolve_ledger_row_agent(rec, project_hint):
+    arts = rec.get("artifacts") or {}
+    sr = arts.get("self_review") if isinstance(arts.get("self_review"), dict) else {}
+    cand = sr.get("agent_id") or arts.get("agent_id")
+    if not cand:
+        ex = rec.get("executor")
+        if ex and ex not in _ORCH_SENTINELS:
+            cand = ex
+    if not cand:
+        rec_agents = _rec_agents_by_project.get(project_hint) or {}
+        cand = rec_agents.get(str(rec.get("task_id")))
+    return cand or None
+
+ledger_dir = env("V11_AS_LEDGER_DIR")
+
+def _iter_ledger_files():
+    if not ledger_dir or not os.path.isdir(ledger_dir):
+        return
+    if only_proj:
+        if not re.match(r'^[A-Za-z0-9._-]+$', only_proj):
+            return
+        p = os.path.join(ledger_dir, f"{only_proj}.jsonl")
+        if os.path.isfile(p):
+            yield only_proj, p
+        return
+    for name in sorted(os.listdir(ledger_dir)):
+        if not name.endswith(".jsonl"):
+            continue
+        path = os.path.join(ledger_dir, name)
+        if not os.path.isfile(path):
+            continue
+        yield name[:-len(".jsonl")], path
+
+# Dispatch-trace spawns already captured for this agent — dedup key set.
+_trace_task_keys = set()
+for t in read_jsonl(trace_path):
+    if t.get("event") != "completion":
+        continue
+    if t.get("spawned_agent") != agent:
+        continue
+    tok = t.get("tokens")
+    if not isinstance(tok, (int, float)) or isinstance(tok, bool):
+        continue
+    if only_proj and t.get("project") != only_proj:
+        continue
+    if not in_window(t, ts_key="ts"):
+        continue
+    tproj, ttid = t.get("project"), t.get("task_id")
+    if tproj is not None and ttid is not None:
+        _trace_task_keys.add((tproj, str(ttid)))
+
+_artifacts_token_values = []
+_artifacts_captured = 0
+_artifacts_unattributed = 0
+for _lf_proj, _lf_path in _iter_ledger_files():
+    for rec in read_jsonl(_lf_path):
+        if rec.get("ev") != "completed":
+            continue
+        _arts = rec.get("artifacts") or {}
+        tok = _arts.get("tokens") if isinstance(_arts, dict) else None
+        if not isinstance(tok, (int, float)) or isinstance(tok, bool):
+            continue
+        row_project = rec.get("project") or _lf_proj
+        if only_proj and row_project != only_proj:
+            continue
+        if not in_window(rec, ts_key="ts"):
+            continue
+        row_agent = _resolve_ledger_row_agent(rec, row_project)
+        if row_agent is None:
+            _artifacts_unattributed += 1
+            continue
+        if row_agent != agent:
+            continue
+        _tid = rec.get("task_id")
+        _key = (row_project, str(_tid)) if _tid is not None else None
+        if _key is not None and _key in _trace_task_keys:
+            continue  # same spawn already captured via dispatch-trace
+        _artifacts_token_values.append(tok)
+        _artifacts_captured += 1
+
+# Merge the two sources into one distribution.
+_merged_token_values = _token_values + _artifacts_token_values
+_trace_captured = len(_token_values)
+
+if _merged_token_values:
+    _tpt_min = min(_merged_token_values)
+    _tpt_max = max(_merged_token_values)
+    _tpt_median = _median(_merged_token_values)
+else:
+    _tpt_min = _tpt_max = _tpt_median = None
+
+_tpt_captured = len(_merged_token_values)
+if _artifacts_captured > 0:
+    _tpt_capture_rate_str = (
+        f"{_tpt_captured}/{_total_spawns} spawns "
+        f"({_trace_captured} trace + {_artifacts_captured} artifacts)"
+    )
+else:
+    _tpt_capture_rate_str = f"{_tpt_captured}/{_total_spawns} spawns"
+
+if _merged_token_values:
+    _tpt_label = f"median {_fmt_tok(_tpt_median)} (capture {_tpt_capture_rate_str})"
+else:
+    _tpt_label = "no capture data"
+
+tokens_per_task_block = {
+    "min": _tpt_min,
+    "median": _tpt_median,
+    "max": _tpt_max,
+    "captured_spawns": _tpt_captured,
+    "total_spawns": _total_spawns,
+    "capture_rate": _tpt_capture_rate_str,
+    "label": _tpt_label,
+    "trace_captured": _trace_captured,
+    "artifacts_captured": _artifacts_captured,
+}
+
+# --- Build output rows ---
+def render_layer_row(layer_name):
+    sl = layers[layer_name]
+    if only_layer != "all" and only_layer != layer_name:
+        return None
+    sev = sl["by_severity"]
+    top = sl["error_types"].most_common(3)
+    top_s = ", ".join(f"{k}:{v}" for k, v in top) if top else "—"
+    return {
+        "layer": layer_name,
+        "actions": sl["actions"],
+        "errors": sl["errors"],
+        "critical": sev["CRITICAL"],
+        "high":     sev["HIGH"],
+        "medium":   sev["MEDIUM"],
+        "low":      sev["LOW"],
+        "trend":    sl["trend"],
+        "top_types": top_s,
+    }
+
+rows = [r for l in LAYERS for r in [render_layer_row(l)] if r]
+
+# --- Recent errors (cross-layer, last 5) ---
+all_recent = []
+for l in LAYERS:
+    if only_layer != "all" and only_layer != l:
+        continue
+    for ev in layers[l]["recent"]:
+        all_recent.append({**ev, "layer": l})
+all_recent.sort(key=lambda e: parse_ts(e.get("timestamp")) or datetime.datetime.min, reverse=True)
+recent5 = all_recent[:5]
+
+# ---------------------------------------------------------------------------
+# Output
+# ---------------------------------------------------------------------------
+
+_out = {
+    "generated_at": now.isoformat(),
+    "agent": agent,
+    "filters": {
+        "since": since_raw,
+        "project": only_proj,
+        "layer": only_layer,
+        "caller_kind": only_caller,
+    },
+    "advisory_only": True,
+    "layers": rows,
+    "caller_kind_split": dict(caller_split),
+    "recent_errors": recent5,
+    "self_review_calibration": calibration_block,
+}
+if _token_count > 0:   # W3-T13: omitted entirely when no token data
+    _out["avg_tokens"] = avg_tokens
+    _out["token_samples"] = _token_count
+# S1-D2: always present (nulls when no data) — never omitted, never fabricated
+_out["tokens_per_task"] = tokens_per_task_block
+
+if as_json:
+    print(json.dumps(_out, indent=2))
+    sys.exit(0)
+
+# --- Human table ---
+TREND_GLYPH = {
+    "improving":  "▲ improving",
+    "degrading":  "▼ degrading",
+    "stable":     "= stable",
+    "no_baseline":"· first 30d",
+    "no_data":    "  no data",
+}
+
+print(f"V11.21 Agent Scorecard — {agent}   (ADVISORY ONLY — does not drive DAAO)")
+filt = []
+if since_raw:    filt.append(f"since={since_raw}")
+if only_proj:    filt.append(f"project={only_proj}")
+if only_layer != "all":   filt.append(f"layer={only_layer}")
+if only_caller != "all":  filt.append(f"caller_kind={only_caller}")
+if filt:
+    print("  filters: " + "  ".join(filt))
+print("=" * 96)
+print(f"  {'LAYER':<8}  {'ACTIONS':>8}  {'ERRORS':>7}  {'CRIT':>4}  {'HIGH':>4}  "
+      f"{'MED':>4}  {'LOW':>4}  {'TREND':<13}  TOP ERROR TYPES")
+print("  " + "-" * 92)
+
+total_actions = total_errors = 0
+for r in rows:
+    print(f"  {r['layer']:<8}  {r['actions']:>8}  {r['errors']:>7}  "
+          f"{r['critical']:>4}  {r['high']:>4}  {r['medium']:>4}  {r['low']:>4}  "
+          f"{TREND_GLYPH.get(r['trend'], r['trend']):<13}  {r['top_types']}")
+    total_actions += r["actions"]
+    total_errors += r["errors"]
+print("  " + "-" * 92)
+print(f"  {'TOTAL':<8}  {total_actions:>8}  {total_errors:>7}")
+print()
+
+# Caller-kind split
+if caller_split and sum(caller_split.values()) > 0:
+    print("  Caller-kind split (across selected layers):")
+    grand = sum(caller_split.values())
+    KNOWN_ORDER = ("orchestrator", "subagent", "unknown", "daemon")
+    ordered_keys = [k for k in KNOWN_ORDER if k in caller_split]
+    ordered_keys += sorted(k for k in caller_split if k not in KNOWN_ORDER)
+    for k in ordered_keys:
+        v = caller_split.get(k, 0)
+        if v == 0:
+            continue
+        pct = 100.0 * v / grand
+        print(f"    {k:<14} {v:>6}  ({pct:5.1f}%)")
+    print()
+
+# Recent errors (last 5)
+if recent5:
+    print("  Recent errors (last 5):")
+    for ev in recent5:
+        ts = (ev.get("timestamp") or "")[:19]
+        sev = ev.get("severity", "")
+        layer = ev.get("layer", "")
+        typ = ev.get("type", "")
+        msg = re.sub(r'[\x00-\x1f\x7f-\x9f]', '', (ev.get("message") or ""))[:80]
+        proj = ev.get("project") or "-"
+        print(f"    {ts}  [{layer:<7}] {sev:<8} {typ:<18} {msg}   ({proj})")
+    print()
+
+# V11.21 T16 — self_review_miss calibration block
+print("  Self-review calibration (INV-3 falsifiability):")
+print(f"    Paired tasks (self + adversarial verdicts): "
+      f"{calibration_block['paired_count_total']} total, "
+      f"{calibration_block['paired_count_last30']} last 30d")
+print(f"    Misses (self=NONE/LOW + adversarial=HIGH/CRITICAL): "
+      f"{calibration_block['miss_count_total']} total, "
+      f"{calibration_block['miss_count_last30']} last 30d")
+if calibration_block["paired_count_total"] > 0:
+    print(f"    Miss rate: {calibration_block['miss_rate_total']*100:.1f}% all-time, "
+          f"{calibration_block['miss_rate_last30']*100:.1f}% last 30d   "
+          f"({TREND_GLYPH.get(calibration_block['trend'], calibration_block['trend'])})")
+else:
+    print("    Miss rate: — (no paired data; emit self_review on completion to populate)")
+if calibration_block["advisory"]:
+    print(f"    ⚠ CALIBRATION ADVISORY: miss rate > 50% over last 30d "
+          f"({calibration_block['miss_count_last30']}/{calibration_block['paired_count_last30']}) "
+          f"— agent's self-review is consistently optimistic vs adversarial findings. "
+          f"Review the agent's postamble + recent miss examples below.")
+    if calibration_block["miss_examples"]:
+        print("    Recent miss examples:")
+        for ex in calibration_block["miss_examples"][:3]:
+            print(f"      • [{ex['project']}] task #{ex['task_id']}: "
+                  f"self={ex['self_severity']} vs adv={ex['adversarial_severity']} "
+                  f"({(ex.get('completed_at') or '')[:19]})")
+print()
+
+# W3-T13 — avg tokens/spawn (dispatch-trace completion events)
+print("  Token usage (W3-T13, from dispatch-trace completion events):")
+if _token_count > 0:
+    avg_s = f"{avg_tokens/1000:.0f}k" if avg_tokens >= 1000 else f"{avg_tokens:.0f}"
+    print(f"    Avg tokens/spawn: {avg_s} (n={_token_count})")
+else:
+    print("    Avg tokens/spawn: — (no completion-event token data for this agent)")
+print()
+
+# S1-D2/S1-D7 — tokens-per-task: min/median/max + source-labeled capture rate
+# (trace = dispatch-trace completion events, artifacts = durable-ledger
+# artifacts.tokens on async task closes)
+print("  Tokens per task (S1-D2/D7, min/median/max output tokens/spawn):")
+if _merged_token_values:
+    print(f"    tokens/task: min {_fmt_tok(_tpt_min)}  median {_fmt_tok(_tpt_median)}  "
+          f"max {_fmt_tok(_tpt_max)}  (capture {_tpt_capture_rate_str})")
+else:
+    print(f"    tokens/task: no capture data  (0 of {_total_spawns} spawns captured)")
+print()
+
+# Empty-state hint
+if total_actions == 0:
+    print("  No activity for this agent under the current filters.")
+    print(f"  Ledgers:")
+    print(f"    {audit_path}  ({'present' if os.path.exists(audit_path) else 'absent'})")
+    print(f"    {errors_path}  ({'present' if os.path.exists(errors_path) else 'absent'})")
+    print(f"  V11.20 wave/swarm findings reach the dashboard via:")
+    print(f"    scripts/backfill-wave-findings  (historical scan)")
+    print(f"    scripts/wave-review --attribute PROJECT WAVE  (post-review)")
+PYEOF

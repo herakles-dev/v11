@@ -1,0 +1,83 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "memory-index.schema.json",
+  "title": "V11 Memory Index",
+  "description": "Schema for project memory index configuration and entries",
+  "type": "object",
+  "properties": {
+    "config": {
+      "type": "object",
+      "properties": {
+        "project": { "type": "string", "minLength": 1 },
+        "index_path": { "type": "string", "description": "Path to .memory-index/ directory" },
+        "chunk_size_tokens": { "type": "integer", "default": 400, "minimum": 100, "maximum": 1000 },
+        "chunk_overlap_tokens": { "type": "integer", "default": 80, "minimum": 0 },
+        "embedding_model": {
+          "type": "string",
+          "enum": ["embedding-gemma-300m", "all-MiniLM-L6-v2", "tfidf", "none"],
+          "default": "all-MiniLM-L6-v2",
+          "description": "Embedding model for vector search. 'none' disables vector search (BM25 only)."
+        },
+        "embedding_dims": { "type": "integer", "default": 384 },
+        "hybrid_weights": {
+          "type": "object",
+          "properties": {
+            "vector": { "type": "number", "default": 0.7, "minimum": 0, "maximum": 1 },
+            "bm25": { "type": "number", "default": 0.3, "minimum": 0, "maximum": 1 }
+          },
+          "description": "Weights for hybrid search (must sum to 1.0)"
+        },
+        "sources": {
+          "type": "array",
+          "items": {
+            "enum": ["spec", "state", "notes", "claude_md", "tasks", "artifacts", "custom"]
+          },
+          "default": ["spec", "tasks", "notes", "artifacts"]
+        },
+        "rerank": { "type": "boolean", "default": false, "description": "Enable reranking step (adds ~300ms)" }
+      },
+      "required": ["project"]
+    },
+    "entry": {
+      "type": "object",
+      "properties": {
+        "id": { "type": "integer", "description": "Auto-increment primary key" },
+        "source_type": {
+          "enum": ["spec", "state", "notes", "claude_md", "tasks", "artifacts", "custom"],
+          "description": "Category of source document"
+        },
+        "file_path": { "type": "string", "description": "Path to source file" },
+        "chunk_text": { "type": "string", "description": "Chunk content (plain text)" },
+        "chunk_index": { "type": "integer", "description": "Position of chunk in source file" },
+        "line_start": { "type": "integer", "minimum": 1 },
+        "line_end": { "type": "integer", "minimum": 1 },
+        "content_hash": { "type": "string", "description": "SHA-256 of chunk_text for cache dedup" },
+        "embedding": { "description": "Float array or null if vector search disabled" },
+        "indexed_at": { "type": "string", "format": "date-time" },
+        "metadata": {
+          "type": "object",
+          "properties": {
+            "task_id": { "type": "string" },
+            "sprint": { "type": "string" },
+            "heading": { "type": "string", "description": "Nearest markdown heading" }
+          }
+        }
+      },
+      "required": ["source_type", "file_path", "chunk_text", "content_hash"]
+    },
+    "search_result": {
+      "type": "object",
+      "properties": {
+        "source": { "type": "string" },
+        "chunk": { "type": "string" },
+        "score": { "type": "number", "minimum": 0, "maximum": 1 },
+        "file": { "type": "string" },
+        "lines": { "type": "string", "pattern": "^\\d+-\\d+$" },
+        "source_type": { "type": "string" },
+        "heading": { "type": "string" }
+      },
+      "required": ["source", "chunk", "score", "file"]
+    }
+  },
+  "additionalProperties": false
+}

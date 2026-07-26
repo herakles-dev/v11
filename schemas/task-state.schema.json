@@ -1,0 +1,101 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "task-state.schema.json",
+  "title": "V11 Task State",
+  "description": "Schema for task-state JSON written by sync-tasks hook. Internal runtime state, not user-configured.",
+  "type": "object",
+  "properties": {
+    "project":          { "type": "string", "minLength": 1 },
+    "total":            { "type": "integer", "minimum": 0 },
+    "completed":        { "type": "integer", "minimum": 0 },
+    "pending":          { "type": "integer", "minimum": 0 },
+    "in_progress":      { "type": "integer", "minimum": 0 },
+    "blocked":          { "type": "integer", "minimum": 0 },
+    "phase":            { "type": "string" },
+    "active_task":      { "type": ["string", "null"] },
+    "active_task_id":   {
+      "type": ["string", "null"],
+      "description": "Canonical active task id (sync-tasks writes this; track-autonomy reads it for proof-of-work)"
+    },
+    "active_task_ids":  { "type": "array", "items": { "type": "string" } },
+    "active_task_sprint": {
+      "type": ["string", "null"],
+      "description": "Sprint label of the currently active task (from metadata.sprint)"
+    },
+    "active_task_gate": {
+      "type": ["string", "null"],
+      "description": "Gate label of the currently active task (from metadata.gate)"
+    },
+    "active_agent_id": {
+      "type": ["string", "null"],
+      "description": "Agent-id of the owner of the currently active task (written by sync-tasks from TaskUpdate owner; read by track-autonomy for audit attribution)"
+    },
+    "recent_completed": { "type": "array", "items": { "type": "string" } },
+    "blocked_tasks": {
+      "type": "array",
+      "description": "Currently blocked task IDs (subset of total, populated by sync-tasks)",
+      "items": { "type": "string" }
+    },
+    "finding_tasks": {
+      "type": "object",
+      "description": "Map of finding task id to metadata — tracked separately from regular tasks by sync-tasks when type=finding.",
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "severity": { "enum": ["critical", "high", "medium", "low", "info"] },
+          "status":   { "enum": ["pending", "in_progress", "completed", "cancelled", "blocked"] }
+        },
+        "additionalProperties": true
+      }
+    },
+    "dark_code_advisories": {
+      "type": "object",
+      "description": "Dark Code Layer 1 advisory counters — tracks how many complex/novel tasks lack spec_test_requirements",
+      "properties": {
+        "missing_str_count": { "type": "integer", "minimum": 0 },
+        "last_advised_at":   { "type": "string" }
+      },
+      "additionalProperties": true
+    },
+    "task_artifacts":   { "type": "object" },
+    "findings_summary": {
+      "type": "object",
+      "description": "Aggregate counts of finding tasks by severity (populated by sync-tasks when type=finding tasks exist)",
+      "properties": {
+        "critical":  { "type": "integer", "minimum": 0 },
+        "high":      { "type": "integer", "minimum": 0 },
+        "medium":    { "type": "integer", "minimum": 0 },
+        "low":       { "type": "integer", "minimum": 0 },
+        "total_raw": { "type": "integer", "minimum": 0, "description": "Total findings before deduplication" },
+        "total_deduped": { "type": "integer", "minimum": 0, "description": "Total findings after deduplication" },
+        "dedup_rate": { "type": "number", "minimum": 0, "maximum": 1, "description": "Fraction of findings that were duplicates" }
+      },
+      "additionalProperties": false
+    },
+    "review_summary": {
+      "type": "object",
+      "description": "Aggregate of per-task adversarial-lite review outcomes (V11.15). Populated by sync-tasks from artifacts.review on completed tasks. Project-scoped rollup; per-agent detail lives in ~/.agent-metrics/agent-effectiveness.jsonl.",
+      "properties": {
+        "tasks_reviewed": { "type": "integer", "minimum": 0 },
+        "total_errors":   { "type": "integer", "minimum": 0 },
+        "by_severity": {
+          "type": "object",
+          "properties": {
+            "critical": { "type": "integer", "minimum": 0 },
+            "high":     { "type": "integer", "minimum": 0 },
+            "medium":   { "type": "integer", "minimum": 0 },
+            "low":      { "type": "integer", "minimum": 0 }
+          },
+          "additionalProperties": false
+        },
+        "auto_fixed":     { "type": "integer", "minimum": 0, "description": "Errors auto-fixed by adversarial-lite-fixer" },
+        "escalated":      { "type": "integer", "minimum": 0, "description": "CRITICAL errors escalated to orchestrator (no auto-edit)" },
+        "avg_difficulty": { "type": "number", "minimum": 0, "maximum": 5 }
+      },
+      "additionalProperties": false
+    },
+    "last_updated":     { "type": "string" },
+    "last_session_end": { "type": "string" }
+  },
+  "required": ["project", "total", "completed", "pending"]
+}

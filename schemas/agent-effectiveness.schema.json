@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "agent-effectiveness.schema.json",
+  "title": "V11 Agent Effectiveness Ledger Line",
+  "description": "Schema for ONE line of ~/.agent-metrics/agent-effectiveness.jsonl (V11.15). Appended by sync-tasks as a rolling-window snapshot per agent after each reviewed task completes. scripts/agent-effectiveness renders the latest snapshot per agent_id as the per-agent scorecard. ADVISORY ONLY — does not feed DAAO routing in this phase.",
+  "type": "object",
+  "properties": {
+    "timestamp":   { "type": "string", "format": "date-time" },
+    "agent_id":    { "type": "string" },
+    "window_days": { "type": "integer", "minimum": 1, "default": 30 },
+    "tasks_completed":  { "type": "integer", "minimum": 0, "description": "Reviewed tasks for this agent in window" },
+    "tasks_error_free": { "type": "integer", "minimum": 0 },
+    "success_rate": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1,
+      "description": "tasks_error_free / tasks_completed (0 when tasks_completed=0)"
+    },
+    "avg_difficulty": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 5,
+      "description": "Mean of review.difficulty across the window — contextualizes success_rate"
+    },
+    "error_count": { "type": "integer", "minimum": 0, "description": "Total errors in window across all reviewed tasks" },
+    "error_types": {
+      "type": "object",
+      "additionalProperties": { "type": "integer", "minimum": 0 },
+      "description": "Map error_type -> count in window"
+    },
+    "trend": {
+      "enum": ["improving", "stable", "degrading"],
+      "description": "Direction of success_rate vs prior half-window"
+    }
+  },
+  "required": ["timestamp", "agent_id", "window_days", "tasks_completed", "success_rate"],
+  "additionalProperties": false
+}

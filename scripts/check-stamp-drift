@@ -1,0 +1,212 @@
+#!/usr/bin/env bash
+# check-stamp-drift — mechanized version-stamp drift detection.
+#
+# ROOT CAUSE this defends (W2-T6): version stamps across the repo (agent registry,
+# README, VERSION.md, CLAUDE.md) drift out of sync with the actual protocol version
+# because nothing checks them against a ground truth — the "hand-sweep" was the only
+# mechanism, and it lapsed for 8-18 versions across just 2 months before the last manual
+# sweep. This closes that gap the same way check-changelog-drift closed the §17 gap.
+#
+# Anchor: the protocol version is derived from git commit history (git log -60, same
+# pattern as the v11-coherence gate's DC1 anchor), NEVER from any in-repo string — an
+# in-repo string could itself be stale, which is exactly the failure mode being guarded
+# against.
+#
+# Checked surfaces (hardcoded list — add new surfaces here, not scattered elsewhere):
+#   agents/V11_AGENT_REGISTRY.json  — metadata.version + every agents[*].version
+#   README.md                       — "## Current Version: V11.x" heading
+#   VERSION.md                      — newest "## v11.x" section heading
+#   CLAUDE.md                       — "**Current: v11.x**" §17 pointer
+#
+# A surface whose claimed version's MAJOR.MINOR != anchor's MAJOR.MINOR → STAMP_DRIFT
+# finding (patch-level differences are tolerated, mirroring check-changelog-drift's
+# same-minor leniency — a stamp at v11.29.2 against anchor v11.29 is not drift).
+#
+# Soft-block: wired into scripts/run-tests --regression; surfaces but never shadows a
+# pytest failure. Rollback: V11_STAMP_DRIFT=off (no-op, always exit 0).
+#
+# Does NOT fix stale stamps — that's W2-T7, run this tool again after that merge to verify.
+set -uo pipefail
+
+V11_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+JSON_MODE=0
+for arg in "$@"; do
+    case "$arg" in
+        --json) JSON_MODE=1 ;;
+    esac
+done
+
+say() { printf '%s\n' "$*" >&2; }
+
+if [ "${V11_STAMP_DRIFT:-on}" = "off" ]; then
+    say "check-stamp-drift: disabled (V11_STAMP_DRIFT=off) — no-op."
+    exit 0
+fi
+
+# --- Checked surfaces (file paths relative to V11_ROOT) ---
+SURFACES=(
+    "agents/V11_AGENT_REGISTRY.json"
+    "README.md"
+    "VERSION.md"
+    "CLAUDE.md"
+)
+
+norm() {
+    # Extract MAJOR.MINOR from a version-ish string (drop leading v, drop patch).
+    printf '%s' "$1" | grep -oE '[0-9]+\.[0-9]+' | head -1
+}
+
+# --- Anchor: derive from git log, NEVER trust in-repo strings ---
+# --no-merges: default merge subjects embed the branch name (e.g. "into v11.28-handoff-steer"),
+# which pollutes the anchor with the branch's version, not the protocol's (found live 2026-07-11).
+ANCHOR_RAW="$(cd "$V11_ROOT" && git log -60 --no-merges --format='%s' 2>/dev/null \
+    | grep -oiE 'V11\.[0-9]+(\.[0-9]+)?' | head -1)"
+ANCHOR="$(printf '%s' "$ANCHOR_RAW" | tr '[:upper:]' '[:lower:]')"
+ANCHOR_MINOR="$(norm "$ANCHOR")"
+
+if [ -z "$ANCHOR_MINOR" ]; then
+    say "⚠ check-stamp-drift: could not derive an anchor version from git log (no V11.x commit subjects in last 60 commits). Skipping — cannot verify without an anchor."
+    [ "$JSON_MODE" -eq 1 ] && printf '{"anchor":null,"findings":[],"skipped":true}\n'
+    exit 0
+fi
+
+# --- Extract claimed version per surface ---
+extract_registry_metadata() {
+    local f="$1"
+    python3 -c "
+import json, sys
+try:
+    d = json.load(open('$f'))
+except Exception:
+    sys.exit(0)
+v = d.get('metadata', {}).get('version', '')
+print(v)
+" 2>/dev/null
+}
+
+extract_registry_agent_versions() {
+    local f="$1"
+    python3 -c "
+import json, sys
+try:
+    d = json.load(open('$f'))
+except Exception:
+    sys.exit(0)
+agents = d.get('agents', {})
+versions = set()
+if isinstance(agents, dict):
+    items = agents.values()
+elif isinstance(agents, list):
+    items = agents
+else:
+    items = []
+for a in items:
+    if isinstance(a, dict):
+        v = a.get('version')
+        if v:
+            versions.add(str(v))
+for v in sorted(versions):
+    print(v)
+" 2>/dev/null
+}
+
+extract_readme() {
+    local f="$1"
+    grep -oE '^## Current Version:[[:space:]]*[vV]?11\.[0-9]+(\.[0-9]+)?' "$f" 2>/dev/null | head -1 \
+        | grep -oE '11\.[0-9]+(\.[0-9]+)?'
+}
+
+extract_version_md() {
+    local f="$1"
+    grep -m1 -oE '^## +[vV]11\.[0-9]+(\.[0-9]+)?' "$f" 2>/dev/null \
+        | grep -oE '11\.[0-9]+(\.[0-9]+)?'
+}
+
+extract_claude_md() {
+    local f="$1"
+    grep -oE '\*\*Current:[[:space:]]*[vV]?11\.[0-9]+(\.[0-9]+)?' "$f" 2>/dev/null | head -1 \
+        | grep -oE '11\.[0-9]+(\.[0-9]+)?'
+}
+
+# --- Collect findings: each row is "file<TAB>field<TAB>found" ---
+ROWS=()
+
+for rel in "${SURFACES[@]}"; do
+    f="$V11_ROOT/$rel"
+    [ -f "$f" ] || { say "⚠ check-stamp-drift: surface not found, skipping ($rel)"; continue; }
+
+    case "$rel" in
+        agents/V11_AGENT_REGISTRY.json)
+            meta_v="$(extract_registry_metadata "$f")"
+            [ -n "$meta_v" ] && ROWS+=("$rel	metadata.version	$meta_v")
+            while IFS= read -r av; do
+                [ -n "$av" ] && ROWS+=("$rel	agents[*].version	$av")
+            done < <(extract_registry_agent_versions "$f")
+            ;;
+        README.md)
+            v="$(extract_readme "$f")"
+            [ -n "$v" ] && ROWS+=("$rel	Current Version	$v")
+            ;;
+        VERSION.md)
+            v="$(extract_version_md "$f")"
+            [ -n "$v" ] && ROWS+=("$rel	newest section heading	$v")
+            ;;
+        CLAUDE.md)
+            v="$(extract_claude_md "$f")"
+            [ -n "$v" ] && ROWS+=("$rel	§17 Current pointer	$v")
+            ;;
+    esac
+done
+
+# --- Compare each row against the anchor; dedupe identical (file,field,found) drift rows ---
+fail=0
+declare -A SEEN=()
+FINDINGS_JSON="["
+first_json=1
+TABLE_LINES=()
+
+for row in "${ROWS[@]}"; do
+    IFS=$'\t' read -r file field found <<<"$row"
+    found_minor="$(norm "$found")"
+    status="OK"
+    if [ "$found_minor" != "$ANCHOR_MINOR" ]; then
+        status="DRIFT"
+        fail=1
+        key="$file|$field|$found"
+        if [ -z "${SEEN[$key]:-}" ]; then
+            SEEN[$key]=1
+            if [ "$first_json" -eq 1 ]; then
+                first_json=0
+            else
+                FINDINGS_JSON+=","
+            fi
+            FINDINGS_JSON+="$(python3 -c "
+import json
+print(json.dumps({'file': '$file', 'field': '$field', 'found': '$found', 'expected': '$ANCHOR_MINOR'}))
+")"
+        fi
+    fi
+    TABLE_LINES+=("$(printf '%-45s %-22s %-12s %-12s %s' "$file" "$field" "$found" "$ANCHOR_MINOR" "$status")")
+done
+FINDINGS_JSON+="]"
+
+if [ "$JSON_MODE" -eq 1 ]; then
+    printf '{"anchor":"%s","findings":%s}\n' "$ANCHOR_MINOR" "$FINDINGS_JSON"
+else
+    say "check-stamp-drift: anchor = v${ANCHOR_MINOR} (derived from git log)"
+    say ""
+    say "$(printf '%-45s %-22s %-12s %-12s %s' "FILE" "FIELD" "FOUND" "EXPECTED" "STATUS")"
+    for line in "${TABLE_LINES[@]}"; do
+        say "$line"
+    done
+    say ""
+    if [ "$fail" -eq 0 ]; then
+        say "✓ check-stamp-drift: all surfaces match anchor v${ANCHOR_MINOR}."
+    else
+        say "❌ STAMP_DRIFT: one or more surfaces disagree with anchor v${ANCHOR_MINOR}."
+        say "   This is a report of a symptom the sweep (W2-T7) must fix — this tool does not write files."
+    fi
+fi
+
+exit "$fail"

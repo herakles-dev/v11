@@ -1,0 +1,272 @@
+#!/bin/bash
+# V11 Script: v11-resume-tasks
+#
+# Reads sessions/{project}/handoff-tasks.json (written by scripts/handoff at the
+# end of the prior session) and emits a Claude-readable <v11-resume> block.
+# The new session's Claude detects the block and issues one TaskCreate per
+# entry, rebuilding the TaskList with subjects + metadata intact.
+#
+# Why this exists:
+#   Claude Code's TaskList is per-session (per-UUID). A new session starts with
+#   an empty TaskList. Before V11.13 the handoff doc claimed the project
+#   task-state was resumable; in practice the receiving session had no way to
+#   address the IDs in that file (they belonged to other sessions' TaskLists).
+#   This script closes the loop: handoff captures open tasks structured for
+#   rebuild; resume-tasks prints them in a format Claude executes.
+#
+# Usage:
+#   v11-resume-tasks PROJECT                # emit <v11-resume> block on stdout
+#   v11-resume-tasks PROJECT --json         # emit raw JSON payload
+#   v11-resume-tasks PROJECT --list         # human-readable summary
+#   v11-resume-tasks PROJECT --dry-run      # alias for --list
+#   v11-resume-tasks --help                 # show this help
+#
+# Exit codes:
+#   0 — emitted (or no open tasks, which is a valid no-op)
+#   1 — usage error or invalid project name
+#   2 — handoff-tasks.json missing (graceful, with stderr message)
+#   3 — handoff-tasks.json corrupt
+
+set -euo pipefail
+
+V11_WORKSPACE_ROOT="${V11_WORKSPACE_ROOT:-$HOME/.v11}"
+SESSIONS_ROOT="${SESSIONS_ROOT:-$V11_WORKSPACE_ROOT/sessions}"
+METRICS_DIR="$V11_WORKSPACE_ROOT/.agent-metrics"
+
+# --- arg parsing ---
+PROJECT=""
+MODE="block"   # block | json | list
+
+for arg in "$@"; do
+    case "$arg" in
+        --help|-h)
+            sed -n '3,32p' "$0" | sed 's/^# \{0,1\}//'
+            exit 0
+            ;;
+        --test)
+            echo "v11-resume-tasks OK"
+            exit 0
+            ;;
+        --json)         MODE="json" ;;
+        --list|--dry-run) MODE="list" ;;
+        -*)
+            echo "Unknown flag: $arg" >&2
+            exit 1
+            ;;
+        *)
+            [ -n "$PROJECT" ] && { echo "Multiple project names given" >&2; exit 1; }
+            PROJECT="$arg"
+            ;;
+    esac
+done
+
+if [ -z "$PROJECT" ]; then
+    # Auto-detect from active-project (sanitized)
+    AP="$METRICS_DIR/active-project"
+    if [ -f "$AP" ] && [ -s "$AP" ]; then
+        candidate=$(head -n 1 "$AP" 2>/dev/null | tr -d '[:space:]')
+        if printf '%s' "$candidate" | grep -qE '^[a-zA-Z0-9._-]{1,64}$'; then
+            PROJECT="$candidate"
+        fi
+    fi
+fi
+
+if [ -z "$PROJECT" ]; then
+    echo "Error: No project specified and no active project detected." >&2
+    echo "Usage: $0 PROJECT [--json|--list]" >&2
+    exit 1
+fi
+
+# Sanitize project name
+if ! printf '%s' "$PROJECT" | grep -qE '^[a-zA-Z0-9._-]{1,64}$'; then
+    echo "Error: invalid project name: $PROJECT" >&2
+    exit 1
+fi
+
+HANDOFF_TASKS="$SESSIONS_ROOT/$PROJECT/handoff-tasks.json"
+
+if [ ! -f "$HANDOFF_TASKS" ]; then
+    echo "v11-resume-tasks: no handoff-tasks.json at $HANDOFF_TASKS" >&2
+    echo "  Either the prior session didn't call /handoff, or this is the first session for $PROJECT." >&2
+    exit 2
+fi
+
+if ! jq empty "$HANDOFF_TASKS" 2>/dev/null; then
+    echo "v11-resume-tasks: handoff-tasks.json is corrupt JSON: $HANDOFF_TASKS" >&2
+    exit 3
+fi
+
+# --- emit ---
+TASK_COUNT=$(jq -r '.open_tasks | length' "$HANDOFF_TASKS")
+SOURCE_UUID=$(jq -r '.source_session_uuid // "unknown"' "$HANDOFF_TASKS")
+SOURCE_KIND=$(jq -r '.source_kind // "unknown"' "$HANDOFF_TASKS")
+HANDOFF_AT=$(jq -r '.handoff_at // ""' "$HANDOFF_TASKS")
+
+# V11.21 (T15): orphan review awareness.
+# When `scripts/handoff` ran with V11_HANDOFF_REVIEW_FILTER=on (default), it
+# filtered out pending_parent siblings (the Phase 4 recovery scan re-synthesizes
+# them) and tagged orphan reviews (parent already completed but review still
+# open) with metadata.is_review_sibling=true. Count them so the resume block
+# can tell the receiving session what's a regular work task vs a standalone
+# review the orchestrator must still spawn.
+ORPHAN_REVIEW_COUNT=$(jq -r '
+    [ .open_tasks[]? | select((.metadata.is_review_sibling // false) == true) ] | length
+' "$HANDOFF_TASKS" 2>/dev/null || echo 0)
+[[ "$ORPHAN_REVIEW_COUNT" =~ ^[0-9]+$ ]] || ORPHAN_REVIEW_COUNT=0
+FILTERED_PENDING_PARENT=$(jq -r '.review_filter.dropped_pending_parent // 0' "$HANDOFF_TASKS" 2>/dev/null || echo 0)
+[[ "$FILTERED_PENDING_PARENT" =~ ^[0-9]+$ ]] || FILTERED_PENDING_PARENT=0
+
+case "$MODE" in
+    json)
+        cat "$HANDOFF_TASKS"
+        ;;
+
+    list)
+        echo "v11-resume-tasks: $PROJECT (source: $SOURCE_KIND/$SOURCE_UUID, handoff_at: $HANDOFF_AT)"
+        echo "Open tasks: $TASK_COUNT"
+        if [ "$ORPHAN_REVIEW_COUNT" -gt 0 ] || [ "$FILTERED_PENDING_PARENT" -gt 0 ]; then
+            echo "Review siblings: $ORPHAN_REVIEW_COUNT orphan (rehydrate standalone), $FILTERED_PENDING_PARENT pending_parent (auto-recreated by Phase 4 recovery scan)"
+        fi
+        if [ "$TASK_COUNT" -eq 0 ]; then
+            echo "  (no rehydration needed)"
+        else
+            # R2.3 (W1-T2): defense-in-depth ledger-fallback subject lookup.
+            # handoff-tasks.json is normally already subject-filled (scripts/handoff
+            # does this at emit time), but a handoff-tasks.json written before that
+            # fix shipped may still carry nulls — recover them here too rather than
+            # printing "(no subject)".
+            _RT_LEDGER_FILE="$METRICS_DIR/ledger/${PROJECT}.jsonl"
+            _RT_SUBJ_MAP="{}"
+            if [ -f "$_RT_LEDGER_FILE" ]; then
+                _RT_SUBJ_MAP=$(jq -s -c '
+                    reduce .[] as $ev ({};
+                        if (($ev.task_id // "") != "") and (($ev.subject // null) != null) and (($ev.subject // "") != "") then
+                            .[$ev.task_id] = $ev.subject
+                        else . end
+                    )
+                ' "$_RT_LEDGER_FILE" 2>/dev/null || echo "{}")
+            fi
+            jq -r --argjson lsm "$_RT_SUBJ_MAP" '
+                .open_tasks[] | "  #\(.id) [\(.status // "pending")]\((.metadata.is_review_sibling // false | if . then " {orphan-review}" else "" end)) \(.subject // $lsm[.id] // "(no subject)")"
+            ' "$HANDOFF_TASKS"
+        fi
+        ;;
+
+    block)
+        # W1-2 (H5): V11_AUTO_REHYDRATE is the documented rehydration off-switch.
+        # Gate ONLY the <v11-resume> block emission path — --json/--list/--test
+        # must remain unaffected (tests/integration/harness.py and
+        # test_scripts_smoke.py call those modes directly).
+        if [ "${V11_AUTO_REHYDRATE:-}" = "off" ]; then
+            echo "v11-resume-tasks: auto-rehydrate disabled (V11_AUTO_REHYDRATE=off)" >&2
+            exit 0
+        fi
+
+        if [ "$TASK_COUNT" -eq 0 ]; then
+            echo "v11-resume-tasks: $PROJECT has 0 open tasks — nothing to rehydrate." >&2
+            exit 0
+        fi
+
+        # T9 (v11-handoff-hygiene): family-aware rehydration.
+        # T1's fold gave us one .open_tasks entry per family. Default rehydration
+        # is one TaskCreate per family (the canonical, with .family_members[] in
+        # metadata for audit). V11_REHYDRATE_FOLD=off unfolds families back to
+        # one TaskCreate per RAW member (V11.17 behavior). Useful when the receiver
+        # wants to manually verify each family member before merging.
+        _UNFOLD="no"
+        [ "${V11_REHYDRATE_FOLD:-on}" = "off" ] && _UNFOLD="yes"
+
+        # Count how many families have size>1 (for the receiver's awareness)
+        _FAM_GT1=$(jq -r '[.open_tasks[] | select((.size // 1) > 1)] | length' "$HANDOFF_TASKS" 2>/dev/null || echo 0)
+        [[ "$_FAM_GT1" =~ ^[0-9]+$ ]] || _FAM_GT1=0
+
+        # Emit a fenced block Claude can parse. Each entry has the minimal fields
+        # needed for TaskCreate: subject, description, metadata.
+        printf '<v11-resume project="%s" count="%s" families_gt1="%s" orphan_reviews="%s" filtered_pending_parent="%s" unfold_mode="%s" source_session="%s" handoff_at="%s">\n' \
+            "$PROJECT" "$TASK_COUNT" "$_FAM_GT1" "$ORPHAN_REVIEW_COUNT" "$FILTERED_PENDING_PARENT" "$_UNFOLD" "$SOURCE_UUID" "$HANDOFF_AT"
+        printf 'Rehydrate the task list for project "%s". Issue one TaskCreate per entry below, ' "$PROJECT"
+        printf 'preserving subject, description, and metadata. After TaskCreate, also TaskUpdate(taskId, status="in_progress") '
+        printf 'for any entry whose status_at_handoff is "in_progress".\n'
+        if [ "$_FAM_GT1" -gt 0 ] && [ "$_UNFOLD" = "no" ]; then
+            printf '\nNOTE: %s of these entries are FAMILIES (multiple near-duplicate subjects from different sessions collapsed into one). Each carries metadata.family_members[] listing the raw members. Verify the merge looks right; if a family is a false-merge, split it manually after rehydration.\n' "$_FAM_GT1"
+        fi
+        if [ "$ORPHAN_REVIEW_COUNT" -gt 0 ]; then
+            printf '\nNOTE: %s of these entries are ORPHAN REVIEW siblings (metadata.is_review_sibling=true). Their parent task is already completed; the review task itself is still pending/in_progress. Rehydrate them as standalone tasks — the Phase 4 recovery scan will NOT re-synthesize them because they already exist in handoff-tasks.json. The orchestrator skill should spawn adversarial-lite-reviewer on each.\n' "$ORPHAN_REVIEW_COUNT"
+        fi
+        if [ "$FILTERED_PENDING_PARENT" -gt 0 ]; then
+            printf '\nNOTE: %s pending_parent review siblings were filtered from this handoff. They will be re-synthesized automatically by the orchestrator skill Phase 4 recovery scan when their parent work tasks rehydrate. Do NOT manually re-create them.\n' "$FILTERED_PENDING_PARENT"
+        fi
+        printf '\n%s\n' "Task payloads (JSON array):"
+
+        if [ "$_UNFOLD" = "yes" ]; then
+            # Unfold: emit one entry per family_member (or the family itself when size=1)
+            jq -c '
+                .open_tasks | map(
+                    (.size // 1) as $sz |
+                    if $sz <= 1 or (.family_members // []) == [] then
+                        [{
+                            subject: (.subject // "untitled (rehydrated)"),
+                            description: (.description // .subject // "rehydrated from handoff"),
+                            status_at_handoff: (.status // "pending"),
+                            metadata: (.metadata // {})
+                        }]
+                    else
+                        (.family_members // []) | map({
+                            subject: (.subject // "untitled (rehydrated)"),
+                            description: (.description // .subject // "rehydrated from handoff"),
+                            status_at_handoff: (.status // "pending"),
+                            metadata: {}
+                        })
+                    end
+                ) | add // []
+            ' "$HANDOFF_TASKS"
+        else
+            # Family-aware: one TaskCreate per family entry, family_members[] in metadata
+            jq -c '.open_tasks | map(
+                . as $f |
+                {
+                    subject: (.subject // "untitled (rehydrated)"),
+                    description: (.description // .subject // "rehydrated from handoff"),
+                    status_at_handoff: (.status // "pending"),
+                    metadata: ((.metadata // {})
+                        + (if (.size // 1) > 1 then {
+                            family_size: ($f.size // 1),
+                            family_member_subjects: ($f.family_members // [] | map(.subject)),
+                            family_member_sessions: ($f.family_members // [] | map(.source_session_uuid // "unknown") | unique),
+                            verify_before_merge: true
+                          } else {} end))
+                }
+            )' "$HANDOFF_TASKS"
+        fi
+        printf '\n</v11-resume>\n'
+
+        # T9 (v11-handoff-hygiene): write rehydration log artifact for observability.
+        _REHYDRATION_LOG="$SESSIONS_ROOT/$PROJECT/.rehydration-log.json"
+        _TMP="$_REHYDRATION_LOG.tmp.$$"
+        jq -n \
+            --arg ts "$(date -Iseconds)" \
+            --arg project "$PROJECT" \
+            --arg source_uuid "$SOURCE_UUID" \
+            --arg handoff_at "$HANDOFF_AT" \
+            --argjson task_count "$TASK_COUNT" \
+            --argjson families_gt1 "$_FAM_GT1" \
+            --arg unfold_mode "$_UNFOLD" '
+            {
+                generated_at: $ts,
+                project: $project,
+                source_session_uuid: $source_uuid,
+                handoff_at: $handoff_at,
+                rehydrated_count: $task_count,
+                families_gt1: $families_gt1,
+                unfold_mode: $unfold_mode,
+                rollback_env: "V11_REHYDRATE_FOLD=off to unfold families into raw members"
+            }' > "$_TMP" 2>/dev/null
+        if [ -s "$_TMP" ] && jq empty "$_TMP" 2>/dev/null; then
+            mv "$_TMP" "$_REHYDRATION_LOG"
+        else
+            rm -f "$_TMP" 2>/dev/null || true
+        fi
+        ;;
+esac
+
+exit 0

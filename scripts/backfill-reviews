@@ -1,0 +1,337 @@
+#!/bin/bash
+# V11.19 Script: backfill-reviews
+# One-shot scan: enqueue completed tasks whose review verdict was never recorded.
+#
+# The V11.19 sync-tasks enqueue path catches new completions going forward.
+# This script catches the historical population — completed tasks across all
+# session task-state files (and the durable ledger aggregate) that completed
+# BEFORE V11.19 deployed (or while V11_REVIEW_ENFORCEMENT=off).
+#
+# Idempotent: if a task is already in the queue (pending OR done), skip it.
+#
+# USAGE:
+#   backfill-reviews                        # All projects, all completed tasks
+#   backfill-reviews --project P            # One project
+#   backfill-reviews --dry-run              # List only, no writes
+#   backfill-reviews --since 2026-04-01     # Skip tasks completed before date
+#   backfill-reviews --test
+#   backfill-reviews --help
+#
+# Skip rules:
+#   - Task already in queue (pending or done) → skip
+#   - Task has metadata.artifacts.review (was reviewed in original session) → skip
+#   - --since cutoff older than completion time → skip
+# Otherwise → enqueue with pending event.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+V11_HOME="${V11_HOME:-$(dirname "$SCRIPT_DIR")}"
+# shellcheck source=../hooks/lib/common.sh
+source "$V11_HOME/hooks/lib/common.sh"
+
+if [ "${1:-}" = "--test" ]; then
+    echo "backfill-reviews v1.0 (V11.19)"
+    exit 0
+fi
+
+if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
+    sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'
+    exit 0
+fi
+
+PROJECT_FILTER=""
+DRY_RUN=false
+SINCE=""
+VERBOSE=false
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --project) PROJECT_FILTER="${2:-}"; shift ;;
+        --dry-run) DRY_RUN=true ;;
+        --since) SINCE="${2:-}"; shift ;;
+        --verbose|-v) VERBOSE=true ;;
+        *) echo "backfill-reviews: unknown arg '$1'" >&2; exit 2 ;;
+    esac
+    shift
+done
+
+# Discover candidate projects from $METRICS_DIR/ledger/*.jsonl (canonical) and
+# $SESSIONS_ROOT/*/.task-state.json (legacy / per-session source).
+declare -a PROJECTS=()
+if [ -n "$PROJECT_FILTER" ]; then
+    PROJECTS=("$PROJECT_FILTER")
+else
+    if [ -d "$METRICS_DIR/ledger" ]; then
+        for f in "$METRICS_DIR/ledger"/*.jsonl; do
+            [ -f "$f" ] || continue
+            p=$(basename "$f" .jsonl)
+            # Skip dot-prefixed (e.g., .migrated)
+            case "$p" in .*) continue ;; esac
+            PROJECTS+=("$p")
+        done
+    fi
+    if [ -d "$SESSIONS_ROOT" ]; then
+        for d in "$SESSIONS_ROOT"/*/; do
+            [ -d "$d" ] || continue
+            p=$(basename "$d")
+            case "$p" in .*) continue ;; esac
+            # Add if not already present
+            present=0
+            for existing in "${PROJECTS[@]:-}"; do
+                [ "$existing" = "$p" ] && { present=1; break; }
+            done
+            [ "$present" = 0 ] && PROJECTS+=("$p")
+        done
+    fi
+fi
+
+[ "${#PROJECTS[@]}" -eq 0 ] && { echo "No projects found."; exit 0; }
+
+TOTAL_ENQUEUED=0
+TOTAL_REJECTED=0
+TOTAL_SKIPPED_QUEUED=0
+TOTAL_SKIPPED_REVIEWED=0
+TOTAL_SKIPPED_SINCE=0
+TOTAL_PROJECTS_TOUCHED=0
+
+# For each project, enumerate completed tasks. Sources of truth (in priority):
+#   1. Durable ledger ($METRICS_DIR/ledger/$PROJECT.jsonl): completed events
+#   2. Aggregate task-state ($METRICS_DIR/task-state/$PROJECT.json): recent_completed
+#   3. Per-session task-state ($SESSIONS_ROOT/$PROJECT/.task-state.json): recent_completed
+# All three converge on (task_id, subject, completed_at, agent_id, artifacts.review).
+
+for project in "${PROJECTS[@]}"; do
+    # Validate project name (SEC-C-02)
+    if ! printf '%s' "$project" | grep -qE '^[a-zA-Z0-9._-]{1,64}$'; then
+        [ "$VERBOSE" = "true" ] && echo "[skip] invalid project name: $project" >&2
+        continue
+    fi
+
+    LEDGER_FILE="$METRICS_DIR/ledger/$project.jsonl"
+    AGG_FILE="$METRICS_DIR/task-state/$project.json"
+    SESSION_FILE="$SESSIONS_ROOT/$project/.task-state.json"
+
+    # Build the candidate list as JSON: [{task_id, subject, agent_id, completed_at, has_review}]
+    CANDIDATES_JSON=$(V11_BF_LEDGER="$LEDGER_FILE" V11_BF_AGG="$AGG_FILE" V11_BF_SESSION="$SESSION_FILE" \
+                      V11_BF_PROJECT="$project" V11_BF_SINCE="$SINCE" python3 - <<'PYEOF' 2>/dev/null || echo '[]'
+import os, json, sys, datetime, re
+
+ledger = os.environ.get("V11_BF_LEDGER", "")
+agg = os.environ.get("V11_BF_AGG", "")
+session = os.environ.get("V11_BF_SESSION", "")
+since = os.environ.get("V11_BF_SINCE", "").strip()
+
+def parse_ts(s):
+    if not s:
+        return None
+    try:
+        return datetime.datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+since_dt = parse_ts(since) if since else None
+
+candidates = {}  # task_id -> dict
+ledger_has_events = False  # When True, trust ledger as canonical; aggregate only supplements known tasks
+
+# Source 1: ledger (durable, V11.16+). When present, this is the source of truth.
+if ledger and os.path.exists(ledger):
+    try:
+        with open(ledger, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    ev = json.loads(line)
+                except Exception:
+                    continue
+                ledger_has_events = True
+                if ev.get("ev") != "completed":
+                    continue
+                tid = str(ev.get("task_id", ""))
+                if not tid:
+                    continue
+                completed_at = ev.get("at") or ev.get("ts") or ""
+                subj = ev.get("subject") or ""
+                has_review = bool((ev.get("artifacts") or {}).get("review"))
+                # Most recent completed wins (later timestamp overrides)
+                slot = candidates.get(tid)
+                cur_dt = parse_ts(completed_at)
+                if slot is None or (cur_dt and parse_ts(slot.get("completed_at", "")) and cur_dt > parse_ts(slot["completed_at"])) or (cur_dt and not slot.get("completed_at")):
+                    candidates[tid] = {
+                        "task_id": tid,
+                        "subject": subj,
+                        "agent_id": "unknown",  # ledger doesn't carry agent reliably
+                        "completed_at": completed_at,
+                        "has_review": has_review,
+                        "source": "ledger",
+                    }
+    except Exception:
+        pass
+
+# Sources 2-3: aggregate / per-session task-state.
+# When ledger HAS events: SUPPLEMENT-ONLY mode. Use these to fill agent_id /
+# subject for tasks the ledger already attests to — but never CREATE new
+# candidates here, because the aggregate is a derivative fold and can drift
+# from the ledger (e.g., counter-only updates that lost identity, residual
+# stamps from prior sessions). Trusting the aggregate to add new task IDs
+# silently re-introduces the V11.15.5/16 cross-session contamination shape.
+# When ledger is ABSENT (legacy / pre-V11.16 project): aggregate IS the
+# source — we let it create candidates as the only available signal.
+def merge_state_file(path, src):
+    if not path or not os.path.exists(path):
+        return
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return
+    recent = data.get("recent_completed", [])
+    rec_agents = data.get("recommended_agents", {})
+    artifacts_map = data.get("task_artifacts", {})
+    for entry in recent:
+        tid = str(entry.get("id", ""))
+        if not tid:
+            continue
+        subj = entry.get("subject", "")
+        at = entry.get("at", "")
+        agent = rec_agents.get(tid) or "unknown"
+        # Has-review check: scan task_artifacts[tid].review presence
+        has_review = bool((artifacts_map.get(tid) or {}).get("review"))
+        slot = candidates.get(tid)
+        if slot is None:
+            # When ledger is present (V11.16+), don't add candidates that the
+            # ledger doesn't attest to. The aggregate can drift; the ledger
+            # cannot. This guard kills the V11.15.5/16-shape contamination
+            # path where stamped recent_completed entries from a foreign
+            # session leak in as enqueues.
+            if ledger_has_events:
+                continue
+            candidates[tid] = {
+                "task_id": tid,
+                "subject": subj,
+                "agent_id": agent,
+                "completed_at": at,
+                "has_review": has_review,
+                "source": src,
+            }
+        else:
+            if slot.get("agent_id") == "unknown" and agent != "unknown":
+                slot["agent_id"] = agent
+            if not slot.get("subject") and subj:
+                slot["subject"] = subj
+            if not slot.get("has_review") and has_review:
+                slot["has_review"] = True
+
+merge_state_file(agg, "aggregate")
+merge_state_file(session, "session")
+
+# Filter by --since
+out = []
+for tid, c in candidates.items():
+    if since_dt:
+        cdt = parse_ts(c.get("completed_at", ""))
+        if cdt is None or cdt < since_dt:
+            c["_skip_since"] = True
+    out.append(c)
+
+print(json.dumps(out, separators=(",", ":")))
+PYEOF
+)
+
+    if [ -z "$CANDIDATES_JSON" ] || [ "$CANDIDATES_JSON" = "[]" ]; then
+        continue
+    fi
+
+    PROJECT_TOUCHED=0
+
+    # Iterate candidates (newline-delimited from jq)
+    while IFS= read -r ENTRY; do
+        [ -z "$ENTRY" ] && continue
+        TASK_ID=$(printf '%s' "$ENTRY" | jq -r '.task_id')
+        SUBJECT=$(printf '%s' "$ENTRY" | jq -r '.subject')
+        AGENT=$(printf '%s' "$ENTRY" | jq -r '.agent_id')
+        HAS_REVIEW=$(printf '%s' "$ENTRY" | jq -r '.has_review')
+        SKIP_SINCE=$(printf '%s' "$ENTRY" | jq -r '._skip_since // false')
+
+        if [ "$SKIP_SINCE" = "true" ]; then
+            TOTAL_SKIPPED_SINCE=$((TOTAL_SKIPPED_SINCE + 1))
+            continue
+        fi
+        if [ "$HAS_REVIEW" = "true" ]; then
+            TOTAL_SKIPPED_REVIEWED=$((TOTAL_SKIPPED_REVIEWED + 1))
+            continue
+        fi
+
+        # Already-in-queue check: any prior event (pending or done) → skip.
+        # We can't use v11_review_queue_add's "exists" alone because it only
+        # detects pending. A task that was mark-done'd shouldn't be re-enqueued
+        # by backfill (it was reviewed somewhere).
+        QUEUE_FILE=$(v11_review_queue_path "$project" jsonl 2>/dev/null || echo "")
+        IN_QUEUE="no"
+        if [ -n "$QUEUE_FILE" ] && [ -f "$QUEUE_FILE" ]; then
+            IN_QUEUE=$(V11_RQ_FILE="$QUEUE_FILE" V11_RQ_TASK="$TASK_ID" python3 -c '
+import os, json
+path = os.environ["V11_RQ_FILE"]
+target = os.environ["V11_RQ_TASK"]
+found = "no"
+try:
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                ev = json.loads(line)
+            except Exception:
+                continue
+            if str(ev.get("task_id", "")) == target:
+                found = "yes"
+                break
+except Exception:
+    pass
+print(found, end="")
+' 2>/dev/null || echo "no")
+        fi
+
+        if [ "$IN_QUEUE" = "yes" ]; then
+            TOTAL_SKIPPED_QUEUED=$((TOTAL_SKIPPED_QUEUED + 1))
+            continue
+        fi
+
+        if [ "$DRY_RUN" = "true" ]; then
+            echo "[dry-run] would enqueue: $project/#$TASK_ID — $SUBJECT (agent: $AGENT)"
+            TOTAL_ENQUEUED=$((TOTAL_ENQUEUED + 1))
+            PROJECT_TOUCHED=1
+        else
+            # Count only writes that actually land — v11_review_queue_add rejects
+            # skeletal bleed entries (subject='unknown' + files_changed=[]) by
+            # design, and swallowing that with `|| true` while bumping the
+            # counter made the summary lie ("enqueued" for rejected rows).
+            if v11_review_queue_add "$project" "$TASK_ID" "$AGENT" "$SUBJECT" "[]" "" >/dev/null 2>&1; then
+                [ "$VERBOSE" = "true" ] && echo "[enqueued] $project/#$TASK_ID — $SUBJECT"
+                TOTAL_ENQUEUED=$((TOTAL_ENQUEUED + 1))
+                PROJECT_TOUCHED=1
+            else
+                TOTAL_REJECTED=$((TOTAL_REJECTED + 1))
+                [ "$VERBOSE" = "true" ] && echo "[rejected] $project/#$TASK_ID — see ~/.agent-metrics/enqueue-rejections.log"
+            fi
+        fi
+    done < <(printf '%s' "$CANDIDATES_JSON" | jq -c '.[]')
+
+    if [ "$PROJECT_TOUCHED" = 1 ]; then
+        TOTAL_PROJECTS_TOUCHED=$((TOTAL_PROJECTS_TOUCHED + 1))
+    fi
+done
+
+echo "Backfill summary:"
+echo "  Projects scanned:     ${#PROJECTS[@]}"
+echo "  Projects touched:     $TOTAL_PROJECTS_TOUCHED"
+echo "  Tasks enqueued:       $TOTAL_ENQUEUED"
+echo "  Rejected (skeletal/bleed defense): $TOTAL_REJECTED"
+echo "  Skipped (already in queue): $TOTAL_SKIPPED_QUEUED"
+echo "  Skipped (already reviewed): $TOTAL_SKIPPED_REVIEWED"
+[ -n "$SINCE" ] && echo "  Skipped (before --since): $TOTAL_SKIPPED_SINCE"
+[ "$DRY_RUN" = "true" ] && echo "  (DRY RUN — no writes performed)"
+exit 0

@@ -1,0 +1,773 @@
+#!/bin/bash
+# V11 Flywheel Ingest — Findings back into the framework
+# Usage: ./scripts/flywheel-ingest [--min-count N] [--since DAYS] [--output FILE] [--dry-run]
+#
+# Scans issues.json files from synthesize-findings across all projects,
+# clusters recurring finding patterns, and proposes patches to:
+#   1. templates/spec.md.template   (pre-generation checklist items)
+#   2. agents/*.md                  ("common failure modes" sections)
+#   3. benchmarks/fixtures/         (regression test cases)
+#
+# Output is a human-reviewable proposal. Nothing is auto-applied.
+# This keeps autonomy boundary clear: findings inform, humans decide.
+#
+# Addresses Dark Code Layer 4 Gap 4 (Quality Flywheel Integration).
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+V11_HOME="${V11_HOME:-$(dirname "$SCRIPT_DIR")}"
+V11_WORKSPACE_ROOT="${V11_WORKSPACE_ROOT:-$HOME/.v11}"
+SESSIONS_ROOT="${SESSIONS_ROOT:-$V11_WORKSPACE_ROOT/sessions}"
+
+if [ "${1:-}" == "--help" ] || [ "${1:-}" == "-h" ]; then
+  cat << 'HELP'
+V11 Flywheel Ingest — Findings → Framework improvements
+
+USAGE:
+    ./scripts/flywheel-ingest [OPTIONS]
+
+OPTIONS:
+    --min-count N     Minimum project count for a pattern to be reported (default: 2)
+    --since DAYS      Only consider issues.json modified in last N days (default: all)
+    --output FILE     Where to write the proposal (default: reports/flywheel-YYYYMMDD.md)
+    --algorithm A     Clustering algorithm: taxonomy (default, V11.8) | legacy (V11.7 fingerprint)
+                      See: sessions/v11-sharpening/adr-001-flywheel-clustering.md
+                      Env: V11_FLYWHEEL_DEFAULT overrides default (for emergency rollback)
+    --source S        Proposal source: all (default) | findings | meta-feedback (V11.15)
+                      meta-feedback clusters sessions/*/meta-feedback/*.json by agent
+                      (low system_prompt_rating + recurring v11_suggestions/friction)
+                      into agent-prompt-tuning proposals. Additive — preserves the
+                      findings sweep verbatim.
+    --dry-run         Print summary only, don't write proposal file
+    --help            Show this help
+
+DESCRIPTION:
+    Reads sessions/*/issues.json produced by synthesize-findings.
+    Groups findings by (category, fingerprint) where fingerprint is the
+    first 4 words of the problem statement, lowercased.
+
+    For each pattern seen across --min-count projects, proposes:
+      - A spec.md.template checklist item ("Verify no X")
+      - An agent "common failure mode" paragraph
+      - A benchmark fixture suggestion
+
+    The proposal is a markdown file. A human applies (or rejects) each
+    suggestion. Rejected patterns are recorded in reports/.flywheel-rejected
+    so they stop surfacing in future runs.
+
+EXAMPLES:
+    ./scripts/flywheel-ingest
+    ./scripts/flywheel-ingest --min-count 3 --since 30
+    ./scripts/flywheel-ingest --dry-run
+HELP
+  exit 0
+fi
+
+MIN_COUNT=2
+SINCE_DAYS=0
+OUTPUT_FILE=""
+DRY_RUN=false
+ALGORITHM="${V11_FLYWHEEL_DEFAULT:-taxonomy}"  # taxonomy | legacy | embeddings(reserved)
+SOURCE="all"                                   # all | findings | meta-feedback (V11.15)
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --min-count) MIN_COUNT="${2:?}"; shift 2 ;;
+    --since)     SINCE_DAYS="${2:?}"; shift 2 ;;
+    --output)    OUTPUT_FILE="${2:?}"; shift 2 ;;
+    --algorithm) ALGORITHM="${2:?}"; shift 2 ;;
+    --source)    SOURCE="${2:?}"; shift 2 ;;
+    --dry-run)   DRY_RUN=true; shift ;;
+    *) echo "Unknown option: $1" >&2; exit 1 ;;
+  esac
+done
+
+case "$ALGORITHM" in
+  legacy|taxonomy) ;;
+  embeddings) echo "Error: --algorithm=embeddings reserved for V11.9 (ADR-001 Option B)" >&2; exit 1 ;;
+  *) echo "Error: unknown --algorithm '$ALGORITHM' (expected: legacy|taxonomy)" >&2; exit 1 ;;
+esac
+
+case "$SOURCE" in
+  all|findings|meta-feedback) ;;
+  *) echo "Error: unknown --source '$SOURCE' (expected: all|findings|meta-feedback)" >&2; exit 1 ;;
+esac
+
+if [ -z "$OUTPUT_FILE" ]; then
+  OUTPUT_FILE="$V11_HOME/reports/flywheel-$(date +%Y%m%d).md"
+fi
+
+mkdir -p "$(dirname "$OUTPUT_FILE")"
+
+python3 - "$SESSIONS_ROOT" "$V11_HOME" "$MIN_COUNT" "$SINCE_DAYS" "$OUTPUT_FILE" "$DRY_RUN" "$ALGORITHM" "$SOURCE" << 'PYTHON_SCRIPT'
+import json, os, sys, time, glob, re, hashlib
+from collections import defaultdict, Counter
+from datetime import datetime, timezone
+
+sessions_root, v11_home, min_count, since_days, output_file, dry_run_s, algorithm, source = sys.argv[1:]
+min_count  = int(min_count)
+since_days = int(since_days)
+dry_run    = dry_run_s.lower() == "true"
+want_findings = source in ("all", "findings")
+want_meta     = source in ("all", "meta-feedback")
+
+rejected_file = os.path.join(v11_home, "reports", ".flywheel-rejected")
+rejected = set()
+if os.path.exists(rejected_file):
+    with open(rejected_file) as f:
+        rejected = {line.strip() for line in f if line.strip() and not line.startswith("#")}
+
+now = time.time()
+cutoff = now - (since_days * 86400) if since_days > 0 else 0
+
+# --- Scan issues.json across projects ---
+all_findings = []          # list of dicts
+per_project_projects = set()
+scanned_files = []
+
+_issues_glob = sorted(glob.glob(os.path.join(sessions_root, "*", "issues.json"))) if want_findings else []
+for issues_path in _issues_glob:
+    if cutoff and os.path.getmtime(issues_path) < cutoff:
+        continue
+    project = os.path.basename(os.path.dirname(issues_path))
+    scanned_files.append(issues_path)
+    try:
+        with open(issues_path) as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, OSError) as e:
+        print(f"skip {project}: {e}", file=sys.stderr)
+        continue
+
+    findings = data.get("findings") or data.get("issues") or []
+    if not isinstance(findings, list):
+        continue
+    per_project_projects.add(project)
+    for item in findings:
+        if not isinstance(item, dict):
+            continue
+        problem = (item.get("problem") or item.get("title") or "").strip()
+        if not problem:
+            continue
+        category = (item.get("category") or item.get("lens") or "unknown").lower()
+        severity = (item.get("severity") or "medium").lower()
+        all_findings.append({
+            "project":  project,
+            "category": category,
+            "severity": severity,
+            "problem":  problem,
+            "fix":      (item.get("fix") or item.get("suggestion") or "").strip(),
+            "file":     (item.get("file") or item.get("location", {}).get("file") or ""),
+        })
+
+# --- Cluster by (category, fingerprint) ---
+# Algorithm: taxonomy (V11.8 default) or legacy (V11.7 fingerprint).
+# Decision recorded in sessions/v11-sharpening/adr-001-flywheel-clustering.md.
+
+TAXONOMY = [
+    "undocumented-behavior",
+    "invariant-claim-unenforced",
+    "silent-fallback",
+    "concurrent-access-race",
+    "schema-drift",
+    "dead-code",
+    "input-validation-gap",
+    "duplication-divergence",
+    "config-scatter",
+    "test-gap",
+    "other",
+]
+
+STOPWORDS = {"the","a","an","in","on","of","to","for","with","via","by","at","is","are","and","or","it","this","that","from","into","over","under","be","has","have"}
+def legacy_fingerprint(text):
+    # V11.7 algorithm: first 2 meaningful tokens. Preserved for --algorithm=legacy.
+    norm = re.sub(r"[^a-z0-9+]+", " ", text.lower()).strip()
+    tokens = [t for t in norm.split(" ") if t and t not in STOPWORDS]
+    return " ".join(tokens[:2]) if tokens else text.lower()[:40]
+
+def finding_hash(project, problem):
+    return hashlib.sha256(f"{project}::{problem}".encode("utf-8")).hexdigest()[:16]
+
+def load_cache(path):
+    if os.path.exists(path):
+        try:
+            with open(path) as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError):
+            return {}
+    return {}
+
+def save_cache(path, cache):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
+        json.dump(cache, f, indent=2, sort_keys=True)
+
+def classify_heuristic(problem, category):
+    # Deterministic keyword classifier. Free, fast, reproducible.
+    # Catches ~80% of common patterns. Returns taxonomy label or "other".
+    p = problem.lower()
+    # Word-boundary check helper to avoid substring collisions
+    # (e.g. "documented" should not match inside "undocumented")
+    def has_word(word):
+        return re.search(rf"\b{re.escape(word)}\b", p) is not None
+
+    # invariant-claim-unenforced: X claims behavior that code doesn't enforce
+    if ("invariant" in p and ("violated" in p or "not enforced" in p or "unenforced" in p or "module.md" in p)) \
+       or ("module.md" in p and ("not" in p or "missing" in p)) \
+       or ("claims" in p and ("not" in p or "despite" in p)) \
+       or ("docstring" in p and ("claim" in p or "not" in p)) \
+       or ("protocol" in p and "not" in p and ("method" in p or "kwarg" in p or "signature" in p)) \
+       or ("required" in p and "but no" in p) \
+       or ("schema" in p and "not" in p and ("code" in p or "implementation" in p)):
+        return "invariant-claim-unenforced"
+
+    # schema-drift: declared interface out of sync with reality
+    if ("schema" in p and ("stale" in p or "drift" in p or "missing" in p or "out of sync" in p or "contradict" in p)) \
+       or ("enum" in p and "stale" in p) \
+       or ("undocumented in schema" in p) \
+       or (has_word("documented") and "not in" in p and "table" in p) \
+       or ("field names" in p and ("not match" in p or "do not match" in p)) \
+       or ("referenced" in p and "no" in p and ("definition" in p or "agent" in p)) \
+       or ("roadmap" in p and ("stale" in p or "last status" in p or "despite" in p)) \
+       or ("claude.md" in p and ("claims" in p or "but" in p) and ("only" in p or "no" in p or "0" in p)):
+        return "schema-drift"
+
+    # silent-fallback: error path swallows or degrades invisibly
+    if ("silent" in p and ("disable" in p or "skip" in p or "fail" in p or "fallback" in p)) \
+       or ("swallow" in p) \
+       or ("plaintext" in p and "absent" in p) \
+       or ("fallback" in p and ("silent" in p or "hidden" in p)):
+        return "silent-fallback"
+
+    # concurrent-access-race
+    if "race" in p or "concurrent" in p or "toctou" in p \
+       or ("class-level" in p and ("process" in p or "thread" in p)) \
+       or ("cross-process" in p) \
+       or ("invisible across" in p) \
+       or ("does not filter" in p and ("worker" in p or "process" in p or "user" in p)) \
+       or "atomic" in p or ("lock" in p and "missing" in p):
+        return "concurrent-access-race"
+
+    # duplication-divergence
+    if ("duplicat" in p and ("divergent" in p or "drift" in p)) \
+       or ("two copies" in p) \
+       or ("contradicts itself" in p) \
+       or ("contradict" in p and ("file" in p or "across" in p)):
+        return "duplication-divergence"
+
+    # dead-code: declared/tracked but never exercised
+    if ("never incremented" in p) or ("never called" in p) or ("never used" in p) \
+       or ("dead" in p and ("code" in p or "tracking" in p)) \
+       or ("initialized but never" in p) \
+       or ("placeholder" in p and ("stub" in p or "empty" in p)) \
+       or ("stub" in p and ("empty" in p or "placeholder" in p)) \
+       or ("declared" in p and ("0 used" in p or "no invocations" in p or "never invoked" in p)) \
+       or ("partially wired" in p and "docs" in p) \
+       or ("declared but" in p and "unused" in p):
+        return "dead-code"
+
+    # undocumented-behavior
+    if "undocumented" in p \
+       or ("not in the" in p and ("hook" in p or "scripts" in p or "table" in p)) \
+       or ("not in docs" in p) or ("not in claude.md" in p) \
+       or ("no auto-population" in p) \
+       or ("no definition" in p and ("referenced" in p or "in claude" in p)):
+        return "undocumented-behavior"
+
+    # input-validation-gap
+    if ("injection" in p) \
+       or ("unvalidated" in p and ("input" in p or "output" in p or "llm" in p or "override" in p or "setattr" in p)) \
+       or ("path traversal" in p) \
+       or ("unsanitiz" in p) \
+       or ("no validation" in p):
+        return "input-validation-gap"
+
+    # config-scatter
+    if ("same" in p and ("config" in p or "setting" in p) and ("multiple" in p or "places" in p)) \
+       or ("config scatter" in p) \
+       or ("inconsistent" in p and "across" in p):
+        return "config-scatter"
+
+    # test-gap
+    if ("untested" in p) or ("no test" in p) or ("test gap" in p) \
+       or ("contract" in p and "no test" in p):
+        return "test-gap"
+
+    # Category-based fallbacks (weaker signal)
+    if category == "security" and ("injection" in p or "unsanitiz" in p or "validation" in p):
+        return "input-validation-gap"
+    if category == "correctness" and "invariant" in p:
+        return "invariant-claim-unenforced"
+
+    return "other"
+
+def classify_taxonomy(findings, cache):
+    # Two-stage classifier:
+    #   1. Heuristic (free, deterministic) handles ~80% of findings
+    #   2. LLM escalation for "other" bucket — optional, requires API key + credits
+    # Cache hits skip both stages entirely.
+    # See: sessions/v11-sharpening/adr-001-flywheel-clustering.md (updated for hybrid approach)
+    pending = []
+    other_findings = []  # findings heuristic labeled "other" — candidates for LLM escalation
+    for f in findings:
+        h = finding_hash(f["project"], f["problem"])
+        if h in cache:
+            continue
+        # Stage 1: heuristic
+        label = classify_heuristic(f["problem"], f["category"])
+        cache[h] = label  # always cache; LLM may overwrite "other" later
+        if label == "other":
+            other_findings.append((h, f))
+    # Stage 2: LLM escalation for "other" bucket (optional, best-effort)
+    pending = other_findings
+    if not pending:
+        return
+    try:
+        import anthropic
+    except ImportError:
+        # SDK missing: heuristic "other" label stands.
+        return
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        # No API key: heuristic "other" label stands, no escalation.
+        return
+    client = anthropic.Anthropic(api_key=api_key)
+    # Build a single prompt with all pending findings; ask for JSON output.
+    taxonomy_list = "\n".join(f"  - {t}" for t in TAXONOMY)
+    batch_items = []
+    for i, (h, f) in enumerate(pending):
+        batch_items.append(f"[{i}] category={f['category']} | problem={f['problem'][:300]}")
+    prompt = f"""Classify each finding into exactly one of these taxonomy labels:
+{taxonomy_list}
+
+Return a JSON object mapping index to label, e.g. {{"0": "invariant-claim-unenforced", "1": "silent-fallback"}}.
+Use "other" only when no category fits. Output ONLY the JSON object, no prose.
+
+Findings:
+""" + "\n".join(batch_items)
+    try:
+        resp = client.messages.create(
+            model="claude-sonnet-4-5",
+            max_tokens=2048,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        text = resp.content[0].text.strip()
+        # Strip markdown code fence if present
+        if text.startswith("```"):
+            text = re.sub(r"^```(?:json)?\s*", "", text)
+            text = re.sub(r"\s*```$", "", text)
+        labels = json.loads(text)
+        for i, (h, f) in enumerate(pending):
+            label = labels.get(str(i)) or labels.get(i)
+            if label and label in TAXONOMY:
+                cache[h] = label
+            else:
+                cache[h] = "other"
+    except (anthropic.APIError, json.JSONDecodeError, KeyError, IndexError) as e:
+        print(f"WARN: LLM escalation failed ({e}); keeping heuristic 'other' labels", file=sys.stderr)
+        # Heuristic "other" labels stand; no overwrite.
+
+cache_path = os.path.join(v11_home, "reports", ".flywheel-cache.json")
+cache = load_cache(cache_path)
+
+clusters = defaultdict(list)
+if algorithm == "legacy":
+    for f in all_findings:
+        key = (f["category"], legacy_fingerprint(f["problem"]))
+        clusters[key].append(f)
+else:  # taxonomy
+    classify_taxonomy(all_findings, cache)
+    save_cache(cache_path, cache)
+    for f in all_findings:
+        h = finding_hash(f["project"], f["problem"])
+        label = cache.get(h)
+        if not label:  # API failure / SDK missing — fall back per-finding
+            label = legacy_fingerprint(f["problem"])
+            key = (f["category"], label)
+        else:
+            key = (label, label)  # cluster by taxonomy label only; category becomes label
+        clusters[key].append(f)
+
+# --- Filter by min-count (distinct projects) and rejected set ---
+patterns = []
+for (category, fp), group in clusters.items():
+    projects = {g["project"] for g in group}
+    if len(projects) < min_count:
+        continue
+    rejection_key = f"{category}:{fp}"
+    if rejection_key in rejected:
+        continue
+    sev_counter = Counter(g["severity"] for g in group)
+    # Per-project sample quotes — one representative finding per project
+    # (first one encountered, chronological order preserved by issues.json order).
+    # V11.8 (S1-5): evidence for cluster coherence that auditable without re-running.
+    per_project_samples = {}
+    for g in group:
+        if g["project"] not in per_project_samples:
+            per_project_samples[g["project"]] = {
+                "problem": g["problem"],
+                "fix": g["fix"],
+                "file": g["file"],
+            }
+    patterns.append({
+        "category":     category,
+        "fingerprint":  fp,
+        "rejection_key": rejection_key,
+        "project_count": len(projects),
+        "finding_count": len(group),
+        "projects":     sorted(projects),
+        "severities":   dict(sev_counter),
+        "sample_problem": group[0]["problem"],
+        "sample_fix":     group[0]["fix"],
+        "sample_file":    group[0]["file"],
+        "per_project_samples": per_project_samples,
+    })
+
+patterns.sort(key=lambda p: (-p["project_count"], -p["finding_count"]))
+
+# --- Build proposal markdown ---
+lines = []
+lines.append(f"# V11 Quality Flywheel — Proposal {datetime.now(timezone.utc).strftime('%Y-%m-%d')}")
+lines.append("")
+lines.append(f"> Generated by `scripts/flywheel-ingest`. "
+             f"Scanned {len(scanned_files)} `issues.json` files across {len(per_project_projects)} projects. "
+             f"Found {len(all_findings)} raw findings, clustered into {len(clusters)} patterns, "
+             f"{len(patterns)} meet the --min-count={min_count} threshold.")
+lines.append("")
+lines.append("**This is a proposal, not an auto-applied change.** Review each pattern. "
+             "Accept by editing the named file. Reject by appending the `rejection_key` to "
+             "`reports/.flywheel-rejected` (one per line).")
+lines.append("")
+
+if not patterns:
+    lines.append("## No recurring patterns found")
+    lines.append("")
+    lines.append("Either the framework is stable, or findings haven't accumulated yet. "
+                 "Run more audits via `scripts/audit-codebase` and rerun flywheel-ingest later.")
+else:
+    lines.append("## Summary")
+    lines.append("")
+    lines.append("| # | Category | Pattern | Projects | Findings | Top Severity |")
+    lines.append("|---|----------|---------|:--------:|:--------:|--------------|")
+    for i, p in enumerate(patterns, 1):
+        top_sev = max(p["severities"], key=lambda s: ["low","medium","high","critical"].index(s) if s in ["low","medium","high","critical"] else 0)
+        lines.append(f"| {i} | {p['category']} | `{p['fingerprint']}` | {p['project_count']} | {p['finding_count']} | {top_sev} |")
+    lines.append("")
+
+    lines.append("## Proposed Patches")
+    lines.append("")
+    for i, p in enumerate(patterns, 1):
+        lines.append(f"### Pattern {i}: {p['category']} — `{p['fingerprint']}`")
+        lines.append("")
+        lines.append(f"**Seen in {p['project_count']} projects** ({', '.join(p['projects'])}) — "
+                     f"{p['finding_count']} findings total")
+        lines.append("")
+        lines.append(f"**Rejection key** (copy into `reports/.flywheel-rejected` to suppress): "
+                     f"`{p['rejection_key']}`")
+        lines.append("")
+        # V11.8 (S1-5): evidence block — per-project samples + rationale.
+        # Makes the proposal auditable without re-running the algorithm.
+        lines.append(f"**Cluster size:** {p['finding_count']} findings across {p['project_count']} projects")
+        lines.append("")
+        lines.append(f"**Evidence — per-project samples:**")
+        lines.append("")
+        for proj in sorted(p["per_project_samples"].keys()):
+            s = p["per_project_samples"][proj]
+            lines.append(f"- **{proj}**: {s['problem'][:200]}")
+            if s.get("file"):
+                lines.append(f"  - _file_: `{s['file']}`")
+        lines.append("")
+        # Rationale: why the taxonomy says these share a root cause.
+        # For taxonomy mode, the label itself is the rationale; for legacy,
+        # the shared token-pair is the rationale.
+        lines.append(f"**Rationale:** These {p['finding_count']} findings cluster as "
+                     f"`{p['fingerprint']}` — they share the pattern declared by that "
+                     f"taxonomy label, across {p['project_count']} independently-audited "
+                     f"projects. Cross-project recurrence signals a framework-level gap, "
+                     f"not a project-local bug.")
+        lines.append("")
+
+        # Proposed spec.md.template checklist item
+        lines.append("**Proposed addition to `templates/spec.md.template`:**")
+        lines.append("")
+        lines.append("```")
+        lines.append(f"- [ ] {p['category'].capitalize()}: no {p['fingerprint']} in any new module")
+        lines.append("```")
+        lines.append("")
+
+        # Proposed agent common-failure-mode paragraph
+        agent_name = {
+            "security":       "security-engineer",
+            "performance":    "performance-optimizer",
+            "reliability":    "sre-specialist",
+            "correctness":    "spec-implementer-v11",
+            "maintainability": "code-quality-engineer",
+            "integration":    "spec-integrator-v11",
+            "test-coverage":  "testing-engineer",
+            "observability":  "monitoring-specialist",
+            "quality":        "code-quality-engineer",
+            "rationale":      "adversarial-reviewer",
+        }.get(p["category"], "spec-implementer-v11")
+        lines.append(f"**Proposed addition to `agents/{agent_name}.md` → Common Failure Modes:**")
+        lines.append("")
+        lines.append("```markdown")
+        lines.append(f"- **{p['fingerprint']}** — observed in {p['project_count']} projects. "
+                     f"Example: {p['sample_problem'][:120]}")
+        if p["sample_fix"]:
+            lines.append(f"  Typical fix: {p['sample_fix'][:150]}")
+        lines.append("```")
+        lines.append("")
+
+        # Proposed benchmark fixture
+        fixture_name = f"{p['category']}-{re.sub(r'[^a-z0-9]+', '-', p['fingerprint']).strip('-')}"
+        lines.append(f"**Proposed benchmark fixture**: `benchmarks/fixtures/{fixture_name}.yml`")
+        lines.append("")
+        lines.append("```yaml")
+        lines.append(f"id: FW-{i:03d}")
+        lines.append(f"category: {p['category']}")
+        lines.append(f"description: Regression test for recurring pattern '{p['fingerprint']}'")
+        lines.append(f"source_projects: [{', '.join(p['projects'])}]")
+        lines.append(f"sample_problem: |")
+        lines.append(f"  {p['sample_problem']}")
+        lines.append("```")
+        lines.append("")
+        lines.append("---")
+        lines.append("")
+
+# --- V11.15: meta-feedback source — per-agent prompt-tuning proposals ---
+# Walks sessions/*/meta-feedback/*.json (written by sync-tasks T7). Clusters
+# per agent_id: low system_prompt_rating + recurring v11_suggestions +
+# prompt_friction themes → actionable agent-prompt-tuning proposals.
+# Additive: the findings sweep above is untouched.
+meta_proposals = []
+meta_files_scanned = 0
+if want_meta:
+    by_agent = defaultdict(lambda: {
+        "ratings": [], "suggestions": Counter(), "friction": Counter(),
+        "postmortems": [], "tasks": set(), "projects": set(),
+    })
+
+    def _norm(s):
+        return re.sub(r"\s+", " ", str(s).strip().lower())[:300]
+
+    # --- Bug F (V11.15.3): semantic clustering for meta-feedback phrases ---
+    # Pre-fix, suggestions/friction were Counter-keyed on _norm() exact text, so
+    # two records describing the SAME theme in different words (e.g. tasks 2 & 7
+    # both hitting the pytest/xdist --override-ini friction) each stayed count=1
+    # and never reached the count>=2 "recurring" bar → 0 proposals on a real
+    # recurring signal. Fix: greedily merge near-duplicate phrases by
+    # stopword-filtered token overlap. Deterministic (stdlib only, fixed
+    # processing order), order-independent, no new infra — consistent with
+    # ADR-001's "minimum viable solution wins; defer embeddings" rationale.
+    # See sessions/v11-sharpening/adr-001-flywheel-clustering.md (addendum).
+    # Rollback: V11_FLYWHEEL_META_CLUSTER=exact restores byte-identical legacy
+    # meta behavior (exact-text Counter, no merging).
+    _META_CLUSTER = os.environ.get("V11_FLYWHEEL_META_CLUSTER", "fuzzy").lower()
+    _STOP = set((
+        "the a an of to is it on in this and or for not be as by we i its "
+        "itself per still so add use uses needs which should sets real fix "
+        "that with into any value off only run runs single each fresh are was "
+        "has have had but if then else when from at out non its can may must "
+        "more most less than over under via not no yes new old all both"
+    ).split())
+
+    def _sal_tokens(s):
+        # Salient tokens: lowercased, domain punctuation kept (xdist, addopts,
+        # override-ini, pytest.ini), stopwords + <=2-char noise dropped.
+        return {
+            t for t in re.findall(r"[a-z0-9][a-z0-9_+.\-]*", str(s).lower())
+            if len(t) > 2 and t not in _STOP
+        }
+
+    def _fuzzy_cluster(counter, jac_thr=0.18, ovl_thr=0.40):
+        """Greedily merge near-duplicate phrases, summing counts.
+
+        Two phrases cluster if their salient-token sets reach Jaccard>=jac_thr
+        OR overlap-coefficient>=ovl_thr. On the real corpus this cleanly
+        separates same-theme pairs (jac 0.17-0.33 / ovl 0.42-0.64) from
+        unrelated ones (0.0). Representative = member with the most salient
+        tokens (tie: longest text, then lexicographically smallest) so the
+        surfaced phrase is the most informative; fully deterministic because
+        items are processed in a fixed (-count, text) order.
+        """
+        if _META_CLUSTER == "exact" or not counter:
+            return counter
+        items = sorted(counter.items(), key=lambda kv: (-kv[1], kv[0]))
+        clusters = []  # {rep, rep_tok, total}
+        for text, cnt in items:
+            ttok = _sal_tokens(text)
+            placed = False
+            for cl in clusters:
+                rtok = cl["rep_tok"]
+                inter = len(ttok & rtok)
+                if inter:
+                    union = len(ttok | rtok)
+                    jac = inter / union if union else 0.0
+                    ovl = inter / min(len(ttok), len(rtok)) if ttok and rtok else 0.0
+                    if jac >= jac_thr or ovl >= ovl_thr:
+                        cl["total"] += cnt
+                        # Promote the more informative representative.
+                        if (len(ttok), len(text), text) > (
+                            len(rtok), len(cl["rep"]), cl["rep"]
+                        ):
+                            cl["rep"], cl["rep_tok"] = text, ttok
+                        placed = True
+                        break
+            if not placed:
+                clusters.append({"rep": text, "rep_tok": ttok, "total": cnt})
+        out = Counter()
+        for cl in clusters:
+            out[cl["rep"]] = cl["total"]
+        return out
+
+    for mf in sorted(glob.glob(os.path.join(sessions_root, "*", "meta-feedback", "*.json"))):
+        if cutoff and os.path.getmtime(mf) < cutoff:
+            continue
+        project = os.path.basename(os.path.dirname(os.path.dirname(mf)))
+        try:
+            with open(mf) as fh:
+                rec = json.load(fh)
+        except (json.JSONDecodeError, OSError) as e:
+            print(f"skip meta {project}: {e}", file=sys.stderr)
+            continue
+        if not isinstance(rec, dict):
+            continue
+        meta_files_scanned += 1
+        agent = rec.get("agent_id") or "unknown"
+        slot = by_agent[agent]
+        r = rec.get("system_prompt_rating")
+        if isinstance(r, (int, float)):
+            slot["ratings"].append(r)
+        for s in (rec.get("v11_suggestions") or []):
+            if str(s).strip():
+                slot["suggestions"][_norm(s)] += 1
+        for fr in (rec.get("prompt_friction") or []):
+            if str(fr).strip():
+                slot["friction"][_norm(fr)] += 1
+        pm = rec.get("error_postmortem")
+        if pm and str(pm).strip():
+            slot["postmortems"].append(str(pm).strip()[:200])
+        slot["tasks"].add(rec.get("task_id") or mf)
+        slot["projects"].add(project)
+
+    for agent, slot in by_agent.items():
+        n = len(slot["tasks"])
+        if n < min_count:
+            continue
+        ratings = slot["ratings"]
+        avg_rating = round(sum(ratings) / len(ratings), 2) if ratings else None
+        low_count = sum(1 for x in ratings if x <= 2)
+        # Bug F: collapse semantically-equivalent phrasings before counting, so
+        # a theme raised in different words across tasks reaches the recurring
+        # bar instead of fragmenting into singletons.
+        slot["suggestions"] = _fuzzy_cluster(slot["suggestions"])
+        slot["friction"] = _fuzzy_cluster(slot["friction"])
+        # Surface only agents with a real signal: a low avg, some low ratings,
+        # or recurring (count>=2) suggestions/friction.
+        recurring_sugg = [(t, c) for t, c in slot["suggestions"].most_common() if c >= 2]
+        recurring_fric = [(t, c) for t, c in slot["friction"].most_common() if c >= 2]
+        has_signal = (
+            (avg_rating is not None and avg_rating <= 3.0)
+            or low_count > 0 or recurring_sugg or recurring_fric
+        )
+        if not has_signal:
+            continue
+        rejection_key = f"meta-feedback:{agent}"
+        if rejection_key in rejected:
+            continue
+        meta_proposals.append({
+            "agent": agent,
+            "feedback_count": n,
+            "avg_rating": avg_rating,
+            "low_rating_count": low_count,
+            "projects": sorted(slot["projects"]),
+            "top_suggestions": (recurring_sugg or slot["suggestions"].most_common(5)),
+            "top_friction": (recurring_fric or slot["friction"].most_common(5)),
+            "postmortems": slot["postmortems"][:3],
+            "rejection_key": rejection_key,
+        })
+
+    meta_proposals.sort(key=lambda m: (
+        m["avg_rating"] if m["avg_rating"] is not None else 5,
+        -m["feedback_count"],
+    ))
+
+    if meta_proposals:
+        lines.append("## Agent Prompt-Tuning Proposals (meta-feedback, V11.15)")
+        lines.append("")
+        lines.append(f"> {meta_files_scanned} meta-feedback record(s) scanned. "
+                     f"{len(meta_proposals)} agent(s) meet --min-count={min_count} "
+                     f"with an actionable signal. **Advisory only** — DAAO routing "
+                     f"on these scores is a deferred future phase.")
+        lines.append("")
+        lines.append("| Agent | Feedback | Avg Prompt Rating | Low (≤2) | Projects |")
+        lines.append("|-------|:--------:|:-----------------:|:--------:|----------|")
+        for m in meta_proposals:
+            ar = m["avg_rating"] if m["avg_rating"] is not None else "—"
+            lines.append(f"| `{m['agent']}` | {m['feedback_count']} | {ar} | "
+                         f"{m['low_rating_count']} | {', '.join(m['projects'])} |")
+        lines.append("")
+        for m in meta_proposals:
+            lines.append(f"### Agent `{m['agent']}` — avg prompt rating "
+                         f"{m['avg_rating'] if m['avg_rating'] is not None else 'n/a'} "
+                         f"over {m['feedback_count']} task(s)")
+            lines.append("")
+            lines.append(f"**Rejection key** (append to `reports/.flywheel-rejected` "
+                         f"to suppress): `{m['rejection_key']}`")
+            lines.append("")
+            if m["top_suggestions"]:
+                lines.append("**Recurring agent-prompt improvements the agent itself proposed:**")
+                lines.append("")
+                for txt, c in m["top_suggestions"]:
+                    lines.append(f"- ({c}×) {txt}")
+                lines.append("")
+            if m["top_friction"]:
+                lines.append("**Recurring prompt/task friction reported:**")
+                lines.append("")
+                for txt, c in m["top_friction"]:
+                    lines.append(f"- ({c}×) {txt}")
+                lines.append("")
+            if m["postmortems"]:
+                lines.append("**Sample error post-mortems (agent's own words):**")
+                lines.append("")
+                for pm in m["postmortems"]:
+                    lines.append(f"- {pm}")
+                lines.append("")
+            lines.append(f"**Proposed addition to `agents/{m['agent']}.md` → "
+                         f"system prompt / Common Failure Modes:**")
+            lines.append("")
+            lines.append("```markdown")
+            if m["top_suggestions"]:
+                lead = m["top_suggestions"][0][0]
+                lines.append(f"- {lead}")
+            else:
+                lines.append(f"- Address recurring friction: {m['top_friction'][0][0]}")
+            lines.append("```")
+            lines.append("")
+            lines.append("---")
+            lines.append("")
+
+proposal_text = "\n".join(lines) + "\n"
+
+if dry_run:
+    print(f"[dry-run] Would write {len(proposal_text)} bytes to {output_file}")
+    print(f"[dry-run] {len(patterns)} patterns proposed from {len(all_findings)} findings")
+    if want_meta:
+        print(f"[dry-run] {len(meta_proposals)} meta-feedback agent proposal(s) "
+              f"from {meta_files_scanned} meta record(s)")
+else:
+    with open(output_file, "w") as f:
+        f.write(proposal_text)
+    print(f"[written] {output_file}")
+    print(f"[summary] {len(patterns)} patterns from {len(all_findings)} findings "
+          f"across {len(per_project_projects)} projects")
+    if want_meta:
+        print(f"[summary] {len(meta_proposals)} meta-feedback agent proposal(s) "
+              f"from {meta_files_scanned} record(s)")
+
+    # Ensure rejected file exists with a header
+    if not os.path.exists(rejected_file):
+        with open(rejected_file, "w") as f:
+            f.write("# V11 Flywheel rejected patterns — one rejection_key per line\n")
+            f.write("# Format: category:fingerprint\n")
+PYTHON_SCRIPT
