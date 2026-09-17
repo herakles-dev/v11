@@ -1,13 +1,13 @@
 {
   "metadata": {
-    "version": "11.34.0",
+    "version": "11.44",
     "protocol": "V11",
     "description": "V11 Spec Agents - Per-Task Agent Assignment, Artifact Handoffs, Adversarial Verification, Semantic Memory, Tracker System",
     "created": "2026-02-11",
     "agent_count": 13,
     "formations_count": 14,
-    "system_prompt_root": "~/v11",
-    "deprecation_note": "V11.11+: per-task `metadata.agent` (recorded in the task-state recommended_agents map) is the primary dispatch mechanism. Per-agent `teammate_messaging` and `handoff_to` graphs below are LEGACY backward-compat \u2014 retained so existing TeamCreate-based projects keep working; they are NOT the recommended coordination model and should not be used for new work.",
+    "system_prompt_root": "/path/to/v11",
+    "deprecation_note": "V11.11+: per-task `metadata.agent` (recorded in the task-state recommended_agents map) is the primary dispatch mechanism. Per-agent `teammate_messaging` and `handoff_to` graphs below are LEGACY backward-compat — retained so existing TeamCreate-based projects keep working; they are NOT the recommended coordination model and should not be used for new work.",
     "deprecated_v8_agents": [
       "spec-conductor-v8"
     ],
@@ -31,7 +31,7 @@
   },
   "agents": [
     {
-      "version": "11.34.0",
+      "version": "11.44",
       "category": "spec-v11",
       "description": "Session planning and initialization for V11 spec-driven development",
       "model": "opus",
@@ -76,7 +76,7 @@
       "v11_native": true
     },
     {
-      "version": "11.34.0",
+      "version": "11.44",
       "category": "spec-v11",
       "description": "Architecture design for complex, novel problems",
       "model": "opus",
@@ -125,7 +125,7 @@
       "v11_native": true
     },
     {
-      "version": "11.34.0",
+      "version": "11.44",
       "category": "spec-v11",
       "description": "Code implementation and business logic",
       "model": "sonnet",
@@ -193,7 +193,7 @@
       "most_frequent": true
     },
     {
-      "version": "11.34.0",
+      "version": "11.44",
       "category": "spec-v11",
       "description": "Multi-service coordination and API contracts",
       "model": "sonnet",
@@ -254,7 +254,7 @@
       "v11_native": true
     },
     {
-      "version": "11.34.0",
+      "version": "11.44",
       "category": "spec-v11",
       "description": "L1-L4 testing and validation",
       "model": "sonnet",
@@ -316,7 +316,7 @@
       "v11_native": true
     },
     {
-      "version": "11.34.0",
+      "version": "11.44",
       "category": "spec-v11",
       "description": "Security architecture and validation (merged)",
       "model": "opus",
@@ -379,7 +379,7 @@
       ]
     },
     {
-      "version": "11.34.0",
+      "version": "11.44",
       "category": "spec-v11",
       "description": "Performance optimization",
       "model": "opus",
@@ -424,7 +424,7 @@
       "v11_native": true
     },
     {
-      "version": "11.34.0",
+      "version": "11.44",
       "category": "spec-v11",
       "description": "Rollback and failure recovery",
       "model": "sonnet",
@@ -476,7 +476,7 @@
       "success_rate_required": "100%"
     },
     {
-      "version": "11.34.0",
+      "version": "11.44",
       "category": "spec-v11",
       "description": "Code review, PR review, and design critique",
       "model": "opus",
@@ -527,9 +527,9 @@
       "read_only": true
     },
     {
-      "version": "11.34.0",
+      "version": "11.44",
       "category": "spec-v11",
-      "description": "Adversarial wave review \u2014 5-lens audit (quality, completeness, integration, security, rationale \u2014 Dark Code Layer 4 'why' lens)",
+      "description": "Adversarial wave review — 5-lens audit (quality, completeness, integration, security, rationale — Dark Code Layer 4 'why' lens)",
       "model": "sonnet",
       "model_tier": "intelligence",
       "default_mode": "subagent",
@@ -570,7 +570,7 @@
       "read_only": true
     },
     {
-      "version": "11.34.0",
+      "version": "11.44",
       "category": "spec-v11",
       "description": "Routing strategist: reviews a plan and recommends V11 formations, specialist agents per role, and skills per task. READ-ONLY advisory.",
       "model": "opus",
@@ -621,13 +621,13 @@
         ]
       },
       "color": "violet",
-      "system_prompt": "~/.claude/agents/agent-assignment.md",
+      "system_prompt": "/path/to/operator-home/.claude/agents/agent-assignment.md",
       "v11_native": true
     },
     {
-      "version": "11.34.0",
+      "version": "11.44",
       "category": "spec-v11",
-      "description": "Adversarial-lite post-task review \u2014 fast 3-lens pass (correctness, completeness, integration) scoped strictly to a task's files_changed; emits difficulty 1-5 + per-error JSON verdict for agent-effectiveness attribution",
+      "description": "Adversarial-lite post-task review — fast 3-lens pass (correctness, completeness, integration) scoped strictly to a task's files_changed; emits difficulty 1-5 + per-error JSON verdict for agent-effectiveness attribution",
       "model": "sonnet",
       "model_tier": "intelligence",
       "default_mode": "subagent",
@@ -666,9 +666,9 @@
       "read_only": true
     },
     {
-      "version": "11.34.0",
+      "version": "11.44",
       "category": "spec-v11",
-      "description": "Minimal-scope auto-fixer for adversarial-lite-reviewer errors (LOW/MEDIUM/HIGH only \u2014 CRITICAL refused/escalated). Smallest change per error + scoped re-verify. Dedicated agent: never the implementer under measurement",
+      "description": "Minimal-scope auto-fixer for adversarial-lite-reviewer errors (LOW/MEDIUM/HIGH only — CRITICAL refused/escalated). Smallest change per error + scoped re-verify. Dedicated agent: never the implementer under measurement",
       "model": "sonnet",
       "model_tier": "intelligence",
       "default_mode": "subagent",
@@ -1053,7 +1053,7 @@
         "implementer",
         "validator"
       ],
-      "when": "SWE-bench Lite instance resolution \u2014 3-wave pipeline with feedback loop",
+      "when": "SWE-bench Lite instance resolution — 3-wave pipeline with feedback loop",
       "mode": "sequential-waves",
       "wave_structure": [
         {
@@ -1075,7 +1075,7 @@
         }
       ],
       "max_iterations": 3,
-      "feedback_loop": "validator \u2192 implementer (on test failure, up to max_iterations)",
+      "feedback_loop": "validator → implementer (on test failure, up to max_iterations)",
       "cost_estimate": {
         "per_instance_tokens": 56000,
         "per_instance_usd": 0.17,
@@ -1154,7 +1154,7 @@
         "legal-finance",
         "business-dev"
       ],
-      "when": "New business launch \u2014 multi-function planning across ops, legal, finance, marketing, BD. Use when project needs business strategy alongside engineering.",
+      "when": "New business launch — multi-function planning across ops, legal, finance, marketing, BD. Use when project needs business strategy alongside engineering.",
       "mode": "parallel-with-synthesis",
       "wave_structure": [
         {
@@ -1391,7 +1391,7 @@
     },
     "codebase-audit": {
       "mode": "parallel-background-agents",
-      "when": "Full codebase review from multiple angles \u2014 security, performance, code quality, database, test coverage. Pre-build assessment, quarterly audit, post-incident review.",
+      "when": "Full codebase review from multiple angles — security, performance, code quality, database, test coverage. Pre-build assessment, quarterly audit, post-incident review.",
       "teammates": [
         "spec-security-v11",
         "spec-reviewer-v11",
@@ -1652,7 +1652,7 @@
   },
   "integration": {
     "tasks_system": "required",
-    "docker_network": "required",
+    "hercules_network": "required",
     "port_registry": "~/config/port-registry.json",
     "observability": "~/scripts/observability-cli/"
   },

@@ -12,7 +12,7 @@
 #   - If .git/hooks/post-commit already exists AND is already the V11 hook
 #     (or a shim/wrapper calling it): exits 0 with "already installed" (idempotent).
 #   - If .git/hooks/post-commit is a SYMLINK pointing to a tracked source file
-#     (a common pattern for repos with an existing hook manager): replaces the symlink with a chain-wrapper script that
+#     (example-project pattern): replaces the symlink with a chain-wrapper script that
 #     delegates to both the original target and the V11 hook.  The tracked source
 #     file is NOT modified.
 #   - If .git/hooks/post-commit exists as a regular file (not a symlink): backs
@@ -30,7 +30,7 @@
 #   To fully remove: rm .git/hooks/post-commit (and restore .pre-v11 if present)
 #
 # Rollout cohort guidance (v11.25-postcommit-spec.md §"Rollout Cohort"):
-#   1. example-project:  2-sprint dry-run (V11_POSTCOMMIT_DRYRUN=on) before live
+#   1. example-project:         2-sprint dry-run (V11_POSTCOMMIT_DRYRUN=on) before live
 #   2. free-chicago:    1-sprint dry-run before live
 #   3. v11-sharpening:  live from V11.25 inception (dogfood)
 
@@ -235,7 +235,7 @@ else
 if [ -n "${V11_HOME:-}" ] && [ -x "${V11_HOME}/hooks/post-commit-close-tasks" ]; then
     "${V11_HOME}/hooks/post-commit-close-tasks" "$@" || true
 elif [ -x "$HOME/v11/hooks/post-commit-close-tasks" ]; then
-    "$HOME/v11/hooks/post-commit-close-tasks" "$@" || true
+    $HOME/v11/hooks/post-commit-close-tasks "$@" || true
 fi
 SHIM
 

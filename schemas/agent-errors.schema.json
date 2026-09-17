@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "agent-errors.schema.json",
+  "$id": "https://herakles.dev/v11/schemas/agent-errors.schema.json",
   "title": "V11 Agent Error Ledger Line",
   "description": "Schema for ONE line of ~/.agent-metrics/agent-errors.jsonl. Appended by sync-tasks (Layer 2: lite review, V11.15), wave-review-attribute (Layer 3: wave review, V11.20), and swarm-review-attribute (Layer 4: swarm review, V11.20). One line per error, attributed to the executing agent. V11.20 adds found_by_layer, caller_kind, task_id_inferred, attribution_key for cross-layer unified scorecards. All four new fields are ADDITIVE: legacy entries without them default to found_by_layer=lite, caller_kind=unknown, task_id_inferred=false, attribution_key absent.",
   "type": "object",
@@ -12,8 +12,8 @@
       "description": "Executing agent the error is attributed to. Layer 2 (lite): from artifacts.review.agent_id, else task-state active_agent_id. Layer 3/4 (wave/swarm): resolved via v11_resolve_file_to_task (file→task→agent). Falls back to 'unattributed' when no task touched the file."
     },
     "error_type": {
-      "enum": ["compilation", "test_failure", "contract_violation", "security", "logic", "completeness", "integration", "quality", "rationale", "false_provenance"],
-      "description": "Error class. Tight enum (V11.20) prevents misspellings across the four review layers. false_provenance is a historical Layer 2 value retained for backward compat with V11.15 entries."
+      "enum": ["compilation", "test_failure", "contract_violation", "security", "logic", "completeness", "integration", "quality", "rationale", "false_provenance", "correctness", "unknown", "unmeasured_causal_claim", "briefing"],
+      "description": "Error class. Tight enum (V11.20) prevents misspellings across the four review layers. false_provenance is a historical Layer 2 value retained for backward compat with V11.15 entries. v11.38 W2-T3 (#50 F2) additions: 'correctness' emitted by adversarial-lite-reviewer + code-quality-engineer (finer-grained than 'logic'); 'unknown' emitted when a reviewer can't classify. v11.40 W3-T1 (#20) addition: 'unmeasured_causal_claim' declared in adversarial-lite-reviewer.md's Lens 4 output enum (see ~/.claude/agents/adversarial-lite-reviewer.md) but was missing from this schema — any Layer B verdict emitting it would have failed schema validation. Discovered by the same reviewer during the v11-38-consolidation review-queue drain (2026-08-29, review verdict #20 E1). Live ledger emissions: 0 as of v11.40 W3-T1 (preventive close of the schema-vs-emitter gap, not a fix for observed validation failures)."
     },
     "severity":   { "enum": ["CRITICAL", "HIGH", "MEDIUM", "LOW"] },
     "error_message": { "type": "string", "maxLength": 500 },
@@ -24,8 +24,8 @@
     "trace_id":   { "type": ["string", "null"], "description": "Carried from artifacts.trace_id for cross-hop correlation" },
     "project":    { "type": ["string", "null"] },
     "found_by_layer": {
-      "enum": ["lite", "lite_self", "lite_adversarial", "wave", "swarm", "runtime"],
-      "description": "V11.20/V11.21: which review layer caught this error. lite=legacy V11.15 per-task adversarial-lite (aliases to lite_adversarial at read time). lite_self=V11.21 self-review (Layer A: implementing agent emits verdict). lite_adversarial=V11.21 paired adversarial-lite-reviewer (Layer B). wave=5-lens adversarial-reviewer (V11.6+). swarm=parallel multi-lens audit (V11.5). runtime=harness/test failure (future). Legacy entries written before V11.21 use 'lite'; consumers must treat 'lite' as 'lite_adversarial' for backward-compat reporting."
+      "enum": ["lite", "lite_self", "lite_adversarial", "wave", "swarm", "runtime", "brief"],
+      "description": "V11.20/V11.21: which review layer caught this error. lite=legacy V11.15 per-task adversarial-lite (aliases to lite_adversarial at read time). lite_self=V11.21 self-review (Layer A: implementing agent emits verdict). lite_adversarial=V11.21 paired adversarial-lite-reviewer (Layer B). wave=5-lens adversarial-reviewer (V11.6+). swarm=parallel multi-lens audit (V11.5). runtime=harness/test failure (future). brief=v11.44 orchestrator briefing-quality finding from grade-briefs (the orchestrator's task authoring, not an executor's work). Legacy entries written before V11.21 use 'lite'; consumers must treat 'lite' as 'lite_adversarial' for backward-compat reporting."
     },
     "caller_kind": {
       "enum": ["orchestrator", "subagent", "unknown", "daemon"],
@@ -47,6 +47,23 @@
     "attribution_degraded": {
       "type": "boolean",
       "description": "V11.30: true when the writer could not determine the executing agent and agent_id fell back to 'unknown' (metadata.agent absent/null on the reviewable task). Emitted by sync-tasks Layer A actuation on self-review synthetic markers. Optional — absent on entries written before V11.30."
+    },
+    "cause_kind": {
+      "enum": ["execution_defect", "briefing_defect", "briefing_risk"],
+      "description": "v11.44: splits a finding by root cause. execution_defect=a defect in the agent's produced work (lite/wave findings, stamped write-time by sync-tasks). briefing_defect=the orchestrator's brief was under-specified AND the task failed (from grade-briefs). briefing_risk=under-specified brief on a task that did NOT fail (advisory near-miss). Additive/union: a dual-fault task carries an execution_defect on the executor AND a briefing_defect on the orchestrator. Absent on pre-v11.44 entries."
+    },
+    "reasons": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "v11.44: brief-layer reason tags for a briefing finding (unscoped / no_agent_assigned / generic_agent / unregistered_agent). Written by grade-briefs. Optional."
+    },
+    "subject_norm": {
+      "type": "string",
+      "description": "v11.44: normalized subject of the brief's task — part of the canonical identity (project|subject_norm|create_seq|brief) behind the brief attribution_key. Written by grade-briefs. Optional."
+    },
+    "create_seq": {
+      "type": ["integer", "number"],
+      "description": "v11.44: canonical create-sequence of the brief's task (with project+subject_norm forms the identity behind attribution_key). Written by grade-briefs. Optional."
     }
   },
   "required": ["timestamp", "task_id", "agent_id", "error_type", "severity", "found_by"],

@@ -4,10 +4,8 @@
 
 | Script | Purpose |
 |--------|---------|
-| `./scripts/scaffold <name>` | Create new project |
 | `./scripts/status [project]` | Show progress from Tasks |
 | `./scripts/handoff [project]` | Generate continuation prompt |
-| `./scripts/deploy <service>` | Production deployment |
 | `./scripts/team-status` | Show active Agent Teams |
 | `./scripts/create-formation-registry FORMATION PROJECT` | Create .formation-registry.json |
 | `./scripts/formation-heartbeat [project]` | Formation health report |
@@ -16,14 +14,11 @@
 | `./scripts/plan-sync [PROJECT]` | Snapshot V11 state to ~/.claude/plans/ |
 | `./scripts/plan-resume [PROJECT]` | Resume from V11 plan file |
 | `./scripts/audit-query [--project P]` | Query proof-of-work audit trail |
-| `./scripts/publish PROJECT` | Publish project (SSL + nginx + registry) |
 | `./scripts/index-project-memory PROJECT` | Build/update memory index |
 | `./scripts/effort-advisor <prompt>` | Suggest effort level |
-| `./scripts/migrate-to-v11 PROJECT` | Migrate any project to V11 (auto-detects version) |
+| `./scripts/build-timing [--project P] [--estimate N] [--since W] [--json]` | Empirical build-timing anchors (active-hrs/days, task cycle) from the durable ledger — planning estimate calibration (v11.43) |
 | `./scripts/v11-compliance-check PROJECT` | 10-gate V11 compliance validation |
 | `./scripts/v11-compliance-check --scan` | Scan all projects for compliance |
-| `./scripts/migrate-v10 <project>` | Migrate V10 project to V11 (legacy) |
-| `./scripts/migrate-v8 <project>` | Migrate V8 project to V11 (legacy) |
 | `./scripts/audit-codebase PROJECT PATH` | Orchestrate multi-agent codebase audit |
 | `./scripts/synthesize-findings PROJECT` | Deduplicate, rank, and generate audit report |
 | `./scripts/findings-to-spec PROJECT` | Convert audit findings into V11 spec for fixes |
@@ -32,7 +27,6 @@
 | `./scripts/recover-session [PROJECT]` | Reconstruct context after cut-off conversation |
 | `./scripts/validate-project-setup PROJECT` | 14-check project validation (V11.6+) |
 | `./scripts/context-status` | Show heuristic context window usage |
-| `./scripts/athenaeum-search "query"` | Search Athenaeum libraries for planning |
 | `./scripts/interview-recommend --stack X` | Athenaeum-backed formation recommendations |
 | `./scripts/v11-update PROJECT` | Upgrade V11 project to latest version |
 | `./scripts/v11-update --scan` | Survey all projects by V11 version |
@@ -43,7 +37,6 @@
 | `./scripts/validate-module-manifest PROJECT` | Validate MODULE.md against module-manifest schema (Dark Code Layer 2) |
 | `./scripts/spec-requirements-extract PROJECT [--json]` | Extract STR candidates from spec.md (Dark Code Layer 1) |
 | `./scripts/flywheel-ingest [--algorithm taxonomy\|legacy] [--min-count N]` | Cluster cross-project findings into framework-improvement proposals |
-| `./scripts/verify-gate0 [PROJECT]` | Sprint 0 exit gate — find-audit + test suite + coverage |
 | `./scripts/formation-select PROJECT` | Project-aware formation recommender (top-3 with confidence) |
 | `./scripts/suggest-formation` | Difficulty-aware formation routing helper |
 | `./scripts/v11-drift-scan PROJECT [--fix]` | Lightweight drift detection; also `--scan` all projects |
@@ -64,7 +57,6 @@
 | `./scripts/improve-subagent AGENT [--apply --from-proposal P]` | Evidence-cited prompt amendments for subagents (V11.20.2) |
 | `./scripts/improve-subagent --list-improvable` | List agents with logged errors, ranked (V11.20.2) |
 | `./scripts/improve-subagent --rollback AGENT` | Restore most-recent agent backup (V11.20.2) |
-| `./scripts/agent-recommend --meta X --complexity Y [--with-scorecard]` | DAAO agent recommendation (V11.21) |
 | `./scripts/wave-check PROJECT WAVE` | Wave gate enforcement — INV-12 (V11.21) |
 | `./scripts/dispatch-trace-append` | Log Phase 4 spawn to dispatch-trace.jsonl (V11.21); `--tokens N --tool-uses N --duration-ms N --event EVENT` capture real per-spawn token/tool-use/duration when the harness reports them (W3-T12/v11.29), absent flags → byte-identical pre-W3-T12 line shape, rollback `V11_TOKEN_CAPTURE=off` |
 | `./scripts/review-queue pending\|stats\|list\|mark-done PROJECT [--verdict-file FILE]` | Review queue CLI (V11.19; `--verdict-file` folds full verdict JSON into the durable ledger + verdict store, v11.30) |
@@ -88,17 +80,17 @@ Previously-undocumented live scripts (backfilled 2026-07-01 during the full-syst
 | `./scripts/task-review` | Review-queue task-review helper |
 | `./scripts/v11-resume-tasks PROJECT` | Emit `<v11-resume>` entries from handoff-tasks.json for rehydration (V11.17) |
 | `./scripts/v11-migrate-task-state` | Migrate task-state.json schema forward |
-| `./scripts/verify-gate1` / `verify-gate2` | Gate-exit verification checks |
 | `./scripts/install-postcommit-hook` | Install/chain the git post-commit task-close hook (V11.25) |
 | `./scripts/install-validation-lint-hook` | Install the git commit-msg validation hook (V11.25) |
 | `./scripts/formation-quality-benchmark` | Benchmark formation output quality |
 | `./scripts/archive PROJECT` | Archive a completed session |
-| `./scripts/cloudflare-setup` | Cloudflare tunnel setup for `publish` |
 | `./scripts/lanes status\|gc\|release PROJECT [...]` | Per-project task-execution lane lease CLI — status/gc/release over `v11_lane_*` in `hooks/lib/common.sh` (V11.29) |
 | `./scripts/worktree-sweep [--apply] [--base BRANCH]` | Classify/clean stale `.claude/worktrees/` — LOCKED/SAFE_REMOVE/KEEP(dirty)/KEEP(unmerged) |
 | `./scripts/worktree-sweep verify [WORKTREE_PATH\|--all] [--base BRANCH] [--json]` | Read-only commit-verify guard: exit-code contract (0 clean-merged / 10 uncommitted-non-generated / 11 unmerged / 12 generated-only-dirty) — catches the "edited but never committed" silent-loss failure mode |
 | `./scripts/ledger-archive` | Operator-on-demand ledger archival; rollback `V11_LEDGER_ARCHIVE=off`; first `--apply` run pending |
 | `./scripts/review-queue-maintenance` | Normalize + GC the review queue; cron wiring lands in v11.32 W2 |
 | `./scripts/ledger-verify [PROJECT]` | Cold-path verdict-hash verification across durable ledgers |
+| `./scripts/migrate-autonomy-level-schema [--apply\|--dry-run\|--verify]` | Rewrite `.autonomy-state` `.level` from display form ("A3") to schema integer (V11.34.3); dry-run by default |
+| `./scripts/audit-project-attribution [--json] [--session S] [--under PREFIX]` | Committed oracle for project-attribution correctness in the autonomy audit trail — match/mismatch/fallback + borrowed-autonomy counts (improvement 15 F0) |
 
 > Note: this file is a curated index, not exhaustive (84 executable scripts exist). Run `ls scripts/` for the full set.

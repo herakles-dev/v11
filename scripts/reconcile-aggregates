@@ -28,7 +28,7 @@
 set -euo pipefail
 
 V11_HOME="${V11_HOME:-$HOME/v11}"
-V11_WORKSPACE_ROOT="${V11_WORKSPACE_ROOT:-$HOME/.v11}"
+HERCULES_ROOT="${HERCULES_ROOT:-$HOME}"
 
 # shellcheck source=/dev/null
 source "$V11_HOME/hooks/lib/common.sh"
@@ -56,8 +56,8 @@ Options:
 
 Examples:
   reconcile-aggregates --dry-run
-  reconcile-aggregates --project my-project --verbose
-  reconcile-aggregates --apply --project my-project
+  reconcile-aggregates --project herakles-terminal --verbose
+  reconcile-aggregates --apply --project herakles-terminal
 EOF
 }
 

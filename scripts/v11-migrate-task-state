@@ -31,14 +31,14 @@
 
 set -euo pipefail
 
-V11_WORKSPACE_ROOT="${V11_WORKSPACE_ROOT:-$HOME/.v11}"
-SESSIONS_ROOT="${SESSIONS_ROOT:-$V11_WORKSPACE_ROOT/sessions}"
-METRICS_DIR="${METRICS_DIR:-$V11_WORKSPACE_ROOT/.agent-metrics}"
+HERCULES_ROOT="${HERCULES_ROOT:-$HOME}"
+SESSIONS_ROOT="${SESSIONS_ROOT:-$HERCULES_ROOT/sessions}"
+METRICS_DIR="${METRICS_DIR:-$HERCULES_ROOT/.agent-metrics}"
 TASK_STATE_DIR="${TASK_STATE_DIR:-$METRICS_DIR/task-state}"
 SESSIONS_METRICS_DIR="$METRICS_DIR/sessions"
 
 # Derive V11_HOME from this script's own location so tests can override
-# V11_WORKSPACE_ROOT without breaking common.sh resolution.
+# HERCULES_ROOT without breaking common.sh resolution.
 _SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 V11_HOME="${V11_HOME:-$(cd "$_SCRIPT_DIR/.." && pwd)}"
 

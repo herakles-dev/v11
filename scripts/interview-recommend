@@ -46,8 +46,7 @@ fi
 
 # ── Athenaeum search (with fallback) ─────────────────────────────────────────
 ATHENAEUM_UP=false
-ATHENAEUM_PORT="${ATHENAEUM_PORT:-8000}"
-if [[ -x "$ATHENAEUM" ]] && curl -sf --max-time 3 "http://localhost:${ATHENAEUM_PORT}/api/libraries" >/dev/null 2>&1; then
+if [[ -x "$ATHENAEUM" ]] && curl -sf --max-time 3 "http://localhost:8140/api/libraries" >/dev/null 2>&1; then
   ATHENAEUM_UP=true
 fi
 

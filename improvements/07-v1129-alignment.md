@@ -1,6 +1,6 @@
 # 07 — V11.29 Alignment & Hardening: Subagents, Playbooks, Skills
 
-**Status:** PROPOSED (2026-07-10) · **Source:** full-surface audit vs v11.29 anchors — coherence gate (5 doc + 3 data-plane lenses), 4 alignment scans, 21-task review-queue drain. Evidence: `sessions/v11-coherence/reports/report-2026-07-10.md` (28 findings: 7 HIGH / 17 MED / 4 LOW).
+**Status:** EXECUTED (W1–W5) (proposed 2026-07-10) · **Source:** full-surface audit vs v11.29 anchors — coherence gate (5 doc + 3 data-plane lenses), 4 alignment scans, 21-task review-queue drain. Evidence: `sessions/v11-coherence/reports/report-2026-07-10.md` (28 findings: 7 HIGH / 17 MED / 4 LOW).
 
 ## Intent
 Close the gap between what v11.29 SHIPPED (lane lease, pre-scope, token ledger, worktree default) and what the consumer surface — subagent defs, orchestrator playbooks, satellite skills, docs — still TEACHES. Plus: stop the version-stamp drift treadmill structurally instead of hand-sweeping it a third time.

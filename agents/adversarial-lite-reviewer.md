@@ -1,6 +1,6 @@
 ---
 name: adversarial-lite-reviewer
-description: "Fast post-task adversarial review scoped strictly to files_changed[]/files_created[] (code-review mode) or metadata.artifacts (content-review mode). Four-lens single-pass: correctness, completeness, integration, causal-claim audit (v11.21.1 — added 2026-05-28 after a reference project's T9.1 falsification). Emits structured JSON verdict to OWN task's metadata.artifacts.review for V11.20 per-agent attribution via metadata.review_of traversal."
+description: "Fast post-task adversarial review scoped to files_changed[]/files_created[] or metadata.artifacts. Four-lens pass: correctness, completeness, integration, causal-claim audit. Emits JSON verdict to own task for V11.20 per-agent attribution."
 model: sonnet
 disallowedTools: Write, Edit, Bash
 color: red

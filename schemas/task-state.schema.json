@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "task-state.schema.json",
+  "$id": "https://herakles.dev/v11/schemas/task-state.schema.json",
   "title": "V11 Task State",
   "description": "Schema for task-state JSON written by sync-tasks hook. Internal runtime state, not user-configured.",
   "type": "object",

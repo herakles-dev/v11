@@ -1,0 +1,203 @@
+#!/usr/bin/env bash
+# check-git-tasklist-alignment — drift guard: modified/untracked files at session end
+# that aren't tied to any completed task's metadata.artifacts
+# (improvements/35-pre-handoff-drift-check.md, case #3).
+#
+# ROOT CAUSE this defends: a session can end with `git status` showing modified/untracked
+# files that never got attached to a completed task's artifact record — not necessarily a
+# bug, but a drift signal: those files should either be reflected in a task's
+# metadata.artifacts.files_changed/files_created/files_touched, or be work still tracked
+# by an open task. Nothing cross-references the two today.
+#
+# Sibling of check-stamp-drift / check-changelog-drift — same shape, same conventions.
+#
+# No config file required — auto-detects: a project is checked only when
+# sessions/{project}/.git exists (i.e. the project's own working tree lives directly under
+# its session dir, as with e.g. claude-ahk). Projects whose code lives in a different repo
+# (this framework's own sessions/v11-proactive-discipline is one — its tracked files are
+# absolute paths into v11/ and ~/.claude/skills/) are skipped: this check only reasons
+# about a project-root repo, it does not guess at an external repo location.
+#
+# For a checked project: `git status --porcelain=v1 -z` (NUL-separated, rename-aware) is
+# cross-referenced against every string found under a "files_changed", "files_created", or
+# "files_touched" key anywhere inside .task-state.json's task_artifacts (any nesting
+# depth — artifact schemas vary by agent). Both sides are normalized to absolute
+# (os.path.realpath) before comparison so relative-vs-absolute recording doesn't produce
+# false positives.
+#
+# Always WARN (never FAIL) — this is an advisory signal, not a correctness violation.
+# Exit: 0 = PASS/skip (clean, or nothing to cross-reference), 2 = WARN (unmapped files
+# found). Rollback: V11_GIT_TASKLIST_CHECK=off.
+set -uo pipefail
+
+SESSIONS_ROOT="${SESSIONS_ROOT:-$HOME/sessions}"
+
+say() { printf '%s\n' "$*" >&2; }
+debug() { [ "${V11_DRIFT_CHECK_DEBUG:-off}" = "on" ] && say "[debug] $*"; }
+
+usage() {
+    cat <<'USAGE'
+check-git-tasklist-alignment — flag git-modified/untracked files not tied to any
+task's metadata.artifacts.
+
+Usage:
+  check-git-tasklist-alignment [--project NAME] [--help]
+
+No config file needed. Only checks projects with a git repo directly at
+sessions/{project}/ — others are skipped. Default (no --project): scans every
+sessions/*/.
+
+Env:
+  V11_GIT_TASKLIST_CHECK=off     Disable entirely (no-op, exit 0).
+  V11_DRIFT_CHECK_DEBUG=on       Verbose per-project debug output on stderr.
+
+Exit: 0 = PASS/skip, 2 = WARN (unmapped files found). Never FAILs.
+USAGE
+}
+
+PROJECT_FILTER=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --help|-h) usage; exit 0 ;;
+        --project) PROJECT_FILTER="${2:-}"; shift 2 ;;
+        *) shift ;;
+    esac
+done
+
+if [ "${V11_GIT_TASKLIST_CHECK:-on}" = "off" ]; then
+    say "check-git-tasklist-alignment: disabled (V11_GIT_TASKLIST_CHECK=off) — no-op."
+    exit 0
+fi
+
+PROJECTS=()
+if [ -n "$PROJECT_FILTER" ]; then
+    if [ ! -d "$SESSIONS_ROOT/$PROJECT_FILTER" ]; then
+        say "⚠ check-git-tasklist-alignment: project not found: $SESSIONS_ROOT/$PROJECT_FILTER"
+        exit 0
+    fi
+    PROJECTS=("$PROJECT_FILTER")
+else
+    while IFS= read -r -d '' d; do
+        PROJECTS+=("$(basename "$d")")
+    done < <(find "$SESSIONS_ROOT" -mindepth 1 -maxdepth 1 -type d -print0 2>/dev/null)
+fi
+
+DBG=0
+[ "${V11_DRIFT_CHECK_DEBUG:-off}" = "on" ] && DBG=1
+
+OVERALL=0
+CHECKED=0
+
+for proj in "${PROJECTS[@]}"; do
+    proj_dir="$SESSIONS_ROOT/$proj"
+    if [ ! -d "$proj_dir/.git" ]; then
+        debug "no .git at $proj_dir, skipping"
+        continue
+    fi
+    CHECKED=$((CHECKED + 1))
+    python3 - "$proj_dir" "$DBG" <<'PYEOF'
+import json, os, subprocess, sys
+
+proj_dir, debug = sys.argv[1], sys.argv[2] == '1'
+proj_name = os.path.basename(proj_dir.rstrip('/'))
+
+
+def dbg(msg):
+    if debug:
+        print(f"[debug] {msg}", file=sys.stderr)
+
+
+try:
+    out = subprocess.run(
+        ['git', '-C', proj_dir, 'status', '--porcelain=v1', '-z'],
+        capture_output=True, timeout=10
+    )
+except Exception as e:
+    print(f"⚠ check-git-tasklist-alignment[{proj_name}]: git status failed: {e}", file=sys.stderr)
+    sys.exit(0)
+
+if out.returncode != 0:
+    print(f"⚠ check-git-tasklist-alignment[{proj_name}]: git status exited {out.returncode}: {out.stderr.decode(errors='replace').strip()}", file=sys.stderr)
+    sys.exit(0)
+
+tokens = out.stdout.decode('utf-8', errors='replace').split('\0')
+git_files = []
+i = 0
+while i < len(tokens):
+    tok = tokens[i]
+    if not tok:
+        i += 1
+        continue
+    status = tok[:2]
+    path = tok[3:]
+    git_files.append(path)
+    if 'R' in status or 'C' in status:
+        # rename/copy: -z porcelain emits <path>=new/current NUL <origPath>=old NUL —
+        # `path` above is already the current file; consume and discard the orig token.
+        i += 1
+    i += 1
+
+if not git_files:
+    dbg(f"{proj_name}: git status clean, nothing to cross-reference")
+    sys.exit(0)
+
+state_path = os.path.join(proj_dir, '.task-state.json')
+tracked = set()
+if os.path.isfile(state_path):
+    try:
+        state = json.load(open(state_path))
+    except Exception as e:
+        print(f"⚠ check-git-tasklist-alignment[{proj_name}]: could not parse .task-state.json: {e}", file=sys.stderr)
+        state = {}
+
+    def walk(obj):
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                if k in ('files_changed', 'files_created', 'files_touched') and isinstance(v, list):
+                    for item in v:
+                        if isinstance(item, str):
+                            tracked.add(item)
+                else:
+                    walk(v)
+        elif isinstance(obj, list):
+            for item in obj:
+                walk(item)
+
+    walk(state.get('task_artifacts', {}))
+else:
+    dbg(f"{proj_name}: no .task-state.json found — treating as zero tracked files")
+
+
+def norm(p):
+    if os.path.isabs(p):
+        return os.path.realpath(p)
+    return os.path.realpath(os.path.join(proj_dir, p))
+
+
+tracked_abs = {norm(p) for p in tracked}
+unmapped = [gf for gf in git_files if norm(gf) not in tracked_abs]
+
+if not unmapped:
+    print(f"✓ check-git-tasklist-alignment[{proj_name}]: all {len(git_files)} modified/untracked file(s) map to a task's artifacts.", file=sys.stderr)
+    sys.exit(0)
+
+print(f"⚠ GIT_TASKLIST_DRIFT[{proj_name}]: {len(unmapped)} of {len(git_files)} modified/untracked file(s) not tied to any task's metadata.artifacts.", file=sys.stderr)
+for f in unmapped[:5]:
+    print(f"   - {f}", file=sys.stderr)
+if len(unmapped) > 5:
+    print(f"   ... and {len(unmapped) - 5} more", file=sys.stderr)
+sys.exit(2)
+PYEOF
+    rc=$?
+    if [ "$rc" -eq 2 ]; then
+        OVERALL=2
+    fi
+done
+
+if [ "$CHECKED" -eq 0 ]; then
+    debug "no project-root git repo found in any scanned project — no-op."
+elif [ "$OVERALL" -eq 0 ]; then
+    say "check-git-tasklist-alignment: no drift found (${CHECKED} project(s) with a repo checked)."
+fi
+
+exit "$OVERALL"

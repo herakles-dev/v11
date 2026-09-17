@@ -1,0 +1,294 @@
+#!/bin/bash
+# v11.44 Script: grade-briefs
+# Grade the quality of the BRIEFS the orchestrator authored — the subject /
+# description / agent-assignment it handed each spawned agent. The orchestrator's
+# authoring is otherwise unmeasured; this is the "brief quality" signal behind the
+# orchestrator scorecard (agent-scorecard orchestrator --layer brief).
+#
+# Reads the durable ledger's `created` events (the brief IS the TaskCreate the
+# orchestrator wrote). Scores each brief on a small, script-decidable rubric and
+# emits (with --apply) additive `found_by_layer="brief"` findings to
+# agent-errors.jsonl, attributed to the canonical "orchestrator" actor. It NEVER
+# touches an executor's existing finding — a task that failed from a bad brief AND
+# a buggy agent correctly shows a fault on BOTH scorecards (the intended union).
+#
+# Usage:
+#   grade-briefs PROJECT                 # human report (propose-only)
+#   grade-briefs PROJECT --json          # machine-readable
+#   grade-briefs PROJECT --since 2026-08-01
+#   grade-briefs PROJECT --apply         # additive-append findings (idempotent)
+#
+# Rubric (SCORED, script-decidable):
+#   scoped      description present, substantive (>=40 chars), not just the subject
+#   right_agent metadata.agent (or recommended_agent) is registry-valid AND not a
+#               generic catch-all (general-purpose/claude/Explore/main/unknown) or absent
+#   outcome     did a MEDIUM+ lite/wave finding later fire on this task?
+# Rubric (ADVISORY-only, coarse heuristic — reported, never gates a defect):
+#   testable    description hints at an acceptance signal (keyword)
+#   agent_fit   subject/description overlaps the assigned agent's registry blurb/triggers
+#
+# Verdict: (not scoped OR not right_agent) AND task-failed => briefing_defect
+#          (not scoped OR not right_agent) AND task-ok     => briefing_risk (near-miss)
+#          otherwise                                        => ok (no finding)
+#
+# Rollback: V11_BRIEF_REVIEW=off disables the grader entirely (prints a notice, exit 0).
+# ADVISORY ONLY: never auto-routes agents, never auto-edits any prompt.
+set -euo pipefail
+
+HERCULES_ROOT="${HERCULES_ROOT:-$HOME}"
+METRICS_DIR="$HERCULES_ROOT/.agent-metrics"
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]:-$0}")")" && pwd)"
+REGISTRY_FILE="${V11_AGENT_REGISTRY:-$HERCULES_ROOT/.agent-registry/agents.json}"
+
+if [ "${1:-}" = "--test" ]; then echo "grade-briefs v1.0 (v11.44)"; exit 0; fi
+if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//'; exit 0; fi
+
+if [ "${V11_BRIEF_REVIEW:-}" = "off" ]; then
+    echo "grade-briefs: V11_BRIEF_REVIEW=off — brief grading disabled (rollback lever)." >&2
+    exit 0
+fi
+
+PROJECT="" SINCE="" JSON=false APPLY=false
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --json) JSON=true ;;
+        --apply) APPLY=true ;;
+        --since) SINCE="${2:-}"; shift ;;
+        -*) echo "grade-briefs: unknown arg '$1'" >&2; exit 2 ;;
+        *) [ -z "$PROJECT" ] && PROJECT="$1" || { echo "grade-briefs: unexpected arg '$1'" >&2; exit 2; } ;;
+    esac
+    shift
+done
+[ -z "$PROJECT" ] && { echo "grade-briefs: PROJECT required (try --help)" >&2; exit 2; }
+
+LEDGER_FILE="$METRICS_DIR/ledger/$PROJECT.jsonl"
+ERRORS_LEDGER="$METRICS_DIR/agent-errors.jsonl"
+
+# Aggregate override rate for the orchestrator, reused from the existing V11.32
+# routing report rather than re-parsing dispatch-trace (single implementation).
+OVERRIDE_JSON="$("$SCRIPT_DIR/agent-scorecard" --routing --project "$PROJECT" ${SINCE:+--since "$SINCE"} --json 2>/dev/null || echo '{}')"
+
+V11_GB_PROJECT="$PROJECT" V11_GB_SINCE="$SINCE" V11_GB_JSON="$JSON" V11_GB_APPLY="$APPLY" \
+V11_GB_LEDGER="$LEDGER_FILE" V11_GB_ERRORS="$ERRORS_LEDGER" V11_GB_REGISTRY="$REGISTRY_FILE" \
+V11_GB_OVERRIDE_JSON="$OVERRIDE_JSON" V11_GB_METRICS="$METRICS_DIR" \
+python3 - <<'PYEOF'
+import os, sys, json, re, hashlib, datetime, fcntl
+
+def env(k, d=""): return os.environ.get(k, d)
+
+project   = env("V11_GB_PROJECT")
+since_raw = env("V11_GB_SINCE") or None
+as_json   = env("V11_GB_JSON") == "true"
+apply     = env("V11_GB_APPLY") == "true"
+ledger    = env("V11_GB_LEDGER")
+errors    = env("V11_GB_ERRORS")
+reg_path  = env("V11_GB_REGISTRY")
+
+GENERIC = {"general-purpose", "claude", "explore", "main", "unknown", "orchestrator", ""}
+ACCEPT_KW = ("verify", "test", "assert", "should", "expect", "ensure", "so that",
+             "returns", "pass", "acceptance", "validate", "confirm", "prove")
+MIN_DESC = 40
+FAIL_SEV = {"MEDIUM", "HIGH", "CRITICAL"}
+
+def parse_ts(s):
+    try:
+        dt = datetime.datetime.fromisoformat(str(s).replace("Z", "+00:00"))
+    except Exception:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=datetime.timezone.utc)
+    return dt
+
+since_dt = parse_ts(since_raw + "T00:00:00") if since_raw else None
+
+def read_jsonl(p):
+    if not p or not os.path.exists(p): return
+    with open(p) as fh:
+        for line in fh:
+            line = line.strip()
+            if not line: continue
+            try: yield json.loads(line)
+            except Exception: continue
+
+# registry: valid agent names are the top-level keys of .agents (object)
+registry = set()
+try:
+    with open(reg_path) as fh:
+        agents = json.load(fh).get("agents", {})
+    registry = set(agents.keys()) if isinstance(agents, dict) else set()
+except Exception:
+    registry = set()
+
+# registry blurbs for the advisory agent-fit heuristic
+reg_blurb = {}
+try:
+    with open(reg_path) as fh:
+        for name, meta in (json.load(fh).get("agents", {}) or {}).items():
+            if isinstance(meta, dict):
+                reg_blurb[name] = ((meta.get("description") or "") + " " + str(meta.get("triggers") or "")).lower()
+except Exception:
+    pass
+
+# Failed-task set: (project, task_id) with any MEDIUM+ finding. NOTE: this join is
+# on the session-local task_id, so it is a COARSE (best-effort) correlation — a
+# heuristic gate for briefing_defect vs briefing_risk, not authoritative identity.
+# The idempotency key below DOES use canonical identity (subject_norm, create_seq).
+failed = set()
+for r in read_jsonl(errors):
+    if r.get("project") != project: continue
+    if (r.get("severity") or "").upper() in FAIL_SEV:
+        tid = r.get("task_id")
+        if tid is not None:
+            failed.add(str(tid))
+
+def tokenize(s):
+    return set(w for w in re.split(r"[^a-z0-9]+", (s or "").lower()) if len(w) > 3)
+
+def brief_key(subject_norm, create_seq):
+    return hashlib.sha256(f"{project}|{subject_norm}|{create_seq}|brief".encode()).hexdigest()
+
+briefs = []
+for row in read_jsonl(ledger):
+    if row.get("ev") != "created":
+        continue
+    if row.get("source") == "migration":   # pre-V11 imports — not the current orchestrator's authoring
+        continue
+    if since_dt is not None:
+        ts = parse_ts(row.get("ts"))
+        if ts is not None and ts < since_dt:
+            continue
+    subject   = row.get("subject") or ""
+    subj_norm = row.get("subject_norm") or ""
+    create_seq = row.get("create_seq")
+    desc      = row.get("description") or ""
+    tid       = str(row.get("task_id")) if row.get("task_id") is not None else ""
+    md        = row.get("metadata") or {}
+    assigned  = md.get("agent") or row.get("recommended_agent") or ""
+
+    # SCORED checks
+    scoped = bool(desc) and len(desc) >= MIN_DESC and desc.strip() != subject.strip()
+    a_low = assigned.lower()
+    right_agent = bool(assigned) and (assigned in registry) and (a_low not in GENERIC)
+    task_failed = tid in failed
+
+    # ADVISORY heuristics
+    testable = any(kw in desc.lower() for kw in ACCEPT_KW)
+    fit = None
+    if assigned in reg_blurb:
+        overlap = tokenize(subject + " " + desc) & tokenize(reg_blurb[assigned])
+        fit = len(overlap) >= 2
+
+    scored_fail = (not scoped) or (not right_agent)
+    if scored_fail and task_failed:
+        verdict = "briefing_defect"
+    elif scored_fail and not task_failed:
+        verdict = "briefing_risk"
+    else:
+        verdict = "ok"
+
+    reasons = []
+    if not scoped: reasons.append("unscoped" if desc else "no_description")
+    if not right_agent:
+        reasons.append("no_agent_assigned" if not assigned
+                        else ("generic_agent" if a_low in GENERIC
+                              else "unregistered_agent"))
+
+    briefs.append({
+        "task_id": tid, "subject": subject[:70], "create_seq": create_seq,
+        "assigned_agent": assigned or None,
+        "scoped": scoped, "right_agent": right_agent, "task_failed": task_failed,
+        "testable_advisory": testable, "agent_fit_advisory": fit,
+        "verdict": verdict, "reasons": reasons,
+        "attribution_key": brief_key(subj_norm, create_seq),
+        "_subject_norm": subj_norm,
+    })
+
+n = len(briefs)
+defects = [b for b in briefs if b["verdict"] == "briefing_defect"]
+risks   = [b for b in briefs if b["verdict"] == "briefing_risk"]
+pct = lambda k: round(100.0 * sum(1 for b in briefs if b[k]) / n, 1) if n else 0.0
+
+try:
+    ov = json.loads(env("V11_GB_OVERRIDE_JSON") or "{}")
+except Exception:
+    ov = {}
+orch_row = next((r for r in ov.get("agents", []) if r.get("recommended_agent") == "orchestrator"), None)
+override_rate = (orch_row or {}).get("rate_pct", ov.get("overall", {}).get("rate_pct"))
+
+summary = {
+    "project": project, "since": since_raw, "briefs_graded": n,
+    "pct_scoped": pct("scoped"), "pct_right_agent": pct("right_agent"),
+    "briefing_defect": len(defects), "briefing_risk": len(risks),
+    "orchestrator_override_rate_pct": override_rate,
+    "advisory_only": True,
+}
+
+# --- T5: additive-append (--apply). ADDITIVE ONLY — appends new found_by_layer="brief"
+# rows attributed to the canonical "orchestrator"; NEVER rewrites/deletes an executor's
+# finding (the union is intended). Idempotent via attribution_key = canonical identity.
+def APPLY_IMPL(briefs, summary):
+    to_write = [b for b in briefs if b["verdict"] in ("briefing_defect", "briefing_risk")]
+    now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    lock_path = errors + ".lock"
+    appended = 0
+    with open(lock_path, "a") as lk:                 # same lock file sync-tasks uses
+        fcntl.flock(lk, fcntl.LOCK_EX)
+        try:
+            existing = {r.get("attribution_key") for r in read_jsonl(errors)
+                        if r.get("found_by_layer") == "brief" and r.get("attribution_key")}
+            with open(errors, "a") as fh:
+                for b in to_write:
+                    if b["attribution_key"] in existing:
+                        continue
+                    sev = "MEDIUM" if b["verdict"] == "briefing_defect" else "LOW"
+                    fh.write(json.dumps({
+                        "timestamp": now_iso,
+                        "project": project,
+                        "task_id": b["task_id"],
+                        "agent_id": "orchestrator",       # canonical actor
+                        "found_by_layer": "brief",
+                        "found_by": "grade-briefs",
+                        "cause_kind": b["verdict"],       # briefing_defect | briefing_risk
+                        "severity": sev,
+                        "error_type": "briefing",
+                        "reasons": b["reasons"],
+                        "subject_norm": b["_subject_norm"],
+                        "create_seq": b["create_seq"],
+                        "attribution_key": b["attribution_key"],
+                        "caller_kind": "orchestrator",    # briefs ARE authored by the orchestrator
+                    }) + "\n")
+                    appended += 1
+        finally:
+            fcntl.flock(lk, fcntl.LOCK_UN)
+    summary["appended"] = appended
+    summary["skipped_idempotent"] = len(to_write) - appended
+
+if apply:
+    APPLY_IMPL(briefs, summary)
+
+if as_json:
+    for b in briefs: b.pop("_subject_norm", None)
+    print(json.dumps({"summary": summary, "briefs": briefs}, indent=2))
+    sys.exit(0)
+
+print(f"v11.44 Brief Quality — {project}   (ADVISORY ONLY — orchestrator authoring signal)")
+if since_raw: print(f"  since={since_raw}")
+print("=" * 88)
+print(f"  briefs graded: {n}   scoped: {summary['pct_scoped']}%   right-agent: {summary['pct_right_agent']}%")
+print(f"  briefing_defect: {len(defects)}   briefing_risk: {len(risks)}   override-rate: {override_rate}")
+print("  " + "-" * 84)
+for b in sorted(briefs, key=lambda x: {"briefing_defect":0,"briefing_risk":1,"ok":2}[x["verdict"]]):
+    if b["verdict"] == "ok":
+        continue
+    flags = ",".join(b["reasons"]) or "-"
+    print(f"  [{b['verdict']:<15}] cs={b['create_seq']!s:<3} {b['subject']:<70}  ({flags})")
+if not defects and not risks:
+    print("  No briefing issues found under current filters.")
+print("  " + "-" * 84)
+if apply:
+    print(f"  APPLIED: appended {summary.get('appended', 0)} finding(s) to agent-errors.jsonl "
+          f"({summary.get('skipped_idempotent', 0)} skipped as already-present)")
+else:
+    print(f"  PROPOSE-ONLY: would append {len(defects)} briefing_defect + {len(risks)} "
+          f"briefing_risk finding(s) — re-run with --apply")
+PYEOF

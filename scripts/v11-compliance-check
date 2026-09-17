@@ -21,8 +21,8 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 V11_HOME="$(dirname "$SCRIPT_DIR")"
-V11_WORKSPACE_ROOT="${V11_WORKSPACE_ROOT:-$HOME/.v11}"
-SESSIONS_ROOT="${SESSIONS_ROOT:-$V11_WORKSPACE_ROOT/sessions}"
+HERCULES_ROOT="${HERCULES_ROOT:-$HOME}"
+SESSIONS_ROOT="${SESSIONS_ROOT:-$HERCULES_ROOT/sessions}"
 
 # Self-test
 if [ "${1:-}" = "--test" ]; then
@@ -79,7 +79,7 @@ if [ "$PROJECT" = "--scan" ]; then
     for d in "$SESSIONS_ROOT"/*/; do
         [ -d "$d" ] && PROJECTS+=("session:$(basename "$d")")
     done
-    for d in "$V11_WORKSPACE_ROOT"/*/; do
+    for d in "$HERCULES_ROOT"/*/; do
         name=$(basename "$d")
         # Skip non-project dirs
         [[ "$name" =~ ^(v6_Ultra|v8|v9\.backup|v10|v11|node_modules|\.archive|scripts|system-apps-config)$ ]] && continue
@@ -98,7 +98,7 @@ if [ "$PROJECT" = "--scan" ]; then
         if [ "$type" = "session" ]; then
             PROJECT_DIR="$SESSIONS_ROOT/$name"
         else
-            PROJECT_DIR="$V11_WORKSPACE_ROOT/$name"
+            PROJECT_DIR="$HERCULES_ROOT/$name"
         fi
 
         # Quick scoring
@@ -163,13 +163,13 @@ fi
 
 # --- Single project check ---
 
-# Find project directory
+# Find project directory — prefer sessions/ (code lives there) over root (may be stale state)
 PROJECT_DIR=""
 SESSION_DIR="$SESSIONS_ROOT/$PROJECT"
-if [ -d "$V11_WORKSPACE_ROOT/$PROJECT" ]; then
-    PROJECT_DIR="$V11_WORKSPACE_ROOT/$PROJECT"
-elif [ -d "$SESSION_DIR" ]; then
+if [ -d "$SESSION_DIR" ]; then
     PROJECT_DIR="$SESSION_DIR"
+elif [ -d "$HERCULES_ROOT/$PROJECT" ]; then
+    PROJECT_DIR="$HERCULES_ROOT/$PROJECT"
 else
     echo "ERROR: Project '$PROJECT' not found"
     exit 2
@@ -242,14 +242,25 @@ SETTINGS=""
 
 EXPECTED_HOOKS=(detect-project guard-write-gates guard-enforcement guard-effort enforce-test-coverage verify-syntax track-autonomy sync-tasks guard-agent-stall track-agents fix-team-model post-compact session-end)
 
+# Dynamic threshold: count v11/hooks references in canonical settings.json (v11.37 W3-T2).
+# Falls back to 13 if the canonical file is missing.
+CANONICAL_SETTINGS="$V11_HOME/.claude/settings.json"
+if [ -f "$CANONICAL_SETTINGS" ]; then
+    HOOK_THRESHOLD=$(grep -c "v11/hooks" "$CANONICAL_SETTINGS" 2>/dev/null || echo 13)
+    HOOK_THRESHOLD=$(echo "$HOOK_THRESHOLD" | tr -d '[:space:]' | head -c 5)
+    [ -z "$HOOK_THRESHOLD" ] || [ "$HOOK_THRESHOLD" -lt 1 ] && HOOK_THRESHOLD=13
+else
+    HOOK_THRESHOLD=13
+fi
+
 if [ -n "$SETTINGS" ]; then
     v11_count=$(grep -c "v11/hooks" "$SETTINGS" 2>/dev/null || echo "0")
     v11_count=$(echo "$v11_count" | tr -d '[:space:]' | head -c 5)
     [ -z "$v11_count" ] && v11_count=0
-    if [ "$v11_count" -ge 13 ]; then
-        gate 3 "V11 hooks wired" "PASS" "$v11_count references"
+    if [ "$v11_count" -ge "$HOOK_THRESHOLD" ]; then
+        gate 3 "V11 hooks wired" "PASS" "$v11_count references (>= $HOOK_THRESHOLD)"
     elif [ "$v11_count" -gt 0 ]; then
-        gate 3 "V11 hooks wired" "WARN" "Only $v11_count/13+ references"
+        gate 3 "V11 hooks wired" "WARN" "Only $v11_count/${HOOK_THRESHOLD}+ references"
     else
         # Check for legacy hooks
         legacy=""
@@ -307,7 +318,7 @@ fi
 
 # Gate 4b: Hooks actually firing (advisory — detects mid-session installs)
 if [ -n "$SETTINGS" ] && [ -f "$SETTINGS" ]; then
-    AUDIT_LOG="$V11_WORKSPACE_ROOT/.agent-metrics/autonomy-audit.jsonl"
+    AUDIT_LOG="$HERCULES_ROOT/.agent-metrics/autonomy-audit.jsonl"
     if [ -f "$AUDIT_LOG" ]; then
         # Check for any audit entry for this project in the last 2 hours
         _CUTOFF=$(date -d '2 hours ago' -Iseconds 2>/dev/null || date -Iseconds)
@@ -555,7 +566,7 @@ fi
 
 # Gate 12: Layer 1 STR coverage
 # Reads dark_code_advisories counter from task-state (persisted by sync-tasks).
-TASK_STATE_FILE="$V11_WORKSPACE_ROOT/.agent-metrics/task-state/${PROJECT}.json"
+TASK_STATE_FILE="$HERCULES_ROOT/.agent-metrics/task-state/${PROJECT}.json"
 [ ! -f "$TASK_STATE_FILE" ] && [ -f "$SESSION_DIR/.task-state.json" ] && TASK_STATE_FILE="$SESSION_DIR/.task-state.json"
 if [ -f "$TASK_STATE_FILE" ]; then
     str_missing=$(jq -r '.dark_code_advisories.str_missing_count // 0' "$TASK_STATE_FILE" 2>/dev/null)

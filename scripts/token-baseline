@@ -25,8 +25,8 @@
 
 set -euo pipefail
 
-V11_WORKSPACE_ROOT="${V11_WORKSPACE_ROOT:-$HOME/.v11}"
-METRICS_DIR="${METRICS_DIR:-$V11_WORKSPACE_ROOT/.agent-metrics}"
+HERCULES_ROOT="${HERCULES_ROOT:-$HOME}"
+METRICS_DIR="${METRICS_DIR:-$HERCULES_ROOT/.agent-metrics}"
 
 if [ "${1:-}" == "--test" ]; then
     echo "token-baseline v1.0 (V11.30)"

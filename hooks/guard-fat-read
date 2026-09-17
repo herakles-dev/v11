@@ -1,0 +1,120 @@
+#!/bin/bash
+# V11 Hook: guard-fat-read (PostToolUse — Read)
+# Advisory only — NEVER blocks.
+#
+# Fires when the file just Read is heavy:
+#   (a) image (.png/.jpg/.jpeg/.gif/.webp/.bmp) with on-disk size >100KB, or
+#   (b) any other file with on-disk size >50KB.
+#
+# A fat Read pulls its whole payload into the MAIN session's context, where
+# it lives for the rest of the session (context-tier rule 14/19: heavy reads
+# belong in a subagent/Explore sidecar so the payload dies with that
+# sidecar's context instead of bloating the orchestrator's).
+#
+# Env vars:
+#   V11_FAT_READ_ADVISORY=off   — disable entirely (default: on)
+#
+# Rate limiting: at most one advisory per 5 Read invocations (of a
+# resolvable, existing, on-disk file) per session — a lightweight counter
+# file under the session scratch dir, mirroring completion-hint's per-task
+# marker convention. This is a size/spam guard, not a security control, so
+# a best-effort (non-atomic) read-increment-write is acceptable.
+#
+# Exit codes:
+#   0 — always (advisory, never blocks)
+
+# Defensive — never fail Read on hook errors. The hook intentionally DOES
+# emit stderr (its whole purpose is to nudge), so we cannot wrap the whole
+# body in 2>/dev/null. Instead, every individual side-effect that could
+# fail is guarded with `|| true`, and the outermost `set +e` keeps any one
+# error from killing the process.
+set -u +e
+
+[ "${V11_FAT_READ_ADVISORY:-on}" = "off" ] && exit 0
+
+# Load shared lib
+_LIB="$(dirname "${BASH_SOURCE[0]}")/lib/common.sh"
+[ -f "$_LIB" ] || exit 0
+source "$_LIB" 2>/dev/null || exit 0
+
+# Guard: common.sh must export METRICS_DIR. If it didn't (minimal env,
+# lazy init, source partial-failure), bail before we touch any path built
+# from it.
+[ -z "${METRICS_DIR:-}" ] && exit 0
+
+# Test mode
+if [ "${1:-}" = "--test" ]; then
+    echo "guard-fat-read v1"
+    exit 0
+fi
+
+# --- Parse input ---
+v11_parse_input
+
+# Only fires on the Read tool
+[ "$V11_TOOL_NAME" = "Read" ] || exit 0
+
+# No file path — nothing to size
+[ -z "$V11_FILE_PATH" ] && exit 0
+
+# Only regular, on-disk files have a meaningful "on-disk size". A Read of a
+# path that no longer exists (deleted mid-session, race, non-file resource)
+# is out of scope — nothing left to route to a sidecar.
+[ -f "$V11_FILE_PATH" ] || exit 0
+
+# --- On-disk size (bytes), Linux stat first, portable fallbacks after ---
+_SIZE_BYTES="$(stat -c%s "$V11_FILE_PATH" 2>/dev/null || true)"
+if [ -z "$_SIZE_BYTES" ]; then
+    _SIZE_BYTES="$(stat -f%z "$V11_FILE_PATH" 2>/dev/null || true)"
+fi
+if [ -z "$_SIZE_BYTES" ]; then
+    _SIZE_BYTES="$(wc -c < "$V11_FILE_PATH" 2>/dev/null | tr -d '[:space:]' || true)"
+fi
+case "$_SIZE_BYTES" in
+    ''|*[!0-9]*) exit 0 ;;
+esac
+
+# --- Rate limit: at most one advisory per 5 Read invocations per session ---
+# Counted against every Read of a resolvable, existing, on-disk file (not
+# just fat ones) — spacing eligible "turns" 5 apart bounds any 5-Read window
+# to at most one advisory, matching the literal "one per 5 Reads" contract.
+_SID="$(v11_session_uuid)"
+_STATE_DIR="$METRICS_DIR/sessions/$_SID"
+mkdir -p "$_STATE_DIR" 2>/dev/null || true
+_COUNT_FILE="$_STATE_DIR/.fat-read-count"
+
+_PREV_COUNT=0
+if [ -f "$_COUNT_FILE" ]; then
+    _PREV_COUNT="$(cat "$_COUNT_FILE" 2>/dev/null || echo 0)"
+fi
+case "$_PREV_COUNT" in ''|*[!0-9]*) _PREV_COUNT=0 ;; esac
+_COUNT=$((_PREV_COUNT + 1))
+printf '%s' "$_COUNT" > "$_COUNT_FILE" 2>/dev/null || true
+
+_ELIGIBLE=0
+[ $(( (_COUNT - 1) % 5 )) -eq 0 ] && _ELIGIBLE=1
+[ "$_ELIGIBLE" -eq 1 ] || exit 0
+
+# --- Classify: image extension -> 100KB threshold, everything else -> 50KB ---
+# CRITICAL: keep the ERE in a variable, never inline inside [[ =~ ]] — an
+# inline pattern here once bricked every tool call in this codebase (see
+# CLAUDE.md / v11.35.4 incident note). Always: pattern in a var, then
+# `[[ $x =~ $pat ]]`.
+_PATH_LOWER="$(printf '%s' "$V11_FILE_PATH" | tr '[:upper:]' '[:lower:]')"
+_IMAGE_EXT_RE='\.(png|jpe?g|gif|webp|bmp)$'
+_IS_IMAGE=0
+[[ "$_PATH_LOWER" =~ $_IMAGE_EXT_RE ]] && _IS_IMAGE=1
+
+_THRESHOLD_BYTES=$((50 * 1024))
+[ "$_IS_IMAGE" -eq 1 ] && _THRESHOLD_BYTES=$((100 * 1024))
+
+[ "$_SIZE_BYTES" -gt "$_THRESHOLD_BYTES" ] || exit 0
+
+# --- Emit advisory (<=3 lines, stderr, never blocks) ---
+_SIZE_KB=$(( (_SIZE_BYTES + 512) / 1024 ))
+
+echo "[V11 advisory] fat Read: $V11_FILE_PATH (${_SIZE_KB}KB) landed in main context permanently." >&2
+echo "Route heavy reads to a subagent/Explore sidecar so the payload dies with its context." >&2
+echo "(V11 context-tier rule 14/19)" >&2
+
+exit 0

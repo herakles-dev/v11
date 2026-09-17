@@ -61,9 +61,14 @@ def get_skips_log() -> Path:
         return Path(env_val)
     return _DEFAULT_SKIPS_LOG
 
-VALID_TAGS = {"HYPOTHESIZED", "DRY-RUN", "MEASURED-LIVE-PARTIAL", "LIVE"}
+VALID_TAGS = {"HYPOTHESIZED", "DRY-RUN", "MEASURED", "MEASURED-LIVE", "MEASURED-LIVE-PARTIAL", "LIVE"}
 
-TAG_RE = re.compile(r"^Validation:\s*(HYPOTHESIZED|DRY-RUN|MEASURED-LIVE-PARTIAL|LIVE)\b", re.MULTILINE)
+# Alternation is ordered LONGEST-FIRST on purpose: `MEASURED\b` would otherwise match inside
+# "MEASURED-LIVE-PARTIAL" (the '-' is a word boundary) and record the wrong tag string.
+TAG_RE = re.compile(
+    r"^Validation:\s*(HYPOTHESIZED|DRY-RUN|MEASURED-LIVE-PARTIAL|MEASURED-LIVE|MEASURED|LIVE)\b",
+    re.MULTILINE
+)
 PAIRS_RE = re.compile(
     r"^Pairs:\s*(?:(?:[a-z0-9-]+:)?T\d+)(?:,\s*(?:[a-z0-9-]+:)?T\d+)*\s*$",
     re.MULTILINE
@@ -379,7 +384,7 @@ def lint_message(
 
             return LintResult("PASS", [f"HYPOTHESIZED with valid open paired task(s)"])
 
-        # DRY-RUN, MEASURED-LIVE-PARTIAL, LIVE — no further checks
+        # DRY-RUN, MEASURED*, LIVE — no further checks
         return LintResult("PASS", [f"Validation: {tag} present"])
 
     # No tag — check heuristic
@@ -388,7 +393,7 @@ def lint_message(
             "WARN_NO_TAG",
             [
                 "commit contains causal language (root-cause verb + quantified outcome, or mechanism assertion) "
-                "but no Validation: tag — add 'Validation: LIVE|DRY-RUN|MEASURED-LIVE-PARTIAL|HYPOTHESIZED' "
+                "but no Validation: tag — add 'Validation: LIVE|MEASURED|DRY-RUN|MEASURED-LIVE-PARTIAL|HYPOTHESIZED' "
                 "or suppress with [no-lint] trailer"
             ]
         )

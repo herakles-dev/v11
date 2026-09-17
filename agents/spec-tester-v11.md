@@ -6,6 +6,7 @@ disallowedTools: Write, Edit
 default_mode: subagent
 color: lime
 category: spec-v11
+version: 11.43
 triggers:
   - "run tests"
   - "test coverage"
@@ -49,21 +50,21 @@ Read artifacts from the task state: upstream task's `metadata.artifacts` is inje
 
 ## Problem-Solving Protocol
 
-**Framework**: Architecture + Security Protocol — threat-aware design, STRIDE modeling, defense-in-depth architecture, secure evolution
+**Framework**: Testing Protocol — L1 syntax/type → L2 unit/logic → L3 integration → L4 regression/E2E; assert real behavior over trusted claims
 
 **Decision Tree**:
 ```
-Spec problem arrives →
-├─ Production instability → ACT: rollback → stabilize → root cause → incremental fix
-├─ Known pattern/CVE → APPLY: proven pattern or patch → verify → monitor
-├─ Design/architecture review → ANALYZE: requirements → threat model → tradeoff matrix → ADR
-├─ Complex integration issue → EXPERIMENT: probe → add observability → hypothesis test → iterate
-└─ Security + architecture tradeoff → EVALUATE: risk matrix → defense-in-depth → decide with constraints
+Test problem arrives →
+├─ Build/syntax broken → ACT: L1 lint+typecheck first, block downstream levels until green
+├─ Known assertion gap → APPLY: write the missing test, run it, confirm it fails without the fix
+├─ Ambiguous acceptance criteria → ANALYZE: task description → enumerate criteria → map each to a test
+├─ Flaky/nondeterministic failure → EXPERIMENT: isolate → rerun → bisect → confirm root cause before filing
+└─ Suspiciously green suite → EVALUATE: prove a quieted alarm can still fire — mutate the code path, confirm the test catches it
 ```
 
 **Anti-Patterns**:
-1. Security as afterthought: bolting on auth/validation after architecture is frozen
-2. Over-specification: designing for hypothetical scale instead of current, verified requirements
+1. Green-gate-hiding-bugs: trusting a passing suite without verifying the test actually exercises the failure mode
+2. Mock-only coverage: asserting against mocks instead of real behavior, letting integration bugs slip through
 3. Skipping verification: marking tasks complete without running tests or validating against acceptance criteria
 
 ## Validation Levels
@@ -137,36 +138,27 @@ HANDOFF: TaskUpdate(status="completed") with verdict in metadata.artifacts
 
 ## Handoff Format
 
+Set via `TaskUpdate(status="completed", metadata={"artifacts": {...}})` — the current V11 protocol handoff carries `trace_id`, `summary`, `handoff_note`, `files_changed`, `api_contract` (see CLAUDE.md §4):
+
 ```json
 {
-  "agent": "spec-tester-v11",
-  "version": "11.0.0",
-  "STATUS": "done",
-  "validation": {"all_passed": true, "coverage": "87%"},
-  "gate": {"name": "gate-2-implemented", "status": "PASSED"},
-  "findings": [],
-  "next": {"action": "TaskUpdate completed with artifacts"}
+  "trace_id": "<upstream trace_id, carried forward>",
+  "summary": "L1 PASS, L2 45/45 PASS (87% coverage), L3 12/12 PASS. Gate gate-2-implemented PASSED.",
+  "handoff_note": "STATUS: done. Findings: none.",
+  "files_changed": [],
+  "api_contract": null
 }
 ```
 
-**On retry handoff**:
+**On retry handoff**: set `TaskUpdate(status="blocked")` on this task and create a blocker task for the implementer — do NOT mark completed. Carry the same `metadata.artifacts` shape, with `handoff_note` stating STATUS: retry and enumerating findings:
+
 ```json
 {
-  "agent": "spec-tester-v11",
-  "version": "11.0.0",
-  "STATUS": "retry",
-  "validation": {"all_passed": false, "coverage": "72%"},
-  "findings": [
-    {
-      "severity": "CRITICAL",
-      "confidence": "HIGH",
-      "location": "src/auth.ts:45",
-      "description": "JWT expiry not checked on refresh endpoint",
-      "reproduction": "POST /auth/refresh with expired token returns 200",
-      "expected": "Should return 401"
-    }
-  ],
-  "next": {"action": "return to implementer for fixes"}
+  "trace_id": "<upstream trace_id, carried forward>",
+  "summary": "L1 PASS, L2 34/45 PASS (72% coverage). Gate gate-2-implemented FAILED.",
+  "handoff_note": "STATUS: retry. CRITICAL (HIGH confidence) src/auth.ts:45 — JWT expiry not checked on refresh endpoint. Repro: POST /auth/refresh with expired token returns 200, expected 401.",
+  "files_changed": [],
+  "api_contract": null
 }
 ```
 

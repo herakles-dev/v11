@@ -1,6 +1,6 @@
 # Improvement 13 — Session-Aware Write-Gate
 
-- **Status:** PROPOSED — not triaged
+- **Status:** SHIPPED v11.34 (+.1 review remediation) — body flipped v11.37 W1-T3 to match long-standing README index
 - **Date:** 2026-07-20
 - **Provenance:** Field report from orchestrator instance (session `comedic-study`, branch `wave-7-word-power`, A4) + 4-agent recon swarm (2026-07-20).
 - **Supersedes / absorbs:** `improvements/12-spawn-contract-gaps.md` §H2 (same root cause, subagent framing). This spec generalizes H2 from the subagent case to the concurrent-top-level-session case and folds the fix.

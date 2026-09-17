@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "memory-index.schema.json",
+  "$id": "https://herakles.dev/v11/schemas/memory-index.schema.json",
   "title": "V11 Memory Index",
   "description": "Schema for project memory index configuration and entries",
   "type": "object",

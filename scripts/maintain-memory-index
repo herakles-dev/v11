@@ -19,15 +19,15 @@ import sqlite3
 import sys
 from pathlib import Path
 
-SESSIONS_ROOT = os.environ.get("SESSIONS_ROOT", os.path.expanduser("~/sessions"))
-V11_WORKSPACE_ROOT = os.environ.get("V11_WORKSPACE_ROOT", os.path.expanduser("~"))
+SESSIONS_ROOT = os.environ.get("SESSIONS_ROOT", "/path/to/operator-home/sessions")
+HERCULES_ROOT = os.environ.get("HERCULES_ROOT", "/path/to/operator-home")
 
 
 def get_index_db(project: str) -> Path:
     """Find memory index database."""
     candidates = [
         Path(SESSIONS_ROOT) / project / ".memory-index" / "memory.sqlite",
-        Path(V11_WORKSPACE_ROOT) / project / ".memory-index" / "memory.sqlite",
+        Path(HERCULES_ROOT) / project / ".memory-index" / "memory.sqlite",
     ]
     for p in candidates:
         if p.exists():

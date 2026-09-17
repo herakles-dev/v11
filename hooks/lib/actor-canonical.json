@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "_comment": "v11.44 read-side actor canonicalization fold-table. SINGLE SOURCE OF TRUTH, loaded by BOTH bash (v11_canonical_actor in hooks/lib/common.sh) and Python (scripts/lib/actor_canonical.py, used by agent-scorecard / agent-effectiveness). Folds the orchestrator identity family to one canonical actor so it becomes scoreable. Non-family inputs pass through UNCHANGED (non-lossy — real project agents like sofly-engineer are never forced to 'unknown'). Gated by V11_ORCH_QUALITY=off (legacy literal-string match).",
+  "fold": {
+    "orchestrator": "orchestrator",
+    "orchestrator-self": "orchestrator",
+    "orchestrator-direct": "orchestrator",
+    "team-orchestrator": "orchestrator",
+    "drift-orchestrator": "orchestrator",
+    "main": "orchestrator"
+  }
+}

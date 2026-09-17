@@ -5,8 +5,8 @@
 # Usage: ./scripts/validate-project-setup PROJECT_NAME [PROJECT_PATH]
 #
 # PROJECT_PATH search order (if not given):
-#   1. <project-root>/{PROJECT_NAME}
-#   2. <project-root>/sessions/{PROJECT_NAME}
+#   1. $HOME/{PROJECT_NAME}
+#   2. $HOME/sessions/{PROJECT_NAME}
 #
 # Exit codes:
 #   0 - No FAIL results
@@ -40,12 +40,12 @@ SESSION_DIR="$SESSIONS_ROOT/$PROJECT"
 if [ $# -ge 2 ]; then
   PROJECT_PATH="$2"
 else
-  if [ -d "$V11_WORKSPACE_ROOT/$PROJECT" ]; then
-    PROJECT_PATH="$V11_WORKSPACE_ROOT/$PROJECT"
+  if [ -d "$HERCULES_ROOT/$PROJECT" ]; then
+    PROJECT_PATH="$HERCULES_ROOT/$PROJECT"
   elif [ -d "$SESSION_DIR" ]; then
     PROJECT_PATH="$SESSION_DIR"
   else
-    PROJECT_PATH="$V11_WORKSPACE_ROOT/$PROJECT"  # may not exist — checks will FAIL gracefully
+    PROJECT_PATH="$HERCULES_ROOT/$PROJECT"  # may not exist — checks will FAIL gracefully
   fi
 fi
 
@@ -347,7 +347,7 @@ check_module_manifests() {
 # ---------------------------------------------------------------------------
 
 check_task_state_dir() {
-  local ts_dir="$V11_WORKSPACE_ROOT/.agent-metrics/task-state"
+  local ts_dir="$HERCULES_ROOT/.agent-metrics/task-state"
   if [ -d "$ts_dir" ] && [ -w "$ts_dir" ]; then
     result_pass "Task state directory ($ts_dir)"
   elif [ -d "$ts_dir" ]; then
@@ -434,11 +434,10 @@ check_athenaeum() {
     return
   fi
 
-  local athenaeum_port="${ATHENAEUM_PORT:-8140}"
-  if curl -sf --max-time 3 "http://localhost:${athenaeum_port}/api/libraries" > /dev/null 2>&1; then
-    result_pass "Athenaeum reachable (localhost:${athenaeum_port})"
+  if curl -sf --max-time 3 "http://localhost:8140/api/libraries" > /dev/null 2>&1; then
+    result_pass "Athenaeum reachable (localhost:8140)"
   else
-    result_warn "Athenaeum not reachable (localhost:${athenaeum_port}) — research features unavailable"
+    result_warn "Athenaeum not reachable (localhost:8140) — research features unavailable"
   fi
 }
 

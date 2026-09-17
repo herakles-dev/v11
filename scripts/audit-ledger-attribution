@@ -1,0 +1,199 @@
+#!/usr/bin/env python3
+"""
+v11.37 W1-T2 — READ-ONLY audit of ledger attribution.
+
+Walks `~/.agent-metrics/ledger/*.jsonl` and reports the honest picture of
+which events do vs don't carry actor attribution (owner || metadata.agent
+|| recommended_agent). Categorizes by event type: agent-authored (should
+have attribution) vs state-transition (inherits from create row) vs system
+event (no actor expected).
+
+Ships as READ-ONLY companion to the ledger-writer normalization gate
+(v11_ledger_append + V11_LEDGER_STRICT_ATTRIBUTION). Historical backfill
+is intentionally NOT included — see ticket #48 v11.38 candidate.
+
+Usage:
+    scripts/audit-ledger-attribution                    # summary across all ledgers
+    scripts/audit-ledger-attribution --since 30d        # filter by time
+    scripts/audit-ledger-attribution --project NAME     # single project
+    scripts/audit-ledger-attribution --by-ev            # break out by event type
+    scripts/audit-ledger-attribution --json             # machine-readable
+"""
+
+from __future__ import annotations
+
+import argparse
+import glob
+import json
+import os
+import re
+import sys
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+DEFAULT_LEDGER_DIR = Path.home() / ".agent-metrics" / "ledger"
+
+# Which event types are expected to carry an actor field.
+# `review` is here because reviews SHOULD name their reviewer (v11.37 W1-T2
+# audit found 100% gap here — likely a separate bug in the review writer,
+# not in this task's scope; file as v11.38 seed).
+AGENT_AUTHORED = {"created", "review", "artifact_warn"}
+# Which event types inherit attribution from the create row of the same task_id.
+STATE_TRANSITION = {"in_progress", "completed", "blocked", "cancelled", "field_update", "status_changed"}
+# Which event types are inherently no-actor (system-generated).
+SYSTEM_EVENT = {"prescope", "reconcile", "artifact_exempt"}
+
+
+def parse_since(s: str) -> datetime | None:
+    if not s:
+        return None
+    m = re.match(r"^(\d+)([dhm])$", s.strip())
+    if m:
+        n = int(m.group(1))
+        unit = m.group(2)
+        delta = {"d": timedelta(days=n), "h": timedelta(hours=n), "m": timedelta(minutes=n)}[unit]
+        return datetime.now(timezone.utc) - delta
+    try:
+        return datetime.fromisoformat(s)
+    except ValueError:
+        return None
+
+
+def has_attribution(ev: dict) -> bool:
+    owner = ev.get("owner") or ""
+    agent = (ev.get("metadata") or {}).get("agent") or ""
+    rec = ev.get("recommended_agent") or ""
+    return bool(owner or agent or rec)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="v11.37 W1-T2 ledger attribution audit (read-only)")
+    parser.add_argument("--ledger-dir", type=Path, default=DEFAULT_LEDGER_DIR)
+    parser.add_argument("--project", help="single-project scope")
+    parser.add_argument("--since", help="time filter: 30d / 24h / 60m / ISO-8601")
+    parser.add_argument("--by-ev", action="store_true", help="break out by event type")
+    parser.add_argument("--json", action="store_true", help="machine-readable output")
+    args = parser.parse_args()
+
+    since_dt = parse_since(args.since) if args.since else None
+
+    if args.project:
+        files = [args.ledger_dir / f"{args.project}.jsonl"]
+    else:
+        files = sorted(args.ledger_dir.glob("*.jsonl"))
+
+    counts: dict[str, dict[str, int]] = {
+        "agent_authored": {"total": 0, "attributed": 0, "gap": 0},
+        "state_transition": {"total": 0, "attributed": 0, "gap": 0},
+        "system_event": {"total": 0, "attributed": 0, "gap": 0},
+        "other": {"total": 0, "attributed": 0, "gap": 0},
+    }
+    by_ev: dict[str, dict[str, int]] = {}
+
+    for f in files:
+        if not f.exists():
+            continue
+        with f.open("r", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    ev = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if since_dt is not None:
+                    ts = ev.get("ts") or ""
+                    try:
+                        ev_dt = datetime.fromisoformat(ts)
+                    except ValueError:
+                        continue
+                    if ev_dt < since_dt:
+                        continue
+                ev_type = ev.get("ev") or "no-ev"
+                if ev_type in AGENT_AUTHORED:
+                    bucket = "agent_authored"
+                elif ev_type in STATE_TRANSITION:
+                    bucket = "state_transition"
+                elif ev_type in SYSTEM_EVENT:
+                    bucket = "system_event"
+                else:
+                    bucket = "other"
+                counts[bucket]["total"] += 1
+                if has_attribution(ev):
+                    counts[bucket]["attributed"] += 1
+                else:
+                    counts[bucket]["gap"] += 1
+                if args.by_ev:
+                    row = by_ev.setdefault(ev_type, {"total": 0, "attributed": 0, "gap": 0})
+                    row["total"] += 1
+                    if has_attribution(ev):
+                        row["attributed"] += 1
+                    else:
+                        row["gap"] += 1
+
+    if args.json:
+        out = {"buckets": counts}
+        if args.by_ev:
+            out["by_ev"] = by_ev
+        json.dump(out, sys.stdout, indent=2)
+        sys.stdout.write("\n")
+        return 0
+
+    print("v11.37 W1-T2 ledger attribution audit")
+    if args.since:
+        print(f"  window: since {args.since}")
+    if args.project:
+        print(f"  project: {args.project}")
+    print()
+    print(f"{'bucket':<20} {'total':>8} {'attr':>8} {'gap':>8}   note")
+    print("-" * 72)
+    print(
+        f"{'agent-authored':<20} "
+        f"{counts['agent_authored']['total']:>8} "
+        f"{counts['agent_authored']['attributed']:>8} "
+        f"{counts['agent_authored']['gap']:>8}   "
+        "SHOULD carry actor (created/review/artifact_warn)"
+    )
+    print(
+        f"{'state-transition':<20} "
+        f"{counts['state_transition']['total']:>8} "
+        f"{counts['state_transition']['attributed']:>8} "
+        f"{counts['state_transition']['gap']:>8}   "
+        "inherits from create row (in_progress/completed/field_update/…)"
+    )
+    print(
+        f"{'system-event':<20} "
+        f"{counts['system_event']['total']:>8} "
+        f"{counts['system_event']['attributed']:>8} "
+        f"{counts['system_event']['gap']:>8}   "
+        "inherently no-actor (prescope/reconcile/artifact_exempt)"
+    )
+    print(
+        f"{'other':<20} "
+        f"{counts['other']['total']:>8} "
+        f"{counts['other']['attributed']:>8} "
+        f"{counts['other']['gap']:>8}   "
+        "unclassified — investigate if nonzero"
+    )
+    print()
+    ag = counts["agent_authored"]
+    if ag["total"] > 0:
+        pct = 100.0 * ag["gap"] / ag["total"]
+        print(f"agent-authored gap rate: {pct:.1f}% ({ag['gap']}/{ag['total']})")
+    if args.by_ev:
+        print()
+        print("break-out by event type:")
+        print(f"  {'ev':<20} {'total':>8} {'attr':>8} {'gap':>8}")
+        for ev_type in sorted(by_ev.keys()):
+            row = by_ev[ev_type]
+            print(f"  {ev_type:<20} {row['total']:>8} {row['attributed']:>8} {row['gap']:>8}")
+    print()
+    print("Note: this is a READ-ONLY audit. Writer normalization gate is")
+    print("V11_LEDGER_STRICT_ATTRIBUTION=advisory|on (default off — no behavior")
+    print("change). See v11/CLAUDE.md §14.1 for the full attribution schema.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -5,8 +5,8 @@
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 V11_HOME="${V11_HOME:-$(dirname "$SCRIPT_DIR")}"
-V11_WORKSPACE_ROOT="${V11_WORKSPACE_ROOT:-$HOME/.v11}"
-SESSIONS_ROOT="${SESSIONS_ROOT:-$V11_WORKSPACE_ROOT/sessions}"
+HERCULES_ROOT="${HERCULES_ROOT:-$HOME}"
+SESSIONS_ROOT="${SESSIONS_ROOT:-$HERCULES_ROOT/sessions}"
 
 # --- Help ---
 if [ "${1:-}" == "--help" ] || [ "${1:-}" == "-h" ]; then
@@ -59,7 +59,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 # --- Validate ---
-TASK_STATE_FILE="$V11_WORKSPACE_ROOT/.agent-metrics/task-state/${PROJECT}.json"
+TASK_STATE_FILE="$HERCULES_ROOT/.agent-metrics/task-state/${PROJECT}.json"
 if [ ! -f "$TASK_STATE_FILE" ]; then
     echo "Error: No task-state found for project '$PROJECT'" >&2
     echo "Expected: $TASK_STATE_FILE" >&2

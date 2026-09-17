@@ -6,7 +6,7 @@
 
 ## Case Study: ArchiveStream Video Processing
 
-**Reference Implementation:** `~/archivestream-service`
+**Reference Implementation:** `/path/to/operator-home/archivestream-service`
 
 **Problem:** 30-minute processing time for 5-second video transformations
 
@@ -447,7 +447,7 @@ for chunk in chunks:
 ## Reference Implementation
 
 **ArchiveStream Service:**
-- **Path:** `~/archivestream-service`
+- **Path:** `/path/to/operator-home/archivestream-service`
 - **Workers:** `lambda_worker/worker.py`, `effects/ditto_processor.py`
 - **API:** `downloader.py` (Flask backend)
 - **Benchmark Results:** See MEMORY.md for empirical data

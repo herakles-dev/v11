@@ -2,7 +2,7 @@
 
 > **Codename:** Deep Plan — "The Forge"
 > **Purpose:** Turn vague ideas into production-ready, deeply-planned research/engineering projects
-> **Origin:** Extracted from an internal reference project's build (2026-03-17), where a concept document
+> **Origin:** Extracted from the the reference project's project build (2026-03-17), where a concept document
 > became a 46-file, 19-Athenaeum-doc, 9-gate, hypothesis-driven operational system in one session.
 
 ## What This Is
@@ -44,8 +44,8 @@ A V11 upgrade proposal and reusable framework for scaffolding massive projects t
 
 ```bash
 # When ready to implement as V11 upgrade:
-cat deep-plan/UPGRADE_SPEC.md
+cat /path/to/v11/deep-plan/UPGRADE_SPEC.md
 
 # To use the methodology on a new project now (before V11 upgrade):
-cat deep-plan/METHODOLOGY.md
+cat /path/to/v11/deep-plan/METHODOLOGY.md
 ```

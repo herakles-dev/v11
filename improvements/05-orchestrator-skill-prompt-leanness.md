@@ -2,7 +2,7 @@
 
 **Author:** orchestrator (sofly session 2026-06-22)
 **Severity:** MEDIUM — the meta-violation that undermines every other context rule
-**Scope:** `~/.claude/skills/team-orchestrator/SKILL.md` (and its playbooks)
+**Scope:** `/path/to/operator-home/.claude/skills/team-orchestrator/SKILL.md` (and its playbooks)
 
 ---
 
@@ -26,7 +26,7 @@ Yet the skill prompt itself is one big "content-heavy file" that the model reads
 - Skill prompt content loaded on `/team-orchestrator` invocation: **~45KB** (Decision Router + Subcommand Router + Situation Playbook + Phase 1-6 + Behavior Rules + Reference Playbooks table + Integration table + version metadata).
 - Agent list loaded as a system reminder: **~38KB** for the full 97-agent block.
 - Skill list loaded as a system reminder: **~12KB** for ~150 skills.
-- Project CLAUDE.md (platform root + sofly): **~6KB**.
+- Project CLAUDE.md (Hercules root + sofly): **~6KB**.
 - MEMORY.md auto-loaded: **~1KB**.
 
 **Before the user's first character of intent reaches the model: ~100KB of contextualizing material already present.** Each subsequent tool result + agent transcript stacks on top.
@@ -96,7 +96,7 @@ Pure refactor. `git revert` on the extraction commit restores the prior monolith
 
 ```bash
 # After extraction:
-$ wc -c ~/.claude/skills/team-orchestrator/SKILL.md
+$ wc -c /path/to/operator-home/.claude/skills/team-orchestrator/SKILL.md
 # Expected: <8500 bytes (~8KB)
 
 # A fresh /v11 invocation should still resolve all current triggers, just with one extra
@@ -104,6 +104,17 @@ $ wc -c ~/.claude/skills/team-orchestrator/SKILL.md
 $ /v11 dark-code-check sofly   # subcommand defined ONLY in playbooks/subcommand-router.md
 # Expected: resolves correctly, with one extra Read in the trace
 ```
+
+## Evidence addendum — 2026-08-18 (archivestream-service session, 14 agents)
+
+Independent confirmation, ~8 weeks after filing; the accretion has continued:
+
+- Core `SKILL.md` is now **472 lines**; `playbooks/` is **17 files / 4,328 lines**. Since this ticket was filed the core gained: the Live-Ops Express Lane block, V11.21's 5-step routing protocol + rollback levers, lanes/pre-scope/backstop dashboard computations, and 6 more behavior rules (18 → 24).
+- **Load-bearing fraction, measured against a maximal session** (3 tracks, 14 agents, 8 adversarial reviews — exactly the workload the apparatus targets): the parts that demonstrably shaped decisions were context-tiering, spec-first, review-per-task, single-writer discipline, AskUserQuestion rules, and the golden rule — roughly **20% of the core**. The V11.21 stratum, subcommand router, live-ops lane, retro/lane/pre-scope machinery went unused.
+- **Zero playbooks were loaded all session.** The core's inline summaries sufficed for everything — evidence that the §B "pointer-only" model works, and that the remaining inline depth is paying rent to nobody.
+- The agent-list system-reminder this ticket measured at ~38KB/97 agents is now **135 agents** (see [[32-agent-roster-cost-and-drift]], which also catches the root CLAUDE.md still advertising 97).
+
+Verdict from the field: this ticket's §A-B extraction remains the single highest-leverage open improvement; it is the meta-fix that cheapens every other ticket. Recommend promoting severity MEDIUM → HIGH.
 
 ## Why this matters
 

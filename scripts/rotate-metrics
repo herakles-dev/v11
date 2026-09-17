@@ -166,4 +166,4 @@ if $DO_SESSIONS; then
 fi
 
 echo "Tip: Add to crontab for automatic rotation:"
-echo "  0 0 * * * $V11_WORKSPACE_ROOT/v11/scripts/rotate-metrics --sessions"
+echo "  0 0 * * * $HERCULES_ROOT/v11/scripts/rotate-metrics --sessions"

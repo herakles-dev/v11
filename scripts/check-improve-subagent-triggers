@@ -103,6 +103,16 @@ CANDIDATES=$(jq -r '
     | unique | .[]
 ' "$TASK_STATE" 2>/dev/null || true)
 
+# v11.44: fold the orchestrator identity family (orchestrator-self, team-orchestrator,
+# main, …) to the canonical actor BEFORE dedup — otherwise a single logical actor emits
+# up to 5 duplicate calibration-miss signals + 5 cooldown markers (one per spelling),
+# 4 of which name a string improve-subagent has no definition file for.
+if [ -n "$CANDIDATES" ]; then
+    CANDIDATES=$(while IFS= read -r _a; do
+        [ -n "$_a" ] && v11_canonical_actor "$_a"; echo
+    done <<< "$CANDIDATES" | awk 'NF' | sort -u)
+fi
+
 [ -n "$CANDIDATES" ] || exit 0
 
 JSON_LINES=()
@@ -122,11 +132,15 @@ while IFS= read -r AGENT; do
     MISS_PCT=$(awk -v r="$MISS_RATE" 'BEGIN{printf "%.0f", r*100}' 2>/dev/null || echo "?")
 
     # Dedup 1: an open task already references this candidate_agent.
+    # improvements/18: .open_tasks is a list of self-describing records here
+    # (this reads the aggregate mirror, $SESSION_DIR/.task-state.json) — id
+    # comes from .value.task_id, falling back to .key for any legacy/
+    # per-session-shaped caller of this same query.
     OPEN_TASK_ID=$(jq -r --arg agent "$AGENT" '
         (.open_tasks // {}) | to_entries[]?
         | select(.value.metadata.trigger == "calibration-miss"
                  and .value.metadata.candidate_agent == $agent)
-        | .key
+        | (.value.task_id // .key)
     ' "$TASK_STATE" 2>/dev/null | head -1 || true)
     if [ -n "$OPEN_TASK_ID" ]; then
         continue   # already covered by an open task — no repeat signal
@@ -180,6 +194,67 @@ while IFS= read -r AGENT; do
             }
         }')")
 done <<< "$CANDIDATES"
+
+# ---------------------------------------------------------------------------
+# v11.44 CONSUMER: orchestrator briefing-quality trigger.
+# Closes the loop the motivating audit flagged ("collects but doesn't consume"):
+# when the orchestrator's briefing_defect RATE crosses a threshold, surface ONE
+# actionable suggestion to review its OWN authoring guidance (team-orchestrator/
+# SKILL.md + CLAUDE.md). Advisory only — never auto-edits those docs (the
+# orchestrator has no ~/.claude/agents/*.md target; auto-amend is out of scope).
+# Skipped under V11_BRIEF_REVIEW=off. Same dedup/cooldown discipline as above.
+# ---------------------------------------------------------------------------
+if [ "${V11_BRIEF_REVIEW:-}" != "off" ]; then
+    GB_JSON=$("$SCRIPT_DIR/grade-briefs" "$PROJECT" --json 2>/dev/null || true)
+    if [ -n "$GB_JSON" ]; then
+        GRADED=$(printf '%s' "$GB_JSON" | jq -r '.summary.briefs_graded // 0' 2>/dev/null || echo 0)
+        DEFECTS=$(printf '%s' "$GB_JSON" | jq -r '.summary.briefing_defect // 0' 2>/dev/null || echo 0)
+        MIN_N="${V11_ORCH_BRIEF_MIN:-3}"
+        THRESH="${V11_ORCH_BRIEF_DEFECT_THRESHOLD:-0.30}"
+        FIRE=$(awk -v g="$GRADED" -v d="$DEFECTS" -v m="$MIN_N" -v t="$THRESH" \
+            'BEGIN{ if (g+0 >= m+0 && g+0 > 0 && (d+0)/(g+0) >= t+0) print "1"; else print "0" }' 2>/dev/null || echo 0)
+        RATE_PCT=$(awk -v g="$GRADED" -v d="$DEFECTS" 'BEGIN{ if(g+0>0) printf "%.0f",(d+0)/(g+0)*100; else print "0" }' 2>/dev/null || echo 0)
+        if [ "$FIRE" = "1" ]; then
+            OBQ_OPEN=$(jq -r '
+                (.open_tasks // {}) | to_entries[]?
+                | select(.value.metadata.trigger == "orchestrator-briefing-quality")
+                | (.value.task_id // .key)
+            ' "$TASK_STATE" 2>/dev/null | head -1 || true)
+            OBQ_MARKER_DIR="$SESSION_DIR/.improve-subagent-triggered"
+            OBQ_MARKER="$OBQ_MARKER_DIR/orchestrator-briefing-quality.json"
+            OBQ_COOL=false
+            if [ -f "$OBQ_MARKER" ]; then
+                _sat=$(jq -r '.signaled_at // empty' "$OBQ_MARKER" 2>/dev/null || true)
+                if [ -n "$_sat" ]; then
+                    _se=$(date -d "$_sat" +%s 2>/dev/null || echo 0)
+                    _age=$(( ($(date +%s) - _se) / 86400 ))
+                    [ "$_age" -lt "$COOLDOWN_DAYS" ] && OBQ_COOL=true
+                fi
+            fi
+            if [ -z "$OBQ_OPEN" ] && [ "$OBQ_COOL" != "true" ]; then
+                mkdir -p "$OBQ_MARKER_DIR" 2>/dev/null || true
+                jq -cn --arg ts "$(date -Iseconds)" --argjson rate "$RATE_PCT" --argjson graded "$GRADED" --argjson defects "$DEFECTS" \
+                    '{signaled_at:$ts, briefing_defect_rate_pct:$rate, briefs_graded:$graded, briefing_defect:$defects}' \
+                    > "$OBQ_MARKER" 2>/dev/null || true
+                HUMAN_LINES+=("Orchestrator briefing quality: ${RATE_PCT}% briefing-defect rate (${DEFECTS}/${GRADED}) in ${PROJECT} — run scripts/grade-briefs ${PROJECT}; review team-orchestrator/SKILL.md + CLAUDE.md authoring guidance")
+                JSON_LINES+=("$(jq -cn --arg project "$PROJECT" --argjson rate "$RATE_PCT" --argjson graded "$GRADED" --argjson defects "$DEFECTS" \
+                    '{
+                        trigger: "orchestrator-briefing-quality",
+                        project: $project,
+                        candidate_agent: "orchestrator",
+                        briefing_defect_rate_pct: $rate,
+                        briefs_graded: $graded,
+                        briefing_defect: $defects,
+                        suggested_taskcreate: {
+                            metadata: { trigger: "orchestrator-briefing-quality", risk: "low", project: $project },
+                            subject: ("Orchestrator briefing quality: " + ($rate|tostring) + "% briefing-defect rate in " + $project),
+                            description: ("scripts/grade-briefs " + $project + " shows the orchestrator authored " + ($defects|tostring) + " briefing_defect brief(s) of " + ($graded|tostring) + " graded. Review team-orchestrator/SKILL.md and CLAUDE.md orchestration guidance (clearer task descriptions, set metadata.agent). Advisory — no auto-edit.")
+                        }
+                    }')")
+            fi
+        fi
+    fi
+fi
 
 if [ "$JSON_OUTPUT" = true ]; then
     for line in "${JSON_LINES[@]:-}"; do

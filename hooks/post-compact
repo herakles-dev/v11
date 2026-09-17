@@ -217,10 +217,12 @@ echo "Next: TaskList for full details, or continue current work."
 echo ""
 echo "Context was compacted. State restored above. Consider /handoff for clean continuation."
 # Reset context tracker for fresh estimate
-python3 - "$V11_HOME" <<'PYEOF' 2>/dev/null || true
+# V11.35.1 fix: same session-scoped state file as hooks/sync-tasks — see
+# scripts/lib/context_tracker.py module docstring for why this matters.
+python3 - "$V11_HOME" "${V11_SESSION_ID:-legacy-cli}" <<'PYEOF' 2>/dev/null || true
 import sys; sys.path.insert(0, sys.argv[1] + '/scripts/lib')
 from context_tracker import ContextTracker
-t = ContextTracker()
+t = ContextTracker(session_id=sys.argv[2])
 t.reset()
 t.record_event('hook', {'note': 'post-compact reset'})
 PYEOF

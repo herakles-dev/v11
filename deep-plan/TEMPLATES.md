@@ -111,7 +111,7 @@ and delegate work using problem-solving frameworks. You plan, decompose, delegat
 ## Quick Reference
 
 \`\`\`bash
-source ~/.secrets/{{project_slug}}.env
+source ~/.secrets/app.env
 docker compose up -d
 {{build_command}}
 {{test_command}}
@@ -147,7 +147,7 @@ docker compose up -d
 **ALL access programmatic. NEVER use /chat endpoint.**
 
 \`\`\`bash
-curl -s "http://localhost:3000/api/libraries/{{library_id}}/search?q=QUERY&mode=hybrid&limit=10" | jq '.results[] | {doc: .document_title, text: .text}'
+curl -s "http://localhost:8140/api/libraries/{{library_id}}/search?q=QUERY&mode=hybrid&limit=10" | jq '.results[] | {doc: .document_title, text: .text}'
 \`\`\`
 
 ## Critical Rules
@@ -211,15 +211,15 @@ curl -s "http://localhost:3000/api/libraries/{{library_id}}/search?q=QUERY&mode=
 
 ## Template: .claude/commands/project-gate.md
 
-See `<project-root>/example-project/.claude/commands/example-project-gate.md` — replace `example-project` with project slug, library ID 113 with project library ID.
+See `/path/to/operator-home/example-project/.claude/commands/example-project-gate.md` — replace `example-project` with project slug, library ID 113 with project library ID.
 
 ## Template: .claude/commands/athenaeum.md
 
-See `<project-root>/example-project/.claude/commands/athenaeum.md` — update library IDs and project context.
+See `/path/to/operator-home/example-project/.claude/commands/athenaeum.md` — update library IDs and project context.
 
 ## Template: scripts/workspace.sh
 
-See `<project-root>/example-project/scripts/example-project.sh` — replace project-specific references (library ID, build commands, test commands).
+See `/path/to/operator-home/example-project/scripts/example-project.sh` — replace project-specific references (library ID, build commands, test commands).
 
 ## Template: .claude/athenaeum.json
 

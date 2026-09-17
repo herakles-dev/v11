@@ -5,8 +5,8 @@
 set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 V10_HOME="${V10_HOME:-$(dirname "$SCRIPT_DIR")}"
-V11_WORKSPACE_ROOT="${V11_WORKSPACE_ROOT:-$HOME/.v11}"
-SESSIONS_ROOT="${SESSIONS_ROOT:-$V11_WORKSPACE_ROOT/sessions}"
+HERCULES_ROOT="${HERCULES_ROOT:-$HOME}"
+SESSIONS_ROOT="${SESSIONS_ROOT:-$HERCULES_ROOT/sessions}"
 
 # Help
 if [ "$1" == "--help" ] || [ "$1" == "-h" ]; then
@@ -174,7 +174,7 @@ if [ -f "$TASK_STATE" ]; then
                            ((.metadata.agent // "") | startswith("adversarial-"));
             def parent_pending: (.metadata.parent_status // "") == "pending_parent";
 
-            (.open_tasks // {}) as $open
+            (.open_tasks // []) as $open
             | [$open[]] as $tasks
             | {
                 work_pending:    [$tasks[] | select(is_review | not) | select(.status == "pending")] | length,
@@ -195,7 +195,7 @@ if [ -f "$TASK_STATE" ]; then
             # "blocking" = adversarial CRITICAL or HIGH from completed review siblings
             review_blocking=$(jq -r '
                 def is_review: (.metadata.review_of // "") != "";
-                (.open_tasks // {}) as $open
+                (.open_tasks // []) as $open
                 | [$open[]
                    | select(is_review)
                    | select(.status == "completed")
@@ -275,18 +275,21 @@ try:
 except Exception:
     state = {}
 
-open_tasks = state.get("open_tasks") or {}
+# improvements/18: open_tasks is now a list of self-describing records
+# (each carrying its own task_id/session_uuid), not a dict keyed by bare
+# task_id -- that shape silently collided across sessions sharing a project.
+open_tasks = state.get("open_tasks") or []
 total = len(open_tasks)
 if total == 0:
     print("")
 else:
     scoped = sum(
-        1 for t in open_tasks.values()
+        1 for t in open_tasks
         if isinstance(t, dict) and (t.get("metadata") or {}).get("scope") in ("small", "medium", "large")
     )
     pct = round(scoped * 100 / total)
 
-    open_ids = set(open_tasks.keys())
+    open_ids = {t.get("task_id") for t in open_tasks if isinstance(t, dict)}
     n = 0
     if ledger_path and os.path.isfile(ledger_path):
         try:
@@ -310,6 +313,51 @@ PYEOF
             read -r _prescope_pct _prescope_n <<< "$_PRESCOPE_OUT"
             echo "Pre-scope: ${_prescope_pct}% scoped, ${_prescope_n} advisories open"
             echo ""
+        fi
+    fi
+
+    # Improvement 16: artifact-on-complete consumer, shipped in the same change
+    # as the hooks/sync-tasks producer (adoption HIGH, swarm review 2026-07-29:
+    # a producer with no consumer repeats this repo's collect-heavy/consume-
+    # light disease). Reports raw counts, not a percentage — there is
+    # deliberately no ev row for the silent-pass case (would add ledger noise
+    # on every clean completion), so a true "% of completions with evidence"
+    # denominator doesn't exist. Honors V11_ARTIFACT_STATUS=off.
+    if [ "${V11_ARTIFACT_STATUS:-on}" != "off" ]; then
+        _ARTIFACT_LEDGER_FILE="${METRICS_DIR:-$HOME/.agent-metrics}/ledger/${PROJECT}.jsonl"
+        if [ -f "$_ARTIFACT_LEDGER_FILE" ]; then
+            _ARTIFACT_OUT=$(LEDGER_PATH="$_ARTIFACT_LEDGER_FILE" python3 - <<'PYEOF' 2>/dev/null || echo ""
+import json, os
+
+ledger_path = os.environ.get("LEDGER_PATH", "")
+warn = 0
+exempt = 0
+if ledger_path and os.path.isfile(ledger_path):
+    try:
+        with open(ledger_path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except Exception:
+                    continue
+                ev = row.get("ev")
+                if ev == "artifact_warn":
+                    warn += 1
+                elif ev == "artifact_exempt":
+                    exempt += 1
+print(f"{warn} {exempt}")
+PYEOF
+)
+            if [ -n "$_ARTIFACT_OUT" ]; then
+                read -r _artifact_warn _artifact_exempt <<< "$_ARTIFACT_OUT"
+                if [ "${_artifact_warn:-0}" -gt 0 ] 2>/dev/null || [ "${_artifact_exempt:-0}" -gt 0 ] 2>/dev/null; then
+                    echo "Artifact evidence: ${_artifact_warn:-0} advisory(ies) recorded, ${_artifact_exempt:-0} exempt"
+                    echo ""
+                fi
+            fi
         fi
     fi
 
@@ -389,7 +437,13 @@ fi
 if [ "${V11_A4_DEADGATE_WARN:-on}" != "off" ]; then
     AUTONOMY_FILE="$SESSION_DIR/.autonomy-state"
     if [ -f "$AUTONOMY_FILE" ]; then
+        # V11.34.3: strip a display-form prefix ("A3" -> 3) and any float tail
+        # before the integer test below. Inlined rather than delegated to
+        # common.sh's v11_normalize_autonomy_level because this script does not
+        # source the hook library; keep the two in sync if either changes.
         A_LEVEL=$(jq -r '.level // 0' "$AUTONOMY_FILE" 2>/dev/null || echo 0)
+        A_LEVEL="${A_LEVEL#[Aa]}"; A_LEVEL="${A_LEVEL%%.*}"
+        case "$A_LEVEL" in ''|*[!0-9]*) A_LEVEL=0 ;; esac
         HRH_LEN=$(jq -r '.high_risk_history // [] | length' "$AUTONOMY_FILE" 2>/dev/null || echo 0)
         if [ "${A_LEVEL:-0}" -ge 4 ] 2>/dev/null && [ "${HRH_LEN:-0}" -eq 0 ] 2>/dev/null; then
             echo "--- Autonomy ---"
@@ -439,7 +493,7 @@ echo "Tip: Use TaskList in Claude to see full task details"
 # review siblings first appear in task-state. Marker prevents repeat firing.
 if [ -f "$TASK_STATE" ] && [ "${V11_AUTO_PAIR_REVIEW:-on}" != "off" ]; then
     HAS_PAIRED=$(jq -r '
-        [(.open_tasks // {})[] | select((.metadata.review_of // "") != "")] | length
+        [(.open_tasks // [])[] | select((.metadata.review_of // "") != "")] | length
     ' "$TASK_STATE" 2>/dev/null || echo 0)
     MARKER="$SESSIONS_ROOT/$PROJECT/.auto-pair-onboarded"
     if [ "${HAS_PAIRED:-0}" -gt 0 ] && [ ! -f "$MARKER" ]; then

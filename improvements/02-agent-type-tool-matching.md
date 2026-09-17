@@ -89,3 +89,7 @@ echo "Spawn Explore with Write requirement" | v11-spawn-check
 ## Why this matters
 
 The user said "before you assign an agent — think and assess. make sure it has everything it needs in its context." I assessed the *topic* but not the *tool surface*. The agent-registry's description should make that surface impossible to miss, and the playbooks should pair agent-type with required-tools at the spawn template level. Otherwise this kind of miss will recur every time the orchestrator picks an agent by vibe.
+
+## 2026-08-28 v11-proactive-discipline scope-check
+
+The V11_SPAWN_CHECK hook (proposed section C, "Validation at spawn time") remains deferred — it needs actual spawn-time enforcement code, which this sprint isn't building. The doc-only tool-surface checklist (proposed section A) was already shipped, predating this sprint, as the "Tool-surface matrix (#02...)" table in `~/.claude/skills/team-orchestrator/playbooks/orchestrate.md` §4d. W3-T6 added a `## Pre-spawn tool-surface checklist` pointer section in `orchestrate.md` cross-referencing that table rather than duplicating it. Sections B (`WRITE_PINPOINT_PROMPT` template) and D (agent-registry description updates) remain deferred — out of this sprint's scope.

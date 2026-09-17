@@ -1,0 +1,385 @@
+#!/usr/bin/env python3
+"""
+v11.37 W1-T1 — Idempotent, atomic agent registry reconciler.
+
+Ships the amplified #38 fix: registry keys must match on-disk `.md`
+frontmatter `name:` values under `-maxdepth 1` at `~/.claude/agents/`.
+Archived agents (`~/.claude/agents/archive/*.md`) are inactive-by-convention
+and excluded from the registry (per v11.37 archive/ policy).
+
+Usage:
+    scripts/reconcile-agent-registry [--dry-run|--apply|--revert]
+                                     [--registry PATH] [--agents-dir PATH]
+
+Modes:
+    --dry-run   (default) print planned adds + prunes; no writes.
+    --apply     compute plan, write `.bak`, generate new registry to a
+                staging file, atomic `mv` into place. NOTE: `.bak` is
+                overwritten unconditionally on each --apply — if you need
+                to preserve multiple generations, snapshot manually before
+                re-running. (Post-CLOSE review-w1-t1 E1 corrected the
+                overclaimed "mtime-guard" wording in this doc.)
+    --revert    consume `.bak` back into place (with its own `.bak` swap).
+                Uses staging→os.replace atomic pattern (post-CLOSE
+                review-w1-t1 E2 fix; was shutil.copy2 direct-write).
+
+Scope note (post-CLOSE review-w1-t1 E3): this reconciler ships a 2-way
+diff (disk `.md` frontmatter vs registry keys), not the 3-way disk↔
+registry↔ledger diff called for in the sprint spec. The 3-way overlay
+is provided by the ongoing WARN check `scripts/check-registry-drift`
+(shipped W2-T3): it surfaces ledger-active-but-not-on-disk labels as
+advisory findings for operator triage, rather than automatic registry
+mutation (safer: rename/alias drift shouldn't auto-add entries).
+
+Env levers:
+    V11_REGISTRY_RECONCILE=off  →  full no-op (script exits 0 without change).
+
+Exit codes:
+    0   no change needed OR --apply succeeded OR --dry-run succeeded
+    1   change required and --dry-run was in effect (advisory)
+    2   error (concurrent-run race, missing registry, malformed data)
+
+Concurrency: uses fcntl.flock(LOCK_EX|LOCK_NB) on the registry directory;
+a second concurrent --apply refuses with exit 2 (never blocks/serializes —
+LOCK_NB by design, post-CLOSE review-w1-t1 E6 fix).
+
+Precedent: staging→atomic-mv pattern from scripts/handoff:1818.
+"""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import json
+import os
+import re
+import shutil
+import sys
+import time
+from pathlib import Path
+from typing import Any
+
+
+DEFAULT_REGISTRY = Path.home() / ".agent-registry" / "agents.json"
+DEFAULT_AGENTS_DIR = Path.home() / ".claude" / "agents"
+ARCHIVE_SUBDIR = "archive"
+
+# Fields the frontmatter carries that we surface into the registry entry.
+# Order matters for stable diffs.
+REGISTRY_ENTRY_KEYS = ("file", "model", "status", "category", "description", "version", "color")
+
+FRONTMATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n", re.DOTALL)
+
+
+def _env_off(name: str) -> bool:
+    return os.environ.get(name, "on").strip().lower() == "off"
+
+
+def parse_frontmatter(md_path: Path) -> dict[str, Any] | None:
+    """Return a dict of frontmatter fields, or None if no valid frontmatter."""
+    try:
+        text = md_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    m = FRONTMATTER_RE.match(text)
+    if not m:
+        return None
+    body = m.group(1)
+    fields: dict[str, Any] = {}
+    key: str | None = None
+    for raw_line in body.splitlines():
+        line = raw_line.rstrip()
+        if not line:
+            continue
+        # simple k: v parser — sufficient for our schema (name, description,
+        # model, color, category, status). Multi-line and list values are
+        # ignored — we only need the scalar fields for the registry entry.
+        if line[0] in (" ", "\t", "-"):
+            continue  # continuation / list item — not a top-level key
+        if ":" not in line:
+            continue
+        k, _, v = line.partition(":")
+        k = k.strip()
+        v = v.strip()
+        # strip enclosing quotes on values, preserve inner
+        if len(v) >= 2 and v[0] == v[-1] and v[0] in ("'", '"'):
+            v = v[1:-1]
+        fields[k] = v
+        key = k
+    return fields
+
+
+def discover_disk_agents(agents_dir: Path) -> dict[str, dict[str, Any]]:
+    """Enumerate .md files at maxdepth 1 (excludes archive/). Return
+    {agent_name: frontmatter_dict}."""
+    result: dict[str, dict[str, Any]] = {}
+    if not agents_dir.is_dir():
+        return result
+    for entry in sorted(agents_dir.iterdir()):
+        if entry.is_dir():
+            continue  # archive/ + anything else — skip
+        if entry.suffix != ".md":
+            continue
+        fm = parse_frontmatter(entry)
+        if fm is None:
+            continue
+        name = fm.get("name")
+        if not name:
+            # skip .md files without a name: frontmatter (READMEs, drafts)
+            continue
+        # canonical file field: basename relative to agents_dir
+        fm["_file"] = entry.name
+        result[name] = fm
+    return result
+
+
+def load_registry(registry_path: Path) -> dict[str, Any]:
+    if not registry_path.is_file():
+        raise SystemExit(f"registry missing: {registry_path}")
+    with registry_path.open("r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def build_registry_entry(fm: dict[str, Any]) -> dict[str, Any]:
+    """Build a canonical registry entry from parsed frontmatter."""
+    entry: dict[str, Any] = {"file": fm.get("_file", "")}
+    if fm.get("model"):
+        entry["model"] = fm["model"]
+    entry["status"] = "active"  # default for freshly-added agents
+    if fm.get("category"):
+        entry["category"] = fm["category"]
+    if fm.get("description"):
+        entry["description"] = fm["description"]
+    entry["version"] = "11.37.0"  # this reconciler stamps its own version
+    if fm.get("color"):
+        entry["color"] = fm["color"]
+    return entry
+
+
+def _registry_file_resolves(agents_dir: Path, entry: dict[str, Any]) -> bool:
+    """v11.38 W1-T1 (#51 fix): a registry entry survives prune if its `file:`
+    field points at an existing on-disk .md — even one level deep. Guards
+    against silently pruning agents whose canonical file lives in a subdir
+    (e.g. `system-prompts/*.md`) that `discover_disk_agents()` skips by
+    the `-maxdepth 1` archive/ exclusion."""
+    file_field = entry.get("file", "")
+    if not file_field or not isinstance(file_field, str):
+        return False
+    candidate = agents_dir / file_field
+    return candidate.is_file()
+
+
+def compute_plan(
+    disk: dict[str, dict[str, Any]], registry: dict[str, Any],
+    agents_dir: Path | None = None,
+) -> tuple[list[str], list[str]]:
+    """Return (adds, prunes). Adds = agent names to insert. Prunes = keys to remove.
+
+    v11.38 W1-T1 (#51 fix): if `agents_dir` is provided, prune candidates
+    whose registry `file:` field resolves to an existing on-disk .md are
+    kept (nested-file agents survive)."""
+    disk_names = set(disk.keys())
+    reg_names = set(registry.get("agents", {}).keys())
+    adds = sorted(disk_names - reg_names)
+    prune_candidates = reg_names - disk_names
+    if agents_dir is not None:
+        reg_agents = registry.get("agents", {})
+        prunes = sorted(
+            name for name in prune_candidates
+            if not _registry_file_resolves(agents_dir, reg_agents.get(name, {}))
+        )
+    else:
+        prunes = sorted(prune_candidates)
+    return adds, prunes
+
+
+def apply_plan(
+    registry: dict[str, Any],
+    disk: dict[str, dict[str, Any]],
+    adds: list[str],
+    prunes: list[str],
+) -> dict[str, Any]:
+    """Return a new registry dict with adds inserted + prunes removed +
+    metadata.total_agents recomputed. Does NOT mutate input."""
+    new = json.loads(json.dumps(registry))  # deep copy via serialization
+    agents = new.setdefault("agents", {})
+    for name in adds:
+        agents[name] = build_registry_entry(disk[name])
+    for name in prunes:
+        agents.pop(name, None)
+    meta = new.setdefault("metadata", {})
+    meta["total_agents"] = len(agents)
+    meta["active_agents"] = sum(
+        1 for v in agents.values() if v.get("status", "active") == "active"
+    )
+    meta["deprecated_agents"] = sum(
+        1 for v in agents.values() if v.get("status") == "deprecated"
+    )
+    meta["last_updated"] = time.strftime("%Y-%m-%d")
+    return new
+
+
+def atomic_write(target: Path, data: dict[str, Any]) -> None:
+    """Staging→atomic-mv (precedent: scripts/handoff:1818)."""
+    staging = target.with_suffix(target.suffix + f".staging.{os.getpid()}")
+    try:
+        with staging.open("w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, sort_keys=False)
+            f.write("\n")
+        # sanity check we produced valid JSON
+        json.loads(staging.read_text(encoding="utf-8"))
+        # atomic replace
+        os.replace(staging, target)
+    finally:
+        if staging.exists():
+            staging.unlink(missing_ok=True)
+
+
+def bak_path(target: Path) -> Path:
+    return target.with_suffix(target.suffix + ".bak")
+
+
+def write_bak(target: Path) -> Path:
+    bak = bak_path(target)
+    shutil.copy2(target, bak)
+    return bak
+
+
+def revert_from_bak(target: Path) -> None:
+    bak = bak_path(target)
+    if not bak.exists():
+        raise SystemExit(f"no .bak at {bak} — nothing to revert")
+    # preserve current as .bak.pre-revert.<ts> so revert is itself reversible
+    ts = time.strftime("%Y%m%d%H%M%S")
+    swap = target.with_suffix(target.suffix + f".bak.pre-revert.{ts}")
+    shutil.copy2(target, swap)
+    # Atomic revert via staging→os.replace (post-CLOSE review-w1-t1 E2 fix):
+    # a crash mid-copy during --revert is exactly when we can least afford
+    # a corrupt registry, so route through the same atomic pattern as --apply.
+    bak_data = json.loads(bak.read_text(encoding="utf-8"))
+    atomic_write(target, bak_data)
+    sys.stderr.write(
+        f"reverted from {bak}. previous state preserved at {swap}.\n"
+    )
+
+
+def _acquire_lock(registry_path: Path) -> Any:
+    """Acquire an exclusive non-blocking lock on the registry file's directory
+    (avoid locking the target itself since we'll mv over it). Returns the fh
+    to hold until process exit."""
+    lock_path = registry_path.parent / ".reconcile.lock"
+    fh = lock_path.open("w")
+    try:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        fh.close()
+        sys.stderr.write(
+            "reconcile: another reconciler is holding the lock. Refusing to proceed.\n"
+        )
+        raise SystemExit(2)
+    return fh
+
+
+def render_plan(
+    adds: list[str],
+    prunes: list[str],
+    disk: dict[str, dict[str, Any]],
+    old_total: int,
+    new_total: int,
+) -> str:
+    lines = []
+    lines.append(f"reconcile-agent-registry plan:")
+    lines.append(f"  registry currently: {old_total} entries")
+    lines.append(f"  disk (maxdepth 1):  {len(disk)} agents")
+    lines.append(
+        f"  planned:  +{len(adds)} add, -{len(prunes)} prune  →  {new_total} entries"
+    )
+    if adds:
+        lines.append("")
+        lines.append("  ADD (on disk, not registered):")
+        for name in adds:
+            desc = disk[name].get("description", "")[:80]
+            lines.append(f"    + {name}: {desc}")
+    if prunes:
+        lines.append("")
+        lines.append("  PRUNE (registered, no .md at maxdepth 1):")
+        for name in prunes:
+            lines.append(f"    - {name}")
+    return "\n".join(lines)
+
+
+def main() -> int:
+    if _env_off("V11_REGISTRY_RECONCILE"):
+        sys.stderr.write(
+            "V11_REGISTRY_RECONCILE=off — no-op mode. Exiting 0.\n"
+        )
+        return 0
+
+    parser = argparse.ArgumentParser(
+        description="v11.37 W1-T1 agent-registry reconciler",
+        epilog="Default is --dry-run. Use --apply to write.",
+    )
+    parser.add_argument(
+        "--apply", action="store_true", help="write the change (with .bak + atomic mv)"
+    )
+    parser.add_argument(
+        "--dry-run", action="store_true", help="print plan; no writes (default)"
+    )
+    parser.add_argument(
+        "--revert",
+        action="store_true",
+        help="consume .bak back into place (swap current to .bak.pre-revert)",
+    )
+    parser.add_argument(
+        "--registry", type=Path, default=DEFAULT_REGISTRY, help=f"default: {DEFAULT_REGISTRY}"
+    )
+    parser.add_argument(
+        "--agents-dir",
+        type=Path,
+        default=DEFAULT_AGENTS_DIR,
+        help=f"default: {DEFAULT_AGENTS_DIR}",
+    )
+    args = parser.parse_args()
+
+    if sum([args.apply, args.dry_run, args.revert]) > 1:
+        sys.stderr.write("pick one of --apply / --dry-run / --revert\n")
+        return 2
+
+    lock_fh = _acquire_lock(args.registry)  # noqa: F841 — must hold to exit
+
+    if args.revert:
+        revert_from_bak(args.registry)
+        return 0
+
+    disk = discover_disk_agents(args.agents_dir)
+    registry = load_registry(args.registry)
+    old_total = len(registry.get("agents", {}))
+    adds, prunes = compute_plan(disk, registry, agents_dir=args.agents_dir)
+
+    if not adds and not prunes:
+        sys.stderr.write("reconcile-agent-registry: registry in sync — nothing to do.\n")
+        return 0
+
+    new_registry = apply_plan(registry, disk, adds, prunes)
+    new_total = len(new_registry["agents"])
+    plan_text = render_plan(adds, prunes, disk, old_total, new_total)
+
+    if args.apply:
+        # write .bak first — reversible even on interrupt
+        bak = write_bak(args.registry)
+        atomic_write(args.registry, new_registry)
+        sys.stderr.write(plan_text + "\n\n")
+        sys.stderr.write(f"applied. backup: {bak}\n")
+        return 0
+
+    # --dry-run (or default)
+    sys.stderr.write(plan_text + "\n\n")
+    sys.stderr.write(
+        "dry-run — nothing written. Re-run with --apply to write, or --revert to consume .bak.\n"
+    )
+    # exit 1 signals "change needed" so a CI check can gate on cleanliness
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "formation-config.schema.json",
+  "$id": "https://herakles.dev/v11/schemas/formation-config.schema.json",
   "title": "V11 Formation Configuration",
   "description": "Schema for formation definitions in the agent registry",
   "type": "object",

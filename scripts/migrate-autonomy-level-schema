@@ -1,0 +1,86 @@
+#!/bin/bash
+# V11.34.3: migrate .autonomy-state files whose .level drifted from the
+# schema-declared integer to the display form ("A3").
+#
+# templates/autonomy-state.schema.json declares .level as {"type":"integer"}.
+# Files written with the display form silently broke every arithmetic consumer
+# (see v11_normalize_autonomy_level in hooks/lib/common.sh for the failure
+# modes). The hook library now coerces at read time, so this migration is a
+# data-hygiene follow-up, not a functional prerequisite — it exists so the
+# corpus matches its own schema and `.level|type == "number"` holds everywhere.
+#
+# Only .level is rewritten; every other key is preserved byte-for-byte by jq.
+# Default is a dry run — pass --apply to write.
+#
+# Usage:
+#   ./scripts/migrate-autonomy-level-schema              # dry run (default)
+#   ./scripts/migrate-autonomy-level-schema --apply      # write + back up
+#   ./scripts/migrate-autonomy-level-schema --verify     # report type census
+
+set -uo pipefail
+
+SESSIONS_ROOT="${SESSIONS_ROOT:-$HOME/sessions}"
+MODE="dry-run"
+case "${1:-}" in
+    --apply)  MODE="apply" ;;
+    --verify) MODE="verify" ;;
+    --dry-run|"") MODE="dry-run" ;;
+    *) echo "Usage: $0 [--apply|--dry-run|--verify]" >&2; exit 64 ;;
+esac
+
+STAMP="$(date -u +%Y%m%d-%H%M%S)"
+TOTAL=0 DRIFTED=0 CHANGED=0 FAILED=0
+
+if [ "$MODE" == "verify" ]; then
+    echo "=== .level type census under $SESSIONS_ROOT ==="
+    for f in "$SESSIONS_ROOT"/*/.autonomy-state; do
+        [ -f "$f" ] || continue
+        jq -r '.level | type' "$f" 2>/dev/null || echo "unreadable"
+    done | sort | uniq -c
+    exit 0
+fi
+
+for f in "$SESSIONS_ROOT"/*/.autonomy-state; do
+    [ -f "$f" ] || continue
+    TOTAL=$((TOTAL + 1))
+
+    # Skip unreadable/malformed files rather than rewriting them — a corrupt
+    # file is a separate problem and must not be silently "fixed" here.
+    jq empty "$f" 2>/dev/null || { echo "SKIP (malformed JSON): $f"; FAILED=$((FAILED + 1)); continue; }
+
+    RAW_TYPE="$(jq -r '.level | type' "$f" 2>/dev/null)"
+    [ "$RAW_TYPE" == "string" ] || continue
+    DRIFTED=$((DRIFTED + 1))
+
+    RAW="$(jq -r '.level' "$f" 2>/dev/null)"
+    NORM="${RAW#[Aa]}"; NORM="${NORM%%.*}"
+    case "$NORM" in
+        ''|*[!0-9]*) echo "SKIP (uncoercible level '$RAW'): $f"; FAILED=$((FAILED + 1)); continue ;;
+    esac
+    NORM=$((10#$NORM))
+    if [ "$NORM" -gt 5 ]; then
+        echo "SKIP (out-of-range level '$RAW'): $f"; FAILED=$((FAILED + 1)); continue
+    fi
+
+    if [ "$MODE" == "dry-run" ]; then
+        printf 'WOULD MIGRATE  %-58s "%s" -> %s\n' "$f" "$RAW" "$NORM"
+        continue
+    fi
+
+    cp -p "$f" "$f.bak-$STAMP" || { echo "SKIP (backup failed): $f"; FAILED=$((FAILED + 1)); continue; }
+    if jq --argjson lvl "$NORM" '.level = $lvl' "$f" > "$f.tmp.$$" 2>/dev/null \
+       && jq empty "$f.tmp.$$" 2>/dev/null \
+       && mv "$f.tmp.$$" "$f"; then
+        printf 'MIGRATED       %-58s "%s" -> %s\n' "$f" "$RAW" "$NORM"
+        CHANGED=$((CHANGED + 1))
+    else
+        rm -f "$f.tmp.$$"
+        echo "FAILED (rewrite): $f — backup kept at $f.bak-$STAMP"
+        FAILED=$((FAILED + 1))
+    fi
+done
+
+echo
+echo "scanned=$TOTAL drifted=$DRIFTED migrated=$CHANGED failed=$FAILED mode=$MODE"
+[ "$FAILED" -gt 0 ] && exit 1
+exit 0

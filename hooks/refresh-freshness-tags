@@ -13,7 +13,7 @@ METRICS_LOG="$METRICS_DIR/freshness-refresh.jsonl"
 
 # --- qualify: at least one completed task this session ---
 # C-E5 fix: use only v11_session_state_path (project-scoped); removed hardcoded
-# reference-project fallback which caused cross-project blast radius in a global hook.
+# example-project fallback which caused cross-project blast radius in a global hook.
 # If no session state file exists, the hook is a no-op (project has no completions).
 _SESS_STATE="$(v11_session_state_path 2>/dev/null || true)"
 _COMPLETED=0
@@ -67,7 +67,7 @@ refresh_file() {
 
 # --- resolve project root ---
 PROJECT_ROOT=""
-[ -n "$PROJECT" ] && for _t in "$V11_WORKSPACE_ROOT/$PROJECT" "$SESSIONS_ROOT/$PROJECT"; do
+[ -n "$PROJECT" ] && for _t in "$HERCULES_ROOT/$PROJECT" "$SESSIONS_ROOT/$PROJECT"; do
     [ -d "$_t" ] && PROJECT_ROOT="$_t" && break
 done
 [ -z "$PROJECT_ROOT" ] && PROJECT_ROOT="$(pwd)"

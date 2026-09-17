@@ -2,13 +2,10 @@
 # V11 Hook Library — shared constants and functions sourced by all hooks.
 
 # Constants
-# Portable default: data/session state lives under $HOME/.v11 unless the
-# operator overrides V11_WORKSPACE_ROOT. (OSS dist: was hardcoded to the origin
-# deployment's home directory.)
-V11_WORKSPACE_ROOT="${V11_WORKSPACE_ROOT:-$HOME/.v11}"
-V11_HOME="${V11_HOME:-$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../.." 2>/dev/null && pwd || echo "$V11_WORKSPACE_ROOT/v11")}"
-SESSIONS_ROOT="${SESSIONS_ROOT:-$V11_WORKSPACE_ROOT/sessions}"
-METRICS_DIR="$V11_WORKSPACE_ROOT/.agent-metrics"
+HERCULES_ROOT="${HERCULES_ROOT:-$HOME}"
+V11_HOME="${V11_HOME:-$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../.." 2>/dev/null && pwd || echo "$HERCULES_ROOT/v11")}"
+SESSIONS_ROOT="${SESSIONS_ROOT:-$HERCULES_ROOT/sessions}"
+METRICS_DIR="$HERCULES_ROOT/.agent-metrics"
 TASK_STATE_DIR="$METRICS_DIR/task-state"
 REGISTRY_FILE="$METRICS_DIR/project-paths.json"
 ACTIVE_PROJECT_FILE="$METRICS_DIR/active-project"
@@ -44,21 +41,35 @@ v11_read_active_project() {
     fi
 
     # Tier 2: global fallback (legacy, scripts without session_id)
+    # 15-F2: check owner liveness — if a different live session owns the global
+    # file, its project binding is theirs, not ours. Return empty (no project)
+    # unless V11_ACTIVE_PROJECT_OWNER=off disables the check.
     [ -f "$ACTIVE_PROJECT_FILE" ] || return 0
     [ -s "$ACTIVE_PROJECT_FILE" ] || return 0
     raw=$(head -n 1 "$ACTIVE_PROJECT_FILE" 2>/dev/null | tr -d '[:space:]')
-    if printf '%s' "$raw" | grep -qE '^[a-zA-Z0-9._-]{1,64}$'; then
-        printf '%s' "$raw"
-    else
+    if ! printf '%s' "$raw" | grep -qE '^[a-zA-Z0-9._-]{1,64}$'; then
         echo "v11_read_active_project: rejected invalid content in $ACTIVE_PROJECT_FILE" >&2
         return 0
     fi
+
+    if [ "${V11_ACTIVE_PROJECT_OWNER:-on}" = "on" ] && [ -n "${V11_SESSION_ID:-}" ]; then
+        local owner
+        owner=$(sed -n '2p' "$ACTIVE_PROJECT_FILE" 2>/dev/null | tr -d '[:space:]')
+        if [ -n "$owner" ] && [ "$owner" != "${V11_SESSION_ID:-}" ] \
+           && v11_session_is_live "$owner" 2>/dev/null; then
+            echo "v11_read_active_project: global file owned by live session ${owner:0:8}, skipping Tier-2" >&2
+            return 0
+        fi
+    fi
+
+    printf '%s' "$raw"
 }
 
 # v11_write_active_project — atomic dual-write to global + session-scoped paths.
 # Args: $1 = sanitized project name (must match the whitelist regex)
 # Side effect: writes to $ACTIVE_PROJECT_FILE always, plus session-scoped file if V11_SESSION_ID set.
 # P4 (2026-05-14): per-session scoping to prevent cross-session active-project contamination.
+# 15-F2 (v11.35.6): global file carries owner session UUID on line 2 for liveness gating.
 v11_write_active_project() {
     local project="$1"
     [ -z "$project" ] && return 1
@@ -70,13 +81,15 @@ v11_write_active_project() {
     fi
 
     # Always update global (legacy compat for CLI tools without V11_SESSION_ID)
+    # Format: line 1 = project name, line 2 = owning session UUID (or empty)
     mkdir -p "$(dirname "$ACTIVE_PROJECT_FILE")"
-    printf '%s\n' "$project" > "$ACTIVE_PROJECT_FILE"
+    local owner="${V11_SESSION_ID:-}"
+    printf '%s\n%s\n' "$project" "$owner" > "$ACTIVE_PROJECT_FILE"
 
     # Additionally update session-scoped file when V11_SESSION_ID is well-formed
-    if [ -n "${V11_SESSION_ID:-}" ] \
-       && printf '%s' "$V11_SESSION_ID" | grep -qE '^[a-zA-Z0-9._-]{1,64}$'; then
-        local scoped_dir="$METRICS_DIR/sessions/$V11_SESSION_ID"
+    if [ -n "$owner" ] \
+       && printf '%s' "$owner" | grep -qE '^[a-zA-Z0-9._-]{1,64}$'; then
+        local scoped_dir="$METRICS_DIR/sessions/$owner"
         mkdir -p "$scoped_dir" 2>/dev/null
         printf '%s\n' "$project" > "$scoped_dir/active-project"
     fi
@@ -265,6 +278,18 @@ v11_rebuild_project_aggregate() {
             # stays detectable by its own timestamp. Diagnosis:
             # sessions/cta-tracker/artifacts/sync-tasks-freeze-diagnosis.json
             echo "v11_rebuild_project_aggregate: session-file scan EMPTY for '$project' but an aggregate exists — preserving prior aggregate unchanged (counters may be stale)" >&2
+            # v11.42 W1-T2 (RC5a): additive audit log so no-ledger dormant projects
+            # become discoverable to align-aggregate/audit tooling (per recon #5
+            # Option D). stderr-only signal was previously invisible to programmatic
+            # readers. Best-effort — never fails the rebuild. Rollback: V11_LEDGER_AUDIT_NOLEDGER=off.
+            if [ "${V11_LEDGER_AUDIT_NOLEDGER:-on}" != "off" ]; then
+                local _empty_scan_log="$METRICS_DIR/ledger-cutover.jsonl"
+                local _empty_scan_ledger="$METRICS_DIR/ledger/${project}.jsonl"
+                local _has_ledger="false"
+                [ -f "$_empty_scan_ledger" ] && _has_ledger="true"
+                printf '{"ts":"%s","project":"%s","decision":"empty-scan-preserve","has_ledger":%s}\n' \
+                    "$now" "$project" "$_has_ledger" >> "$_empty_scan_log" 2>/dev/null || true
+            fi
             aggregate=$(cat "$aggregate_file")
         else
             aggregate=$(jq -n --arg project "$project" --arg now "$now" '{
@@ -695,7 +720,7 @@ v11_rebuild_project_aggregate() {
         # (latent in the sprint-1 shadow path; load-bearing here). Project is
         # passed positionally ("$1") to avoid any quoting/injection.
         _replay=$(
-            V11_WORKSPACE_ROOT="$(dirname "${METRICS_DIR}")" \
+            HERCULES_ROOT="$(dirname "${METRICS_DIR}")" \
             METRICS_DIR="${METRICS_DIR}" \
             V11_HOME="${V11_HOME}" \
             timeout 15 bash -c \
@@ -744,11 +769,67 @@ v11_rebuild_project_aggregate() {
             # cutover had a higher count than a freshly-recomputed legacy
             # fold would produce) — never write a smaller total/completed
             # than a consumer already saw, on either axis.
-            if [ "$_rt" -lt "$_prior_total" ] 2>/dev/null || [ "$_rc" -lt "$_prior_completed" ] 2>/dev/null; then
-                echo "v11_rebuild_project_aggregate: REGRESSION-GUARD for '$project' — ledger replay (total=$_rt completed=$_rc) would regress below the currently-displayed aggregate (total=$_prior_total completed=$_prior_completed); cutover skipped, prior aggregate preserved." >&2
-                printf '{"ts":"%s","project":"%s","decision":"regression-guard-blocked","prior_total":%s,"prior_completed":%s,"ledger_total":%s,"ledger_completed":%s}\n' \
-                    "$now" "$project" "$_prior_total" "$_prior_completed" "$_rt" "$_rc" >> "$_cutover_log" 2>/dev/null || true
-            elif [ "$_rt" -ge "$_lt" ] 2>/dev/null && [ "$_rc" -ge "$_lc" ] 2>/dev/null; then
+            # improvements/24: an operator-authorized CORRECTION can
+            # legitimately DECREASE replay counts (e.g. the identity-fallback
+            # fix removes phantom records that inflated total, or folds stray
+            # completed events onto real records). Raw counts cannot tell a
+            # correction from a regression, so the guard stays fail-closed by
+            # default. The escape hatch is PROJECT-SCOPED (adversarial
+            # finding #3, 2026-08-06): V11_CUTOVER_ACCEPT_CORRECTION must
+            # equal THIS project's name — a leftover exported flag can never
+            # authorize a correction on a different project (the exact
+            # trust-the-operator-marker failure mode that once cost
+            # container-control-api 5 real completions). It deliberately
+            # bypasses BOTH count floors (prior-aggregate AND ledger-vs-
+            # legacy): a correction of an inflated aggregate is precisely the
+            # case where the honest replay is below both. Set it for ONE
+            # rebuild of ONE project; never export it persistently.
+            local _accept_correction=0
+            case "${V11_CUTOVER_ACCEPT_CORRECTION:-off}" in
+                off|"") : ;;
+                on)
+                    echo "v11_rebuild_project_aggregate: V11_CUTOVER_ACCEPT_CORRECTION=on is not accepted — set it to the exact project name (e.g. =$project) so the authorization cannot leak onto other projects. Guard remains active." >&2
+                    ;;
+                "$project") _accept_correction=1 ;;
+                *) : ;;  # names a different project — guard stays active here
+            esac
+            # v11.42 W2-T2 (RC5b): FOOTGUN PROTECTION. The unsafe lever combo
+            # V11_REVIEW_SIBLING_AGEOUT=on + V11_AGEOUT_GUARD_CARVEOUT=off would
+            # reproduce exactly the silent-revert the bundling was designed to
+            # prevent (age-out shrinks replay → REGRESSION-GUARD trips → pins to
+            # stale zombie-inflated legacy). Detect + auto-force CARVEOUT=on with
+            # loud WARN. The reverse combo (AGEOUT=off + CARVEOUT=on) is inert
+            # and safe (nothing to credit → carve-out is a no-op).
+            if [ "${V11_REVIEW_SIBLING_AGEOUT:-on}" != "off" ] && [ "${V11_AGEOUT_GUARD_CARVEOUT:-on}" = "off" ]; then
+                echo "v11_rebuild_project_aggregate: FOOTGUN for '$project' — V11_REVIEW_SIBLING_AGEOUT=on + V11_AGEOUT_GUARD_CARVEOUT=off silently reverts age-out via regression-guard. Auto-forcing V11_AGEOUT_GUARD_CARVEOUT=on for this rebuild. Set both =off (or both =on) intentionally to avoid this warning." >&2
+                export V11_AGEOUT_GUARD_CARVEOUT=on
+            fi
+            # v11.42 W2-T2 (RC5b): cancel-driven-shrink carve-out. Count ledger
+            # events with reason="review_sibling_ageout" (written by Wave 2 T3's
+            # skill v1.4 age-out sweep) and add that count to replay's total for
+            # comparison — a shrink fully accounted for by age-out is NOT a
+            # regression. Prior events without this reason (pre-Wave-2 manual
+            # cancellations) are NOT counted, so this never retroactively
+            # bypasses the guard for other correction paths.
+            local _ageout_count=0
+            if [ "${V11_AGEOUT_GUARD_CARVEOUT:-on}" != "off" ] && [ -f "$_ledger_file" ]; then
+                # grep -c prints the count to stdout even on 0 matches (exit 1);
+                # do NOT chain || echo 0 (would concatenate two zeros → "00").
+                _ageout_count=$(grep -c '"reason":"review_sibling_ageout"' "$_ledger_file" 2>/dev/null || true)
+                _ageout_count="${_ageout_count//[^0-9]/}"
+                [ -z "$_ageout_count" ] && _ageout_count=0
+            fi
+            local _rt_adj="$_rt"
+            local _rc_adj="$_rc"
+            if [ "$_ageout_count" -gt 0 ] 2>/dev/null; then
+                _rt_adj=$((_rt + _ageout_count))
+                # cancelled events don't affect .completed; _rc_adj unchanged.
+            fi
+            if [ "$_accept_correction" != "1" ] && { [ "$_rt_adj" -lt "$_prior_total" ] 2>/dev/null || [ "$_rc_adj" -lt "$_prior_completed" ] 2>/dev/null; }; then
+                echo "v11_rebuild_project_aggregate: REGRESSION-GUARD for '$project' — ledger replay (total=$_rt completed=$_rc; +ageout_carveout=$_ageout_count → adjusted total=$_rt_adj) would regress below the currently-displayed aggregate (total=$_prior_total completed=$_prior_completed); cutover skipped, prior aggregate preserved." >&2
+                printf '{"ts":"%s","project":"%s","decision":"regression-guard-blocked","prior_total":%s,"prior_completed":%s,"ledger_total":%s,"ledger_completed":%s,"ageout_carveout":%s}\n' \
+                    "$now" "$project" "$_prior_total" "$_prior_completed" "$_rt" "$_rc" "$_ageout_count" >> "$_cutover_log" 2>/dev/null || true
+            elif [ "$_accept_correction" = "1" ] || { [ "$_rt_adj" -ge "$_lt" ] 2>/dev/null && [ "$_rc_adj" -ge "$_lc" ] 2>/dev/null; }; then
                 # CUTOVER: ledger is equal-or-superset of legacy on total AND
                 # completed — replay is authoritative and never regresses.
                 (
@@ -770,8 +851,11 @@ v11_rebuild_project_aggregate() {
                             cp "$aggregate_file" "$mirror_file" 2>/dev/null
                         ) 203>"$mirror_file.lock" || true
                     fi
-                    printf '{"ts":"%s","project":"%s","decision":"cutover","reason":"guard-pass","legacy_total":%s,"legacy_completed":%s,"ledger_total":%s,"ledger_completed":%s}\n' \
-                        "$now" "$project" "$_lt" "$_lc" "$_rt" "$_rc" >> "$_cutover_log" 2>/dev/null || true
+                    local _cutover_reason="guard-pass"
+                    [ "$_accept_correction" = "1" ] && _cutover_reason="correction-authorized"
+                    [ "$_ageout_count" -gt 0 ] 2>/dev/null && [ "$_cutover_reason" = "guard-pass" ] && _cutover_reason="ageout-carveout-material"
+                    printf '{"ts":"%s","project":"%s","decision":"cutover","reason":"%s","prior_total":%s,"prior_completed":%s,"legacy_total":%s,"legacy_completed":%s,"ledger_total":%s,"ledger_completed":%s,"ageout_carveout":%s}\n' \
+                        "$now" "$project" "$_cutover_reason" "$_prior_total" "$_prior_completed" "$_lt" "$_lc" "$_rt" "$_rc" "$_ageout_count" >> "$_cutover_log" 2>/dev/null || true
                 }
             else
                 # LEDGER BEHIND LEGACY -> keep legacy (NEVER regress a visible
@@ -861,7 +945,7 @@ v11_shadow_reconciliation_diff() {
     # correctness fix as the cutover path: a `VAR=val source f && func` prefix
     # applies only to the builtin, leaving METRICS_DIR empty in the replay.
     replay_output=$(
-        V11_WORKSPACE_ROOT="$(dirname "${METRICS_DIR}")" \
+        HERCULES_ROOT="$(dirname "${METRICS_DIR}")" \
         METRICS_DIR="${METRICS_DIR}" \
         V11_HOME="${V11_HOME}" \
         timeout 10 bash -c \
@@ -935,7 +1019,7 @@ SHADOW_PYEOF
 }
 
 # Infrastructure dirs excluded from project detection
-NON_PROJECTS="v11 v10 v9 v8 v7 sessions scripts \
+NON_PROJECTS="v11 v10 v9 v8 v7 v6_Ultra sessions scripts system-apps-config portfolio-platform \
 .claude .agent-metrics .agent-registry .secrets .archive .cache .local .npm .nvm .config \
 .ssh snap node_modules deploy.sh"
 
@@ -955,10 +1039,29 @@ v11_parse_input() {
   _V11_TR_JSON="$(printf '%s' "$V11_RAW_INPUT" | jq -c '.tool_response // empty' 2>/dev/null)"
   if [ -n "$_V11_TR_JSON" ] && [ "$_V11_TR_JSON" != "null" ]; then
       V11_TOOL_OUTPUT="$_V11_TR_JSON"
+      _V11_TR_FROM_RESPONSE=1
   else
       V11_TOOL_OUTPUT="$(printf '%s' "$V11_RAW_INPUT" | jq -r '.tool_output // empty')"
+      _V11_TR_FROM_RESPONSE=0
   fi
   unset _V11_TR_JSON
+  # S81-W0-2 (U-new-1): dsh-hooks-claude-code flattens .tool_response into a
+  # JSON-encoded STRING before delivering the hook payload. Downstream jq paths
+  # like .task.id / .taskId then error with "Cannot index string with X".
+  # Unwrap once here so every consumer sees the object shape.
+  #
+  # GATE (v11-test-debt): only the .tool_response path can be a JSON-encoded
+  # string wrapper. The legacy .tool_output fallback is already RAW TEXT and must
+  # NOT be re-parsed as JSON — jq reads a value like "1. Fix bug [completed]\n2…"
+  # as a JSON stream, greedily emits the leading number 1, and silently truncates
+  # the entire TaskList text to "1" (breaking counter + active_task_ids
+  # reconciliation). Skipping the unwrap for legacy text leaves it untouched.
+  if [ "${_V11_TR_FROM_RESPONSE:-0}" = "1" ]; then
+      _V11_TR_UW="$(printf '%s' "${V11_TOOL_OUTPUT:-}" | jq -c 'if type == "string" then (fromjson? // .) else . end' 2>/dev/null)"
+      [ -n "$_V11_TR_UW" ] && [ "$_V11_TR_UW" != "null" ] && V11_TOOL_OUTPUT="$_V11_TR_UW"
+      unset _V11_TR_UW
+  fi
+  unset _V11_TR_FROM_RESPONSE
   V11_ERROR="$(printf '%s' "$V11_RAW_INPUT"       | jq -r '.error // empty')"
   V11_CWD="$(printf '%s' "$V11_RAW_INPUT"         | jq -r '.working_directory // empty')"
 
@@ -966,13 +1069,15 @@ v11_parse_input() {
 }
 
 # Classify risk: prints "high", "medium", or "low".
-v11_risk_level() {
-  local tool="$V11_TOOL_NAME" cmd="$V11_COMMAND"
-  # High-risk: destructive system/data/git operations
-  # rm with recursive flag: only matches actual flag TOKENS (-[a-zA-Z]+ bounded by whitespace),
-  # not "-r" substrings embedded in path components like "references/v11-quick-ref.md".
-  # Bug 2026-06-01: previous regex used .* and matched any -r in the command string.
-  if [[ "$cmd" =~ (^|[[:space:]])rm([[:space:]]+-[a-zA-Z]+)*[[:space:]]+(-[a-zA-Z]*[rR][a-zA-Z]*|--recursive)([[:space:]]|$) ]] \
+# v11_matches_high_risk_pattern TEXT — the high-risk pattern chain, factored
+# out of v11_risk_level so it can run against both the raw command and the
+# improvements/25 masked view.
+# rm with recursive flag: only matches actual flag TOKENS (-[a-zA-Z]+ bounded by whitespace),
+# not "-r" substrings embedded in path components like "references/v11-quick-ref.md".
+# Bug 2026-06-01: previous regex used .* and matched any -r in the command string.
+v11_matches_high_risk_pattern() {
+  local cmd="$1"
+  [[ "$cmd" =~ (^|[[:space:]])rm([[:space:]]+-[a-zA-Z]+)*[[:space:]]+(-[a-zA-Z]*[rR][a-zA-Z]*|--recursive)([[:space:]]|$) ]] \
   || [[ "$cmd" =~ DROP[[:space:]]+(DATABASE|TABLE)|TRUNCATE|DELETE[[:space:]]+FROM ]] \
   || [[ "$cmd" =~ docker[[:space:]]+system[[:space:]]+prune[[:space:]]+-a ]] \
   || [[ "$cmd" =~ docker[[:space:]]+volume[[:space:]]+rm ]] \
@@ -980,8 +1085,102 @@ v11_risk_level() {
   || [[ "$cmd" =~ git[[:space:]]+reset[[:space:]]+--hard|git[[:space:]]+clean[[:space:]]+-f ]] \
   || [[ "$cmd" =~ shutdown|reboot|mkfs|dd[[:space:]]+if= ]] \
   || [[ "$cmd" =~ chown[[:space:]]+-R|chmod[[:space:]]+-R[[:space:]]+777 ]] \
-  || [[ "$cmd" =~ \>[[:space:]]*/dev/sda ]]; then
-    echo "high"; return
+  || [[ "$cmd" =~ \>[[:space:]]*/dev/sda ]]
+}
+
+# v11_risk_classification_text — improvements/25: the classifier matches
+# command TEXT, not command STRUCTURE, so prose inside commit-message
+# heredocs/quotes trips HIGH patterns (live incident 2026-08-06: the
+# v11.35.3 commit was blocked because its own message DESCRIBED the
+# recursive-delete pattern). This emits $V11_COMMAND with inert text
+# payloads masked, for risk classification ONLY — every consumer of the
+# actual command keeps the raw string.
+#
+# Fail-closed at every branch — any doubt returns the string unmasked:
+#   1. Any shell-EXECUTOR token present (sh/bash/eval/ssh/xargs/python/
+#      docker/...) -> no masking: a quoted "rm -rf" handed to an executor
+#      is a real delete, not prose.
+#   2. Heredoc BODIES are stripped by line-anchored terminator match (exact
+#      for arbitrary content). An unclosed heredoc aborts to raw (never
+#      over-mask past a bad terminator).
+#   3. Single-quoted spans -> MASKED placeholder (valid shell guarantees
+#      pairing; a placeholder, not deletion, so masking can never join
+#      adjacent tokens into a new dangerous string). Odd quote count -> stop.
+#   4. Double-quoted spans only when provably well-paired: any \" or $'
+#      in the remaining text -> stop (mispairing could swallow a REAL
+#      command between two strings -> false negative; we refuse).
+# Rollback: V11_RISK_TEXT_MASK=off restores raw-text classification exactly.
+v11_risk_classification_text() {
+  local cmd="$V11_COMMAND"
+  if [ "${V11_RISK_TEXT_MASK:-on}" = "off" ]; then printf '%s' "$cmd"; return; fi
+
+  # (1) executor tokens — word-bounded; broad list on purpose (less masking
+  # = fail-closed). git is deliberately NOT here.
+  local _exec_re='(^|[[:space:]]|[;&|(`])(sh|bash|zsh|dash|ksh|csh|fish|eval|exec|source|ssh|scp|sudo|su|doas|xargs|find|env|nohup|setsid|timeout|watch|script|expect|chroot|nsenter|systemd-run|at|batch|screen|tmux|parallel|python[0-9.]*|perl|ruby|node|deno|bun|php|lua|awk|gawk|mawk|osascript|docker|podman|nerdctl|kubectl|crictl|make)([[:space:]]|$|[;&|)`])'
+  if [[ "$cmd" =~ $_exec_re ]]; then printf '%s' "$cmd"; return; fi
+  # ". file" source alias — regex MUST live in a variable: an inline ERE with
+  # parens inside a char class breaks the [[ ]] tokenizer (this exact line,
+  # written inline, bricked every hook on 2026-08-06 — recovery required the
+  # user-run `!` escape hatch; see improvements/25 §incident).
+  local _src_alias_re='(^|[[:space:]]|[;&|(])\.[[:space:]]'
+  if [[ "$cmd" =~ $_src_alias_re ]]; then printf '%s' "$cmd"; return; fi
+
+  # (2) heredoc bodies
+  local masked
+  masked=$(printf '%s\n' "$cmd" | awk '
+    BEGIN { n = 0; i = 0 }
+    {
+      if (i < n) {
+        line = $0
+        sub(/^\t+/, "", line)            # <<- permits leading tabs
+        if (line == terms[i]) { i++ }
+        next                              # body + terminator masked
+      }
+      scan = $0
+      while (match(scan, /<<-?[ \t]*[^ \t<]+/)) {
+        m = substr(scan, RSTART, RLENGTH)
+        sub(/^<<-?[ \t]*/, "", m)
+        gsub(/["'"'"']/, "", m)
+        terms[n++] = m
+        scan = substr(scan, RSTART + RLENGTH)
+      }
+      print
+    }
+    END { if (i < n) exit 3 }            # unclosed heredoc -> abort to raw
+  ' 2>/dev/null) || { printf '%s' "$cmd"; return; }
+
+  # (3) single-quoted spans
+  local _sq_count
+  _sq_count=$(printf '%s' "$masked" | tr -cd "'" | wc -c)
+  if [ $(( _sq_count % 2 )) -ne 0 ]; then printf '%s' "$masked"; return; fi
+  masked=$(printf '%s' "$masked" | sed "s/'[^']*'/MASKED/g")
+
+  # (4) double-quoted spans — refuse on \" or $' (mispairing hazard)
+  if printf '%s' "$masked" | grep -qF '\"' || printf '%s' "$masked" | grep -qF "\$'"; then
+    printf '%s' "$masked"; return
+  fi
+  local _dq_count
+  _dq_count=$(printf '%s' "$masked" | tr -cd '"' | wc -c)
+  if [ $(( _dq_count % 2 )) -ne 0 ]; then printf '%s' "$masked"; return; fi
+  masked=$(printf '%s' "$masked" | sed 's/"[^"]*"/MASKED/g')
+
+  printf '%s' "$masked"
+}
+
+v11_risk_level() {
+  local tool="$V11_TOOL_NAME" cmd="$V11_COMMAND"
+  # High-risk: destructive system/data/git operations
+  if v11_matches_high_risk_pattern "$cmd"; then
+    # improvements/25: the raw hit may live in inert text (commit-message
+    # heredoc, quoted prose). Re-test the masked view; only IT decides.
+    # Masking bails back to raw on any structural doubt, so a real
+    # destructive command can never be hidden by this path.
+    local _masked
+    _masked="$(v11_risk_classification_text)"
+    if [ "$_masked" = "$cmd" ] || v11_matches_high_risk_pattern "$_masked"; then
+      echo "high"; return
+    fi
+    cmd="$_masked"   # prose-only hit: fall through to medium/low on the masked view
   fi
   # Medium-risk: file writes, or bash with stateful commands
   if [[ "$tool" == "Write" || "$tool" == "Edit" ]]; then
@@ -1031,13 +1230,38 @@ _v11_detect_project_from_path() {
   if [[ "$filepath" =~ ^$SESSIONS_ROOT/([^/]+) ]]; then
     V11_PROJECT="${BASH_REMATCH[1]}" V11_DETECTION_METHOD="sessions"; return
   fi
-  # Convention 2: $V11_WORKSPACE_ROOT/{name}/ (excluding infra dirs)
-  if [[ "$filepath" =~ ^$V11_WORKSPACE_ROOT/([^/]+) ]]; then
+  # Convention 2: portfolio-platform/apps/{name}/
+  if [[ "$filepath" =~ ^$HERCULES_ROOT/portfolio-platform/apps/([^/]+) ]]; then
+    V11_PROJECT="${BASH_REMATCH[1]}" V11_DETECTION_METHOD="portfolio-app"; return
+  fi
+  # Convention 3: $HERCULES_ROOT/{name}/ (excluding infra dirs)
+  if [[ "$filepath" =~ ^$HERCULES_ROOT/([^/]+) ]]; then
     local candidate="${BASH_REMATCH[1]}"
     for np in $NON_PROJECTS; do
       [[ "$candidate" == "$np" ]] && return
     done
-    V11_PROJECT="$candidate" V11_DETECTION_METHOD="workspace-root"
+    V11_PROJECT="$candidate" V11_DETECTION_METHOD="hercules-root"
+  fi
+}
+
+# Attribution-only project detection: like _v11_detect_project_from_path but
+# resolves NON_PROJECTS dirs to their directory name (method="non-project").
+# Use for audit rows where correct attribution matters even for framework files.
+# 15-F3 (v11.35.6): closes the self-work attribution leak.
+_v11_detect_project_for_attribution() {
+  local filepath="$1"
+  [ -z "$filepath" ] && return
+  _v11_detect_project_from_path "$filepath"
+  [ -n "$V11_PROJECT" ] && return
+  # Path-based detection returned empty — check if it's a NON_PROJECTS dir
+  if [[ "$filepath" =~ ^$HERCULES_ROOT/([^/]+) ]]; then
+    local candidate="${BASH_REMATCH[1]}"
+    for np in $NON_PROJECTS; do
+      if [[ "$candidate" == "$np" ]]; then
+        V11_PROJECT="$candidate" V11_DETECTION_METHOD="non-project"
+        return
+      fi
+    done
   fi
 }
 
@@ -1062,6 +1286,128 @@ v11_is_metadata_file() {
 # Check risk level and apply autonomy grants for enforcement.
 # Returns 0 if allowed, 2 if blocked.
 # Used by guard-enforcement hook.
+# Coerce a raw autonomy level value to a plain integer 0-5.
+#
+# templates/autonomy-state.schema.json declares .level as an integer, but live
+# state files drifted to the display form ("A3") — 6 of 179 as of v11.34.3.
+# Every consumer did `jq -r '.level // 0'` then bare arithmetic, so a string
+# level silently failed EVERY comparison:
+#   - v11_check_risk: `[ "A3" -ge 4 ] 2>/dev/null` errored, making the A4/A5
+#     high-risk auto-approval branch UNREACHABLE — autonomy was never consulted
+#     for exactly the commands that most need it.
+#   - v11_check_autonomy: the same test at the A3/A2/A1 gates leaked raw
+#     "integer expression expected" to hook stderr and denied A3+ medium
+#     auto-approval.
+# Coercing at read time fixes every consumer at once and stays correct if a
+# future writer re-emits the display form.
+#
+# Fails closed in EVERY direction: missing, empty, malformed, non-numeric,
+# negative, or out-of-range input all yield 0 (least autonomy). Out-of-range
+# high values deliberately do NOT clamp to 5 — a corrupted state file reading
+# `"level": 9` must not be handed maximum autonomy. This matches the schema
+# validator (v11_validate_state_file), which already rejects <0 or >5 outright.
+v11_normalize_autonomy_level() {
+  local raw="${1:-0}"
+  raw="${raw#[Aa]}"        # strip display prefix ("A3" -> "3")
+  raw="${raw%%.*}"         # tolerate float form ("3.0" -> "3")
+  case "$raw" in
+    ''|*[!0-9]*) printf '0'; return 0 ;;
+  esac
+  # Force base-10: a leading zero would otherwise be read as octal and "08"
+  # would abort the comparison ("value too great for base").
+  raw=$((10#$raw))
+  [ "$raw" -gt 5 ] && raw=0     # invalid, not "maximally autonomous"
+  printf '%s' "$raw"
+}
+
+# Read an autonomy level from a state file as a plain integer 0-5.
+# Wraps v11_normalize_autonomy_level; returns 0 for a missing/unreadable file.
+v11_autonomy_level() {
+  local file="$1"
+  if [ -z "$file" ] || [ ! -f "$file" ] || [ ! -s "$file" ]; then
+    printf '0'; return 0
+  fi
+  v11_normalize_autonomy_level "$(jq -r '.level // 0' "$file" 2>/dev/null)"
+}
+
+# Improvement #20 (2026-08-06) path-context helper: does every path argument
+# of a flagged `rm -rf`-class command resolve to a literal absolute path
+# strictly inside the harness session scratchpad root? Fail-closed by
+# construction:
+#   - Any character anywhere in the command that could mean shell expansion,
+#     quoting, or path traversal (.. $ ` * ? ~ ' " \ or a literal newline)
+#     aborts the WHOLE command from consideration, not just the offending
+#     token -- this helper does not attempt real shell parsing of compound
+#     commands, so ambiguity anywhere in the command must not leak into a
+#     path we never actually inspected.
+#   - Zero path arguments (flags only) stays HIGH -- v1 does not treat a
+#     flagless `rm -rf` as "nothing to downgrade, therefore safe".
+#   - Only the FIRST "rm" word found in the command is treated as the
+#     flagged invocation; a compound command with an earlier unrelated rm
+#     (e.g. `docker rm x && rm -rf <scratchpad>/y`) conservatively stays
+#     HIGH because that earlier segment's args won't match the scratchpad
+#     regex. Known v1 limitation; safe direction (under-downgrades, never
+#     over-downgrades).
+#   - Relative paths and `cd`-then-relative-target compounds stay HIGH (no
+#     cd-tracking in v1 -- see improvements/20-risk-gate-path-context.md,
+#     which explicitly accepts this as the conservative fallback). Session
+#     worktree paths are also NOT handled here -- the ticket proposes
+#     reusing the v11.34 write-gate's session-attribution machinery for
+#     that, but it's DEFERRED; this function only ever matches scratchpad
+#     paths.
+# Sets V11_RISK_PATH_CONTEXT_RESOLVED to the space-joined resolved paths on
+# success. Returns 0 (downgrade OK) or 1 (stay HIGH).
+v11_rm_is_scratchpad_only_delete() {
+  local cmd="$1"
+  V11_RISK_PATH_CONTEXT_RESOLVED=""
+  [ -z "$cmd" ] && return 1
+
+  # Reject on any of these appearing ANYWHERE in the command -- see comment
+  # above for why a whole-command reject (not per-token) is the safe choice.
+  [[ "$cmd" == *..* ]] && return 1
+  [[ "$cmd" == *'$'* ]] && return 1
+  [[ "$cmd" == *'`'* ]] && return 1
+  [[ "$cmd" == *'*'* ]] && return 1
+  [[ "$cmd" == *'?'* ]] && return 1
+  [[ "$cmd" == *'~'* ]] && return 1
+  [[ "$cmd" == *"'"* ]] && return 1
+  [[ "$cmd" == *'"'* ]] && return 1
+  [[ "$cmd" == *'\'* ]] && return 1
+  case "$cmd" in *$'\n'*) return 1 ;; esac
+
+  # Isolate the flagged rm's own arguments: from the first "rm" word up to
+  # the next shell control operator (&&, ||, ;, |) or end of string.
+  local segment
+  if [[ "$cmd" =~ (^|[[:space:]])rm[[:space:]]+([^\&\|\;]*) ]]; then
+    segment="${BASH_REMATCH[2]}"
+  else
+    return 1
+  fi
+
+  # Word-split without pathname expansion (safe: glob-meaningful chars were
+  # already rejected above; `read -ra` never globs regardless).
+  local -a tokens
+  read -ra tokens <<< "$segment"
+
+  local -a paths=()
+  local tok
+  for tok in "${tokens[@]}"; do
+    [[ "$tok" == -* ]] && continue   # flag token, not a path
+    paths+=("$tok")
+  done
+
+  # No path args -> nothing resolvable to downgrade, stay HIGH.
+  [ "${#paths[@]}" -eq 0 ] && return 1
+
+  local p
+  for p in "${paths[@]}"; do
+    [[ "$p" =~ ^/tmp/claude-[0-9]+/[^/]*/[^/]*/scratchpad/.+$ ]] || return 1
+  done
+
+  V11_RISK_PATH_CONTEXT_RESOLVED="${paths[*]}"
+  return 0
+}
+
 v11_check_risk() {
   local RISK="$(v11_risk_level)"
 
@@ -1111,25 +1457,39 @@ v11_check_risk() {
     RISK_DESCRIPTION="Destructive operation detected by risk classifier"
   fi
 
+  # Improvement #20 (2026-08-06): path-context downgrade for scratchpad-scoped
+  # recursive-force deletes. `rm -rf <path>` inside the harness-designated
+  # session scratchpad is not the same risk as `rm -rf` on project/production
+  # data, but pattern-only classification treats them identically -- training
+  # operators to route around the guard on the deletes that ARE dangerous.
+  # See improvements/20-risk-gate-path-context.md. Rollback:
+  # V11_RISK_PATH_CONTEXT=off restores pattern-only classification exactly.
+  if [ "$RISK_DESCRIPTION" = "Recursive force delete" ] \
+     && [ "${V11_RISK_PATH_CONTEXT:-on}" != "off" ] \
+     && v11_rm_is_scratchpad_only_delete "$V11_COMMAND"; then
+    echo "guard-enforcement: risk downgraded HIGH→LOW (scratchpad-scoped recursive delete): $V11_RISK_PATH_CONTEXT_RESOLVED" >&2
+    return 0
+  fi
+
   # Check A4 auto-approval (project-local autonomy state)
   local AUTONOMY_FILE=""
   v11_detect_project "$V11_FILE_PATH"
   # Fallback: extract path from command if project still unknown
   if [ -z "$V11_PROJECT" ] && [ -n "$V11_COMMAND" ]; then
     local CMD_PATH
-    CMD_PATH=$(printf '%s' "$V11_COMMAND" | grep -oE "$V11_WORKSPACE_ROOT/[^ ]+" | head -1)
+    CMD_PATH=$(printf '%s' "$V11_COMMAND" | grep -oE "$HERCULES_ROOT/[^ ]+" | head -1)
     [ -n "$CMD_PATH" ] && v11_detect_project "$CMD_PATH"
   fi
   if [ -n "$V11_PROJECT" ] && [ -f "$SESSIONS_ROOT/$V11_PROJECT/.autonomy-state" ]; then
     AUTONOMY_FILE="$SESSIONS_ROOT/$V11_PROJECT/.autonomy-state"
-  elif [ -n "$V11_PROJECT" ] && [ -f "$V11_WORKSPACE_ROOT/$V11_PROJECT/.autonomy-state" ]; then
-    AUTONOMY_FILE="$V11_WORKSPACE_ROOT/$V11_PROJECT/.autonomy-state"
+  elif [ -n "$V11_PROJECT" ] && [ -f "$HERCULES_ROOT/$V11_PROJECT/.autonomy-state" ]; then
+    AUTONOMY_FILE="$HERCULES_ROOT/$V11_PROJECT/.autonomy-state"
   fi
 
   if [ -n "$AUTONOMY_FILE" ] && [ -f "$AUTONOMY_FILE" ]; then
-    local LEVEL="$(jq -r '.level // 0' "$AUTONOMY_FILE" 2>/dev/null)"
+    local LEVEL="$(v11_autonomy_level "$AUTONOMY_FILE")"
 
-    if [ "$LEVEL" -ge 4 ] 2>/dev/null; then
+    if [ "$LEVEL" -ge 4 ]; then
       # Exact pattern match
       if jq -e --arg p "$MATCHED_PATTERN" \
           '.high_risk_history // [] | any(. == $p)' \
@@ -1151,10 +1511,27 @@ v11_check_risk() {
     fi
   fi
 
-  # Block with message
-  local CURRENT_LEVEL="?"
+  # Block with message.
+  # V11.34.3: the level goes through v11_autonomy_level so a display-form
+  # ("A3") state file renders as A3 rather than the old double-prefixed "AA3",
+  # and BLOCK_REASON names why auto-approval did not apply — a granted A5 with
+  # an empty high_risk_history previously read as though the grant was ignored.
+  local CURRENT_LEVEL="?" BLOCK_REASON=""
   if [ -n "$AUTONOMY_FILE" ] && [ -f "$AUTONOMY_FILE" ]; then
-    CURRENT_LEVEL="$(jq -r '.level // 0' "$AUTONOMY_FILE" 2>/dev/null)"
+    local CUR_LEVEL HIST_LEN
+    CUR_LEVEL="$(v11_autonomy_level "$AUTONOMY_FILE")"
+    CURRENT_LEVEL="$CUR_LEVEL"
+    HIST_LEN="$(jq -r '.high_risk_history // [] | length' "$AUTONOMY_FILE" 2>/dev/null)"
+    case "$HIST_LEN" in ''|*[!0-9]*) HIST_LEN=0 ;; esac
+    if [ "$CUR_LEVEL" -lt 4 ]; then
+      BLOCK_REASON="level is below A4 — high-risk auto-approval requires A4+"
+    elif [ "$HIST_LEN" -eq 0 ]; then
+      BLOCK_REASON="A$CUR_LEVEL is sufficient, but high_risk_history is empty — no high-risk pattern has been approved for this project yet"
+    else
+      BLOCK_REASON="A$CUR_LEVEL is sufficient, but this pattern is not in high_risk_history ($HIST_LEN entr$([ "$HIST_LEN" -eq 1 ] && printf 'y' || printf 'ies'))"
+    fi
+  else
+    BLOCK_REASON="no .autonomy-state resolved for this project — defaults to A0 (manual)"
   fi
 
   # Write to stderr so Claude Code surfaces the reason to the user.
@@ -1168,7 +1545,8 @@ Pattern: $MATCHED_PATTERN
 Command: $V11_COMMAND
 
 Current Autonomy Level: A$CURRENT_LEVEL
-Note: A4 with history can auto-approve high-risk actions.
+Not auto-approved: $BLOCK_REASON
+Note: A4+ with a matching high_risk_history entry can auto-approve.
 
 This operation can cause data loss or system damage.
 To proceed, get explicit user approval.
@@ -1195,7 +1573,7 @@ v11_check_autonomy() {
   # Detect project for project-specific autonomy
   v11_detect_project "$V11_FILE_PATH"
   if [ -z "$V11_PROJECT" ] && [ -n "$V11_COMMAND" ]; then
-    local CMD_PATH=$(printf '%s' "$V11_COMMAND" | grep -oE "$V11_WORKSPACE_ROOT/[^ ]+" | head -1)
+    local CMD_PATH=$(printf '%s' "$V11_COMMAND" | grep -oE "$HERCULES_ROOT/[^ ]+" | head -1)
     [ -n "$CMD_PATH" ] && v11_detect_project "$CMD_PATH"
   fi
 
@@ -1213,8 +1591,11 @@ v11_check_autonomy() {
   # This is safe: guard-risk will handle blocking if needed
   [ -z "$AUTONOMY_STATE" ] && return 1
 
-  local LEVEL=$(printf '%s' "$AUTONOMY_STATE" | jq -r '.level // 0' 2>/dev/null)
-  [ -z "$LEVEL" ] || [ "$LEVEL" == "null" ] && LEVEL=0
+  # V11.34.3: normalize at read. This also subsumes the old empty/"null"
+  # guard, whose `[ -z ] || [ == null ] && LEVEL=0` chaining relied on
+  # ||/&& precedence rather than stating the intent.
+  local LEVEL
+  LEVEL="$(v11_normalize_autonomy_level "$(printf '%s' "$AUTONOMY_STATE" | jq -r '.level // 0' 2>/dev/null)")"
 
   # A3+: all medium auto-approved
   if [ "$LEVEL" -ge 3 ]; then
@@ -1319,8 +1700,8 @@ v11_check_file_ownership() {
   if [ -n "$V11_PROJECT" ]; then
     if [ -f "$SESSIONS_ROOT/$V11_PROJECT/.formation-registry.json" ]; then
       registry="$SESSIONS_ROOT/$V11_PROJECT/.formation-registry.json"
-    elif [ -f "$V11_WORKSPACE_ROOT/$V11_PROJECT/.formation-registry.json" ]; then
-      registry="$V11_WORKSPACE_ROOT/$V11_PROJECT/.formation-registry.json"
+    elif [ -f "$HERCULES_ROOT/$V11_PROJECT/.formation-registry.json" ]; then
+      registry="$HERCULES_ROOT/$V11_PROJECT/.formation-registry.json"
     fi
   fi
 
@@ -1436,7 +1817,7 @@ v11_inject_upstream_artifacts() {
           local ref_path
           ref_path=$(printf '%s' "$ref" | jq -r '.path // empty')
           [ -z "$ref_path" ] && continue
-          local full_path="$V11_WORKSPACE_ROOT/$ref_path"
+          local full_path="$HERCULES_ROOT/$ref_path"
           if [ -f "$full_path" ]; then
             local size
             size=$(wc -c < "$full_path" 2>/dev/null || echo 9999)
@@ -1510,7 +1891,7 @@ v11_read_artifact_ref() {
   rel_path=$(printf '%s' "$ref_json" | jq -r '.path // empty')
   [ -z "$rel_path" ] && return 1
 
-  local full_path="$V11_WORKSPACE_ROOT/$rel_path"
+  local full_path="$HERCULES_ROOT/$rel_path"
   [ ! -f "$full_path" ] && return 1
 
   cat "$full_path"
@@ -1705,8 +2086,18 @@ v11_validate_json_jq() {
       local level
       level=$(printf '%s' "$json_data" | jq -r '.level // empty')
       [ -z "$level" ] && errors="${errors}Missing required field: level\n"
-      if [ -n "$level" ] && { [ "$level" -lt 0 ] || [ "$level" -gt 5 ]; } 2>/dev/null; then
-        errors="${errors}Invalid level: $level (must be 0-5)\n"
+      if [ -n "$level" ]; then
+        case "$level" in
+          # Non-digit (incl. display form "A3" and floats like "3.0") is
+          # malformed input, not a range violation — flag it explicitly
+          # instead of letting bare arithmetic error out and get swallowed.
+          *[!0-9]*) errors="${errors}Invalid level: $level (must be 0-5)\n" ;;
+          *)
+            if [ "$level" -lt 0 ] || [ "$level" -gt 5 ]; then
+              errors="${errors}Invalid level: $level (must be 0-5)\n"
+            fi
+            ;;
+        esac
       fi
       ;;
 
@@ -2148,6 +2539,64 @@ v11_ledger_append() {
     local subject_norm
     subject_norm=$(printf '%s' "$event_json" | jq -r '.subject_norm // ""' 2>/dev/null)
 
+    # v11.37 W1-T2 (ticket #38 amplification): attribution-normalization gate.
+    # Agent-authored events (created / review / artifact_warn) should
+    # carry an actor field (owner || metadata.agent || recommended_agent). State
+    # transitions (in_progress / completed / cancelled / field_update) inherit
+    # attribution from the create row of the same task_id; system events
+    # (prescope / reconcile) are inherently no-actor.
+    # (Post-CLOSE review-w1-t2 E1 fix: comment previously miscategorized
+    # `cancelled` as agent-authored — case statement + CLAUDE.md §14.1 +
+    # audit-ledger-attribution script all correctly treat it as state-transition;
+    # only this comment was wrong. Corrected inline.)
+    # When strict mode is on and an agent-authored event
+    # lacks attribution, we mirror to a side-file for later analysis — the primary
+    # ledger write ALWAYS proceeds (never silently drop data). Lever tri-state:
+    #   off (default)  — no observability, no side-file (pre-v11.37 behavior)
+    #   advisory       — STDERR WARN + side-file mirror
+    #   on             — same as advisory (kept as separate token for future
+    #                    "hard refuse" semantics if the operator ever needs it)
+    # Rollback: V11_LEDGER_STRICT_ATTRIBUTION=off (default).
+    local _v11_lsa="${V11_LEDGER_STRICT_ATTRIBUTION:-off}"
+    if [ "$_v11_lsa" != "off" ]; then
+        case "$ev_type" in
+            created|review|artifact_warn)
+                local _owner _agent _rec
+                _owner=$(printf '%s' "$event_json" | jq -r '.owner // ""' 2>/dev/null)
+                _agent=$(printf '%s' "$event_json" | jq -r '.metadata.agent // ""' 2>/dev/null)
+                _rec=$(printf '%s' "$event_json" | jq -r '.recommended_agent // ""' 2>/dev/null)
+                if [ -z "$_owner" ] && [ -z "$_agent" ] && [ -z "$_rec" ]; then
+                    echo "v11_ledger_append: attribution missing on '$ev_type' event (project=$project task_id=$(printf '%s' "$event_json" | jq -r '.task_id // "?"'))" >&2
+                    local _unattr_file="${METRICS_DIR}/unattributed-events.jsonl"
+                    local _unattr_lock="${METRICS_DIR}/.unattributed-events.lock"
+                    mkdir -p "$METRICS_DIR" 2>/dev/null || true
+                    # v11.38 W1-T2 (#52 fix): dedicated flock (FD 209, 2s timeout)
+                    # + best-effort truncation cap at 4000B (jq del artifacts/metadata/
+                    # description if line too big for atomic O_APPEND on Linux).
+                    # Primary FD-207 critical section is unaffected. All best-effort;
+                    # never fail the caller.
+                    (
+                        exec 209>"$_unattr_lock"
+                        flock -w 2 209 || {
+                            echo "v11_ledger_append: mirror flock timeout — dropping this unattributed event to STDERR only" >&2
+                            exit 0
+                        }
+                        local _line
+                        _line="$event_json"
+                        if [ "${#_line}" -gt 4000 ]; then
+                            local _reduced
+                            _reduced=$(printf '%s' "$_line" | jq -c 'del(.description,.metadata,.artifacts)' 2>/dev/null)
+                            if [ -n "$_reduced" ] && [ "${#_reduced}" -le 4000 ]; then
+                                _line="$_reduced"
+                            fi
+                        fi
+                        printf '%s\n' "$_line" >> "$_unattr_file" 2>/dev/null || true
+                    ) 2>/dev/null || true
+                fi
+                ;;
+        esac
+    fi
+
     # --- FD-207 critical section: read .seq → bump → atomic-write .seq → append ---
     # flock -w 5: on timeout skip the ledger write and log (side-effect-never-fails).
     # The subshell exits non-zero on any internal failure; the outer || true ensures
@@ -2543,6 +2992,146 @@ print("MISS", end=""); sys.exit(0)
 RESOLVE_PYEOF
 }
 
+# v11_resolve_identity PROJECT TASK_ID SESSION_UUID [SUBJECT]
+#   v11.42 W1-T3 — canonical-identity resolver for downstream consumers.
+#   Recon #1 (sessions/v11-task-state-integrity/recon-notes/README.md#recon-1)
+#   confirmed create_seq is correct and monotonic per (project, subject_norm);
+#   apparent non-monotonicity across a task_id was two unrelated subjects
+#   reusing the same session-local, ephemeral task_id slot (documented at
+#   common.sh:2744). Canonical identity is (project, subject_norm, create_seq)
+#   — see idk() at common.sh:3092. Callers correlating ledger events across
+#   time MUST resolve through this helper, not compare task_id directly.
+#
+#   Bounded reverse-scan of the project ledger for the most-recent `created`
+#   event matching (session_uuid, task_id). When SUBJECT is non-empty, the
+#   match additionally requires subject_norm(SUBJECT) to equal the event's
+#   subject_norm — mirrors the (session, task_id, subject_norm) key proven
+#   correct by ~/.claude/skills/align-aggregate/align_aggregate.py
+#   index_events() (v1.1 fix for the same task_id-reuse trap).
+#
+#   Emits JSON on stdout:
+#     {"create_seq": N, "subject_norm": "...", "found": true}
+#   or on no match / any internal error (side-effect-never-fails):
+#     {"create_seq": null, "subject_norm": null, "found": false}
+#
+#   Rollback: V11_IDENTITY_HELPER=off emits the not-found shape unconditionally.
+v11_resolve_identity() {
+    local project="$1"
+    local task_id="$2"
+    local session_uuid="$3"
+    local subject="${4:-}"
+    local _not_found='{"create_seq":null,"subject_norm":null,"found":false}'
+
+    if [ "${V11_IDENTITY_HELPER:-on}" = "off" ]; then
+        printf '%s' "$_not_found"
+        return 0
+    fi
+
+    if [ -z "$project" ] || ! printf '%s' "$project" | grep -qE '^[a-zA-Z0-9._-]{1,64}$'; then
+        printf '%s' "$_not_found"
+        return 0
+    fi
+    if [ -z "$task_id" ] || [ -z "$session_uuid" ]; then
+        printf '%s' "$_not_found"
+        return 0
+    fi
+
+    local ledger_file="${METRICS_DIR}/ledger/${project}.jsonl"
+    if [ ! -f "$ledger_file" ] || [ ! -s "$ledger_file" ]; then
+        printf '%s' "$_not_found"
+        return 0
+    fi
+
+    local target_norm=""
+    if [ -n "$subject" ]; then
+        target_norm=$(v11_normalize_subject "$subject" 2>/dev/null) || target_norm=""
+    fi
+
+    local _result
+    _result=$(
+        V11_RI_FILE="$ledger_file" \
+        V11_RI_TASK="$task_id" \
+        V11_RI_SESSION="$session_uuid" \
+        V11_RI_PROJECT="$project" \
+        V11_RI_NORM="$target_norm" \
+        V11_RI_CAP="50000" \
+        python3 - <<'RESOLVE_IDENTITY_PYEOF' 2>/dev/null
+import os, sys, json
+
+ledger_path = os.environ.get("V11_RI_FILE", "")
+target_task = os.environ.get("V11_RI_TASK", "")
+target_sess = os.environ.get("V11_RI_SESSION", "")
+project     = os.environ.get("V11_RI_PROJECT", "")
+target_norm = os.environ.get("V11_RI_NORM", "")
+scan_cap    = int(os.environ.get("V11_RI_CAP", "50000"))
+
+MISS = json.dumps({"create_seq": None, "subject_norm": None, "found": False})
+
+if not ledger_path or not target_task or not target_sess or not project:
+    print(MISS, end=""); sys.exit(0)
+
+try:
+    with open(ledger_path, "rb") as fh:
+        fh.seek(0, 2)
+        scan_end_off = fh.tell()
+        if scan_end_off == 0:
+            print(MISS, end=""); sys.exit(0)
+        fh.seek(0)
+        raw_bytes = fh.read(scan_end_off)
+except OSError:
+    print(MISS, end=""); sys.exit(0)
+
+try:
+    raw_text = raw_bytes.decode("utf-8", errors="replace")
+except Exception:
+    print(MISS, end=""); sys.exit(0)
+
+lines = raw_text.split("\n")
+if lines and lines[-1] != "":
+    lines = lines[:-1]  # drop torn tail (§4.3)
+
+lines_scanned = 0
+for raw in reversed(lines):
+    if raw == "":
+        continue
+    lines_scanned += 1
+    if lines_scanned > scan_cap:
+        print(f"LEDGER-IDENTITY-MISS-SCAN-CAP: scan_cap={scan_cap} project={project}", file=sys.stderr)
+        print(MISS, end=""); sys.exit(0)
+    try:
+        ev = json.loads(raw)
+    except json.JSONDecodeError:
+        continue
+    if not isinstance(ev, dict):
+        continue
+    if ev.get("ev") != "created":
+        continue
+    if ev.get("project") != project:
+        continue
+    if str(ev.get("session_uuid", "")) != target_sess:
+        continue
+    if str(ev.get("task_id", "")) != str(target_task):
+        continue
+    sn = ev.get("subject_norm", "") or ""
+    if target_norm and sn != target_norm:
+        continue
+    cs = ev.get("create_seq")
+    if cs is None:
+        continue
+    print(json.dumps({"create_seq": int(cs), "subject_norm": sn, "found": True}), end="")
+    sys.exit(0)
+
+print(MISS, end="")
+RESOLVE_IDENTITY_PYEOF
+    ) || true
+
+    if [ -z "$_result" ]; then
+        _result="$_not_found"
+    fi
+    printf '%s' "$_result"
+    return 0
+}
+
 # v11_replay_ledger PROJECT
 #   Pure function of $METRICS_DIR/ledger/<project>.jsonl.
 #   Folds all events via the ADR §3.1–§3.5 single-pass algorithm and emits the
@@ -2583,6 +3172,8 @@ v11_replay_ledger() {
     V11_REPLAY_LEDGER="$ledger_file" \
     V11_REPLAY_V11HOME="$V11_HOME" \
     V11_REPLAY_NOW="$(date -Iseconds)" \
+    V11_CANCELLED_FILTERS_REPLAY="${V11_CANCELLED_FILTERS_REPLAY:-on}" \
+    V11_CANCELLED_UNFOLD_SINCE_TS="${V11_CANCELLED_UNFOLD_SINCE_TS:-}" \
     python3 - <<'PYEOF'
 import os, sys, json, datetime
 
@@ -2590,6 +3181,30 @@ project     = os.environ.get("V11_REPLAY_PROJECT", "")
 ledger_path = os.environ.get("V11_REPLAY_LEDGER", "")
 v11_home    = os.environ.get("V11_REPLAY_V11HOME", "")
 now         = os.environ.get("V11_REPLAY_NOW") or datetime.datetime.now().isoformat()
+
+# improvements/48 (v11.39-1): V11_CANCELLED_FILTERS_REPLAY gates the cancelled-
+# fold branch in the open-view construction (line ~3469). Default "on" preserves
+# #17's F1 behavior (cancelled is terminal, absent from open_tasks). When "off",
+# cancelled events are unfolded ONLY when cancelled_at >= V11_CANCELLED_UNFOLD_
+# SINCE_TS (default now-1h). The paired cutoff prevents R2 swarm's retroactive-
+# unfold silent failure on stale cancelled events surfacing in long sessions.
+cancelled_filters_replay = os.environ.get("V11_CANCELLED_FILTERS_REPLAY", "on")
+
+def _v11_parse_iso(s):
+    """Tolerant ISO-8601 parse; return None on any failure or empty input."""
+    if not s:
+        return None
+    try:
+        return datetime.datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return None
+
+_cancelled_cutoff_dt = None
+if cancelled_filters_replay == "off":
+    _cancelled_cutoff_dt = _v11_parse_iso(os.environ.get("V11_CANCELLED_UNFOLD_SINCE_TS", ""))
+    if _cancelled_cutoff_dt is None:
+        _now_dt = _v11_parse_iso(now) or datetime.datetime.now()
+        _cancelled_cutoff_dt = _now_dt - datetime.timedelta(hours=1)
 
 # Import the canonical normalize_subject from scripts/lib (ADR §2.1, Risk #4).
 # This is the ONLY normalization path — no reimplementation here.
@@ -2686,6 +3301,8 @@ def fresh():
         "completed_at": None,
         "blocked_at": None,
         "blocked_reason": None,
+        "cancelled_at": None,
+        "cancelled_reason": None,
         "artifacts": None,
         "task_id": None,
         "session_uuid": None,
@@ -2717,8 +3334,51 @@ def deep_merge(base, overlay):
 events = parse_ledger(ledger_path, project)
 events.sort(key=sort_key)
 
-counters = {"total": 0, "pending": 0, "in_progress": 0, "completed": 0, "blocked": 0}
+counters = {"total": 0, "pending": 0, "in_progress": 0, "completed": 0, "blocked": 0, "cancelled": 0}
 by_id = {}
+# improvements/24: (session_uuid, task_id) -> idk key, built from
+# identity-bearing events only. Status events appended WITHOUT subject_norm
+# (e.g. hand-appended "cancelled" events per #17's remediation, plus a
+# handful of historical "completed" events) would otherwise phantom-key to
+# (project, "", create_seq) and never touch the real record — the fold
+# result silently kept them open. Mirrors the review branch's E1
+# unresolved-identity handling, but resolves to the REAL record instead of
+# a sentinel, since status events must advance the actual state machine.
+#
+# AMBIGUITY (adversarial finding #1, 2026-08-06): a session CAN legitimately
+# reuse a local task_id for two distinct identities (real example: HAM
+# session bd617d7c created task_id=6 twice — TaskList wipe + re-create).
+# Once a SECOND distinct identity claims a (session_uuid, task_id) pair, a
+# subject_norm-less event for that pair is irreducibly ambiguous — resolving
+# to the newest claimant can cancel/complete the WRONG task, which is worse
+# than phantom-keying. The pair goes permanently AMBIGUOUS and lookups
+# refuse (legacy phantom fallthrough). Resolution before the second claim
+# still lands on the then-only claimant (closest-preceding semantics).
+sess_task_index = {}
+_IDK_AMBIGUOUS = object()
+
+def sess_index_note(ev, key):
+    """Record `key` as a claimant of this event's (session_uuid, task_id).
+    Call ONLY for identity-bearing (subject_norm-carrying) events."""
+    _s = ev.get("session_uuid")
+    _t = ev.get("task_id")
+    if not _s or _t is None:
+        return
+    _k = (str(_s), str(_t))
+    _prev = sess_task_index.get(_k)
+    if _prev is None or _prev == key:
+        sess_task_index[_k] = key
+    else:
+        sess_task_index[_k] = _IDK_AMBIGUOUS  # sticky — never resolves again
+
+def sess_index_resolve(ev):
+    """Fallback idk key for a subject_norm-less event, or None when there is
+    no unambiguous well-formed precedent for its (session_uuid, task_id)."""
+    _fb = sess_task_index.get(
+        (str(ev.get("session_uuid") or ""), str(ev.get("task_id") or "")))
+    if _fb is None or _fb is _IDK_AMBIGUOUS:
+        return None
+    return _fb
 project_pinned_at = None
 last_ts = ""
 phase = "discovery"
@@ -2791,6 +3451,15 @@ for ev in events:
         elif scope == "identity":
             # identity-scope reconcile IS permitted to key by_id
             rec = by_id.setdefault(idk(ev), fresh())
+            # improvements/24 (adversarial finding #2): an identity-bearing
+            # reconcile also registers its claim so a later subject_norm-less
+            # status event can heal through it — relevant post-archive, where
+            # the reconcile may be the only surviving identity-bearing event
+            # for a task. Subject_norm-less identity reconciles get no F1
+            # fallback (out of scope — reconcile emitters are our own
+            # tooling and always stamp identity).
+            if ev.get("subject_norm"):
+                sess_index_note(ev, idk(ev))
             forced = ev.get("identity_status")
             if forced in ("pending", "in_progress", "completed", "blocked"):
                 rec["status"] = forced
@@ -2863,7 +3532,22 @@ for ev in events:
     # ------------------------------------------------------------------
     # Per-identity state machine — last-event-wins (ADR §3.3/§3.4)
     # ------------------------------------------------------------------
-    rec = by_id.setdefault(idk(ev), fresh())
+    _key = idk(ev)
+    if not ev.get("subject_norm"):
+        # improvements/24 fallback: no identity fields on this event —
+        # resolve through the (session_uuid, task_id) index so the status
+        # transition lands on the real record. Fires ONLY when subject_norm
+        # is missing/empty (where current behavior is already a phantom
+        # record), so well-formed events are keyed exactly as before. If the
+        # index has no unambiguous match (no identity-bearing precedent, or
+        # 2+ identities claimed the pair — see _IDK_AMBIGUOUS above), fall
+        # through to the legacy phantom key unchanged.
+        _fb = sess_index_resolve(ev)
+        if _fb is not None:
+            _key = _fb
+    else:
+        sess_index_note(ev, _key)
+    rec = by_id.setdefault(_key, fresh())
     # F3 fix: a real (non-review, non-reconcile) event landing on this
     # identity proves it corresponds to an actual task — clear any
     # review_only phantom flag a prior orphaned review event may have set.
@@ -2881,6 +3565,16 @@ for ev in events:
         rec["status"] = "blocked"
         rec["blocked_reason"] = ev.get("reason")
         rec["blocked_at"] = ev.get("at") or ev.get("ts")
+    elif ev_type == "cancelled":
+        # improvements/17 F1: a cancelled task must become TERMINAL — never
+        # reappear in open_tasks/active_task_ids/active_task_ids_by_session
+        # regardless of replay order or rebuild count. Without this branch,
+        # ev_type=="cancelled" matched none of the above elifs, so rec["status"]
+        # was silently left at whatever it was before (usually "in_progress")
+        # forever — the cancellation never actually took.
+        rec["status"] = "cancelled"
+        rec["cancelled_reason"] = ev.get("reason")
+        rec["cancelled_at"] = ev.get("at") or ev.get("ts")
 
     # field updates — any event type may carry these; None/"" means no change
     for fld in ("subject", "description", "owner", "sprint", "gate", "recommended_agent"):
@@ -2929,6 +3623,10 @@ derived = {
     "in_progress": sum(1 for r in by_id.values() if r["status"] == "in_progress" and not r.get("review_only")),
     "completed":   sum(1 for r in by_id.values() if r["status"] == "completed" and not r.get("review_only")) + archived_completed,
     "blocked":     sum(1 for r in by_id.values() if r["status"] == "blocked" and not r.get("review_only")),
+    # v11.42 W1-T1 (RC4): populate .cancelled so consumers see the count that
+    # matches open_tasks[]'s already-correct cancelled exclusion. Additive; no
+    # existing consumer reads this field (per recon-6). Rollback: V11_CANCELLED_COUNTER=off.
+    "cancelled":   sum(1 for r in by_id.values() if r["status"] == "cancelled" and not r.get("review_only")) if os.environ.get("V11_CANCELLED_COUNTER", "on") != "off" else 0,
 }
 # F3 fix: review_only phantom records (orphaned review events for identities
 # that never had a created event) must never inflate total, including via
@@ -2953,7 +3651,15 @@ if any(derived[k] != counters.get(k, 0) for k in derived):
 seen_active = set()
 active_rec = None
 for ev in reversed(events):
+    # improvements/24 (adversarial finding #4): key subject_norm-less events
+    # through the same fallback the main fold used, so this walk agrees with
+    # by_id instead of relying on the by-reference invariant. Ambiguous or
+    # precedent-less events keep raw idk(ev) — same as the fold did.
     k = idk(ev)
+    if not ev.get("subject_norm"):
+        _fbk = sess_index_resolve(ev)
+        if _fbk is not None:
+            k = _fbk
     if k in seen_active:
         continue
     if k in by_id and by_id[k]["status"] == "in_progress":
@@ -2965,16 +3671,62 @@ active_task        = active_rec["subject"]  if active_rec else None
 active_agent_id    = active_rec["owner"]    if active_rec else None
 active_task_sprint = active_rec["sprint"]   if active_rec else None
 active_task_gate   = active_rec["gate"]     if active_rec else None
-active_task_ids    = sorted({
+# improvements/18 sibling defect / #12 M1: was a SET comprehension, which
+# silently deduped when two DIFFERENT identities (different by_id keys,
+# i.e. genuinely different in-progress tasks) happened to carry the same
+# per-session-local task_id string -- undercounting distinct active tasks.
+# Now a list (duplicates preserved) so the count reflects reality. This is
+# a shape-preserving fix (still list[str], sorted) -- disambiguating WHICH
+# session each entry belongs to remains active_task_ids_by_session's job,
+# not this field's; changing this field's shape (unlike open_tasks) was
+# not part of the approved design decision for this task.
+active_task_ids    = sorted([
     r["task_id"] for r in by_id.values()
     if r["status"] == "in_progress" and r["task_id"]
-})
+])
 
-# §3.5 HIGH-2 / HIGH-B: open_tasks_by_session — exclude completed AND blocked
+# §3.5 HIGH-2 / HIGH-B: open_tasks_by_session — exclude completed, blocked,
+# AND cancelled (improvements/17 F1 — cancelled is terminal, same as blocked)
+#
+# KNOWN RESIDUAL (improvements/24 remediation, 2026-08-06): this per-session
+# dict is keyed by local t_id, so two SIMULTANEOUSLY-OPEN identities sharing
+# a (session, task_id) pair collapse to one display entry (last wins) — the
+# within-session sibling of the cross-session collision #18 fixed. by_id,
+# counters, and active_task_ids all still carry both (truth is unaffected);
+# only this view and the flat open_tasks built from it lose one. Live task
+# ids only recur within a session via complete-then-recreate (never both
+# open), so this is a display-only edge under anomalous ledgers. Fixing it
+# means changing this dict's shape — a consumer-breaking change deliberately
+# NOT bundled into the #24 remediation.
 open_tasks_by_session = {}
 for _k, rec in by_id.items():
     if rec["status"] in ("completed", "blocked"):
         continue
+    if rec["status"] == "cancelled":
+        # improvements/48 (v11.39-1): default = fold (V11_CANCELLED_FILTERS_
+        # REPLAY=on, matches #17 F1). When =off, unfold ONLY when cancelled_at
+        # >= V11_CANCELLED_UNFOLD_SINCE_TS (default now-1h). Unparseable or
+        # missing cancelled_at → fold (safe default).
+        if _cancelled_cutoff_dt is None:
+            continue
+        _ca_dt = _v11_parse_iso(rec.get("cancelled_at"))
+        if _ca_dt is None:
+            continue
+        # v11.39.1 (Layer B fix): normalize BOTH datetimes to UTC-aware via
+        # astimezone() rather than force one's tzinfo onto the other with
+        # .replace(). Forcing offsets silently misclassifies when cancelled_at
+        # and cutoff carry different real offsets (e.g. one +02:00, one UTC).
+        _cutoff_cmp = _cancelled_cutoff_dt
+        if _ca_dt.tzinfo is None:
+            _ca_dt = _ca_dt.replace(tzinfo=datetime.timezone.utc)
+        else:
+            _ca_dt = _ca_dt.astimezone(datetime.timezone.utc)
+        if _cutoff_cmp.tzinfo is None:
+            _cutoff_cmp = _cutoff_cmp.replace(tzinfo=datetime.timezone.utc)
+        else:
+            _cutoff_cmp = _cutoff_cmp.astimezone(datetime.timezone.utc)
+        if _ca_dt < _cutoff_cmp:
+            continue
     for sess_uuid, t_id in rec["task_id_by_session"].items():
         open_tasks_by_session.setdefault(sess_uuid, {})[t_id] = {
             "subject":     rec["subject"],
@@ -2993,19 +3745,29 @@ for _k, rec in by_id.items():
         if t_id not in lst:
             lst.append(t_id)
 
-# open_tasks flat convenience view (§3.5)
-open_tasks = {}
-for _k, rec in by_id.items():
-    if rec["status"] in ("completed", "blocked"):
-        continue
-    t_id = rec["task_id"]
-    if t_id:
-        open_tasks[t_id] = {
-            "subject":     rec["subject"],
-            "description": rec["description"],
-            "status":      rec["status"],
-            "metadata":    rec["metadata"],
-        }
+# open_tasks flat convenience view (§3.5) — improvements/18 F1 / #12 M1:
+# was a dict[task_id]->record, which silently collided when two DIFFERENT
+# identities (by_id keys) from DIFFERENT sessions happened to share the same
+# per-session-local task_id integer (every session's TaskCreate counter
+# starts at 1) -- last dict write wins, no warning, no signal. Now a LIST of
+# self-describing records, each carrying its OWN task_id + session_uuid,
+# making the collision structurally impossible. Flattened directly from the
+# already collision-safe open_tasks_by_session above (not rebuilt
+# independently) -- the same flatten-with-session_uuid pattern
+# scripts/handoff's own generator already uses for its "everything open,
+# across sessions" view.
+open_tasks = [
+    {
+        "task_id":      t_id,
+        "session_uuid": sess_uuid,
+        "subject":      task_rec["subject"],
+        "description":  task_rec["description"],
+        "status":       task_rec["status"],
+        "metadata":     task_rec["metadata"],
+    }
+    for sess_uuid, sess_tasks in open_tasks_by_session.items()
+    for t_id, task_rec in sess_tasks.items()
+]
 
 # recent_completed — top 10 by completed_at desc (§3.5)
 completed_recs = [
@@ -3131,6 +3893,7 @@ aggregate = {
     "pending":                    counters["pending"],
     "in_progress":                counters["in_progress"],
     "blocked":                    counters["blocked"],
+    "cancelled":                  counters["cancelled"],
     "phase":                      phase,
     "active_task":                active_task,
     "active_agent_id":            active_agent_id,
@@ -3244,9 +4007,9 @@ v11_review_queue_path() {
 #
 #   Project root discovery (dynamic):
 #     - $SESSIONS_ROOT/<name>/ -> project name is <name>
-#     - $V11_WORKSPACE_ROOT/<target_project>/ is also accepted for the target project
+#     - $HERCULES_ROOT/<target_project>/ is also accepted for the target project
 #   Path matching is anchored prefix with trailing slash to prevent false substring matches
-#   (e.g. /path/to/project will NOT match /path/to/project-old).
+#   (e.g. $HOME/example-project will NOT match $HOME/example-project-old).
 #
 #   Gated by V11_REVIEW_CROSS_PROJECT_CHECK (default on). Off -> always return 0.
 #   On mismatch: writes JSON line to $METRICS_DIR/cross-project-rejections.log.
@@ -3267,10 +4030,10 @@ v11_review_queue_check_project_scope() {
 
     # Accepted roots for the target project (always allowed):
     #   - $SESSIONS_ROOT/<target_project>/
-    #   - $V11_WORKSPACE_ROOT/<target_project>/
-    local _sessions_root="${SESSIONS_ROOT:-$V11_WORKSPACE_ROOT/sessions}"
+    #   - $HERCULES_ROOT/<target_project>/
+    local _sessions_root="${SESSIONS_ROOT:-$HERCULES_ROOT/sessions}"
     local _target_root_sessions="${_sessions_root}/${target_project}/"
-    local _target_root_main="${V11_WORKSPACE_ROOT}/${target_project}/"
+    local _target_root_main="${HERCULES_ROOT}/${target_project}/"
 
     # Build a registry of (project_name, root_prefix) pairs from $SESSIONS_ROOT.
     # One ls call; each subdirectory name = project name; root = $SESSIONS_ROOT/<name>/.
@@ -3285,7 +4048,7 @@ v11_review_queue_check_project_scope() {
     fi
 
     # Also ingest project-paths.json if present for richer root coverage
-    # (handles projects with roots outside $SESSIONS_ROOT like /path/to/project).
+    # (handles projects with roots outside $SESSIONS_ROOT like $HOME/example-project).
     local _reg_extra=""
     if [ -f "${REGISTRY_FILE:-}" ]; then
         _reg_extra=$(jq -r '
@@ -3352,8 +4115,8 @@ except Exception:
 
 conflicts = []
 # Policy: any single foreign-project path in files_changed[] triggers
-# rejection (strict). A legitimate cross-project edit (e.g. a demo-service task
-# that also patches a shared utility under sessions/another-project/) will be
+# rejection (strict). A legitimate cross-project edit (e.g. example-project task
+# that also patches a shared utility under sessions/dreamscape/) will be
 # silently rejected. Override via V11_REVIEW_CROSS_PROJECT_CHECK=off.
 for fpath in files:
     if not isinstance(fpath, str) or not fpath:
@@ -3475,7 +4238,7 @@ v11_review_queue_add() {
     # V11_REVIEW_CROSS_PROJECT_CHECK (default on) — reject well-formed entries whose
     # files_changed[] paths belong to a different known V11 project.
     # Catches the bleed lane missed by skeletal validator (real subject + real files
-    # from wrong project, e.g. a task from one project ending up in another project's ledger file).
+    # from wrong project, e.g. music-session task ending up in example-project.jsonl).
     # Rollback: export V11_REVIEW_CROSS_PROJECT_CHECK=off to restore permissive behavior.
     if ! v11_review_queue_check_project_scope "$project" "${files_json:-[]}"; then
         return 1
@@ -3664,6 +4427,15 @@ _v11_review_ledger_event() {
     error_count=$(jq '(.errors // []) | length' "$verdict_file" 2>/dev/null)
     case "$error_count" in ''|*[!0-9]*) error_count=0 ;; esac
 
+    # v11.38 W3-T1 (#49 fix): populate `owner` for attribution — was 100% gap
+    # (209/209 review events unattributed in v11.37 30d audit). Read reviewer
+    # identity from the verdict file's `reviewer` field, falling back to the
+    # canonical adversarial-lite-reviewer name when the verdict file predates
+    # the identity contract.
+    local reviewer_identity
+    reviewer_identity=$(jq -r '.reviewer // "adversarial-lite-reviewer"' "$verdict_file" 2>/dev/null)
+    [ -z "$reviewer_identity" ] || [ "$reviewer_identity" = "null" ] && reviewer_identity="adversarial-lite-reviewer"
+
     local now drainer_session
     now="$(date -u +%Y-%m-%dT%H:%M:%S+00:00)"
     drainer_session="$(v11_session_uuid)"
@@ -3674,10 +4446,11 @@ _v11_review_ledger_event() {
             --arg ts "$now" --arg project "$project" --arg task_id "$task_id" \
             --arg session_uuid "$drainer_session" --arg severity "$severity" \
             --arg verdict_sha "$verdict_sha" --arg verdict_ref "$verdict_ref" \
+            --arg owner "$reviewer_identity" \
             --argjson error_count "${error_count:-0}" \
             '{v:1, ev:"review", ts:$ts, project:$project, subject_norm:"", task_id:$task_id,
               create_seq:null, identity_unresolved:true, session_uuid:$session_uuid,
-              review_severity:$severity, reviewer_agent:"adversarial-lite-reviewer",
+              review_severity:$severity, reviewer_agent:$owner, owner:$owner,
               error_count:$error_count, verdict_sha:$verdict_sha, verdict_ref:$verdict_ref,
               source:"cli-drain"}' 2>/dev/null) || return 1
     else
@@ -3686,10 +4459,11 @@ _v11_review_ledger_event() {
             --arg subject_norm "$subject_norm" --argjson create_seq "$create_seq" \
             --arg session_uuid "$drainer_session" --arg severity "$severity" \
             --arg verdict_sha "$verdict_sha" --arg verdict_ref "$verdict_ref" \
+            --arg owner "$reviewer_identity" \
             --argjson error_count "${error_count:-0}" \
             '{v:1, ev:"review", ts:$ts, project:$project, subject_norm:$subject_norm, task_id:$task_id,
               create_seq:$create_seq, session_uuid:$session_uuid,
-              review_severity:$severity, reviewer_agent:"adversarial-lite-reviewer",
+              review_severity:$severity, reviewer_agent:$owner, owner:$owner,
               error_count:$error_count, verdict_sha:$verdict_sha, verdict_ref:$verdict_ref,
               source:"cli-drain"}' 2>/dev/null) || return 1
     fi
@@ -4358,11 +5132,61 @@ v11_compute_attribution_key() {
     } || true
 }
 
+# v11_canonical_actor RAW   (v11.44 — orchestrator-quality)
+#
+# Read-side actor canonicalization. Folds the orchestrator identity family
+# (orchestrator / orchestrator-self / orchestrator-direct / team-orchestrator /
+# drift-orchestrator / main) -> canonical "orchestrator" so the orchestrator is one
+# scoreable actor instead of five free-form spellings. Non-family inputs pass through
+# UNCHANGED (non-lossy — real project agents are never forced to "unknown").
+#
+# SINGLE SOURCE OF TRUTH is hooks/lib/actor-canonical.json, shared with the Python
+# reader scripts/lib/actor_canonical.py (agent-scorecard / agent-effectiveness). A
+# cross-language identity test asserts bash and Python agree.
+#
+# Rollback: V11_ORCH_QUALITY=off echoes RAW verbatim (legacy literal-string match).
+# A missing/corrupt table degrades to identity (echo RAW) — never breaks a caller.
+v11_canonical_actor() {
+    local raw="${1:-}"
+    if [ "${V11_ORCH_QUALITY:-}" = "off" ]; then
+        printf '%s' "$raw"
+        return 0
+    fi
+    local table="${V11_ACTOR_CANONICAL_TABLE:-$V11_HOME/hooks/lib/actor-canonical.json}"
+    local mapped=""
+    if [ -f "$table" ]; then
+        mapped=$(jq -r --arg a "$raw" '.fold[$a] // empty' "$table" 2>/dev/null || true)
+    fi
+    if [ -n "$mapped" ]; then
+        printf '%s' "$mapped"
+    else
+        printf '%s' "$raw"
+    fi
+}
+
+# v11_brief_attribution_key PROJECT SUBJECT_NORM CREATE_SEQ   (v11.44)
+#
+# SHA256 hex of 'project|subject_norm|create_seq|brief' — the idempotency key for
+# brief-layer findings written by scripts/grade-briefs. Uses CANONICAL identity
+# (project, subject_norm, create_seq) NOT task_id, which is session-local/ephemeral
+# (CLAUDE.md §4). Same brief across sessions/rehydrates => same key => no duplicate.
+# Mirrors v11_compute_attribution_key's guard semantics (empty stdout on failure).
+v11_brief_attribution_key() {
+    local project="${1:-}"
+    local subject_norm="${2:-}"
+    local create_seq="${3:-}"
+    {
+        printf '%s|%s|%s|%s' "$project" "$subject_norm" "$create_seq" "brief" \
+            | sha256sum \
+            | awk '{printf "%s", $1}'
+    } || true
+}
+
 # v11_resolve_file_to_task PROJECT FILE
 #
 # Scan PROJECT's aggregate task-state JSON for the most-recent task whose
 # task_artifacts[task_id].files_changed includes FILE. Returns the task_id on stdout,
-# empty if no match. Uses TASK_STATE_DIR / V11_WORKSPACE_ROOT / V11_HOME from the
+# empty if no match. Uses TASK_STATE_DIR / HERCULES_ROOT / V11_HOME from the
 # sourcing hook; all have built-in fallback defaults, so the function works
 # standalone. Internal V11_RFT_* env vars are set-and-consumed inline.
 #
@@ -4373,7 +5197,7 @@ v11_compute_attribution_key() {
 # FILE matching:
 #   - Tries exact match first
 #   - Then tries with V11_HOME stripped (handles relative paths like "hooks/lib/common.sh")
-#   - Then tries with V11_WORKSPACE_ROOT stripped
+#   - Then tries with HERCULES_ROOT stripped
 #   - Final fallback: basename match (least precise; documented in unattributed reason)
 #
 # Empty stdout (no match) is a contract: callers route to unattributed-findings.jsonl.
@@ -4388,22 +5212,22 @@ v11_resolve_file_to_task() {
     # but a novel consumer (standalone script, sourced indirectly) may have it unset.
     # The `:-` fallback derives it the same way common.sh does, so the function is
     # safe under `set -u` regardless of init order.
-    local tsdir="${TASK_STATE_DIR:-${V11_WORKSPACE_ROOT:-$HOME/.v11}/.agent-metrics/task-state}"
+    local tsdir="${TASK_STATE_DIR:-${HERCULES_ROOT:-$HOME}/.agent-metrics/task-state}"
     local state_file="$tsdir/${project}.json"
     if [ ! -f "$state_file" ]; then
         return 0
     fi
 
     V11_RFT_PROJECT="$project" V11_RFT_FILE="$file" V11_RFT_STATE="$state_file" \
-    V11_RFT_V11_WORKSPACE_ROOT="${V11_WORKSPACE_ROOT:-$HOME/.v11}" \
-    V11_RFT_V11_HOME="${V11_HOME:-$HOME/.v11/v11}" \
+    V11_RFT_HERCULES_ROOT="${HERCULES_ROOT:-$HOME}" \
+    V11_RFT_V11_HOME="${V11_HOME:-$HOME/v11}" \
     python3 - <<'PYEOF' 2>/dev/null || true
 import os, json, re
 
 state_path = os.environ.get("V11_RFT_STATE", "")
 target_file = os.environ.get("V11_RFT_FILE", "")
-workspace_root = os.environ.get("V11_RFT_V11_WORKSPACE_ROOT", os.path.expanduser("~/.v11")).rstrip("/")
-v11_home = os.environ.get("V11_RFT_V11_HOME", os.path.expanduser("~/.v11/v11")).rstrip("/")
+hercules_root = os.environ.get("V11_RFT_HERCULES_ROOT", "$HOME").rstrip("/")
+v11_home = os.environ.get("V11_RFT_V11_HOME", "$HOME/v11").rstrip("/")
 
 try:
     with open(state_path, "r", encoding="utf-8") as f:
@@ -4420,15 +5244,15 @@ if not artifacts:
 candidates = {target_file}
 abs_form = target_file
 if target_file.startswith("/"):
-    # absolute → also add v11-relative and workspace-relative forms
+    # absolute → also add v11-relative and hercules-relative forms
     if target_file.startswith(v11_home + "/"):
         candidates.add(target_file[len(v11_home)+1:])
-    if target_file.startswith(workspace_root + "/"):
-        candidates.add(target_file[len(workspace_root)+1:])
+    if target_file.startswith(hercules_root + "/"):
+        candidates.add(target_file[len(hercules_root)+1:])
 else:
     # relative → also add absolute forms
     candidates.add(f"{v11_home}/{target_file}")
-    candidates.add(f"{workspace_root}/{target_file}")
+    candidates.add(f"{hercules_root}/{target_file}")
 basename = os.path.basename(target_file) if "/" in target_file else target_file
 
 # completed_at lookup table from recent_completed[]

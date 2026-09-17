@@ -440,7 +440,7 @@ async def get_user(user_id: str) -> User:
 
 ## Video Processing Standards
 
-> Patterns from ArchiveStream service (reference implementation at `~/archivestream-service`)
+> Patterns from ArchiveStream service (reference implementation at `/path/to/operator-home/archivestream-service`)
 
 ### FFmpeg Best Practices
 

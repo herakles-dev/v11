@@ -28,9 +28,9 @@ import re
 import sys
 from pathlib import Path
 
-V11_HOME = Path(os.environ.get("V11_HOME", os.path.expanduser("~/v11")))
-V11_WORKSPACE_ROOT = Path(os.environ.get("V11_WORKSPACE_ROOT", os.path.expanduser("~")))
-SESSIONS_ROOT = Path(os.environ.get("SESSIONS_ROOT", V11_WORKSPACE_ROOT / "sessions"))
+V11_HOME = Path(os.environ.get("V11_HOME", "/path/to/v11"))
+HERCULES_ROOT = Path(os.environ.get("HERCULES_ROOT", "/path/to/operator-home"))
+SESSIONS_ROOT = Path(os.environ.get("SESSIONS_ROOT", HERCULES_ROOT / "sessions"))
 SCHEMA_PATH = V11_HOME / "schemas" / "module-manifest.schema.json"
 
 
@@ -99,7 +99,7 @@ def validate_project(project, schema, strict=False, json_output=False):
     """Validate one project. Returns (pass_count, fail_count, report)."""
     # Resolve project dir
     candidates = [
-        V11_WORKSPACE_ROOT / project,
+        HERCULES_ROOT / project,
         SESSIONS_ROOT / project,
     ]
     project_dir = next((c for c in candidates if c.is_dir()), None)
@@ -199,7 +199,7 @@ def main():
     schema = load_schema()
 
     if args[0] == "--scan":
-        # Scan every project that exists in sessions/ or the workspace root
+        # Scan every project that exists in sessions/ or herakles root
         projects = set()
         for d in SESSIONS_ROOT.iterdir() if SESSIONS_ROOT.is_dir() else []:
             if d.is_dir():

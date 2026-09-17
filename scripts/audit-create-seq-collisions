@@ -1,0 +1,244 @@
+#!/usr/bin/env python3
+"""
+v11.42 W1-T4 — READ-ONLY audit for genuine create_seq collisions.
+
+Ships as a Wave-1 follow-up to Recon #1 (sessions/v11-task-state-integrity/
+recon-notes/README.md): create_seq is FD-207-protected and keyed on
+(project, subject_norm) only — session-agnostic, task_id-agnostic. task_id
+reuse within/across sessions is EXPECTED and NOT a collision (each
+subject_norm has its own independent counter; comparing create_seq across
+different subject_norms is meaningless).
+
+A REAL collision is: within one project, two `created` events sharing the
+SAME (project, subject_norm) but carrying DIFFERENT create_seq values that
+arrive in NON-MONOTONIC ts order (a later-ts event has a lower create_seq
+than an earlier-ts event for that same subject_norm) — evidence the writer's
+lock did not serialize two concurrent creators. Duplicate create_seq values
+(same value assigned twice) are a related-but-distinct symptom and are
+reported separately under `duplicate_create_seq` — they do not affect the
+collision count or exit code, since the task's collision definition is
+scoped to differing values in non-monotonic order.
+
+Usage:
+    scripts/audit-create-seq-collisions                  # full JSON (default)
+    scripts/audit-create-seq-collisions --summary         # compact human summary
+    scripts/audit-create-seq-collisions --project NAME    # single project ledger
+    scripts/audit-create-seq-collisions --ledger-dir DIR  # override ledger location
+
+Exit code: 0 if zero collisions found, 1 if any real collision is found.
+READ-ONLY: never writes to any ledger file.
+"""
+
+from __future__ import annotations
+
+import argparse
+import glob
+import json
+import os
+import sys
+from collections import defaultdict
+from datetime import datetime
+from pathlib import Path
+
+DEFAULT_LEDGER_DIR = Path.home() / ".agent-metrics" / "ledger"
+
+
+def parse_ts(ts):
+    if not isinstance(ts, str):
+        return None
+    try:
+        return datetime.fromisoformat(ts)
+    except ValueError:
+        return None
+
+
+def load_created_events(path: Path, malformed_counter: list) -> list:
+    """Return list of `created`-event dicts from one ledger .jsonl file.
+
+    Malformed lines are skipped and counted, never raised.
+    """
+    events = []
+    try:
+        with open(path, "r", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    malformed_counter[0] += 1
+                    continue
+                if not isinstance(rec, dict):
+                    malformed_counter[0] += 1
+                    continue
+                if rec.get("ev") == "created":
+                    events.append(rec)
+    except OSError as e:
+        print(f"warning: could not read {path}: {e}", file=sys.stderr)
+    return events
+
+
+def find_collisions_and_duplicates(events: list) -> tuple:
+    """Group `created` events by subject_norm and detect real collisions.
+
+    Returns (collisions, duplicates) — both lists of dicts in the output
+    event-list shape.
+    """
+    groups = defaultdict(list)
+    for ev in events:
+        subject_norm = ev.get("subject_norm")
+        if subject_norm is None:
+            continue
+        groups[subject_norm].append(ev)
+
+    collisions = []
+    duplicates = []
+
+    for subject_norm, group in groups.items():
+        if len(group) < 2:
+            continue
+
+        enriched = []
+        for ev in group:
+            ts_raw = ev.get("ts")
+            ts_parsed = parse_ts(ts_raw)
+            cs = ev.get("create_seq")
+            if ts_parsed is None or not isinstance(cs, (int, float)) or isinstance(cs, bool):
+                continue
+            enriched.append({"ts_parsed": ts_parsed, "ts": ts_raw, "create_seq": cs, "ev": ev})
+        if len(enriched) < 2:
+            continue
+
+        enriched.sort(key=lambda e: e["ts_parsed"])
+
+        max_seen = enriched[0]
+        collision_hits = []
+        duplicate_hits = []
+
+        for cur in enriched[1:]:
+            if cur["ts_parsed"] <= max_seen["ts_parsed"]:
+                # Same or ambiguous ts ordering — cannot assert "later ts",
+                # skip comparison for this pair but still track duplicates.
+                if cur["create_seq"] == max_seen["create_seq"]:
+                    duplicate_hits.extend([max_seen, cur])
+                if cur["ts_parsed"] == max_seen["ts_parsed"] and cur["create_seq"] > max_seen["create_seq"]:
+                    max_seen = cur
+                continue
+
+            if cur["create_seq"] < max_seen["create_seq"]:
+                collision_hits.extend([max_seen, cur])
+            elif cur["create_seq"] == max_seen["create_seq"]:
+                duplicate_hits.extend([max_seen, cur])
+            else:
+                max_seen = cur
+
+        def _dedupe(hits):
+            seen = set()
+            out = []
+            for h in hits:
+                key = (h["ts"], h["create_seq"], h["ev"].get("session_uuid"))
+                if key in seen:
+                    continue
+                seen.add(key)
+                out.append(h)
+            out.sort(key=lambda e: e["ts_parsed"])
+            return out
+
+        def _to_event_dicts(hits):
+            return [
+                {
+                    "ts": h["ts"],
+                    "create_seq": h["create_seq"],
+                    "session_uuid": h["ev"].get("session_uuid", ""),
+                    "task_id": h["ev"].get("task_id", ""),
+                }
+                for h in _dedupe(hits)
+            ]
+
+        if collision_hits:
+            project = collision_hits[0]["ev"].get("project", "")
+            collisions.append({
+                "project": project,
+                "subject_norm": subject_norm,
+                "events": _to_event_dicts(collision_hits),
+            })
+
+        if duplicate_hits:
+            project = duplicate_hits[0]["ev"].get("project", "")
+            duplicates.append({
+                "project": project,
+                "subject_norm": subject_norm,
+                "events": _to_event_dicts(duplicate_hits),
+            })
+
+    return collisions, duplicates
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="v11.42 W1-T4 — READ-ONLY audit for genuine create_seq collisions"
+    )
+    parser.add_argument("--ledger-dir", type=Path, default=DEFAULT_LEDGER_DIR)
+    parser.add_argument("--project", help="restrict to a single project's ledger file")
+    parser.add_argument("--json", action="store_true", help="full JSON output (default)")
+    parser.add_argument("--summary", action="store_true", help="compact human-readable summary")
+    args = parser.parse_args()
+
+    ledger_dir = args.ledger_dir
+    if args.project:
+        paths = [ledger_dir / f"{args.project}.jsonl"]
+        paths = [p for p in paths if p.exists()]
+    else:
+        paths = sorted(Path(p) for p in glob.glob(str(ledger_dir / "*.jsonl")))
+
+    malformed_counter = [0]
+    all_collisions = []
+    all_duplicates = []
+    total_events_scanned = 0
+    scanned_projects = 0
+
+    for path in paths:
+        events = load_created_events(path, malformed_counter)
+        total_events_scanned += len(events)
+        if not events:
+            continue
+        scanned_projects += 1
+        collisions, duplicates = find_collisions_and_duplicates(events)
+        all_collisions.extend(collisions)
+        all_duplicates.extend(duplicates)
+
+    collision_projects = {c["project"] for c in all_collisions}
+
+    result = {
+        "scanned_projects": scanned_projects,
+        "total_events_scanned": total_events_scanned,
+        "malformed_lines_skipped": malformed_counter[0],
+        "collisions_found": all_collisions,
+        "duplicate_create_seq": all_duplicates,
+        "summary": (
+            f"{len(all_collisions)} collisions across {len(collision_projects)} projects"
+            f" ({len(all_duplicates)} duplicate-create_seq groups, informational only)"
+        ),
+    }
+
+    if args.summary:
+        print(result["summary"])
+        print(f"scanned {scanned_projects} project ledgers, {total_events_scanned} created events, "
+              f"{malformed_counter[0]} malformed lines skipped")
+        if all_collisions:
+            for c in all_collisions:
+                print(f"  COLLISION project={c['project']} subject_norm={c['subject_norm']!r} "
+                      f"events={len(c['events'])}")
+        if all_duplicates:
+            for d in all_duplicates:
+                print(f"  duplicate-seq (info) project={d['project']} subject_norm={d['subject_norm']!r} "
+                      f"events={len(d['events'])}")
+    else:
+        print(json.dumps(result, indent=2))
+
+    return 1 if all_collisions else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

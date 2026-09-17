@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "agent-effectiveness.schema.json",
+  "$id": "https://herakles.dev/v11/schemas/agent-effectiveness.schema.json",
   "title": "V11 Agent Effectiveness Ledger Line",
   "description": "Schema for ONE line of ~/.agent-metrics/agent-effectiveness.jsonl (V11.15). Appended by sync-tasks as a rolling-window snapshot per agent after each reviewed task completes. scripts/agent-effectiveness renders the latest snapshot per agent_id as the per-agent scorecard. ADVISORY ONLY — does not feed DAAO routing in this phase.",
   "type": "object",

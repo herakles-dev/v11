@@ -1,0 +1,177 @@
+#!/usr/bin/env python3
+"""V11 improvements/12 H2+M2 — scoped self-report tool.
+
+Purpose-built, narrowly-scoped write path for agents that lack TaskUpdate
+(executors AND review-only subagents alike, per H2's finding that
+subagents structurally have no Task* tools regardless of their nominal
+tool grant). Writes metadata.artifacts.self_review on ONE task_id in ONE
+project — nothing else. Rejected alternative (spec.md Decision #1): full
+TaskUpdate access — too much mutation power for an agent class whose whole
+contract is "reads and reports, never mutates."
+
+"No status changes" (spec.md Decision #1) means no CHOICE of status, not
+"status never moves": self_review is ONLY consumed by hooks/sync-tasks's
+existing V11.21 pipeline (validation, ledger append, INV-3 calibration
+counters) when it arrives on the SAME TaskUpdate call that also sets
+status="completed" — confirmed by reading sync-tasks directly, not
+assumed: the entire self_review handling block lives inside sync-tasks'
+`completed)` case branch, keyed on THIS call's own tool_input, not
+whatever was merged into state by an earlier call. A prior draft of this
+script omitted the status field entirely (trying to satisfy "no status
+changes" literally) and, when tested end-to-end, silently discarded the
+self_review with no error — sync-tasks never even entered the branch that
+validates or persists it. So this tool hardcodes status="completed" — not
+caller-choosable, always exactly this one value — which is the one status
+transition inherent to "reporting a self-review at all." The caller
+cannot reach any OTHER status (blocked/in_progress/pending), cannot touch
+any task but its own, and cannot set any metadata key but self_review.
+
+Mechanism: constructs a synthetic PostToolUse:TaskUpdate hook payload
+(project + task_id + self_review are the ONLY caller-controlled values;
+the wrapping shape — fixed status="completed", no other metadata keys —
+is fixed by this script, not the caller) and pipes it into
+hooks/sync-tasks, the SAME hook that processes a real TaskUpdate call.
+This reuses the entire existing, tested self_review consumption pipeline
+with zero new state-mutation code — the only new code here is validation
++ payload construction. Even a self_review blob that happens to contain a
+key literally named "status" cannot escalate: it lands under
+metadata.artifacts.self_review.status, never the task's own top-level
+status, since it's nested, not merged.
+
+Usage:
+    report-self-review PROJECT TASK_ID < self_review.json
+    echo '{"severity":"LOW","summary":"..."}' | report-self-review PROJECT TASK_ID
+    report-self-review PROJECT TASK_ID --json '{"severity":"LOW",...}'
+
+Exposed to Bash-less agents (e.g. adversarial-lite-reviewer, which has no
+Write/Edit/Bash) via the mcp-tools/self-review-report MCP server, which
+shells out to this script — see that server's docstring for wiring notes.
+
+Exit codes: 0 success, 1 validation error (bad project/task_id/JSON),
+            2 sync-tasks subprocess failed.
+"""
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+from datetime import datetime, timezone
+
+V11_HOME = os.environ.get("V11_HOME", "/path/to/v11")
+SYNC_TASKS = os.path.join(V11_HOME, "hooks", "sync-tasks")
+
+# Mirrors the project/task_id sanitization pattern used elsewhere in V11
+# (e.g. hooks/fix-team-model's PROJECT read, active-project validation).
+PROJECT_RE = re.compile(r"^[a-zA-Z0-9._-]{1,64}$")
+TASK_ID_RE = re.compile(r"^[a-zA-Z0-9._-]{1,128}$")
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S+00:00")
+
+
+SESSION_ID_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$")
+
+
+def _default_session_id() -> str:
+    """Mirrors hooks/lib/common.sh's v11_session_uuid() precedence exactly
+    (V11_SESSION_ID, then CLAUDE_CODE_SESSION_ID, then a sentinel) — NOT a
+    blind hardcoded sentinel. A subagent's own MCP-server subprocess
+    inherits its real Claude Code session's environment naturally; using
+    the same env vars sync-tasks itself trusts means this tool attributes
+    to the CALLING agent's real session whenever one exists, instead of
+    funneling every caller into one shared fake session bucket (which
+    would silently reintroduce the exact per-session task_id collision
+    class improvements/18 exists to fix — this time inside the per-session
+    scratch file rather than the cross-session aggregate)."""
+    for var in ("V11_SESSION_ID", "CLAUDE_CODE_SESSION_ID"):
+        val = os.environ.get(var, "")
+        if val and SESSION_ID_RE.match(val):
+            return val
+    return "self-review-tool"
+
+
+def build_payload(project: str, task_id: str, self_review: dict, session_id: str) -> dict:
+    """The ONLY fields under tool_input are taskId, the hardcoded
+    status="completed" (not caller-choosable — the one status transition
+    inherent to "reporting a self-review"), and metadata.{project,
+    artifacts.self_review} — no other metadata keys. This function is the
+    entire enforcement boundary: the caller controls project/task_id/
+    self_review's CONTENT, never the wrapping shape or which status."""
+    return {
+        "session_id": session_id,
+        "hook_event_name": "PostToolUse",
+        "tool_name": "TaskUpdate",
+        "tool_input": {
+            "taskId": task_id,
+            "status": "completed",
+            "metadata": {
+                "project": project,
+                "artifacts": {"self_review": self_review},
+            },
+        },
+        "tool_output": "Task updated",
+    }
+
+
+def main(argv=None) -> int:
+    p = argparse.ArgumentParser(
+        description="Scoped self-review write: metadata.artifacts.self_review only, own task only.",
+    )
+    p.add_argument("project", help="Project identifier (exact metadata.project stamp — no active-project fallback).")
+    p.add_argument("task_id", help="Your own task_id (the task you were spawned to work on/review).")
+    p.add_argument("--session-id", default=None,
+                   help="Optional session_uuid for ledger attribution "
+                        "(default: V11_SESSION_ID or CLAUDE_CODE_SESSION_ID "
+                        "env var if set, else the 'self-review-tool' sentinel).")
+    p.add_argument("--json", dest="json_str", default=None,
+                   help="Self-review JSON as a string (default: read from stdin).")
+    args = p.parse_args(argv)
+    session_id = args.session_id if args.session_id is not None else _default_session_id()
+
+    if not PROJECT_RE.match(args.project):
+        print(f"ERROR: invalid project name: {args.project!r}", file=sys.stderr)
+        return 1
+    if not TASK_ID_RE.match(args.task_id):
+        print(f"ERROR: invalid task_id: {args.task_id!r}", file=sys.stderr)
+        return 1
+
+    raw = args.json_str if args.json_str is not None else sys.stdin.read()
+    try:
+        self_review = json.loads(raw)
+    except json.JSONDecodeError as e:
+        print(f"ERROR: self_review is not valid JSON: {e}", file=sys.stderr)
+        return 1
+    if not isinstance(self_review, dict):
+        print("ERROR: self_review must be a JSON object", file=sys.stderr)
+        return 1
+
+    payload = build_payload(args.project, args.task_id, self_review, session_id)
+
+    try:
+        result = subprocess.run(
+            [SYNC_TASKS], input=json.dumps(payload), capture_output=True,
+            text=True, timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError) as e:
+        print(f"ERROR: could not invoke sync-tasks: {e}", file=sys.stderr)
+        return 2
+
+    if result.returncode != 0:
+        print(f"ERROR: sync-tasks failed (exit {result.returncode}): {result.stderr}", file=sys.stderr)
+        return 2
+
+    if result.stderr.strip():
+        # sync-tasks emits advisories (e.g. malformed_self_review) on stderr
+        # without failing — surface them so the caller knows their self_review
+        # shape was accepted structurally but flagged by the existing
+        # V11.21 validation.
+        print(result.stderr, file=sys.stderr, end="")
+
+    print(f"OK: self_review recorded for task #{args.task_id} in project {args.project} at {_now_iso()}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

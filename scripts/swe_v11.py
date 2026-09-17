@@ -63,8 +63,8 @@ except ImportError:
 # ── config ────────────────────────────────────────────────────────────────────
 
 CLAUDE_MODEL    = "claude-sonnet-4-6"
-REPO_CACHE_DIR  = Path(os.path.expanduser("~/v11/swebench-repos"))
-PRED_DIR        = Path(os.path.expanduser("~/v11/swebench-predictions/v11-formation"))
+REPO_CACHE_DIR  = Path("/path/to/v11/swebench-repos")
+PRED_DIR        = Path("/path/to/v11/swebench-predictions/v11-formation")
 TRAJ_DIR        = PRED_DIR / "trajs"
 MAX_CONTEXT_CHARS = 100_000
 MAX_FILE_CHARS    = 20_000
@@ -1173,7 +1173,7 @@ def main():
 
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
-        sys.exit("Set ANTHROPIC_API_KEY (source your secrets env file, e.g. ~/.secrets/api-keys.env)")
+        sys.exit("Set ANTHROPIC_API_KEY (source ~/.secrets/app.env)")
     client = anthropic.Anthropic(api_key=api_key)
 
     print(f"\nRunning V11 formation inference on {len(instances)} instances")

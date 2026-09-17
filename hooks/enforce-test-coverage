@@ -11,7 +11,7 @@ source "$(dirname "${BASH_SOURCE[0]}")/lib/common.sh"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 V11_HOME="${SCRIPT_DIR%/hooks}"
-SESSIONS_ROOT="${SESSIONS_ROOT:-$HOME/.v11/sessions}"
+SESSIONS_ROOT="${SESSIONS_ROOT:-$HOME/sessions}"
 
 # Default coverage threshold (can be overridden per project)
 DEFAULT_THRESHOLD=80

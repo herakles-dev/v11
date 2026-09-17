@@ -12,9 +12,9 @@
 
 set -euo pipefail
 
-V11_WORKSPACE_ROOT="${V11_WORKSPACE_ROOT:-$HOME/.v11}"
-SESSIONS_ROOT="${SESSIONS_ROOT:-$V11_WORKSPACE_ROOT/sessions}"
-METRICS_DIR="$V11_WORKSPACE_ROOT/.agent-metrics"
+HERCULES_ROOT="${HERCULES_ROOT:-$HOME}"
+SESSIONS_ROOT="${SESSIONS_ROOT:-$HERCULES_ROOT/sessions}"
+METRICS_DIR="$HERCULES_ROOT/.agent-metrics"
 TASK_STATE_DIR="$METRICS_DIR/task-state"
 ACTIVE_PROJECT_FILE="$METRICS_DIR/active-project"
 PLANS_DIR="$HOME/.claude/plans"
@@ -204,7 +204,7 @@ emit_reasoning_context() {
 # --- Helper: generate resume instructions ---
 emit_resume_instructions() {
     echo "## Resume Instructions"
-    echo "1. Read $V11_WORKSPACE_ROOT/v11/CLAUDE.md (protocol)"
+    echo "1. Read $HERCULES_ROOT/v11/CLAUDE.md (protocol)"
     echo "2. Read $SESSIONS_ROOT/$PROJECT/spec.md (intent)"
     echo "3. TaskList (verify state)"
     echo "4. Resume from: ${PHASE} phase, ${PENDING} tasks pending"

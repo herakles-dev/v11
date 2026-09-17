@@ -40,8 +40,8 @@ except ImportError:
 # ── config ────────────────────────────────────────────────────────────────────
 
 GEMINI_MODEL   = "gemini-2.0-flash"
-REPO_CACHE_DIR = Path(os.path.expanduser("~/v11/swebench-repos"))
-PRED_DIR       = Path(os.path.expanduser("~/v11/swebench-predictions"))
+REPO_CACHE_DIR = Path("/path/to/v11/swebench-repos")
+PRED_DIR       = Path("/path/to/v11/swebench-predictions")
 MAX_CONTEXT_CHARS = 100_000  # ~25K tokens — safe for flash 1M context
 MAX_FILE_CHARS    = 20_000   # per file (up from 8K to see more code)
 MAX_FILE_LINES    = 600      # max lines per file (up from 300)

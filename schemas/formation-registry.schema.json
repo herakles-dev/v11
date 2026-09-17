@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "formation-registry.schema.json",
+  "$id": "https://herakles.dev/v11/schemas/formation-registry.schema.json",
   "title": "V11 Formation Registry",
   "description": "Schema for .formation-registry.json — defines teammate roles, ownership, and agent assignments",
   "type": "object",

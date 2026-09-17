@@ -85,6 +85,115 @@ if [ -n "${V11_SESSION_ID:-}" ] \
     fi
 fi
 
+# L2.5 (v11-handoff-cross-session-loop, sprint-02): orphan handoff detector.
+# Scans $SESSIONS_ROOT/*/.last-spawn-at for spawn latches older than
+# V11_LOOP_ORPHAN_MINUTES (default 60) with no matching handoff_ack OR
+# rehydrate_missed event in ~/.agent-metrics/loop-events.jsonl (ts >= latch
+# mtime, same project). Missing → emit HANDOFF_ORPHAN event. Fire-once per
+# orphan via {latch}.orphan-notified marker sibling to the latch file itself
+# (survives across sessions, not per-session-scoped, since the observer that
+# notices may not be the observer that later re-notices). Global scan (not
+# restricted to $PROJECT — orphans are cross-project by nature).
+# Rollback: V11_ORPHAN_DETECTOR=off. Never blocks session-end; hook always
+# exits 0 regardless.
+if [ "${V11_ORPHAN_DETECTOR:-on}" != "off" ] && [ -d "$SESSIONS_ROOT" ]; then
+    _L25_MIN_MIN="${V11_LOOP_ORPHAN_MINUTES:-60}"
+    [[ "$_L25_MIN_MIN" =~ ^[0-9]+$ ]] || _L25_MIN_MIN=60
+    if [ "$_L25_MIN_MIN" -gt 0 ]; then
+        _L25_V11_HOME="${V11_HOME:-$(dirname "$(dirname "$(readlink -f "${BASH_SOURCE[0]:-$0}")")")}"
+        _L25_LOOP_EVENTS="$_L25_V11_HOME/scripts/lib/loop_events.py"
+        _L25_LEDGER="${HOME}/.agent-metrics/loop-events.jsonl"
+        if [ -f "$_L25_LOOP_EVENTS" ]; then
+            _L25_NOW=$(date +%s)
+            _L25_MIN_S=$(( _L25_MIN_MIN * 60 ))
+            for _L25_LATCH in "$SESSIONS_ROOT"/*/.last-spawn-at; do
+                [ -f "$_L25_LATCH" ] || continue
+                _L25_MARKER="${_L25_LATCH}.orphan-notified"
+                [ -f "$_L25_MARKER" ] && continue
+                _L25_MTIME=$(stat -c %Y "$_L25_LATCH" 2>/dev/null || echo 0)
+                [ "$_L25_MTIME" -gt 0 ] || continue
+                _L25_AGE_S=$(( _L25_NOW - _L25_MTIME ))
+                [ "$_L25_AGE_S" -ge "$_L25_MIN_S" ] || continue
+                _L25_PROJ=$(basename "$(dirname "$_L25_LATCH")")
+                printf '%s' "$_L25_PROJ" | grep -qE '^[a-zA-Z0-9._-]{1,64}$' || continue
+                _L25_SPAWN_ISO=$(date -Iseconds -d "@$_L25_MTIME" 2>/dev/null || echo "")
+                [ -n "$_L25_SPAWN_ISO" ] || continue
+
+                # Ledger scan — someone-woke-up if any handoff_ack OR
+                # rehydrate_missed row for this project has ts >= spawn ISO.
+                _L25_ACKED=0
+                if [ -f "$_L25_LEDGER" ]; then
+                    _L25_ACKED=$(python3 -c "
+import json, sys
+project, spawn_ts = sys.argv[1], sys.argv[2]
+try:
+    with open(sys.argv[3]) as f:
+        for line in f:
+            line = line.strip()
+            if not line: continue
+            try:
+                d = json.loads(line)
+            except Exception:
+                continue
+            if d.get('project') != project: continue
+            if d.get('kind') not in ('handoff_ack', 'rehydrate_missed'): continue
+            if d.get('ts', '') >= spawn_ts:
+                print(1)
+                sys.exit(0)
+    print(0)
+except Exception:
+    print(0)
+" "$_L25_PROJ" "$_L25_SPAWN_ISO" "$_L25_LEDGER" 2>/dev/null || echo 0)
+                    [[ "$_L25_ACKED" =~ ^[01]$ ]] || _L25_ACKED=0
+                fi
+                [ "$_L25_ACKED" = "1" ] && continue
+
+                _L25_AGE_MIN=$(( _L25_AGE_S / 60 ))
+                _L25_DET_BY="${V11_SESSION_ID:-unknown}"
+                if timeout 5 python3 "$_L25_LOOP_EVENTS" \
+                    --project "$_L25_PROJ" \
+                    --session-id "$_L25_DET_BY" \
+                    --kind handoff_orphan \
+                    --spawn-ts "$_L25_SPAWN_ISO" \
+                    --detected-by "$_L25_DET_BY" \
+                    --age-minutes "$_L25_AGE_MIN" \
+                    >/dev/null 2>&1; then
+                    : > "$_L25_MARKER" 2>/dev/null || true
+                fi
+            done
+        fi
+    fi
+fi
+
+# v11.42 W2-T3 (RC2): review-sibling age-out via /align-aggregate skill.
+# When V11_ALIGN_ON_SESSION_END=apply, the skill's Shape 3 detection (parent
+# completed > V11_REVIEW_SIBLING_AGEOUT_DAYS ago + parent_status="pending") auto-
+# cancels stale V11.21 review siblings. Cancellation events carry EXACT
+# reason="review_sibling_ageout" — v11.42 W2-T2's guard-rollback carve-out in
+# hooks/lib/common.sh credits them so the resulting count drop doesn't trip
+# REGRESSION-GUARD and silently revert.
+# Default =dryrun: skill only lists what it WOULD cancel (stderr, quiet in normal use).
+# Rollback: V11_ALIGN_ON_SESSION_END=off skips the invocation entirely.
+# Best-effort — never blocks session-end (hook always exits 0).
+_ALIGN_MODE="${V11_ALIGN_ON_SESSION_END:-dryrun}"
+if [ "$_ALIGN_MODE" != "off" ] && [ -x "$HOME/.claude/skills/align-aggregate/align_aggregate.py" ]; then
+    _ALIGN_ARG=""
+    case "$_ALIGN_MODE" in
+        apply)   _ALIGN_ARG="--apply" ;;
+        dryrun|"") _ALIGN_ARG="--list-phantoms" ;;
+    esac
+    _ALIGN_PROJ=""
+    if [ -n "${PROJECT:-}" ]; then
+        _ALIGN_PROJ="$PROJECT"
+    elif [ -f "$SESSIONS_ROOT/../.agent-metrics/active-project" ]; then
+        _ALIGN_PROJ=$(head -1 "$SESSIONS_ROOT/../.agent-metrics/active-project" 2>/dev/null | tr -d '\n' | head -c 64)
+    fi
+    if [ -n "$_ALIGN_PROJ" ] && printf '%s' "$_ALIGN_PROJ" | grep -qE '^[a-zA-Z0-9._-]{1,64}$'; then
+        timeout 15 python3 "$HOME/.claude/skills/align-aggregate/align_aggregate.py" \
+            "$_ALIGN_PROJ" $_ALIGN_ARG >/dev/null 2>&1 || true
+    fi
+fi
+
 # Read active project from ACTIVE_PROJECT_FILE
 # SEC-C-02: sanitized read — rejects path-traversal / metacharacter payloads
 PROJECT="$(v11_read_active_project)"
@@ -233,7 +342,7 @@ fi
 (
     _DC="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/scripts/handoff-discipline-check"
     [ -x "$_DC" ] && [ -n "$PROJECT" ] || exit 0
-    V11_WORKSPACE_ROOT="$V11_WORKSPACE_ROOT" \
+    HERCULES_ROOT="$HERCULES_ROOT" \
     SESSIONS_ROOT="$SESSIONS_ROOT" \
     METRICS_DIR="$METRICS_DIR" \
     timeout 10 "$_DC" "$PROJECT" >/dev/null 2>&1 || true
@@ -278,7 +387,7 @@ _v11_auto_emit_handoff() {
     # unconditionally; --file pointed at that same path would overwrite it AFTER the
     # steer sidecar was already consumed, with the markerless $PROMPT — silently
     # dropping the steer on this safety-net path. Let handoff own the file write.
-    V11_WORKSPACE_ROOT="$V11_WORKSPACE_ROOT" \
+    HERCULES_ROOT="$HERCULES_ROOT" \
     SESSIONS_ROOT="$SESSIONS_ROOT" \
     METRICS_DIR="$METRICS_DIR" \
     V11_HOME="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)" \
@@ -314,7 +423,7 @@ fi
 
     # --- autonomy state ---
     AUTONOMY_FILE="$SESSIONS_ROOT/$PROJECT/.autonomy-state"
-    [ ! -f "$AUTONOMY_FILE" ] && AUTONOMY_FILE="$V11_WORKSPACE_ROOT/$PROJECT/.autonomy-state"
+    [ ! -f "$AUTONOMY_FILE" ] && AUTONOMY_FILE="$HERCULES_ROOT/$PROJECT/.autonomy-state"
     AUTONOMY_LEVEL=0; AUTONOMY_OK=0; AUTONOMY_ERRORS=0
     if [ -f "$AUTONOMY_FILE" ]; then
         AUTONOMY_LEVEL=$(jq -r '.level // 0' "$AUTONOMY_FILE" 2>/dev/null || echo "0")
@@ -328,7 +437,7 @@ fi
     # --- formation name ---
     FORMATION_NAME=""
     FORMATION_FILE="$SESSIONS_ROOT/$PROJECT/.formation-registry.json"
-    [ ! -f "$FORMATION_FILE" ] && FORMATION_FILE="$V11_WORKSPACE_ROOT/$PROJECT/.formation-registry.json"
+    [ ! -f "$FORMATION_FILE" ] && FORMATION_FILE="$HERCULES_ROOT/$PROJECT/.formation-registry.json"
     if [ -f "$FORMATION_FILE" ]; then
         FORMATION_NAME=$(jq -r '.formation // empty' "$FORMATION_FILE" 2>/dev/null || true)
         [ "$FORMATION_NAME" = "null" ] && FORMATION_NAME=""
@@ -338,7 +447,7 @@ fi
     # first non-empty line under "## Formation" in spec.md.
     if [ -z "$FORMATION_NAME" ]; then
         _SPEC_FILE="$SESSIONS_ROOT/$PROJECT/spec.md"
-        [ ! -f "$_SPEC_FILE" ] && _SPEC_FILE="$V11_WORKSPACE_ROOT/$PROJECT/spec.md"
+        [ ! -f "$_SPEC_FILE" ] && _SPEC_FILE="$HERCULES_ROOT/$PROJECT/spec.md"
         if [ -f "$_SPEC_FILE" ]; then
             FORMATION_NAME=$(awk '/^## Formation/{flag=1; next} flag && NF{print; exit}' "$_SPEC_FILE" 2>/dev/null \
                 | sed -E 's/^[`*_[:space:]]*([^`*_]+)[`*_].*/\1/; s/[[:space:]]+$//' \
@@ -348,7 +457,7 @@ fi
 
     # --- git diff stat (2-second timeout, project path detection) ---
     GIT_STAT=""
-    PROJECT_PATH="$V11_WORKSPACE_ROOT/$PROJECT"
+    PROJECT_PATH="$HERCULES_ROOT/$PROJECT"
     [ ! -d "$PROJECT_PATH" ] && PROJECT_PATH="$SESSIONS_ROOT/$PROJECT"
     if [ -d "$PROJECT_PATH" ]; then
         GIT_STAT=$(timeout 2 git -C "$PROJECT_PATH" diff --stat 2>/dev/null | tail -1 || true)

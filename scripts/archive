@@ -10,10 +10,10 @@
 
 set -euo pipefail
 
-V11_WORKSPACE_ROOT="${V11_WORKSPACE_ROOT:-$HOME/.v11}"
-SESSIONS_ROOT="${SESSIONS_ROOT:-$V11_WORKSPACE_ROOT/sessions}"
+HERCULES_ROOT="${HERCULES_ROOT:-$HOME}"
+SESSIONS_ROOT="${SESSIONS_ROOT:-$HERCULES_ROOT/sessions}"
 ARCHIVE_ROOT="$SESSIONS_ROOT/archive"
-V11_HOME="${V11_HOME:-$V11_WORKSPACE_ROOT/v11}"
+V11_HOME="${V11_HOME:-$HERCULES_ROOT/v11}"
 
 # ── Args ──────────────────────────────────────────────────────────────────────
 PROJECT="${1:-}"

@@ -51,7 +51,7 @@ if [ -x "$DISCIPLINE_SCRIPT" ]; then
 fi
 
 # Read the artifact
-SESSION_DIR="${SESSIONS_ROOT:-$HOME/.v11/sessions}/$PROJECT"
+SESSION_DIR="${SESSIONS_ROOT:-$HOME/sessions}/$PROJECT"
 DISC_LOG="$SESSION_DIR/.handoff-discipline-log.json"
 [ -f "$DISC_LOG" ] || exit 0
 [ -s "$DISC_LOG" ] || exit 0

@@ -17,11 +17,11 @@ Net: the retro system exists in code, claims to be auto-triggered, but is dead i
 ## Evidence observed this session
 
 ```bash
-$ cat ~/sessions/sofly/.retro-counter
+$ cat /path/to/operator-home/sessions/sofly/.retro-counter
 226
-$ grep V11_RETRO_THRESHOLD ~/v11/playbooks/journal.md
+$ grep V11_RETRO_THRESHOLD /path/to/v11/playbooks/journal.md
 # default 5
-$ ls ~/sessions/sofly/retros/ 2>/dev/null || echo "no retros dir"
+$ ls /path/to/operator-home/sessions/sofly/retros/ 2>/dev/null || echo "no retros dir"
 no retros dir
 ```
 

@@ -2,9 +2,9 @@
 # V11 Team Status - Show active Agent Teams, formation health, and diagnostics
 # Usage: ./scripts/team-status
 
-V11_WORKSPACE_ROOT="${V11_WORKSPACE_ROOT:-$HOME/.v11}"
-SESSIONS_ROOT="${SESSIONS_ROOT:-$V11_WORKSPACE_ROOT/sessions}"
-METRICS_DIR="$V11_WORKSPACE_ROOT/.agent-metrics"
+HERCULES_ROOT="${HERCULES_ROOT:-$HOME}"
+SESSIONS_ROOT="${SESSIONS_ROOT:-$HERCULES_ROOT/sessions}"
+METRICS_DIR="$HERCULES_ROOT/.agent-metrics"
 TASK_STATE_DIR="$METRICS_DIR/task-state"
 ACTIVE_PROJECT_FILE="$METRICS_DIR/active-project"
 

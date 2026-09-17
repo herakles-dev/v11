@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "autonomy-audit.schema.json",
+  "$id": "https://herakles.dev/v11/schemas/autonomy-audit.schema.json",
   "title": "V11 Autonomy Audit Trail Line",
   "description": "Schema for ONE line of ~/.agent-metrics/autonomy-audit.jsonl. Appended by track-autonomy hook on every PostToolUse Write/Edit/Bash event. V11.4 enriched with task_id/agent_id/diff_summary/diff_hash. V11.20 adds caller_kind to distinguish orchestrator runtime actions from subagent runtime actions in agent-scorecard. Legacy entries (pre-V11.4) lack the enrichment fields; pre-V11.20 entries lack caller_kind. All additions are ADDITIVE — consumers tolerate absence and default caller_kind to 'unknown'.",
   "type": "object",

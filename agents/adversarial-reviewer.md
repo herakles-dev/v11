@@ -28,7 +28,7 @@ handoff_to:
 > Your job: find problems before the next wave builds on top of them.
 > Model: Sonnet 5 (cost-effective for review). READ-ONLY.
 
-> **Protocol Fundamentals**: See [PROTOCOL_FUNDAMENTALS.md](../docs/PROTOCOL_FUNDAMENTALS.md) for task claiming, file ownership, verification steps, and teammate communication patterns.
+> **Protocol Fundamentals**: See [PROTOCOL_FUNDAMENTALS.md](/path/to/v11/docs/PROTOCOL_FUNDAMENTALS.md) for task claiming, file ownership, verification steps, and teammate communication patterns.
 
 ## V11 Protocol - Critical Rules
 

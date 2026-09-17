@@ -15,9 +15,9 @@
 
 set -euo pipefail
 
-V11_WORKSPACE_ROOT="${V11_WORKSPACE_ROOT:-$HOME/.v11}"
-SESSIONS_ROOT="${SESSIONS_ROOT:-$V11_WORKSPACE_ROOT/sessions}"
-METRICS_DIR="$V11_WORKSPACE_ROOT/.agent-metrics"
+HERCULES_ROOT="${HERCULES_ROOT:-$HOME}"
+SESSIONS_ROOT="${SESSIONS_ROOT:-$HERCULES_ROOT/sessions}"
+METRICS_DIR="$HERCULES_ROOT/.agent-metrics"
 ACTIVE_PROJECT_FILE="$METRICS_DIR/active-project"
 NOW=$(date -Iseconds)
 
@@ -47,7 +47,7 @@ if [ -z "$PROJECT" ]; then
     CWD="$PWD"
     if [[ "$CWD" =~ ^$SESSIONS_ROOT/([^/]+) ]]; then
         PROJECT="${BASH_REMATCH[1]}"
-    elif [[ "$CWD" =~ ^$V11_WORKSPACE_ROOT/([^/]+) ]]; then
+    elif [[ "$CWD" =~ ^$HERCULES_ROOT/([^/]+) ]]; then
         candidate="${BASH_REMATCH[1]}"
         # Exclude infra dirs
         case "$candidate" in
@@ -87,8 +87,8 @@ PER_SESSION_STATE_FILE="$METRICS_DIR/sessions/$SESSION_UUID/task-state.json"
 # --- check mode ---
 if $CHECK_ONLY; then
     needs=0
-    [ ! -f "$ACTIVE_PROJECT_FILE" ] || [ "$(tr -d '[:space:]' < "$ACTIVE_PROJECT_FILE" 2>/dev/null)" != "$PROJECT" ] && {
-        echo "NEEDS BOOTSTRAP: active-project is '$(cat "$ACTIVE_PROJECT_FILE" 2>/dev/null || echo "(missing)")' not '$PROJECT'"
+    [ ! -f "$ACTIVE_PROJECT_FILE" ] || [ "$(head -n 1 "$ACTIVE_PROJECT_FILE" 2>/dev/null | tr -d '[:space:]')" != "$PROJECT" ] && {
+        echo "NEEDS BOOTSTRAP: active-project is '$(head -n 1 "$ACTIVE_PROJECT_FILE" 2>/dev/null || echo "(missing)")' not '$PROJECT'"
         needs=1
     }
     [ ! -d "$SESSION_DIR" ] && { echo "NEEDS BOOTSTRAP: session dir missing"; needs=1; }
@@ -105,9 +105,15 @@ changes=0
 # 1. active-project
 mkdir -p "$METRICS_DIR"
 current_active=""
-[ -f "$ACTIVE_PROJECT_FILE" ] && current_active=$(tr -d '[:space:]' < "$ACTIVE_PROJECT_FILE" 2>/dev/null || true)
+[ -f "$ACTIVE_PROJECT_FILE" ] && current_active=$(head -n 1 "$ACTIVE_PROJECT_FILE" 2>/dev/null | tr -d '[:space:]' || true)
 if [ "$current_active" != "$PROJECT" ]; then
-    printf '%s\n' "$PROJECT" > "$ACTIVE_PROJECT_FILE"
+    # MUST go through v11_write_active_project (common.sh) — it validates the project
+    # name and performs the session-scoped dual-write. Writing $ACTIVE_PROJECT_FILE
+    # directly here was the second of the two bypass writers named in improvements/15
+    # F1 (sync-tasks:380 fixed 2026-07-27, commit 3ebae21b). Isolated subshell
+    # (matches the v11_rebuild_project_aggregate call below) so common.sh's own
+    # variable defaults can't clobber this script's already-resolved ones.
+    bash -c "source '$(dirname "$(readlink -f "$0")")/../hooks/lib/common.sh'; v11_write_active_project '$PROJECT'"
     echo "  [+] active-project → $PROJECT (was: ${current_active:-<empty>})"
     changes=$((changes + 1))
 else
@@ -179,7 +185,7 @@ if [ ! -f "$PER_SESSION_STATE_FILE" ] || [ ! -s "$PER_SESSION_STATE_FILE" ]; the
 
     # Rebuild aggregate so legacy readers see the bootstrapped state too.
     # Source common.sh inside a subshell to keep this script's set -euo pipefail clean.
-    V11_WORKSPACE_ROOT="$V11_WORKSPACE_ROOT" \
+    HERCULES_ROOT="$HERCULES_ROOT" \
     SESSIONS_ROOT="$SESSIONS_ROOT" \
     METRICS_DIR="$METRICS_DIR" \
     V11_SESSION_ID="$SESSION_UUID" \

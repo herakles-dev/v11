@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "agent-registry.schema.json",
+  "$id": "https://herakles.dev/v11/schemas/agent-registry.schema.json",
   "title": "V11 Agent Registry",
   "description": "Schema for V11_AGENT_REGISTRY.json — defines V11 spec agents and pre-built formations",
   "type": "object",

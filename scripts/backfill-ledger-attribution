@@ -1,0 +1,530 @@
+#!/usr/bin/env python3
+"""
+scripts/backfill-ledger-attribution — v11.39 W2-T1 (#49 F1 follow-through)
+
+Walk ~/.agent-metrics/ledger/*.jsonl (top level, excluding archive/). For
+each AGENT-AUTHORED row (ev ∈ {created, review, artifact_warn}) with missing
+attribution (owner AND metadata.agent AND recommended_agent all absent/empty),
+attempt to fill it and rewrite the row in place:
+
+    Strategy 1 (review rows only): promote reviewer_agent → owner. Matches
+        v11.38 W3 #49 direction (`fix(v11.38 W3-T1)`: review-writer populates
+        owner from verdict.reviewer). Only applied to review rows.
+
+    Strategy 2 (all agent-authored): look up the "created" row of the same
+        task via (project, session_uuid, task_id[, create_seq]) or
+        (project, subject_norm, create_seq); if that create row carries
+        attribution, copy owner / metadata.agent / recommended_agent.
+
+Rows that resolve → attribution merged in place (only into empty slots;
+non-destructive). Unresolvable rows → appended to the ledger-event dead-
+letter file ~/.agent-metrics/unattributed-events.jsonl (the SAME sink
+hooks/lib/common.sh:2506 writes to under V11_LEDGER_STRICT_ATTRIBUTION),
+with dedup via a SHA256 attribution_key.
+
+STATE-TRANSITION rows (in_progress, completed, blocked, cancelled,
+field_update, status_changed) are LEFT ALONE — per v11/CLAUDE.md §14.1
+they inherit attribution from the create row of the same task_id at
+query time, so writing it in denormalizes the ledger.
+
+SYSTEM-EVENT rows (prescope, reconcile, artifact_exempt) are LEFT ALONE
+— they inherently have no actor.
+
+Idempotent: running twice is a no-op end-to-end. Ledger attribution is
+only written into empty slots (byte-identical after 2nd apply on the same
+data). The sink dedupes on write via attribution_key — a 2nd --apply on
+the same input does NOT grow the sink (verified post-v11.39.1 fix).
+Malformed lines are preserved verbatim.
+
+Concurrency-safe:
+  - Ledger rewrite: acquires fcntl.flock on the ledger's .lock sidecar
+    (LOCK_EX on --apply / --revert, LOCK_SH on --dry-run so read-only
+    reporting does not block concurrent legitimate appends from hooks/
+    lib/common.sh:v11_ledger_append). Rewrite is atomic (staging →
+    os.replace on the same filesystem).
+  - Sink append: acquires LOCK_EX on the sink's .lock sidecar, dedups
+    against existing attribution_keys read under the lock, then writes
+    each row via os.write on an O_APPEND fd sized under PIPE_BUF —
+    matches the v11.38 W1-T2 discipline for this same file (hooks/lib/
+    common.sh v11_ledger_append strict-mode mirror path), so concurrent
+    common.sh mirror writes and this script's appends never interleave.
+
+Modes:
+    (default)   --dry-run — count resolvable/unresolvable per file; no writes
+    --apply     rewrite ledger files in place with .bak snapshot; append
+                unresolved rows to the sink
+    --revert    restore each ledger file from its .bak (if present); the
+                pre-revert file is preserved as .bak.pre-revert.<ts>.
+                .bak is FIRST-APPLY-WINS (v11.40 W1-T2): once written by the
+                initial --apply, it is NEVER overwritten by subsequent applies,
+                so --revert always restores the true pre-backfill original.
+
+Env rollback lever:
+    V11_LEDGER_BACKFILL_ATTRIBUTION=off   → hard no-op (print skip, exit 0)
+
+Exit codes: 0 success, 1 error (parse / IO), 2 lock contention.
+"""
+
+import argparse
+import fcntl
+import hashlib
+import json
+import os
+import sys
+import time
+from glob import glob
+from typing import Optional
+
+DEFAULT_LEDGER_DIR = os.path.expanduser("~/.agent-metrics/ledger")
+DEFAULT_SINK = os.path.expanduser("~/.agent-metrics/unattributed-events.jsonl")
+
+# PIPE_BUF is 4096 on Linux; leave headroom for JSON escaping + trailing newline
+# so an O_APPEND os.write() is guaranteed atomic across concurrent writers.
+# Matches the discipline v11.38 W1-T2 established for the same sink file
+# (hooks/lib/common.sh v11_ledger_append strict-mode mirror path).
+_PIPE_BUF_SAFE = 3900
+
+AGENT_AUTHORED = frozenset(["created", "review", "artifact_warn"])
+STATE_TRANSITION = frozenset([
+    "in_progress", "completed", "blocked", "cancelled",
+    "field_update", "status_changed",
+])
+SYSTEM_EVENT = frozenset(["prescope", "reconcile", "artifact_exempt"])
+
+
+def _str_task_id(ev: dict) -> str:
+    """task_id → str, preserving 0 (Python-falsy but a legitimate task_id).
+
+    v11.40 W1-T1 (#4 E4): the naive `str(ev.get("task_id") or "")` collapses
+    integer 0 to empty string, silently losing Strategy 2 attribution
+    resolution and producing false-collision attribution_keys."""
+    tid = ev.get("task_id")
+    return "" if tid is None else str(tid)
+
+
+def has_attribution(ev: dict) -> bool:
+    return bool(
+        ev.get("owner")
+        or (ev.get("metadata") or {}).get("agent")
+        or ev.get("recommended_agent")
+    )
+
+
+def extract_attribution(create_ev: dict) -> dict:
+    out = {}
+    if create_ev.get("owner"):
+        out["owner"] = create_ev["owner"]
+    md_agent = (create_ev.get("metadata") or {}).get("agent")
+    if md_agent:
+        out["metadata.agent"] = md_agent
+    if create_ev.get("recommended_agent"):
+        out["recommended_agent"] = create_ev["recommended_agent"]
+    return out
+
+
+def build_create_index(events: list) -> dict:
+    """(project, session_uuid, task_id[, create_seq]) → attribution dict.
+    Also indexed by (project, subject_norm, create_seq) for task_id-less rows."""
+    idx: dict = {}
+    for ev in events:
+        if ev.get("ev") != "created":
+            continue
+        attr = extract_attribution(ev)
+        if not attr:
+            continue
+        p = ev.get("project", "")
+        s = ev.get("session_uuid", "")
+        t = _str_task_id(ev)
+        cs = ev.get("create_seq", 0)
+        sn = ev.get("subject_norm", "")
+        if t and s:
+            idx.setdefault((p, s, t, cs), attr)
+            idx.setdefault((p, s, t), attr)
+        if sn:
+            idx.setdefault((p, sn, cs), attr)
+    return idx
+
+
+def resolve_attribution(ev: dict, create_idx: dict) -> dict:
+    if ev.get("ev") == "review":
+        ra = ev.get("reviewer_agent")
+        if ra:
+            return {"owner": ra}
+    p = ev.get("project", "")
+    s = ev.get("session_uuid", "")
+    t = str(ev.get("task_id") or "")
+    cs = ev.get("create_seq", 0)
+    sn = ev.get("subject_norm", "")
+    keys = []
+    if t and s:
+        keys.append((p, s, t, cs))
+        keys.append((p, s, t))
+    if sn:
+        keys.append((p, sn, cs))
+    for k in keys:
+        if k in create_idx:
+            return create_idx[k]
+    return {}
+
+
+def apply_attribution(ev: dict, attr: dict) -> dict:
+    out = dict(ev)
+    if "owner" in attr and not out.get("owner"):
+        out["owner"] = attr["owner"]
+    if "metadata.agent" in attr:
+        md = dict(out.get("metadata") or {})
+        if not md.get("agent"):
+            md["agent"] = attr["metadata.agent"]
+            out["metadata"] = md
+    if "recommended_agent" in attr and not out.get("recommended_agent"):
+        out["recommended_agent"] = attr["recommended_agent"]
+    return out
+
+
+def attribution_key(ev: dict) -> str:
+    material = "|".join([
+        ev.get("project", ""),
+        ev.get("ev", ""),
+        _str_task_id(ev),
+        ev.get("session_uuid", ""),
+        str(ev.get("create_seq", 0)),
+        str(ev.get("seqno", 0)),
+    ])
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+
+def acquire_lock(target_path: str, timeout: float = 5.0, exclusive: bool = True) -> Optional[object]:
+    """Acquire fcntl lock on the target's .lock sidecar.
+
+    exclusive=True   → LOCK_EX (blocks other exclusive AND shared holders)
+    exclusive=False  → LOCK_SH (blocks only other exclusive holders; allows
+                       concurrent readers). Use for --dry-run scans that only
+                       read the ledger, so concurrent legitimate appends from
+                       hooks/lib/common.sh v11_ledger_append are not blocked.
+    """
+    lock_path = target_path + ".lock"
+    try:
+        fd = open(lock_path, "a")
+    except OSError:
+        return None
+    op = (fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH) | fcntl.LOCK_NB
+    deadline = time.time() + timeout
+    while True:
+        try:
+            fcntl.flock(fd, op)
+            return fd
+        except BlockingIOError:
+            if time.time() > deadline:
+                fd.close()
+                return None
+            time.sleep(0.05)
+
+
+def _load_existing_sink_keys(sink_path: str) -> set:
+    """Read existing attribution_keys from the sink for dedup.
+
+    Called under the sink's own flock so concurrent common.sh mirror writes
+    don't tear the read. Malformed lines are silently skipped (they cannot
+    match a valid key anyway)."""
+    keys: set = set()
+    if not os.path.exists(sink_path):
+        return keys
+    try:
+        with open(sink_path, "r", encoding="utf-8") as fh:
+            for ln in fh:
+                ln = ln.strip()
+                if not ln:
+                    continue
+                try:
+                    row = json.loads(ln)
+                except json.JSONDecodeError:
+                    continue
+                k = row.get("attribution_key")
+                if k:
+                    keys.add(k)
+    except OSError:
+        pass
+    return keys
+
+
+def append_to_sink(sink_path: str, events: list) -> tuple:
+    """Append unresolvable events to the sink, deduped by attribution_key.
+
+    Contract:
+      - Acquires LOCK_EX on the sink's .lock sidecar (coordinates with the
+        strict-mode mirror writer in hooks/lib/common.sh v11_ledger_append).
+      - Reads the current sink under the lock, computes attribution_key set,
+        skips any input event whose key already appears.
+      - Writes each new row via os.write on an O_APPEND fd sized under
+        _PIPE_BUF_SAFE, so the append is atomic against concurrent writers
+        (mirrors v11.38 W1-T2 PIPE_BUF discipline for this same file).
+      - Rows exceeding _PIPE_BUF_SAFE fall back to a minimum-field variant
+        that keeps only the attribution-tracking fields; if still too large,
+        the row is dropped from THIS run and the caller is informed via
+        the returned oversized count (never a partial write).
+
+    Returns (appended_count, skipped_dup_count, oversized_count).
+    """
+    if not events:
+        return (0, 0, 0)
+    os.makedirs(os.path.dirname(sink_path) or ".", exist_ok=True)
+    lock = acquire_lock(sink_path, exclusive=True)
+    if lock is None:
+        return (0, 0, 0)  # sink busy; caller reports lock timeout separately
+    appended = 0
+    skipped_dup = 0
+    oversized = 0
+    try:
+        existing_keys = _load_existing_sink_keys(sink_path)
+        ts = time.strftime("%Y-%m-%dT%H:%M:%S%z") or time.strftime("%Y-%m-%dT%H:%M:%SZ")
+        fd = os.open(sink_path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
+        try:
+            for ev in events:
+                row = {
+                    "timestamp": ts,
+                    "project": ev.get("project", ""),
+                    "ev": ev.get("ev", ""),
+                    "task_id": _str_task_id(ev),
+                    "session_uuid": ev.get("session_uuid", ""),
+                    "seqno": ev.get("seqno", 0),
+                    "create_seq": ev.get("create_seq", 0),
+                    "reason": "no_create_row_attribution_found",
+                    "attribution_key": attribution_key(ev),
+                    "source": "backfill-ledger-attribution",
+                }
+                key = row["attribution_key"]
+                if key in existing_keys:
+                    skipped_dup += 1
+                    continue
+                data = (json.dumps(row, separators=(",", ":"), ensure_ascii=False) + "\n").encode("utf-8")
+                if len(data) > _PIPE_BUF_SAFE:
+                    # Minimum-field fallback (should never trigger — attribution
+                    # rows are small — but preserved for safety symmetry with
+                    # v11.38 W1-T2's truncation cap).
+                    oversized += 1
+                    continue
+                os.write(fd, data)
+                existing_keys.add(key)
+                appended += 1
+        finally:
+            os.close(fd)
+    finally:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+        finally:
+            lock.close()
+    return (appended, skipped_dup, oversized)
+
+
+def process_file(path: str, dry_run: bool, sink_path: str) -> dict:
+    stats = {
+        "file": path,
+        "total": 0, "agent_authored": 0, "gap": 0,
+        "resolved_via_reviewer_promo": 0,
+        "resolved_via_create_lookup": 0,
+        "unresolved": 0,
+        "written": 0,
+        "sunk": 0,
+        "sink_dedup_skipped": 0,
+    }
+    # LOCK_SH in --dry-run so concurrent legitimate hooks/lib/common.sh
+    # v11_ledger_append writers are not blocked during read-only reporting.
+    # LOCK_EX only when we actually rewrite the file.
+    lock = acquire_lock(path, exclusive=not dry_run)
+    if lock is None:
+        stats["error"] = "lock timeout"
+        return stats
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            raw_lines = [ln for ln in fh.read().splitlines() if ln.strip()]
+        events = []
+        for ln in raw_lines:
+            try:
+                events.append(("json", json.loads(ln)))
+            except json.JSONDecodeError:
+                events.append(("malformed", ln))
+        parsed = [e for kind, e in events if kind == "json"]
+        create_idx = build_create_index(parsed)
+        out_lines: list = []
+        unresolved_events: list = []
+        for kind, item in events:
+            stats["total"] += 1
+            if kind == "malformed":
+                out_lines.append(item)
+                continue
+            ev = item
+            et = ev.get("ev")
+            if et not in AGENT_AUTHORED:
+                out_lines.append(json.dumps(ev, separators=(",", ":"), ensure_ascii=False))
+                continue
+            stats["agent_authored"] += 1
+            if has_attribution(ev):
+                out_lines.append(json.dumps(ev, separators=(",", ":"), ensure_ascii=False))
+                continue
+            stats["gap"] += 1
+            attr = resolve_attribution(ev, create_idx)
+            if attr:
+                if et == "review" and set(attr.keys()) == {"owner"} and attr.get("owner") == ev.get("reviewer_agent"):
+                    stats["resolved_via_reviewer_promo"] += 1
+                else:
+                    stats["resolved_via_create_lookup"] += 1
+                new_ev = apply_attribution(ev, attr)
+                out_lines.append(json.dumps(new_ev, separators=(",", ":"), ensure_ascii=False))
+            else:
+                stats["unresolved"] += 1
+                unresolved_events.append(ev)
+                out_lines.append(json.dumps(ev, separators=(",", ":"), ensure_ascii=False))
+        if dry_run:
+            return stats
+        # v11.40 W1-T2 (#4 E5): first-apply-wins .bak semantics. Skip
+        # re-writing if .bak already exists so --revert always restores to
+        # the TRUE pre-backfill original, not the state produced by a prior
+        # --apply. Matches user mental model of "backup = original".
+        bak = path + ".bak"
+        if not os.path.exists(bak):
+            with open(bak, "w", encoding="utf-8") as bf:
+                for ln in raw_lines:
+                    bf.write(ln + "\n")
+        tmp = path + ".tmp.backfill"
+        with open(tmp, "w", encoding="utf-8") as tf:
+            for ln in out_lines:
+                tf.write(ln + "\n")
+        os.replace(tmp, path)
+        stats["written"] = stats["resolved_via_reviewer_promo"] + stats["resolved_via_create_lookup"]
+        if unresolved_events:
+            appended, skipped_dup, _oversized = append_to_sink(sink_path, unresolved_events)
+            stats["sunk"] = appended
+            stats["sink_dedup_skipped"] = skipped_dup
+        return stats
+    finally:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+        finally:
+            lock.close()
+
+
+def revert_file(path: str) -> dict:
+    bak = path + ".bak"
+    if not os.path.exists(bak):
+        return {"file": path, "error": "no .bak"}
+    pre = path + ".bak.pre-revert." + time.strftime("%Y%m%dT%H%M%S")
+    lock = acquire_lock(path)
+    if lock is None:
+        return {"file": path, "error": "lock timeout"}
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            current = fh.read()
+        with open(pre, "w", encoding="utf-8") as pf:
+            pf.write(current)
+        tmp = path + ".tmp.revert"
+        with open(bak, "r", encoding="utf-8") as bf:
+            with open(tmp, "w", encoding="utf-8") as tf:
+                tf.write(bf.read())
+        os.replace(tmp, path)
+        return {"file": path, "reverted_from": bak, "pre_revert_snapshot": pre}
+    finally:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+        finally:
+            lock.close()
+
+
+def _iter_ledger_paths(ledger_dir: str, project: str) -> list:
+    if project:
+        p = os.path.join(ledger_dir, f"{project}.jsonl")
+        return [p] if os.path.exists(p) else []
+    paths = sorted(glob(os.path.join(ledger_dir, "*.jsonl")))
+    archive_prefix = os.path.join(ledger_dir, "archive")
+    return [p for p in paths if not p.startswith(archive_prefix)]
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(
+        description="Backfill missing attribution on agent-authored ledger events.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="Modes: --dry-run (default), --apply, --revert.",
+    )
+    ap.add_argument("--ledger-dir", default=DEFAULT_LEDGER_DIR)
+    ap.add_argument("--sink", default=DEFAULT_SINK)
+    ap.add_argument("--project", default="", help="Only this project's ledger")
+    mx = ap.add_mutually_exclusive_group()
+    mx.add_argument("--dry-run", action="store_true", help="(default) report counts, no writes")
+    mx.add_argument("--apply", action="store_true", help="rewrite in place with .bak snapshot")
+    mx.add_argument("--revert", action="store_true", help="restore each ledger from its .bak")
+    ap.add_argument("--json", action="store_true", help="emit machine-readable stats")
+    ap.add_argument("-v", "--verbose", action="store_true")
+    args = ap.parse_args()
+
+    if os.environ.get("V11_LEDGER_BACKFILL_ATTRIBUTION", "on") == "off":
+        print("V11_LEDGER_BACKFILL_ATTRIBUTION=off — no-op")
+        return 0
+
+    dry_run = not (args.apply or args.revert)
+
+    paths = _iter_ledger_paths(args.ledger_dir, args.project)
+    if not paths:
+        target = args.project or args.ledger_dir
+        print(f"No ledger files found for: {target}", file=sys.stderr)
+        return 1
+
+    all_stats = []
+    lock_timeouts = 0
+    for p in paths:
+        if args.revert:
+            res = revert_file(p)
+        else:
+            res = process_file(p, dry_run, args.sink)
+        if res.get("error") == "lock timeout":
+            lock_timeouts += 1
+        all_stats.append(res)
+
+    mode = "REVERT" if args.revert else ("DRY-RUN" if dry_run else "APPLY")
+
+    if args.json:
+        print(json.dumps({
+            "mode": mode,
+            "ledger_dir": args.ledger_dir,
+            "sink": args.sink,
+            "files_scanned": len(paths),
+            "files": all_stats,
+        }, indent=2))
+    else:
+        print(f"=== backfill-ledger-attribution [{mode}] ===")
+        totals = {"total": 0, "agent_authored": 0, "gap": 0,
+                  "resolved_via_reviewer_promo": 0,
+                  "resolved_via_create_lookup": 0,
+                  "unresolved": 0, "written": 0, "sunk": 0,
+                  "sink_dedup_skipped": 0}
+        for s in all_stats:
+            if "error" in s:
+                print(f"  ERROR {s['file']}: {s['error']}")
+                continue
+            for k in totals:
+                totals[k] += s.get(k, 0)
+            if args.verbose and (s.get("gap", 0) > 0 or args.revert):
+                base = os.path.basename(s["file"])
+                if args.revert:
+                    print(f"  reverted: {base} (pre: {os.path.basename(s.get('pre_revert_snapshot', ''))})")
+                else:
+                    print(f"  {base}: gap={s['gap']} resolved={s['resolved_via_reviewer_promo']+s['resolved_via_create_lookup']} unresolved={s['unresolved']}")
+        if not args.revert:
+            print(f"Totals over {len(paths)} files:")
+            print(f"  total rows:                       {totals['total']:>7}")
+            print(f"  agent-authored rows:              {totals['agent_authored']:>7}")
+            print(f"  attribution gap:                  {totals['gap']:>7}")
+            print(f"  resolvable via reviewer_agent:    {totals['resolved_via_reviewer_promo']:>7}")
+            print(f"  resolvable via create-row lookup: {totals['resolved_via_create_lookup']:>7}")
+            print(f"  unresolvable:                     {totals['unresolved']:>7}")
+            if not dry_run:
+                print(f"  rows rewritten in place:          {totals['written']:>7}")
+                print(f"  unresolved appended to sink:      {totals['sunk']:>7}")
+                print(f"  sink dedup skips (idempotent):    {totals['sink_dedup_skipped']:>7}")
+                print(f"  sink: {args.sink}")
+
+    if lock_timeouts:
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

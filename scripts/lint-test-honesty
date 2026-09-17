@@ -35,7 +35,7 @@ Patterns:
 
 Env knobs:
   V11_LINT_TEST_HONESTY=off  → exit 0 immediately (rollback)
-  V11_HOME=<path>            → override repo root (default $HOME/v11)
+  V11_HOME=<path>            → override repo root (default /path/to/v11)
 
 Exit codes:
   0 — no violations OR linter disabled
@@ -215,7 +215,7 @@ def main() -> int:
     if os.environ.get("V11_LINT_TEST_HONESTY", "on") == "off":
         return 0
 
-    v11_home = Path(os.environ.get("V11_HOME", str(Path.home() / "v11")))
+    v11_home = Path(os.environ.get("V11_HOME", "/path/to/v11"))
     if not v11_home.exists():
         print(f"lint-test-honesty: V11_HOME={v11_home} does not exist", file=sys.stderr)
         return 1

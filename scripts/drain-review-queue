@@ -156,6 +156,99 @@ if [ "$COUNT" = "0" ]; then
     exit 0
 fi
 
+# --- Content-mode fallback (task #9) -----------------------------------
+# scripts/task-review exits 2 when a task has no files_changed/files_created
+# to review (task-review:193-197). That contract is intentional and must
+# NOT change here. What must change: drain-review-queue used to swallow
+# that exit-2 via `2>/dev/null || echo ""`, silently emitting an empty
+# spawn-prompt (JSON mode) or a dropped block (XML mode) with no warning
+# anywhere — the dashboard says "N drainable" but drain delivers fewer.
+#
+# _build_review_prompt wraps task-review: on success it returns the normal
+# code-mode prompt; on exit 2 it warns on stderr and falls back to a
+# content-mode prompt (mirrors task-review's JSON output contract, scoped
+# to the task's ledger artifacts instead of a file diff); on any other
+# failure it warns and returns non-zero so the caller can still render the
+# entry (never drop it silently).
+_content_mode_fallback_prompt() {
+    local tid="$1" subj="$2" agent="$3"
+    cat << PROMPT_EOF
+## Adversarial-Lite Review — Task #$tid (content mode — no files_changed)
+Project: $PROJECT
+Executing agent (review subject): $agent
+
+### Task
+$subj
+
+### SCOPE — this task carries no files_changed/files_created in its ledger
+artifacts, so there is no file diff to review. Locate the deliverable via:
+1. The task subject above.
+2. sessions/$PROJECT/artifacts/ (look for files/dirs matching this task_id or subject).
+3. ~/.agent-metrics/ledger/$PROJECT.jsonl — find the entry for task_id "$tid" and read its artifacts.summary field for a description of what was produced.
+
+### Instructions
+Single fast pass, 3 lenses:
+1. Correctness vs the task description above.
+2. Completeness / edge-cases / error paths.
+3. Integration / contract breakage against callers of the deliverable.
+
+If the deliverable cannot be located via any of the three paths above, treat
+that as a HIGH-severity completeness error (id E1, type "completeness") —
+do NOT silently pass an unlocatable deliverable.
+
+Rate task difficulty 1-5 (1=trivial, 5=very hard). Count every error.
+
+### Output — emit EXACTLY this JSON, nothing else
+{
+  "reviewer": "adversarial-lite-reviewer",
+  "task_id": "$tid",
+  "agent_id": "$agent",
+  "difficulty": <1-5 int>,
+  "error_count": <int>,
+  "errors": [
+    {"id":"E1","severity":"CRITICAL|HIGH|MEDIUM|LOW","file":"<path or artifact ref>",
+      "line":null,"type":"compilation|test_failure|contract_violation|security|logic|completeness|integration",
+      "detail":"<=500 chars","fix_hint":"<=300 chars","confidence":"HIGH|MEDIUM|LOW"}
+  ],
+  "verdict": "PASS|ISSUES_FOUND|BLOCKED",
+  "stats": {"files_reviewed": <int>, "lines_reviewed": <int>}
+}
+Do NOT emit \`reviewed_at\` — sync-tasks stamps the persist timestamp.
+
+Verdict rules: PASS = 0 CRITICAL & 0 HIGH & <=3 MEDIUM;
+ISSUES_FOUND = any HIGH or >3 MEDIUM; BLOCKED = any CRITICAL.
+PROMPT_EOF
+}
+
+_build_review_prompt() {
+    local tid="$1" subj="$2" agent="$3" files="$4"
+    local out rc
+    if [ -n "$files" ]; then
+        if out=$("$V11_HOME/scripts/task-review" "$PROJECT" "$tid" --files "$files" --agent "$agent" --subject "$subj" 2>/dev/null); then
+            rc=0
+        else
+            rc=$?
+        fi
+    else
+        if out=$("$V11_HOME/scripts/task-review" "$PROJECT" "$tid" --agent "$agent" --subject "$subj" 2>/dev/null); then
+            rc=0
+        else
+            rc=$?
+        fi
+    fi
+    if [ "$rc" = "0" ]; then
+        printf '%s' "$out"
+        return 0
+    fi
+    if [ "$rc" = "2" ]; then
+        echo "[drain-review-queue] WARNING: task $tid has no files_changed — content-mode fallback" >&2
+        _content_mode_fallback_prompt "$tid" "$subj" "$agent"
+        return 0
+    fi
+    echo "[drain-review-queue] WARNING: task-review failed for $tid (exit $rc) — no prompt available" >&2
+    return 1
+}
+
 if [ "$JSON_OUT" = "true" ]; then
     # JSON output: array of {task_id, subject, agent_id, files_changed, pending_since, prompt}
     printf '%s' "$PENDING_JSON" | jq -c '.[]' | while IFS= read -r entry; do
@@ -163,12 +256,7 @@ if [ "$JSON_OUT" = "true" ]; then
         SUBJ=$(printf '%s' "$entry" | jq -r '.subject')
         AGENT=$(printf '%s' "$entry" | jq -r '.agent_id')
         FILES=$(printf '%s' "$entry" | jq -r '(.files_changed // []) | join(",")')
-        # Build task-review prompt
-        if [ -n "$FILES" ]; then
-            PROMPT=$("$V11_HOME/scripts/task-review" "$PROJECT" "$TID" --files "$FILES" --agent "$AGENT" --subject "$SUBJ" 2>/dev/null || echo "")
-        else
-            PROMPT=$("$V11_HOME/scripts/task-review" "$PROJECT" "$TID" --agent "$AGENT" --subject "$SUBJ" 2>/dev/null || echo "")
-        fi
+        PROMPT=$(_build_review_prompt "$TID" "$SUBJ" "$AGENT" "$FILES" || echo "")
         printf '%s' "$entry" | jq --arg prompt "$PROMPT" '. + {prompt: $prompt}'
     done | jq -s '.'
 else
@@ -196,13 +284,16 @@ else
         echo "  <pending-review task-id=\"$TID_X\" agent=\"$AGENT_X\" since=\"$PSINCE_X\">"
         echo "    <subject>$SUBJ_X</subject>"
         echo "    <files-changed>$FILES_X</files-changed>"
-        echo "    <spawn-prompt>"
-        if [ -n "$FILES" ]; then
-            "$V11_HOME/scripts/task-review" "$PROJECT" "$TID" --files "$FILES" --agent "$AGENT" --subject "$SUBJ" 2>/dev/null | sed 's/^/      /'
+        # Never render an entry without a spawn-prompt body — a total prompt
+        # build failure gets a <drain-error> note instead of a silently
+        # dropped block.
+        if PROMPT=$(_build_review_prompt "$TID" "$SUBJ" "$AGENT" "$FILES"); then
+            echo "    <spawn-prompt>"
+            printf '%s\n' "$PROMPT" | sed 's/^/      /'
+            echo "    </spawn-prompt>"
         else
-            "$V11_HOME/scripts/task-review" "$PROJECT" "$TID" --agent "$AGENT" --subject "$SUBJ" 2>/dev/null | sed 's/^/      /'
+            echo "    <drain-error>prompt construction failed for task $TID_X — see stderr</drain-error>"
         fi
-        echo "    </spawn-prompt>"
         echo "  </pending-review>"
     done
     echo ""

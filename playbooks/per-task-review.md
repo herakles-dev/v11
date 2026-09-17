@@ -6,6 +6,10 @@
 
 This is **distinct from wave-review / swarm-review**. Those are deep, multi-lens, repo-wide audits run at wave/system boundaries. This is a *lite*, single-pass, single-task check run after **every** completed task, scoped to that task's changed files only (~2-3k tokens). "Lite" is a hard requirement — never expand it into the 5-lens swarm.
 
+## Load trigger
+
+Phase 4r — marking a task completed and its `metadata.artifacts` is empty
+
 ---
 
 ## V11.21 Dual-Layer Workflow (canonical when `V11_AUTO_PAIR_REVIEW=on`)

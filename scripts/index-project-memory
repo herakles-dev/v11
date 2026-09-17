@@ -26,11 +26,11 @@ sys.path.insert(0, str(SCRIPT_DIR / "lib"))
 
 from chunker import chunk_markdown, content_hash
 
-SESSIONS_ROOT = os.environ.get("SESSIONS_ROOT", os.path.expanduser("~/sessions"))
-V11_WORKSPACE_ROOT = os.environ.get("V11_WORKSPACE_ROOT", os.path.expanduser("~"))
+SESSIONS_ROOT = os.environ.get("SESSIONS_ROOT", "/path/to/operator-home/sessions")
+HERCULES_ROOT = os.environ.get("HERCULES_ROOT", "/path/to/operator-home")
 TASK_STATE_DIR = os.environ.get(
     "TASK_STATE_DIR",
-    os.path.join(V11_WORKSPACE_ROOT, ".agent-metrics", "task-state"),
+    os.path.join(HERCULES_ROOT, ".agent-metrics", "task-state"),
 )
 
 # Source type mapping
@@ -48,7 +48,7 @@ def get_project_dir(project: str) -> Path:
     session_dir = Path(SESSIONS_ROOT) / project
     if session_dir.is_dir():
         return session_dir
-    project_dir = Path(V11_WORKSPACE_ROOT) / project
+    project_dir = Path(HERCULES_ROOT) / project
     if project_dir.is_dir():
         return project_dir
     return session_dir  # Default to sessions even if not exists yet

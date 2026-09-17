@@ -33,8 +33,8 @@ fi
 REGISTRY=""
 if [ -f "$SESSIONS_ROOT/$PROJECT/.formation-registry.json" ]; then
     REGISTRY="$SESSIONS_ROOT/$PROJECT/.formation-registry.json"
-elif [ -f "$V11_WORKSPACE_ROOT/$PROJECT/.formation-registry.json" ]; then
-    REGISTRY="$V11_WORKSPACE_ROOT/$PROJECT/.formation-registry.json"
+elif [ -f "$HERCULES_ROOT/$PROJECT/.formation-registry.json" ]; then
+    REGISTRY="$HERCULES_ROOT/$PROJECT/.formation-registry.json"
 fi
 
 # Find task state
@@ -119,8 +119,8 @@ if [ -n "$REGISTRY" ]; then
             FULL_DIR=""
             if [ -d "$SESSIONS_ROOT/$PROJECT/$dir" ]; then
                 FULL_DIR="$SESSIONS_ROOT/$PROJECT/$dir"
-            elif [ -d "$V11_WORKSPACE_ROOT/$PROJECT/$dir" ]; then
-                FULL_DIR="$V11_WORKSPACE_ROOT/$PROJECT/$dir"
+            elif [ -d "$HERCULES_ROOT/$PROJECT/$dir" ]; then
+                FULL_DIR="$HERCULES_ROOT/$PROJECT/$dir"
             fi
 
             if [ -n "$FULL_DIR" ] && [ -d "$FULL_DIR" ]; then
@@ -157,7 +157,7 @@ fi
 # System resources
 echo ""
 echo "Resources:"
-DISK_AVAIL=$(df -BG "${V11_WORKSPACE_ROOT:-$HOME/.v11}" 2>/dev/null | awk 'NR==2 {print $4}' | tr -d 'G' || echo "")
+DISK_AVAIL=$(df -BG "${HERCULES_ROOT:-$HOME}" 2>/dev/null | awk 'NR==2 {print $4}' | tr -d 'G' || echo "")
 MEM_PCT=$(free 2>/dev/null | awk 'NR==2 {printf "%.0f", $3/$2 * 100}' || echo "")
 
 DISK_STATUS="OK"

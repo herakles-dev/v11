@@ -307,7 +307,7 @@ def fold_families(
                 str(m.get("id")) for m in members if m.get("id") is not None
             ]
 
-        families.append({
+        family_record = {
             "family_id": cl["family_id"],
             # Both `subject` (drop-in compat for legacy consumers like
             # v11-resume-tasks) and `canonical_subject` (explicit family
@@ -327,7 +327,20 @@ def fold_families(
             # Preserve the canonical's original id so v11-resume-tasks can keep
             # an audit-trail of which raw task became the family canonical.
             "id": canon.get("id"),
-        })
+        }
+        # Propagate the staleness flags set by the upstream handoff staleness
+        # stage (scripts/handoff jq emits {status:"stale", stale:true,
+        # stale_reason:...} on an all-terminated group). The explicit field list
+        # above carries `status` through but would otherwise DROP the boolean
+        # `stale` + its `stale_reason` — the receiver-facing "VERIFY before
+        # re-creating, do not blind-resume" guidance. Emit only when the
+        # canonical actually carries them so non-stale families stay
+        # byte-identical for existing consumers.
+        if canon.get("stale") is not None:
+            family_record["stale"] = canon.get("stale")
+        if canon.get("stale_reason") is not None:
+            family_record["stale_reason"] = canon.get("stale_reason")
+        families.append(family_record)
 
     manifest = {
         "fold_version": "v1",

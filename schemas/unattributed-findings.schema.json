@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "unattributed-findings.schema.json",
+  "$id": "https://herakles.dev/v11/schemas/unattributed-findings.schema.json",
   "title": "V11.20 Unattributed Finding Line",
   "description": "Schema for ONE line of ~/.agent-metrics/unattributed-findings.jsonl. Written by wave-review-attribute and swarm-review-attribute when a finding cannot be mapped to a task via v11_resolve_file_to_task. Findings are NEVER dropped silently — they land here with a reason for investigation. Periodically reviewed; entries can be re-resolved retroactively if task-state catches up.",
   "type": "object",

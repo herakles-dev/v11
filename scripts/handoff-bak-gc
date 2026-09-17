@@ -1,0 +1,98 @@
+#!/usr/bin/env bash
+# handoff-bak-gc: one-shot cleanup of accumulated handoff-tasks.json.bak.*
+# files across all V11 sessions. Enforces the same 5-newest-per-session
+# retention cap as scripts/handoff:2538, sweeping historical violations
+# that pre-date v11.15.6/W5 (when the cap shipped) or accumulated during
+# guard-blocked handoff runs that skipped rotation.
+#
+# QR-6 (2026-09-01): audit found 32/138 sessions in violation, 1820 total
+# bak files vs 690 budget (2.6× over). Worst: archivestream-service (201),
+# HAM (219). See sessions/v11-handoff-quality-remediation/spec.md.
+#
+# Usage:
+#   scripts/handoff-bak-gc           # dry-run — report what would be deleted
+#   scripts/handoff-bak-gc --apply   # actually delete
+#   scripts/handoff-bak-gc --json    # machine-readable per-session tallies
+#
+# Env:
+#   V11_BAK_CAP=<int>       default 5 (keep this many newest per session)
+#   SESSIONS_ROOT=<path>    default $HOME/sessions
+#
+# Exit codes:
+#   0 = success (dry or apply)
+#   1 = usage error
+set -euo pipefail
+
+SESSIONS_ROOT="${SESSIONS_ROOT:-$HOME/sessions}"
+BAK_CAP="${V11_BAK_CAP:-5}"
+APPLY=0
+JSON=0
+
+for arg in "$@"; do
+    case "$arg" in
+        --apply) APPLY=1 ;;
+        --json)  JSON=1 ;;
+        -h|--help)
+            sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'
+            exit 0
+            ;;
+        *)
+            echo "Unknown arg: $arg (see --help)" >&2
+            exit 1
+            ;;
+    esac
+done
+
+if ! [ -d "$SESSIONS_ROOT" ]; then
+    echo "SESSIONS_ROOT not found: $SESSIONS_ROOT" >&2
+    exit 1
+fi
+
+TOTAL_SESSIONS=0
+VIOLATING_SESSIONS=0
+TOTAL_DELETED=0
+TOTAL_BAK_FILES=0
+declare -a REPORT_LINES=()
+
+# One session per directory containing a handoff-tasks.json (or bak files).
+while IFS= read -r sd; do
+    [ -n "$sd" ] || continue
+    project=$(basename "$sd")
+    # List bak files, sort newest first (lex sort works: YYYYMMDDHHMMSS suffix).
+    mapfile -t bak_files < <(find "$sd" -maxdepth 1 -name 'handoff-tasks.json.bak.*' -type f 2>/dev/null | sort -r)
+    count=${#bak_files[@]}
+    [ "$count" -eq 0 ] && continue
+    TOTAL_SESSIONS=$((TOTAL_SESSIONS + 1))
+    TOTAL_BAK_FILES=$((TOTAL_BAK_FILES + count))
+    if [ "$count" -gt "$BAK_CAP" ]; then
+        VIOLATING_SESSIONS=$((VIOLATING_SESSIONS + 1))
+        to_delete_count=$((count - BAK_CAP))
+        TOTAL_DELETED=$((TOTAL_DELETED + to_delete_count))
+        REPORT_LINES+=("$project: $count bak files → trim $to_delete_count (keep $BAK_CAP)")
+        if [ "$APPLY" -eq 1 ]; then
+            # Delete entries from index BAK_CAP onward (0-indexed).
+            for ((i = BAK_CAP; i < count; i++)); do
+                rm -f "${bak_files[$i]}" 2>/dev/null || true
+            done
+        fi
+    fi
+done < <(find "$SESSIONS_ROOT" -maxdepth 1 -mindepth 1 -type d 2>/dev/null)
+
+if [ "$JSON" -eq 1 ]; then
+    printf '{"total_sessions_with_bak":%d,"violating_sessions":%d,"total_bak_files":%d,"total_deleted":%d,"applied":%s,"bak_cap":%d}\n' \
+        "$TOTAL_SESSIONS" "$VIOLATING_SESSIONS" "$TOTAL_BAK_FILES" "$TOTAL_DELETED" \
+        "$([ "$APPLY" -eq 1 ] && echo true || echo false)" "$BAK_CAP"
+else
+    if [ "$APPLY" -eq 1 ]; then
+        echo "handoff-bak-gc: applied — deleted $TOTAL_DELETED file(s) across $VIOLATING_SESSIONS session(s)."
+    else
+        echo "handoff-bak-gc: DRY RUN — would delete $TOTAL_DELETED file(s) across $VIOLATING_SESSIONS session(s). Re-run with --apply."
+    fi
+    echo "handoff-bak-gc: total: $TOTAL_SESSIONS session(s) with bak files, $TOTAL_BAK_FILES total files, cap $BAK_CAP."
+    if [ "${#REPORT_LINES[@]}" -gt 0 ]; then
+        echo "handoff-bak-gc: per-session violations:"
+        for line in "${REPORT_LINES[@]}"; do
+            echo "  - $line"
+        done
+    fi
+fi

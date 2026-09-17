@@ -28,15 +28,15 @@ if not os.path.isdir(_scripts_lib):
         file=sys.stderr,
     )
 
-SESSIONS_ROOT = os.environ.get("SESSIONS_ROOT", os.path.expanduser("~/sessions"))
-V11_WORKSPACE_ROOT = os.environ.get("V11_WORKSPACE_ROOT", os.path.expanduser("~"))
+SESSIONS_ROOT = os.environ.get("SESSIONS_ROOT", "/path/to/operator-home/sessions")
+HERCULES_ROOT = os.environ.get("HERCULES_ROOT", os.path.expanduser("~"))
 
 
 def get_index_path(project: str) -> Path:
     """Find memory index for a project."""
     candidates = [
         Path(SESSIONS_ROOT) / project / ".memory-index" / "memory.sqlite",
-        Path(V11_WORKSPACE_ROOT) / project / ".memory-index" / "memory.sqlite",
+        Path(HERCULES_ROOT) / project / ".memory-index" / "memory.sqlite",
     ]
     for p in candidates:
         if p.exists():

@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "module-manifest.schema.json",
+  "$id": "https://herakles.dev/v11/schemas/module-manifest.schema.json",
   "title": "V11 Module Manifest",
   "description": "Self-describing manifest for a source code module. Addresses Dark Code Layer 2 (Structural Context): every module must declare its responsibility, dependencies, and consumers so that code is legible without re-reading it. Lives as sidecar MODULE.md or embedded JSON in module docstring.",
   "type": "object",

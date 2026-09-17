@@ -2,8 +2,8 @@
 # Generate CLAUDE.md section 14 from V11_AGENT_REGISTRY.json
 # Usage: ./scripts/generate-agent-roster
 
-V11_WORKSPACE_ROOT="${V11_WORKSPACE_ROOT:-$HOME/.v11}"
-REGISTRY="$V11_WORKSPACE_ROOT/v11/agents/V11_AGENT_REGISTRY.json"
+HERCULES_ROOT="${HERCULES_ROOT:-$HOME}"
+REGISTRY="$HERCULES_ROOT/v11/agents/V11_AGENT_REGISTRY.json"
 
 if [[ ! -f "$REGISTRY" ]]; then
     echo "Error: V11_AGENT_REGISTRY.json not found at $REGISTRY" >&2

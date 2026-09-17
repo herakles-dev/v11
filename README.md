@@ -18,6 +18,8 @@ treat it as a serious starting point rather than a finished product for every
 environment — see **Known limitations** below before you install it somewhere
 that matters.
 
+_Distribution sync status: tracks source protocol v11.44 "Orchestrator Quality"._
+
 ## What's actually in the box
 
 Six mechanisms make up the required loop; everything else in this repo is

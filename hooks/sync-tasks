@@ -108,6 +108,15 @@ PROJECT=""
 # Strategy 1: Explicit metadata.project in tool input
 PROJECT=$(printf '%s' "$V11_RAW_INPUT" | jq -r '.tool_input.metadata.project // ""' 2>/dev/null)
 [ "$PROJECT" = "null" ] && PROJECT=""
+# V11.35.6 (#15-F4): validate project name characters. Shell-unsafe names
+# break downstream scripts (jq, grep, path construction). Allowlist: alphanum,
+# hyphen, underscore, dot. Rollback: V11_PROJECT_NAME_GUARD=off
+if [ -n "$PROJECT" ] && [ "${V11_PROJECT_NAME_GUARD:-on}" = "on" ]; then
+    if ! printf '%s' "$PROJECT" | grep -qE '^[a-zA-Z0-9._-]{1,128}$'; then
+        echo "sync-tasks: REJECTED metadata.project=\"$PROJECT\" — contains disallowed characters (allowed: a-z A-Z 0-9 . _ -). Fix the TaskCreate call." >&2
+        PROJECT=""
+    fi
+fi
 PROJECT_SOURCE="metadata"
 # V11.15.3: remember whether the caller passed metadata.project explicitly.
 # Drives the Bug-E quick-win advisory below and distinguishes a clean Strategy
@@ -246,6 +255,28 @@ if [ -z "$PROJECT" ] && [ -n "$TASK_ID" ] && [ -n "$_v11_sess_project_cached" ];
     fi
 fi
 
+# Strategy 1.7 (V11.36 — #36-F1, W2-T9/T10): session's CWD is inside
+# $SESSIONS_ROOT/{project}/. Higher-confidence than Strategy 2 below — it's
+# derived from where the session is physically rooted, not from a globally
+# mutable active-project file that can drift across sessions. Runs AFTER
+# every task/session/ledger-identity strategy above (a task's own known home
+# always wins) and BEFORE Strategy 2 (a real directory beats an ambient
+# pointer file). Reuses the same sessions/{name}/ convention as
+# _v11_detect_project_from_path in lib/common.sh.
+#
+# Gate: V11_TASK_PROJECT_AUTODEFAULT (default on). =off skips this strategy
+# entirely, restoring pre-V11.36 behavior (falls through to Strategy 2 /
+# NO PROJECT HOME as before).
+if [ -z "$PROJECT" ] && [ -n "$V11_CWD" ] && [ "${V11_TASK_PROJECT_AUTODEFAULT:-on}" != "off" ]; then
+    if [[ "$V11_CWD" =~ ^$SESSIONS_ROOT/([^/]+) ]]; then
+        _v11_cwd_project="${BASH_REMATCH[1]}"
+        if printf '%s' "$_v11_cwd_project" | grep -qE '^[a-zA-Z0-9._-]{1,64}$'; then
+            PROJECT="$_v11_cwd_project"
+            PROJECT_SOURCE="cwd-sessions-match"
+        fi
+    fi
+fi
+
 # Strategy 2: Active project file (set by guard-task-state or previous sync)
 # SEC-C-02: sanitized read — rejects path-traversal / metacharacter payloads
 # Last resort only: ambient + globally mutable. Strategies 1 and 1.5 run first
@@ -255,8 +286,39 @@ if [ -z "$PROJECT" ]; then
     PROJECT_SOURCE="active-project-fallback"
 fi
 
-# No project found -> nothing to sync
-[ -z "$PROJECT" ] && exit 0
+# No project found -> nothing to sync.
+# H4 (improvements/12): this used to be a BARE silent `exit 0`, and it is the exact path that
+# produced "the task returns success, lists in TaskList, but never reaches
+# sessions/{project}/.task-state.json — with no error anywhere". A malformed TaskCreate (leaked
+# args landing in the description string) loses metadata.project; every resolution strategy then
+# misses; and the hook exited silently. The orchestrator believed it had filed a task, while
+# guard-write-gates correctly reported "No task in_progress" — two views disagreeing with no
+# signal to tell "the gate is wrong" from "I never actually filed it".
+# Cost when it bit: 3 occurrences in one session, two agents blocked mid-flight, one full
+# re-dispatch, ~150k tokens of agent research nearly discarded.
+# Fail loud instead. Still exit 0 (never block task creation over an attribution problem) —
+# but never again exit SILENTLY on a task-mutating event.
+if [ -z "$PROJECT" ]; then
+    case "$V11_TOOL_NAME" in
+        TaskCreate|TaskUpdate)
+            echo "sync-tasks: ⚠ NO PROJECT HOME — ${V11_TOOL_NAME} for task #${TASK_ID:-?} could not be attributed to any project." >&2
+            echo "  The task will exist in TaskList but will NOT appear in any sessions/{project}/.task-state.json," >&2
+            echo "  so guard-write-gates will report 'No task in_progress' even though you filed it." >&2
+            echo "  Cause: metadata.project absent AND no session binding AND no active-project fallback resolved." >&2
+            echo "  Remedy: re-issue with an explicit metadata.project (a malformed call can silently drop it)." >&2
+            # H4 model-visible advisory (task #14): the stderr warnings above are
+            # operator/log-visible only — the orchestrator MODEL never sees stderr.
+            # Reuse the same additionalContext JSON shape as the S1-B1 emitter
+            # (grep -n additionalContext hooks/sync-tasks) so this failure mode is
+            # surfaced to the model too, not just the terminal.
+            _V11_H4_MSG="sync-tasks: NO PROJECT HOME — ${V11_TOOL_NAME} for task #${TASK_ID:-?} could not be attributed to any project (metadata.project missing/unresolved). It will NOT appear in any sessions/{project}/.task-state.json. Re-issue with an explicit metadata.project."
+            jq -n -c --arg ctx "$_V11_H4_MSG" \
+                '{hookSpecificOutput: {hookEventName: "PostToolUse", additionalContext: $ctx}}' \
+                2>/dev/null || true
+            ;;
+    esac
+    exit 0
+fi
 
 # M3 (meta-improvement 2026-05): warn when TaskCreate falls back to active-project.
 # This is the most common cross-session contamination vector: a task created in
@@ -264,8 +326,18 @@ fi
 # is set, polluting that project's task list. The warning makes the implicit
 # attribution visible. TaskUpdate/TaskList don't typically carry metadata in
 # the input, so we only warn on TaskCreate to keep noise low.
-if [ "$V11_TOOL_NAME" = "TaskCreate" ] && [ "$PROJECT_SOURCE" = "active-project-fallback" ]; then
-    echo "sync-tasks: TaskCreate without metadata.project — implicitly attributed to '$PROJECT' via active-project. Pass metadata.project explicitly to be safe." >&2
+if [ "$V11_TOOL_NAME" = "TaskCreate" ] \
+   && { [ "$PROJECT_SOURCE" = "active-project-fallback" ] || [ "$PROJECT_SOURCE" = "cwd-sessions-match" ]; }; then
+    if [ "${V11_TASK_PROJECT_AUTODEFAULT:-on}" != "off" ]; then
+        # V11.36 (#36-F1): downgraded from WARN — a fallback strategy DID
+        # successfully resolve the project, so this is informational, not a
+        # discipline slip. Rollback: V11_TASK_PROJECT_AUTODEFAULT=off restores
+        # the original WARN text below (and disables Strategy 1.7, so this
+        # branch only ever sees active-project-fallback again).
+        echo "sync-tasks: INFO — metadata.project auto-defaulted to '$PROJECT' via ${PROJECT_SOURCE} (TaskCreate without explicit metadata.project). Pass metadata.project explicitly to be safe." >&2
+    else
+        echo "sync-tasks: TaskCreate without metadata.project — implicitly attributed to '$PROJECT' via active-project. Pass metadata.project explicitly to be safe." >&2
+    fi
 fi
 
 # V11.15.3 (Bug E quick-win): a terminal completed TaskUpdate is the moment
@@ -277,7 +349,15 @@ fi
 # TaskUpdate, not just TaskCreate).
 if [ "$V11_TOOL_NAME" = "TaskUpdate" ] && [ "$TASK_STATUS" = "completed" ] \
    && [ -z "$EXPLICIT_METADATA_PROJECT" ]; then
-    echo "sync-tasks: ADVISORY — TaskUpdate(completed) for task #${TASK_ID:-?} without metadata.project; resolved to '$PROJECT' via ${PROJECT_SOURCE}. Artifact + ledger writes ride this event — pass metadata.project explicitly on terminal completions (CLAUDE.md §1, Bug E)." >&2
+    # V11.36 (#36-F1): reaching this point means a fallback strategy DID
+    # resolve PROJECT (an unresolved PROJECT exits earlier at the NO PROJECT
+    # HOME block) — downgrade WARN/ADVISORY to INFO. Rollback:
+    # V11_TASK_PROJECT_AUTODEFAULT=off restores the original ADVISORY text.
+    if [ "${V11_TASK_PROJECT_AUTODEFAULT:-on}" != "off" ]; then
+        echo "sync-tasks: INFO — TaskUpdate(completed) for task #${TASK_ID:-?} without metadata.project; resolved to '$PROJECT' via ${PROJECT_SOURCE}. Artifact + ledger writes ride this event — pass metadata.project explicitly on terminal completions (CLAUDE.md §1, Bug E)." >&2
+    else
+        echo "sync-tasks: ADVISORY — TaskUpdate(completed) for task #${TASK_ID:-?} without metadata.project; resolved to '$PROJECT' via ${PROJECT_SOURCE}. Artifact + ledger writes ride this event — pass metadata.project explicitly on terminal completions (CLAUDE.md §1, Bug E)." >&2
+    fi
 fi
 
 # --- V11.8 (S1-7, S1-8): STR candidate cache + advisory helper ---
@@ -338,9 +418,15 @@ _v11_str_advisory() {
     return 1  # caller uses this to bump a counter
 }
 
-# Persist active project for downstream hooks
-mkdir -p "$(dirname "$ACTIVE_PROJECT_FILE")"
-printf '%s\n' "$PROJECT" > "$ACTIVE_PROJECT_FILE"
+# Persist active project for downstream hooks.
+# MUST go through v11_write_active_project (common.sh) — it validates the project name and
+# performs the session-scoped dual-write. Writing $ACTIVE_PROJECT_FILE directly here bypassed
+# session scoping on TaskCreate|TaskUpdate|TaskList|TaskGet, the highest-frequency event in the
+# system: concurrent sessions overwrote each other's global pointer, so downstream autonomy
+# gating attributed edits to whichever project a sibling session touched last.
+# Measured before fix: 1972/7367 (26.8%) file-mutating edits resolved via the global fallback,
+# 1504 credited to the wrong project, 602 of those auto-approved at A4/A5. (improvements/15)
+v11_write_active_project "$PROJECT"
 
 # --- Load or initialize task state ---
 # V11.13: per-session ownership. Source of truth is now
@@ -916,6 +1002,31 @@ case "$V11_TOOL_NAME" in
                 _AP_PROJ_M=$(printf '%s' "$_AP_PARENT_META" | jq -r '.project // ""' 2>/dev/null || true)
                 [ -z "$_AP_PROJ_M" ] && _AP_PROJ_M="$PROJECT"
 
+                # v11.42 W2-T1 (RC3): pair-ID durability. Source seq from durable
+                # ledger max (avoids STATE_FILE-reset regression where per-session
+                # counter resets to 0 while sid8 is unchanged → pair_<sid8>_1
+                # collision). Belt+braces: append _<rand6hex> suffix ALWAYS,
+                # eliminating collision from the legacy-cli sid8 fallback too.
+                # Old bare `pair_<sid8>_<N>` IDs stay valid (opaque string match).
+                # Rollback: V11_PAIR_ID_DURABLE=off restores per-STATE counter,
+                # no suffix (pre-v11.42 behavior; retains collision risk).
+                _AP_DURABLE_SEQ=""
+                _AP_RAND_SUFFIX=""
+                if [ "${V11_PAIR_ID_DURABLE:-on}" != "off" ]; then
+                    _AP_RAND_SUFFIX=$(head -c3 /dev/urandom 2>/dev/null | od -An -tx1 2>/dev/null | tr -d ' \n' || echo "")
+                    _AP_LEDGER_FILE="$METRICS_DIR/ledger/${_AP_PROJ_M:-$PROJECT}.jsonl"
+                    _AP_SID8="${SESSION_UUID:0:8}"
+                    if [ -f "$_AP_LEDGER_FILE" ] && [ -n "$_AP_SID8" ]; then
+                        # Scan for existing pair_<sid8>_<N>[_hex] task_ids in the ledger.
+                        # Extract the N portion (may or may not have _hex suffix), take max.
+                        _AP_DURABLE_SEQ=$(grep -oE "\"task_id\":\"pair_${_AP_SID8}_[0-9]+" "$_AP_LEDGER_FILE" 2>/dev/null \
+                            | grep -oE '[0-9]+$' \
+                            | sort -n \
+                            | tail -1)
+                    fi
+                    [ -z "$_AP_DURABLE_SEQ" ] && _AP_DURABLE_SEQ=0
+                fi
+
                 _AP_NEW_STATE=$(printf '%s' "$STATE" | jq \
                     --arg parent_id "$TASK_ID" \
                     --arg parent_subj "${_AP_PARENT_SUBJ:-}" \
@@ -925,7 +1036,9 @@ case "$V11_TOOL_NAME" in
                     --arg proj_src "$PROJECT_SOURCE" \
                     --argjson live_reconcile "$([ "${V11_HANDOFF_LIVE_RECONCILE:-on}" != "off" ] && echo 'true' || echo 'false')" \
                     --arg now "$_AP_NOW" \
-                    --arg sid "$SESSION_UUID" '
+                    --arg sid "$SESSION_UUID" \
+                    --arg durable_seq "$_AP_DURABLE_SEQ" \
+                    --arg rand_suffix "$_AP_RAND_SUFFIX" '
                     # Allocate counter (0 when field absent → first pair is pair_1).
                     # Collision fix: the counter is per-session STATE, so two concurrent
                     # sessions on the same project could each mint bare "pair_1", and
@@ -933,9 +1046,15 @@ case "$V11_TOOL_NAME" in
                     # task_id — silently colliding/misattributing review pairing. Scope
                     # the ID to this session via an 8-char SESSION_UUID fragment (opaque
                     # string ID; no consumer parses the numeric suffix positionally).
+                    # v11.42 W2-T1: seq sourced from durable ledger max in durable mode
+                    # (bash pre-compute); STATE counter still bumped for backwards compat
+                    # + as fallback when durable mode off. Rand suffix appended in durable
+                    # mode for belt+braces vs legacy-cli sid8 collisions.
                     ._v11_pair_seq = (._v11_pair_seq // 0) + 1
                     | ($sid | .[0:8]) as $sid_frag
-                    | ("pair_" + $sid_frag + "_" + (._v11_pair_seq | tostring)) as $pair_id
+                    | (if $durable_seq != "" then ($durable_seq | tonumber) + 1 else ._v11_pair_seq end) as $pair_seq
+                    | (if $rand_suffix != "" then "_" + $rand_suffix else "" end) as $suffix_part
+                    | ("pair_" + $sid_frag + "_" + ($pair_seq | tostring) + $suffix_part) as $pair_id
                     # Stamp review_task_id on parent
                     | .open_tasks[$parent_id].metadata.review_task_id = $pair_id
                     # Synthesize sibling entry
@@ -1537,7 +1656,7 @@ case "$V11_TOOL_NAME" in
                                 # formula exactly (file/line empty, error_id sentinel below).
                                 # Never fails the hook. Rollback: V11_SELF_REVIEW_ACTUATE=off.
                                 if [ "${V11_SELF_REVIEW_ACTUATE:-on}" != "off" ]; then
-                                    _SRA_METRICS="${METRICS_DIR:-$V11_WORKSPACE_ROOT/.agent-metrics}"
+                                    _SRA_METRICS="${METRICS_DIR:-$HERCULES_ROOT/.agent-metrics}"
                                     mkdir -p "$_SRA_METRICS" 2>/dev/null
                                     _SRA_KEY=$(printf '%s|%s|%s|%s|%s' "${PROJECT:-}" "$TASK_ID" "" "" "missing_self_review" \
                                         | sha256sum 2>/dev/null | awk '{print $1}' || echo "")
@@ -1609,7 +1728,7 @@ case "$V11_TOOL_NAME" in
                                 _SR_AGENT=$(printf '%s' "$STATE" | jq -r --arg id "$TASK_ID" '.recommended_agents[$id] // empty' 2>/dev/null)
                             fi
                             [ -z "$_SR_AGENT" ] || [ "$_SR_AGENT" = "null" ] && _SR_AGENT="unknown"
-                            _SR_METRICS="${METRICS_DIR:-$V11_WORKSPACE_ROOT/.agent-metrics}"
+                            _SR_METRICS="${METRICS_DIR:-$HERCULES_ROOT/.agent-metrics}"
                             mkdir -p "$_SR_METRICS" 2>/dev/null
                             # Compute attribution key the same way as the bash helper.
                             # File/line empty; error_id=malformed_self_review (sentinel).
@@ -1653,6 +1772,110 @@ case "$V11_TOOL_NAME" in
                         fi
                     fi
                 fi
+
+                # ── Improvement 16: artifact-on-complete advisory (audit-class) ──
+                # Read-only/audit tasks (Explore sweeps, verify-status checks) can
+                # complete with nothing checkable persisted. v1 of this spec proposed
+                # a `block` mode; a 5-lens swarm review found sync-tasks (PostToolUse,
+                # always exits 0 — see file header) structurally cannot reject a
+                # completion, so this ships warn-only. Reuses the existing reviewable-
+                # classifier's data (ARTIFACTS/REVIEW/ACTIVE_SUBJECT already parsed
+                # above) rather than a second classification pass.
+                # Rollback: V11_ARTIFACT_ON_COMPLETE=off.
+                if [ "${V11_ARTIFACT_ON_COMPLETE:-warn}" != "off" ] && [ "$_V21_SYNTHETIC" != "true" ]; then
+                    _AOC_AGENT=$(printf '%s' "$V11_RAW_INPUT" | jq -r '.tool_input.metadata.agent // empty' 2>/dev/null || true)
+                    _AOC_TASK_CLASS=$(printf '%s' "$V11_RAW_INPUT" | jq -r '.tool_input.metadata.task_class // empty' 2>/dev/null || true)
+                    _AOC_CLASS="no"
+                    # Explicit list, not a glob: adversarial-lite-fixer is write-path
+                    # (always carries files_changed) and must not classify audit-class
+                    # (back-compat MEDIUM finding, swarm review 2026-07-29).
+                    case "$_AOC_AGENT" in
+                        Explore|adversarial-reviewer|adversarial-lite-reviewer|coherence-reviewer) _AOC_CLASS="yes" ;;
+                    esac
+                    case "${ACTIVE_SUBJECT:-}" in
+                        Audit*|Verify*|Inventory*|Map*|Find*|Investigate*) _AOC_CLASS="yes" ;;
+                    esac
+                    # metadata.task_class overrides in both directions.
+                    case "$_AOC_TASK_CLASS" in
+                        audit) _AOC_CLASS="yes" ;;
+                        exempt) _AOC_CLASS="exempt" ;;
+                    esac
+
+                    _AOC_METRICS="${METRICS_DIR:-$HERCULES_ROOT/.agent-metrics}"
+                    _AOC_LEDGER="$_AOC_METRICS/ledger/${PROJECT:-_unbound}.jsonl"
+
+                    if [ "$_AOC_CLASS" = "exempt" ]; then
+                        # Exempt is audited, not silent (completeness HIGH, swarm
+                        # review): an unaudited escape hatch in an audit-trail
+                        # mechanism is self-defeating.
+                        if [ -n "$PROJECT" ]; then
+                            mkdir -p "$(dirname "$_AOC_LEDGER")" 2>/dev/null
+                            # Timestamp-free key (sentinel style, matching the
+                            # missing_self_review/malformed_self_review keys
+                            # elsewhere in this file): a genuine retry of the SAME
+                            # underlying completion gets a fresh $NOW, so including
+                            # it here would defeat the dedup it's meant to provide.
+                            _AOC_KEY=$(printf '%s|%s|%s' "$PROJECT" "$TASK_ID" "artifact_exempt" | sha256sum 2>/dev/null | awk '{print $1}' || echo "")
+                            _AOC_DUP=""
+                            [ -f "$_AOC_LEDGER" ] && _AOC_DUP=$(grep -F "\"artifact_exempt\"" "$_AOC_LEDGER" 2>/dev/null | grep -F "\"$_AOC_KEY\"" | head -1)
+                            if [ -z "$_AOC_DUP" ]; then
+                                jq -cn --arg ts "$NOW" --arg tid "$TASK_ID" --arg proj "$PROJECT" --arg key "$_AOC_KEY" \
+                                    '{v:1, ts:$ts, ev:"artifact_exempt", task_id:$tid, project:$proj, attribution_key:$key}' \
+                                    2>/dev/null | (flock -x 9; cat >> "$_AOC_LEDGER") 9>"$_AOC_LEDGER.lock" 2>/dev/null || true
+                            fi
+                        fi
+                    elif [ "$_AOC_CLASS" = "yes" ]; then
+                        _AOC_FC=$(printf '%s' "${ARTIFACTS:-}" | jq -r '(.files_changed // []) | length' 2>/dev/null || echo 0)
+                        _AOC_SUM=$(printf '%s' "${ARTIFACTS:-}" | jq -r '.summary // ""' 2>/dev/null || true)
+                        [ "$_AOC_SUM" = "null" ] && _AOC_SUM=""
+                        _AOC_REV_SUM=$(printf '%s' "${REVIEW:-}" | jq -r '.summary // ""' 2>/dev/null || true)
+                        [ "$_AOC_REV_SUM" = "null" ] && _AOC_REV_SUM=""
+                        _AOC_SR_SUM=$(printf '%s' "$V11_RAW_INPUT" | jq -r '(.tool_input.metadata.artifacts.self_review.summary // .tool_input.metadata.artifacts.self_review // "") | tostring' 2>/dev/null || true)
+                        [ "$_AOC_SR_SUM" = "null" ] && _AOC_SR_SUM=""
+                        [[ "$_AOC_FC" =~ ^[0-9]+$ ]] || _AOC_FC=0
+
+                        if [ "$_AOC_FC" -eq 0 ] && [ -z "$_AOC_SUM" ] && [ -z "$_AOC_REV_SUM" ] && [ -z "$_AOC_SR_SUM" ]; then
+                            # Absence case: nothing checkable persisted at all.
+                            _AOC_MSG="sync-tasks: task #$TASK_ID completed as audit-class (agent=${_AOC_AGENT:-subject-match}) with no artifact evidence (files_changed/summary/review.summary/self_review all empty). Persist a checkable deliverable, or set metadata.task_class=\"exempt\" if intentional (improvement 16)."
+                            echo "⚠ $_AOC_MSG" >&2
+                            _V11_ARTIFACT_CTX="$_AOC_MSG"
+                            if [ -n "$PROJECT" ]; then
+                                mkdir -p "$(dirname "$_AOC_LEDGER")" 2>/dev/null
+                                # Timestamp-free key — see the exempt-branch comment above.
+                                _AOC_KEY=$(printf '%s|%s|%s' "$PROJECT" "$TASK_ID" "artifact_warn" | sha256sum 2>/dev/null | awk '{print $1}' || echo "")
+                                _AOC_DUP=""
+                                [ -f "$_AOC_LEDGER" ] && _AOC_DUP=$(grep -F "\"artifact_warn\"" "$_AOC_LEDGER" 2>/dev/null | grep -F "\"$_AOC_KEY\"" | head -1)
+                                if [ -z "$_AOC_DUP" ]; then
+                                    jq -cn --arg ts "$NOW" --arg tid "$TASK_ID" --arg proj "$PROJECT" --arg key "$_AOC_KEY" \
+                                        '{v:1, ts:$ts, ev:"artifact_warn", task_id:$tid, project:$proj, attribution_key:$key}' \
+                                        2>/dev/null | (flock -x 9; cat >> "$_AOC_LEDGER") 9>"$_AOC_LEDGER.lock" 2>/dev/null || true
+                                fi
+                            fi
+                        else
+                            # §3 provenance nudge: independent of the absence case above —
+                            # fires on whichever evidence text exists when it reads as
+                            # numbers-without-sources. Advisory-only, no ledger row.
+                            _AOC_NUDGE_TEXT="${_AOC_SUM:-${_AOC_REV_SUM:-$_AOC_SR_SUM}}"
+                            if [ -n "$_AOC_NUDGE_TEXT" ]; then
+                                _AOC_NUDGE=$(printf '%s' "$_AOC_NUDGE_TEXT" | python3 -c '
+import re, sys
+text = sys.stdin.read()
+num_re = re.compile(r"(?<![\w/.])\d[\d,.]*%?(?![\w/])")
+path_re = re.compile(r"[\w.-]+/[\w./-]+|\w+\.(py|sh|md|json|jsonl)\b")
+nums = num_re.findall(text)
+paths = path_re.findall(text)
+print("yes" if (len(nums) >= 3 and len(paths) == 0) else "no")
+' 2>/dev/null || echo "no")
+                                if [ "$_AOC_NUDGE" = "yes" ]; then
+                                    _AOC_MSG="sync-tasks: task #$TASK_ID (audit-class) evidence reads as numbers without sources — cite the file each came from (improvement 16)."
+                                    echo "⚠ $_AOC_MSG" >&2
+                                    _V11_ARTIFACT_CTX="$_AOC_MSG"
+                                fi
+                            fi
+                        fi
+                    fi
+                fi
+
                 if [ -n "$REVIEW" ] && [ "$REVIEW" != "null" ]; then
                     # agent_id: review.agent_id → task-state active_agent_id → 'unknown'
                     RV_AGENT=$(printf '%s' "$REVIEW" | jq -r '.agent_id // empty' 2>/dev/null || true)
@@ -1751,7 +1974,7 @@ case "$V11_TOOL_NAME" in
                     V11_REVIEW="$REVIEW" V11_RV_META="$RV_META" V11_RV_AGENT="$RV_AGENT" \
                     V11_RV_TRACE="$RV_TRACE" V11_RV_NOW="$NOW" V11_RV_TASK="$TASK_ID" \
                     V11_RV_REVIEW_OF="$_V21_REVIEW_OF" \
-                    V11_RV_PROJECT="${PROJECT:-}" V11_RV_METRICS="${METRICS_DIR:-$V11_WORKSPACE_ROOT/.agent-metrics}" \
+                    V11_RV_PROJECT="${PROJECT:-}" V11_RV_METRICS="${METRICS_DIR:-$HERCULES_ROOT/.agent-metrics}" \
                     V11_RV_SESSIONS="${SESSIONS_ROOT:-}" \
                     V11_RV_CALLER_KIND="$RV_CALLER_KIND" \
                     V11_RV_LAYER="${RV_LAYER:-lite}" \
@@ -1926,6 +2149,12 @@ for e in errors:
     ek = os.environ.get("V11_RV_EXECUTOR_KIND") or ""
     if ek:
         line["executor_kind"] = ek
+    # v11.44: additive cause_kind. A lite/wave review finding is a defect in the
+    # agent's PRODUCED work -> execution_defect (as opposed to a briefing_defect,
+    # which grade-briefs attributes to the orchestrator's brief). Write-time only,
+    # going forward; never mutates historical rows. V11_BRIEF_REVIEW=off omits it.
+    if os.environ.get("V11_BRIEF_REVIEW") != "off":
+        line["cause_kind"] = "execution_defect"
     err_lines.append(line)
 err_path = mdir / "agent-errors.jsonl"
 append_atomic(err_path, err_lines)
@@ -2673,7 +2902,7 @@ PYEOF
                 # Run the discipline check (idempotent, writes .handoff-discipline-log.json)
                 _T3_DC="$V11_HOME/scripts/handoff-discipline-check"
                 if [ -x "$_T3_DC" ]; then
-                    V11_WORKSPACE_ROOT="$V11_WORKSPACE_ROOT" \
+                    HERCULES_ROOT="$HERCULES_ROOT" \
                     SESSIONS_ROOT="$SESSIONS_ROOT" \
                     METRICS_DIR="$METRICS_DIR" \
                     timeout 10 "$_T3_DC" "$PROJECT" >/dev/null 2>&1 || true
@@ -2954,10 +3183,12 @@ fi
 # S1-B1: captured into a variable instead of printed directly — see the
 # stdout-arbitration block below for why (mixing plain text with the JSON
 # hookSpecificOutput emission on the same stdout stream is invalid).
-_V11_CTX_MSG="$(python3 - "$V11_HOME" <<'PYEOF' 2>/dev/null
+_V11_CTX_MSG="$(python3 - "$V11_HOME" "${V11_SESSION_ID:-legacy-cli}" <<'PYEOF' 2>/dev/null
 import sys; sys.path.insert(0, sys.argv[1] + '/scripts/lib')
 from context_tracker import ContextTracker
-t = ContextTracker()
+# V11.35.1 fix: session-scoped state file (sessions/$V11_SESSION_ID/context-estimate.json)
+# instead of one un-scoped global file every session on the host shared forever.
+t = ContextTracker(session_id=sys.argv[2])
 t.record_event('task')
 e = t.get_estimate()
 if e['threshold'] == 'warning':
@@ -2993,6 +3224,18 @@ PYEOF
 if [ "$V11_TOOL_NAME" = "TaskCreate" ] && [ -n "${_V11_ADVISORY_CTX:-}" ] \
    && [ "${V11_PRESCOPE_CONTEXT:-on}" != "off" ]; then
     _V11_CTX_FULL="$_V11_ADVISORY_CTX"
+    if [ -n "$_V11_CTX_MSG" ]; then
+        _V11_CTX_FULL="${_V11_CTX_FULL}
+${_V11_CTX_MSG}"
+    fi
+    jq -n -c --arg ctx "$_V11_CTX_FULL" \
+        '{hookSpecificOutput: {hookEventName: "PostToolUse", additionalContext: $ctx}}' \
+        2>/dev/null || true
+elif [ "$V11_TOOL_NAME" = "TaskUpdate" ] && [ -n "${_V11_ARTIFACT_CTX:-}" ]; then
+    # Improvement 16: audit-class completion advisory, same JSON shape as the
+    # TaskCreate branch above. Own branch (not folded into _V11_ADVISORY_CTX,
+    # which is TaskCreate-scoped) since it fires on a different event.
+    _V11_CTX_FULL="$_V11_ARTIFACT_CTX"
     if [ -n "$_V11_CTX_MSG" ]; then
         _V11_CTX_FULL="${_V11_CTX_FULL}
 ${_V11_CTX_MSG}"

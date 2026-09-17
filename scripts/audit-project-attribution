@@ -1,0 +1,273 @@
+#!/usr/bin/env python3
+"""Measure project-attribution correctness in the autonomy audit trail.
+
+WHY THIS EXISTS (improvement 15 F0): the numbers describing the active-project
+attribution leak were originally computed by a throwaway one-liner. Two
+independent reviewers then recomputed them and got different answers — partly
+real drift (the log grows while you measure it), partly methodology (which rows
+count as "file-bearing"). A design doc cannot cite counts that nobody can
+regenerate, so this is the committed oracle. Quote its output, not a one-off.
+
+WHAT IT MEASURES
+
+For every audit row carrying a real filesystem path, recompute the project the
+way `_v11_detect_project_from_path` (hooks/lib/common.sh) would from the path
+alone, then compare against the `project` the hook actually recorded:
+
+  match       — path-derived project == recorded project
+  mismatch    — path names a project, but a different one was recorded
+  fallback    — path names NO project (infra dir / dotdir / outside $HOME), so
+                the recorded value came from the active-project fallback chain.
+                These are the population AT RISK, not proven errors.
+
+It also reports BORROWED AUTONOMY: rows where the recorded project disagrees
+with the path-derived one AND the row carries an autonomy_level. Those are the
+serious cases — the gating autonomy level was taken from another project, so
+the same edit could be authorized at A1 or at A5 depending only on which
+session last wrote the shared global file.
+
+USAGE
+  scripts/audit-project-attribution                # human table
+  scripts/audit-project-attribution --json         # machine-readable
+  scripts/audit-project-attribution --session SID  # restrict to one session
+  scripts/audit-project-attribution --under ~/v11  # restrict to a path prefix
+
+EXIT CODES
+  0  clean (no mismatches, no borrowed autonomy)
+  1  mismatches or borrowed-autonomy rows present
+  2  audit log unreadable
+"""
+import argparse
+import json
+import os
+import re
+import sys
+from collections import Counter
+
+HR = os.environ.get("HERCULES_ROOT", "/path/to/operator-home")
+METRICS = os.environ.get("METRICS_DIR", f"{HR}/.agent-metrics")
+AUDIT = f"{METRICS}/autonomy-audit.jsonl"
+SESSIONS = os.environ.get("SESSIONS_ROOT", f"{HR}/sessions")
+
+# Mirrors NON_PROJECTS in hooks/lib/common.sh. Keep in sync — a drift here
+# silently changes what counts as "at risk".
+NON_PROJECTS = {
+    "v11", "v10", "v9", "v8", "v7", "v6_Ultra", "sessions", "scripts",
+    "system-apps-config", "portfolio-platform", ".claude", ".agent-metrics",
+    ".agent-registry", ".secrets", ".archive", ".cache", ".local", ".npm",
+    ".nvm", ".config", ".ssh", "snap", "node_modules", "deploy.sh",
+}
+
+
+def implied_project(path):
+    """Return (project|None, reason). None => the path alone names no project.
+    15-F3: NON_PROJECTS dirs now return the dir name with reason 'non-project',
+    matching _v11_detect_project_for_attribution in common.sh."""
+    if not path or not path.startswith("/"):
+        return None, "not-a-path"
+    m = re.match(rf"^{re.escape(SESSIONS)}/([^/]+)", path)
+    if m:
+        return m.group(1), "sessions"
+    m = re.match(rf"^{re.escape(HR)}/portfolio-platform/apps/([^/]+)", path)
+    if m:
+        return m.group(1), "portfolio-app"
+    m = re.match(rf"^{re.escape(HR)}/([^/]+)", path)
+    if m:
+        cand = m.group(1)
+        if cand in NON_PROJECTS:
+            return cand, f"non-project"
+        return cand, "hercules-root"
+    return None, "outside-hercules"
+
+
+def main():
+    ap = argparse.ArgumentParser(add_help=True)
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument("--session", help="restrict to one session_id (prefix ok)")
+    ap.add_argument("--under", help="restrict to rows whose path starts with this prefix")
+    args = ap.parse_args()
+
+    under = os.path.expanduser(args.under) if args.under else None
+
+    total = with_path = match = mismatch = fallback = 0
+    fb_reason = Counter()
+    mismatch_pairs = Counter()
+    inflated = Counter()
+    deflated = Counter()
+    borrowed = []          # rows where a BORROWED autonomy level gated the edit
+    borrowed_levels = Counter()
+    infra_borrowed = Counter()   # infra path credited to a foreign project
+    infra_levels = Counter()
+    infra_examples = []
+    dates = []
+
+    try:
+        fh = open(AUDIT, encoding="utf-8", errors="replace")
+    except OSError as e:
+        print(f"FATAL: cannot read {AUDIT}: {e}", file=sys.stderr)
+        return 2
+
+    with fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+            sid = row.get("session_id") or ""
+            if args.session and not sid.startswith(args.session):
+                continue
+            total += 1
+
+            ts = row.get("timestamp") or ""
+            if ts:
+                dates.append(ts[:10])
+
+            path = row.get("file") or row.get("file_path") or ""
+            # Bash rows park the whole COMMAND TEXT in `file`, and a command
+            # often begins with an absolute path (`/path/to/operator-home/bin/x ...`),
+            # so startswith("/") alone lets commands masquerade as file paths —
+            # that false positive is what produced a spurious "4 mismatches"
+            # figure during the improvement-15 review. Require a file-mutating
+            # action AND a whitespace-free path.
+            action = (row.get("action") or row.get("tool") or "")
+            if action not in ("Edit", "Write", "NotebookEdit"):
+                continue
+            if not path.startswith("/") or re.search(r"\s", path):
+                continue
+            if under and not path.startswith(under):
+                continue
+            with_path += 1
+
+            recorded = row.get("project") or ""
+            imp, reason = implied_project(path)
+
+            if imp is None:
+                fallback += 1
+                fb_reason[reason] += 1
+                # An `infra:X` path lives under X's own tree. If the row was
+                # credited to some OTHER project, the fallback chain borrowed a
+                # foreign binding — and with it, that project's autonomy level
+                # gated this edit. This is the serious class: the same edit can
+                # be authorized at A1 or A5 depending only on which session
+                # last wrote the shared global file.
+                if reason.startswith("infra:"):
+                    owner = reason.split(":", 1)[1]
+                    if recorded and recorded != owner:
+                        lvl = row.get("autonomy_level")
+                        infra_borrowed[f"{owner} -> {recorded}"] += 1
+                        if lvl is not None:
+                            infra_levels[f"A{lvl}"] += 1
+                            if len(infra_examples) < 25:
+                                infra_examples.append({
+                                    "ts": ts, "session": sid[:8], "path": path,
+                                    "path_owner": owner, "recorded_project": recorded,
+                                    "autonomy_level": lvl,
+                                    "approval_method": row.get("approval_method"),
+                                })
+                continue
+            if imp == recorded:
+                match += 1
+                continue
+
+            mismatch += 1
+            mismatch_pairs[f"{imp} -> {recorded or '(null)'}"] += 1
+            inflated[recorded or "(null)"] += 1
+            deflated[imp] += 1
+            lvl = row.get("autonomy_level")
+            if lvl is not None:
+                borrowed_levels[f"A{lvl}"] += 1
+                if len(borrowed) < 25:
+                    borrowed.append({
+                        "ts": ts, "session": sid[:8], "path": path,
+                        "recorded_project": recorded or None,
+                        "path_project": imp,
+                        "autonomy_level": lvl,
+                        "approval_method": row.get("approval_method"),
+                    })
+
+    decidable = match + mismatch
+    result = {
+        "audit_log": AUDIT,
+        "date_range": [min(dates), max(dates)] if dates else None,
+        "rows_scanned": total,
+        "rows_with_real_path": with_path,
+        "decidable_by_path": decidable,
+        "match": match,
+        "mismatch": mismatch,
+        "mismatch_pct": round(100.0 * mismatch / decidable, 2) if decidable else None,
+        "fallback_only": fallback,
+        "fallback_pct_of_path_rows": round(100.0 * fallback / with_path, 1) if with_path else None,
+        "fallback_reasons": dict(fb_reason.most_common()),
+        "mismatch_pairs": dict(mismatch_pairs.most_common(15)),
+        "projects_inflated": dict(inflated.most_common(10)),
+        "projects_deflated": dict(deflated.most_common(10)),
+        "borrowed_autonomy_rows": sum(borrowed_levels.values()),
+        "borrowed_autonomy_levels": dict(borrowed_levels.most_common()),
+        "borrowed_examples": borrowed,
+        "infra_borrowed_rows": sum(infra_borrowed.values()),
+        "infra_borrowed_pairs": dict(infra_borrowed.most_common(15)),
+        "infra_borrowed_levels": dict(infra_levels.most_common()),
+        "infra_borrowed_examples": infra_examples,
+        "filters": {"session": args.session, "under": args.under},
+    }
+
+    if args.json:
+        print(json.dumps(result, indent=2))
+    else:
+        r = result
+        print("=" * 74)
+        print("PROJECT-ATTRIBUTION AUDIT")
+        print("=" * 74)
+        rng = f"{r['date_range'][0]} .. {r['date_range'][1]}" if r["date_range"] else "unknown"
+        print(f"rows={r['rows_scanned']}  range={rng}")
+        print(f"rows with a real filesystem path: {r['rows_with_real_path']}")
+        print()
+        print(f"  decidable by path : {decidable}")
+        print(f"  match             : {match}")
+        print(f"  MISMATCH          : {mismatch}  ({r['mismatch_pct']}%)")
+        print(f"  fallback-only     : {fallback}  ({r['fallback_pct_of_path_rows']}% of path rows) "
+              f"— at risk, not proven wrong")
+        print()
+        print("  fallback reasons (path alone names no project):")
+        for k, v in r["fallback_reasons"].items():
+            print(f"    {v:6d}  {k}")
+        if mismatch:
+            print()
+            print("  mismatch pairs (path implies -> recorded as):")
+            for k, v in r["mismatch_pairs"].items():
+                print(f"    {v:6d}  {k}")
+        if r["borrowed_autonomy_rows"]:
+            print()
+            print(f"  ** BORROWED AUTONOMY: {r['borrowed_autonomy_rows']} row(s) gated by another "
+                  f"project's level **")
+            for k, v in r["borrowed_autonomy_levels"].items():
+                print(f"    {v:6d}  {k}")
+            for b in r["borrowed_examples"][:5]:
+                print(f"      {b['ts'][11:19]} {b['session']} {b['path']}")
+                print(f"        recorded={b['recorded_project']} (path says {b['path_project']}) "
+                      f"A{b['autonomy_level']} {b['approval_method']}")
+        print()
+        if r["infra_borrowed_rows"]:
+            print()
+            print(f"  ** INFRA PATHS CREDITED ELSEWHERE: {r['infra_borrowed_rows']} row(s) — an edit under")
+            print( "     one tree was attributed to a different project, so THAT project's autonomy")
+            print( "     level gated it. Levels seen:")
+            for k, v in r["infra_borrowed_levels"].items():
+                print(f"    {v:6d}  {k}")
+            for k, v in r["infra_borrowed_pairs"].items():
+                print(f"      {v:5d}  {k}")
+        print()
+        verdict = "CLEAN" if (mismatch == 0 and not r["borrowed_autonomy_rows"] and not r["infra_borrowed_rows"]) else "ATTENTION"
+        print(f"verdict: {verdict}")
+
+    clean = (mismatch == 0 and not result["borrowed_autonomy_rows"]
+             and not result["infra_borrowed_rows"])
+    return 0 if clean else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

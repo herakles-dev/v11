@@ -162,7 +162,7 @@ fi
 # Detect project from file path or command for downstream checks
 v11_detect_project "$V11_FILE_PATH"
 if [ -z "$V11_PROJECT" ] && [ -n "$V11_COMMAND" ]; then
-    CMD_PATH=$(printf '%s' "$V11_COMMAND" | grep -oE "$V11_WORKSPACE_ROOT/[^ ]+" | head -1)
+    CMD_PATH=$(printf '%s' "$V11_COMMAND" | grep -oE "$HERCULES_ROOT/[^ ]+" | head -1)
     [ -n "$CMD_PATH" ] && v11_detect_project "$CMD_PATH"
 fi
 
@@ -213,11 +213,15 @@ if ! v11_check_autonomy; then
     # HS-004/FH-014 (Wave 3c): extract level to local with jq-validated read. V11_PROJECT
     # is pre-validated by v11_detect_project at the top of this hook, but guard against
     # empty V11_PROJECT causing reads of $SESSIONS_ROOT//.autonomy-state.
+    # V11.34.3: read through v11_autonomy_level. The raw jq read used to be
+    # concatenated onto the "A" prefix, so a display-form state file ("A3")
+    # rendered as "AA3" here. Only reachable when v11_check_autonomy declines
+    # (level < 3), which is why the medium-risk auto-approve path never showed it.
     _LEVEL="A0"
     if [ -n "$V11_PROJECT" ]; then
         _GE_STATE="$SESSIONS_ROOT/$V11_PROJECT/.autonomy-state"
         if [ -f "$_GE_STATE" ] && [ -s "$_GE_STATE" ] && jq empty "$_GE_STATE" 2>/dev/null; then
-            _LEVEL="A$(jq -r '.level // 0' "$_GE_STATE" 2>/dev/null)"
+            _LEVEL="A$(v11_autonomy_level "$_GE_STATE")"
         fi
     fi
     echo "V11 ADVISORY: medium-risk operation at autonomy level $_LEVEL" >&2

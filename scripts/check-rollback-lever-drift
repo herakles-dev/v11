@@ -1,0 +1,274 @@
+#!/usr/bin/env python3
+"""
+check-rollback-lever-drift — drift guard: V11_* rollback env-var reads in
+scripts/+hooks/ vs documented rows in docs/ROLLBACK_REFERENCE.md
+(improvements/44-check-rollback-lever-drift.md).
+
+ROOT CAUSE this defends: adding or renaming a runtime lever touches N surfaces
+(code where it's read, docs/ROLLBACK_REFERENCE.md, sometimes the ticket file's
+"Rollback" section) and nothing enforces that a lever declared in one is
+declared in all. The v11.36 alignment audit surfaced V11_CANCELLED_FILTERS_
+REPLAY (documented, never in code) + 5 silent levers (in code, never in docs).
+
+Sibling of `check-stamp-drift` / `check-index-body-status-consistency` / etc.
+Same v11.36 W2 shape.
+
+Exit codes:
+  0 = PASS
+  1 = FAIL (doc-lie: env var appears in ROLLBACK_REFERENCE but 0 code reads)
+  2 = WARN (silent lever: env var read as a gate in code but no doc row)
+
+Rollback: V11_ROLLBACK_LEVER_CHECK=off (no-op, exit 0).
+Debug: V11_DRIFT_CHECK_DEBUG=on prints matched vars.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+V11_HOME = Path(os.environ.get("V11_HOME", "/path/to/v11"))
+DEFAULT_ROLLBACK_DOC = V11_HOME / "docs" / "ROLLBACK_REFERENCE.md"
+DEFAULT_SCRIPTS_DIR = V11_HOME / "scripts"
+DEFAULT_HOOKS_DIR = V11_HOME / "hooks"
+
+# Vars that are NOT rollback levers — inter-hook state channels, test seams,
+# and internal command-carrying vars. These must not be flagged as silent
+# levers. Curated during v11.37 R2 swarm review L2/L4.
+EXCLUSIONS = {
+    # inter-hook state channels
+    "V11_AGENT_ID",
+    "V11_CALLER_KIND",
+    "V11_CALLER_KIND_INFERENCE",
+    "V11_SESSION_ID",
+    "V11_PROJECT",
+    "V11_ACTIVE_PROJECT_OWNER",
+    "V11_ERROR",
+    "V11_FILE_PATH",
+    "V11_POLICY_REASON",
+    "V11_SUBAGENT",
+    "V11_PARENT_SESSION_ID",
+    "V11_HOOK",
+    "V11_HOOKS",
+    "V11_CWD",
+    "V11_DETECTION_METHOD",
+    "V11_DURATION_MS",
+    "V11_DISPATCH_TRACE",
+    # environment vars, not levers
+    "V11_HOME",
+    "V11_SCHEMA_DIR",
+    "V11_NL",  # newline sentinel in scripts/handoff
+    # generic placeholders in this check's own docstrings/help text
+    "V11_X",
+    "V11_FOO",
+    "V11_BAR",
+}
+# Prefixes to exclude wholesale.
+EXCLUDED_PREFIXES = ("V11_TEST_",)
+
+# bash: ${V11_FOO:-...} or ${V11_FOO:default} — captures FOO in group 1
+BASH_LEVER_RE = re.compile(r"\$\{V11_([A-Z0-9_]+)\s*:?-")
+# python: os.environ.get('V11_FOO', ...) or os.environ["V11_FOO"]
+PY_LEVER_RE = re.compile(
+    r"""os\.environ(?:\.get|\[)\s*[('"]V11_([A-Z0-9_]+)['"\)]"""
+)
+# python: helper-function call with literal env-name argument, e.g.
+# _env_off("V11_FOO") — the helper indirection hides the direct env read.
+# Match a common indirection pattern any function taking a "V11_*" string arg.
+PY_HELPER_LEVER_RE = re.compile(r"""[('"]V11_([A-Z0-9_]+)['"\)]""")
+# ROLLBACK_REFERENCE.md rows format: `| \`V11_FOO\` | ... |` — one entry per row.
+# Strikethrough (~~V11_FOO~~) marks HISTORICAL/downgraded rows and is treated
+# as a self-declared "no longer expected in code" marker (not a doc-lie).
+DOC_ROW_RE = re.compile(
+    r"^\|\s*(~~)?[`~]*\s*V11_([A-Z0-9_]+)\s*[`~]*(~~)?\s*\|\s*([^|]*)\|\s*(.+?)\s*\|",
+    re.MULTILINE,
+)
+# Phrases that self-declare a lever as prompt-only / doc-only (intentional
+# no-code-read). If the doc row contains one, we don't flag as doc-lie.
+PROMPT_ONLY_PHRASES = (
+    "prompt-level lever",
+    "docs-level policy",
+    "doc-only",
+    "prompt-only",
+    "no hook reads",
+    "orchestrator-side directive",
+    "not code-enforced",
+)
+
+
+def _env_off(name: str) -> bool:
+    return os.environ.get(name, "on").strip().lower() == "off"
+
+
+def debug(msg: str) -> None:
+    if os.environ.get("V11_DRIFT_CHECK_DEBUG", "off") == "on":
+        sys.stderr.write(f"[debug] {msg}\n")
+
+
+def is_excluded(name: str) -> bool:
+    # `name` may or may not already start with V11_ depending on caller path.
+    # Normalize to the fully-qualified form for exclusion tests.
+    if not name.startswith("V11_"):
+        name = "V11_" + name
+    if name in EXCLUSIONS:
+        return True
+    for prefix in EXCLUDED_PREFIXES:
+        if name.startswith(prefix):
+            return True
+    return False
+
+
+def enumerate_code_levers(*roots: Path) -> dict[str, list[str]]:
+    """{var_name: [example_files]} for every V11_* read in code."""
+    result: dict[str, set[str]] = {}
+    # Files that reference V11_* names in documentation strings, not as
+    # actual reads. Empty by default now — placeholder names (V11_X/V11_FOO/
+    # V11_BAR) are handled via EXCLUSIONS, and the check's OWN env read
+    # (V11_ROLLBACK_LEVER_CHECK) must be counted.
+    SELF_EXCLUDE: set[str] = set()
+    for root in roots:
+        if not root.is_dir():
+            continue
+        for path in root.rglob("*"):
+            if not path.is_file():
+                continue
+            # skip non-text
+            if path.suffix in {".pyc", ".jsonl", ".json", ".bak"}:
+                continue
+            try:
+                rel = str(path.relative_to(V11_HOME))
+            except ValueError:
+                rel = str(path)
+            if rel in SELF_EXCLUDE:
+                continue
+            try:
+                text = path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            for m in BASH_LEVER_RE.finditer(text):
+                name = "V11_" + m.group(1)
+                if is_excluded(name):
+                    continue
+                result.setdefault(name, set()).add(str(path.relative_to(V11_HOME)))
+            for m in PY_LEVER_RE.finditer(text):
+                name = "V11_" + m.group(1)
+                if is_excluded(name):
+                    continue
+                result.setdefault(name, set()).add(str(path.relative_to(V11_HOME)))
+            # Helper-function indirection: python scripts commonly wrap env
+            # reads in a helper (`_env_off("V11_X")`) which the direct regex
+            # above misses. Widen to any "V11_*" literal appearing in a call
+            # argument context; false-positive risk on comment mentions is
+            # low because we filter through EXCLUSIONS + prefix guards.
+            # Only apply to .py files to keep the false-positive surface
+            # controlled.
+            if path.suffix == ".py" or (path.is_file() and _looks_like_python(path)):
+                for m in PY_HELPER_LEVER_RE.finditer(text):
+                    name = "V11_" + m.group(1)
+                    if is_excluded(name):
+                        continue
+                    result.setdefault(name, set()).add(
+                        str(path.relative_to(V11_HOME))
+                    )
+    return {k: sorted(v)[:3] for k, v in result.items()}
+
+
+def _looks_like_python(path: Path) -> bool:
+    """Peek at shebang to detect python-suffix-less scripts (like scripts/*).
+    Slice covers `#!/usr/bin/env python3` (22 chars). Small widening safe."""
+    try:
+        with path.open("rb") as f:
+            first = f.read(80)
+        return b"python" in first[:40]
+    except OSError:
+        return False
+
+
+def enumerate_doc_levers(doc_path: Path) -> set[str]:
+    """Return the set of documented levers to compare against code reads.
+
+    Excludes:
+      - Strikethrough rows (~~V11_FOO~~) — self-declared HISTORICAL.
+      - Rows whose prose self-declares 'prompt-only' / 'doc-only' etc.
+    Both are intentionally-not-in-code and would produce noise if flagged.
+    """
+    if not doc_path.is_file():
+        return set()
+    text = doc_path.read_text(encoding="utf-8", errors="replace")
+    result: set[str] = set()
+    for m in DOC_ROW_RE.finditer(text):
+        struck_open = m.group(1)
+        name = "V11_" + m.group(2)
+        struck_close = m.group(3)
+        row_prose = (m.group(4) + " " + m.group(5)).lower()
+        if is_excluded(name):
+            continue
+        if struck_open or struck_close:
+            debug(f"skip strikethrough: {name}")
+            continue
+        if any(phrase in row_prose for phrase in PROMPT_ONLY_PHRASES):
+            debug(f"skip prompt-only: {name}")
+            continue
+        result.add(name)
+    return result
+
+
+def main() -> int:
+    if _env_off("V11_ROLLBACK_LEVER_CHECK"):
+        return 0
+
+    parser = argparse.ArgumentParser(
+        description="v11.37 W2-T2 rollback-lever drift check",
+    )
+    parser.add_argument(
+        "--rollback-doc",
+        type=Path,
+        default=DEFAULT_ROLLBACK_DOC,
+        help=f"default: {DEFAULT_ROLLBACK_DOC}",
+    )
+    parser.add_argument(
+        "--scripts-dir", type=Path, default=DEFAULT_SCRIPTS_DIR
+    )
+    parser.add_argument(
+        "--hooks-dir", type=Path, default=DEFAULT_HOOKS_DIR
+    )
+    args = parser.parse_args()
+
+    code = enumerate_code_levers(args.scripts_dir, args.hooks_dir)
+    docs = enumerate_doc_levers(args.rollback_doc)
+
+    code_names = set(code.keys())
+    silent = sorted(code_names - docs)  # in code, not in docs
+    doc_lies = sorted(docs - code_names)  # in docs, not in code
+
+    if not silent and not doc_lies:
+        debug(f"in sync: {len(code_names)} levers documented + implemented")
+        return 0
+
+    for name in doc_lies:
+        sys.stderr.write(
+            f"⚠ ROLLBACK_LEVER_DRIFT[FAIL]: {name} — documented in {args.rollback_doc.name} but ZERO code reads (doc-lie)\n"
+        )
+    for name in silent:
+        example = ", ".join(code.get(name, [])[:2])
+        sys.stderr.write(
+            f"⚠ ROLLBACK_LEVER_DRIFT[WARN]: {name} — read in code ({example}) but no doc row (silent lever)\n"
+        )
+
+    if doc_lies:
+        sys.stderr.write(
+            f"check-rollback-lever-drift: {len(doc_lies)} FAIL (doc-lies) + {len(silent)} WARN (silent). Rollback: V11_ROLLBACK_LEVER_CHECK=off.\n"
+        )
+        return 1
+    sys.stderr.write(
+        f"check-rollback-lever-drift: {len(silent)} WARN (silent lever(s)). Rollback: V11_ROLLBACK_LEVER_CHECK=off.\n"
+    )
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

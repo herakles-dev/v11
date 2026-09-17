@@ -5,6 +5,7 @@ model: haiku
 disallowedTools: Write, Edit, Bash
 color: yellow
 category: spec-v11
+version: 11.43
 default_mode: subagent
 effort: medium
 triggers:
@@ -30,24 +31,27 @@ The skill provides these as literal values in your prompt:
 
 - `lens_id`: one of `L1-VERSION`, `L2-AGENTS`, `L3-ORCHESTRATOR`, `L4-SATELLITES`, `L5-CORE`
 - `lens_scope`: explicit list of file paths / globs to inspect
-- `anchor`: pre-computed protocol facts:
+- `anchor`: pre-computed protocol facts. **Illustrative only** — the block below is a placeholder shape; real values are injected at runtime by the `/v11-coherence` skill and are never read from this file:
   ```json
   {
-    "protocol_version": "<git-derived, e.g. V11.14.4>",
-    "hook_script_count": 14,
+    "protocol_version": "<git-derived, e.g. v11.43>",
+    "hook_script_count": 25,
     "hooks_on_disk": ["detect-project", "enforce-test-coverage", "fix-team-model",
                       "guard-agent-stall", "guard-effort", "guard-enforcement",
-                      "guard-teammate-timeout", "guard-write-gates", "post-compact",
+                      "guard-fat-read", "guard-write-gates", "post-compact",
                       "session-end", "sync-tasks", "track-agents", "track-autonomy",
-                      "verify-syntax"],
+                      "verify-syntax", "commit-msg-validation", "post-commit-close-tasks",
+                      "guard-teammate-timeout"],
     "hooks_wired": ["detect-project", "enforce-test-coverage", "fix-team-model",
                     "guard-agent-stall", "guard-effort", "guard-enforcement",
-                    "guard-write-gates", "post-compact", "session-end", "sync-tasks",
-                    "track-agents", "track-autonomy", "verify-syntax"],
-    "superseded_hooks": ["guard-teammate-timeout"],
-    "hooks_wired_count": 13
+                    "guard-fat-read", "guard-write-gates", "post-compact", "session-end",
+                    "sync-tasks", "track-agents", "track-autonomy", "verify-syntax",
+                    "commit-msg-validation", "post-commit-close-tasks"],
+    "superseded_hooks": ["guard-teammate-timeout", "refresh-freshness-tags", "enforce-subagent"],
+    "hooks_wired_count": 22
   }
   ```
+  (Above: illustrative placeholders only — 22 wired [20 tool-event + 2 git-event] + 3 dormant-on-disk, per v11.43 `CLAUDE.md` §13. The `/v11-coherence` skill injects the live-computed anchor at spawn time.)
 - `exclusion_rules`: list of NOT-A-FINDING rules (see below — also encoded verbatim in this file)
 - `finding_schema`: the JSON schema to emit
 
@@ -89,7 +93,7 @@ Example: file=`v11/CLAUDE.md`, kind=`HOOKCOUNT_DELTA`, normalized_found=`hooks` 
 | `VERSION_LAG` | A file stamps an older protocol version than `anchor.protocol_version` |
 | `SELF_CONTRADICTION` | A file contradicts itself (e.g., frontmatter version ≠ footer version) |
 | `DEPRECATED_AS_ACTIVE` | A file describes TeamCreate, teammate_messaging, or guard-teammate-timeout as the current active pattern |
-| `HOOKCOUNT_DELTA` | A file asserts a hook count that doesn't match anchor's wired count (13) OR wrongly asserts disk count (14) as the canonical count, without noting the superseded hook |
+| `HOOKCOUNT_DELTA` | A file asserts a hook count that doesn't match the anchor's `hooks_wired_count`, OR wrongly asserts the on-disk script count as the canonical count, without noting the dormant/superseded hooks (use the injected anchor's live values — never a hardcoded literal) |
 | `STALE_MODEL` | A file references a model version that the anchor supersedes (e.g., Opus 4.5, Sonnet 4.5) |
 | `MISSING_STAMP` | A file in scope has no protocol version stamp where one is expected |
 

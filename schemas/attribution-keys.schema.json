@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "attribution-keys.schema.json",
+  "$id": "https://herakles.dev/v11/schemas/attribution-keys.schema.json",
   "title": "V11.20 Attribution Key Ledger Line",
   "description": "Schema for ONE line of ~/.agent-metrics/attribution-keys.jsonl. Append-only log of (attribution_key, layer, attributed_at) triples written by wave-review-attribute and swarm-review-attribute. Used for idempotency: before writing a new agent-errors.jsonl entry from a wave/swarm finding, the attribute script checks whether the key already exists here. Same finding twice = same key = skipped. Replay-resistant. Dedup check: before appending, scan attribution-keys.jsonl for the key string (grep or python set-load). If present, skip the write to agent-errors.jsonl AND skip the append here. JSONL format means JSON Schema CANNOT enforce uniqueness — enforcement is the write-path contract in T5/T6/T10/T11. Note: lite findings (V11.15) and runtime findings (future) do NOT enter this ledger — lite is already idempotent via task-keyed review-queue, runtime has no concept of attribution_key (no file/line at the error origin).",
   "type": "object",

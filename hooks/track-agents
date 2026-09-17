@@ -33,7 +33,7 @@ MODEL=$(printf '%s' "$V11_RAW_INPUT" | jq -r '.tool_input.model // ""')
 # probe paths (tool_response.subagent_tokens / .usage.subagent_tokens /
 # .usage.total_tokens) were HYPOTHESIZED and never matched real output --
 # confirmed via this session's own Claude Code transcripts
-# (~/.claude/projects/<slugified-project-path>/*.jsonl), where a completed
+# (~/.claude/projects/-home-hercules-v11/*.jsonl), where a completed
 # foreground Agent/Task tool_response actually looks like:
 #   { status, agentId, agentType, totalDurationMs, totalTokens,
 #     totalToolUseCount, usage: {input_tokens, output_tokens, ...}, toolStats }
@@ -188,7 +188,16 @@ if [ "${V11_DISPATCH_TRACE:-on}" != "off" ] \
         _DT_TID=$(jq -r '.active_task_ids[0] // ""' "$_DT_STATE_FILE" 2>/dev/null)
         if [ -n "$_DT_TID" ]; then
             _DT_REC=$(jq -r --arg id "$_DT_TID" '.recommended_agents[$id] // ""' "$_DT_STATE_FILE" 2>/dev/null)
-            _DT_SPRINT=$(jq -r --arg id "$_DT_TID" '.open_tasks[$id].metadata.sprint // ""' "$_DT_STATE_FILE" 2>/dev/null)
+            # improvements/18: open_tasks is now a session-scoped list, not a
+            # dict keyed by bare task_id (that shape silently collided across
+            # sessions). Search across all sessions for the first match on
+            # $id -- same session-agnostic "first hit wins" semantics this
+            # lookup always had (it never disambiguated by session before
+            # either), just reading from the collision-safe source instead
+            # of the removed flat dict.
+            _DT_SPRINT=$(jq -r --arg id "$_DT_TID" \
+                '([.open_tasks_by_session[]? | .[$id]?.metadata.sprint] | map(select(. != null)) | .[0]) // ""' \
+                "$_DT_STATE_FILE" 2>/dev/null)
             # .autonomy-state stores level as numeric (0-5), not "A0"-"A5"
             _DT_AUTONOMY=$(jq -r '.level // 0' "$SESSIONS_ROOT/$V11_PROJECT/.autonomy-state" 2>/dev/null)
             case "$_DT_AUTONOMY" in

@@ -127,7 +127,7 @@ Quick lookup by domain. IDs link to https://cwe.mitre.org/data/definitions/NNN.h
 
 ## Secret Detection Workflow
 
-**Installed**: `gitleaks` at `~/go/bin/gitleaks`. `trivy` and `semgrep` not installed — use fallbacks below.
+**Installed**: `gitleaks` at `/path/to/operator-home/go/bin/gitleaks`. `trivy` and `semgrep` not installed — use fallbacks below.
 
 ```bash
 # Primary: gitleaks (installed)

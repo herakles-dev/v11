@@ -104,7 +104,7 @@ Use search API to pull raw text, synthesize yourself.
 
 **Location:** Project-scoped (`.claude/commands/athenaeum.md`) — copied during scaffold.
 
-See `<project-root>/example-project/.claude/commands/athenaeum.md` for the reference implementation.
+See `/path/to/operator-home/example-project/.claude/commands/athenaeum.md` for the reference implementation.
 
 ### Mission Types
 
@@ -120,7 +120,7 @@ See `<project-root>/example-project/.claude/commands/athenaeum.md` for the refer
 
 **Location:** Project-scoped (`.claude/commands/{project}-gate.md`) — generated during scaffold.
 
-See `<project-root>/example-project/.claude/commands/example-project-gate.md` for the reference implementation.
+See `/path/to/operator-home/example-project/.claude/commands/example-project-gate.md` for the reference implementation.
 
 ### Modes
 

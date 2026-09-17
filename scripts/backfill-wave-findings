@@ -57,7 +57,7 @@ if [ ! -x "$ATTR_SCRIPT" ]; then
     exit 1
 fi
 
-SESSIONS_ROOT="${SESSIONS_ROOT:-$V11_WORKSPACE_ROOT/sessions}"
+SESSIONS_ROOT="${SESSIONS_ROOT:-$HERCULES_ROOT/sessions}"
 if [ ! -d "$SESSIONS_ROOT" ]; then
     echo "backfill-wave-findings: no sessions dir at $SESSIONS_ROOT" >&2
     exit 0

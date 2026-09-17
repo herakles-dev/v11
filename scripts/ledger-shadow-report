@@ -40,7 +40,7 @@ from pathlib import Path
 
 METRICS_DIR = os.environ.get(
     "METRICS_DIR",
-    os.path.join(os.environ.get("V11_WORKSPACE_ROOT", os.path.expanduser("~")), ".agent-metrics"),
+    os.path.join(os.environ.get("HERCULES_ROOT", os.path.expanduser("~")), ".agent-metrics"),
 )
 DIVERGENCE_FILE = os.path.join(METRICS_DIR, "ledger-shadow-divergence.jsonl")
 

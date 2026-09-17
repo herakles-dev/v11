@@ -21,9 +21,9 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 V11_HOME="$(dirname "$SCRIPT_DIR")"
-V11_WORKSPACE_ROOT="${V11_WORKSPACE_ROOT:-$HOME/.v11}"
-SESSIONS_ROOT="${SESSIONS_ROOT:-$V11_WORKSPACE_ROOT/sessions}"
-PORT_REGISTRY_FILE="$V11_WORKSPACE_ROOT/config/port-registry.json"
+HERCULES_ROOT="${HERCULES_ROOT:-$HOME}"
+SESSIONS_ROOT="${SESSIONS_ROOT:-$HERCULES_ROOT/sessions}"
+PORT_REGISTRY="$V11_WORKSPACE_ROOT/config/port-registry.json"
 
 # Colors
 RED='\033[0;31m'
@@ -128,18 +128,32 @@ if [ "$PROJECT" = "--scan" ]; then
     printf "%-35s %-8s %-8s %-8s %-8s %-8s %-8s %s\n" \
         "-------" "-----" "----" "-----" "------" "-------" "-----" "-----"
 
-    # Collect projects
+    # Collect projects — root dirs AND sessions/ dirs (deduplicated, sessions preferred)
+    declare -A SEEN
     PROJECTS=()
-    for d in "$V11_WORKSPACE_ROOT"/*/; do
+    for d in "$SESSIONS_ROOT"/*/; do
+        name=$(basename "$d")
+        [[ "$name" =~ ^(\*|_archived|sessions|archive|artifacts|agents-manifest|tmp|scratch)$ ]] && continue
+        [ -f "$d/CLAUDE.md" ] || continue
+        PROJECTS+=("$name")
+        SEEN["$name"]=1
+    done
+    for d in "$HERCULES_ROOT"/*/; do
         name=$(basename "$d")
         [[ "$name" =~ ^(v6_Ultra|v8|v9\.backup|v10|v11|node_modules|\.archive|scripts|system-apps-config|sessions)$ ]] && continue
+        [ -n "${SEEN[$name]:-}" ] && continue
         [ -f "$d/CLAUDE.md" ] || continue
         PROJECTS+=("$name")
     done
 
     for name in "${PROJECTS[@]}"; do
         ((TOTAL++)) || true
-        PROJECT_DIR="$V11_WORKSPACE_ROOT/$name"
+        # Prefer sessions/ dir (code lives there) over root
+        if [ -d "$SESSIONS_ROOT/$name" ]; then
+            PROJECT_DIR="$SESSIONS_ROOT/$name"
+        else
+            PROJECT_DIR="$HERCULES_ROOT/$name"
+        fi
         SESSION_DIR="$SESSIONS_ROOT/$name"
 
         # Quick checks per category
@@ -205,7 +219,7 @@ if [ "$PROJECT" = "--scan" ]; then
         if [ -d "$SESSION_DIR" ]; then
             [ ! -d "$SESSION_DIR/archive" ] && ((arch_score+=2)) || true
             # Temp debris
-            debris=$(find "$PROJECT_DIR" -maxdepth 2 \( -name "*.tmp" -o -name "*.bak" -o -name "*.orig" -o -name "*.swp" -o -name ".DS_Store" \) 2>/dev/null | wc -l)
+            debris=$(find "$PROJECT_DIR" -maxdepth 2 \( -name "*.tmp" -o -name "*.tmp.*" -o -name "*.bak" -o -name "*.bak.*" -o -name "*.orig" -o -name "*.swp" -o -name ".DS_Store" \) -not -path "$PROJECT_DIR/.tmp" 2>/dev/null | wc -l)
             [ "$debris" -gt 5 ] && ((arch_score+=5)) || true
             [ "$debris" -gt 0 ] && ((arch_score+=1)) || true
             # Oversized session
@@ -265,12 +279,14 @@ fi
 
 # --- Single Project Mode ---
 
-# Resolve project paths
-PROJECT_DIR="$V11_WORKSPACE_ROOT/$PROJECT"
+# Resolve project paths — prefer sessions/ (code lives there) over root (may be stale state)
 SESSION_DIR="$SESSIONS_ROOT/$PROJECT"
-
-if [ ! -d "$PROJECT_DIR" ] && [ ! -d "$SESSION_DIR" ]; then
-    echo -e "${RED}Error: Project '$PROJECT' not found at $PROJECT_DIR or $SESSION_DIR${NC}"
+if [ -d "$SESSION_DIR" ]; then
+    PROJECT_DIR="$SESSION_DIR"
+elif [ -d "$HERCULES_ROOT/$PROJECT" ]; then
+    PROJECT_DIR="$HERCULES_ROOT/$PROJECT"
+else
+    echo -e "${RED}Error: Project '$PROJECT' not found at $HERCULES_ROOT/$PROJECT or $SESSION_DIR${NC}"
     exit 2
 fi
 
@@ -312,7 +328,7 @@ if [ -f "$PROJECT_DIR/CLAUDE.md" ]; then
     done < <(grep -oP '\[.*?\]\([^)]*\.md[^)]*\)' "$PROJECT_DIR/CLAUDE.md" 2>/dev/null || true)
 
     # Required sections
-    for section in "Purpose\|What\|About" "Quick Start\|Commands\|Development" "Critical Rules\|Rules\|Constraints" "Key Files\|Architecture\|Structure"; do
+    for section in "Purpose|What|About" "Quick Start|Commands|Development" "Critical Rules|Rules|Constraints" "Key Files|Architecture|Structure"; do
         if ! grep -qiE "^##.*($section)" "$PROJECT_DIR/CLAUDE.md" 2>/dev/null; then
             add_finding "LOW" "claude-md-section" "Missing recommended section: $section"
         fi
@@ -389,7 +405,7 @@ echo -e "${BOLD}4. Temp File Debris${NC}"
 DEBRIS_COUNT=0
 DEBRIS_LIST=""
 for pattern in "*.tmp" "*.bak" "*.orig" "*.swp" "*.swo" "*~" ".DS_Store" "Thumbs.db"; do
-    found=$(find "$PROJECT_DIR" -maxdepth 3 -name "$pattern" 2>/dev/null | head -10)
+    found=$(find "$PROJECT_DIR" -maxdepth 3 -name "$pattern" -not -path "$PROJECT_DIR/.tmp" 2>/dev/null | head -10)
     if [ -n "$found" ]; then
         count=$(echo "$found" | wc -l)
         ((DEBRIS_COUNT+=count)) || true
@@ -523,7 +539,7 @@ echo ""
 echo -e "${BOLD}7. Dark Code Alignment${NC}"
 
 # 7a. Persisted STR advisories in task state
-TASK_STATE_FILE="$V11_WORKSPACE_ROOT/.agent-metrics/task-state/${PROJECT}.json"
+TASK_STATE_FILE="$HERCULES_ROOT/.agent-metrics/task-state/${PROJECT}.json"
 [ ! -f "$TASK_STATE_FILE" ] && [ -f "$SESSION_DIR/.task-state.json" ] && TASK_STATE_FILE="$SESSION_DIR/.task-state.json"
 if [ -f "$TASK_STATE_FILE" ]; then
     STR_MISSING=$(jq -r '.dark_code_advisories.str_missing_count // 0' "$TASK_STATE_FILE" 2>/dev/null)

@@ -9,7 +9,7 @@ V11 currently excels at **implementation orchestration** — coordinating agents
 But it has no framework for **pre-implementation planning** — the phase where vague ideas become
 validated, gate-structured, hypothesis-driven roadmaps.
 
-The reference project's build proved that rigorous planning (7 phases, 8 problem-solving frameworks,
+The the reference project's build proved that rigorous planning (7 phases, 8 problem-solving frameworks,
 Athenaeum-backed research) is the difference between building on sand and building on evidence.
 
 This upgrade makes that process repeatable for any massive project.
@@ -30,7 +30,7 @@ This upgrade makes that process repeatable for any massive project.
 7. Verify alignment (Phase 7)
 
 **Replaces:** Manual execution of the 7-phase methodology
-**Depends on:** Athenaeum API (localhost:3000), agent registry, existing scaffold skill
+**Depends on:** Athenaeum API (localhost:8140), agent registry, existing scaffold skill
 
 ### New Formation: `deep-research`
 

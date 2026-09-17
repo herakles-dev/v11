@@ -12,8 +12,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 V11_HOME="$(cd "$SCRIPT_DIR/.." && pwd)"
 source "$SCRIPT_DIR/../hooks/lib/common.sh" 2>/dev/null || {
-  V11_WORKSPACE_ROOT="${V11_WORKSPACE_ROOT:-$HOME/.v11}"
-  SESSIONS_ROOT="${SESSIONS_ROOT:-$V11_WORKSPACE_ROOT/sessions}"
+  HERCULES_ROOT="${HERCULES_ROOT:-$HOME}"
+  SESSIONS_ROOT="${SESSIONS_ROOT:-$HERCULES_ROOT/sessions}"
 }
 
 CURRENT_VERSION="v11.11"
@@ -58,7 +58,7 @@ detect_v11_6() { detect_current_features; }
 
 find_settings() {
   local project="$1"
-  for p in "$V11_WORKSPACE_ROOT/$project/.claude/settings.json" \
+  for p in "$HERCULES_ROOT/$project/.claude/settings.json" \
            "$SESSIONS_ROOT/$project/.claude/settings.json"; do
     [ -f "$p" ] && echo "$p" && return
   done
@@ -85,8 +85,7 @@ upgrade_to_v11_1() {
   echo "  + Add fix-team-model PostToolUse (TeamCreate|Agent) [V11.11: dormant safety net]"
   [ "$dry" = "true" ] && return
   local tmp="${settings}.tmp"
-  jq --arg cmd "$V11_HOME/hooks/fix-team-model" \
-    '.hooks.PostToolUse += [{"matcher": "TeamCreate|Agent", "type": "command", "command": $cmd}]' \
+  jq '.hooks.PostToolUse += [{"matcher": "TeamCreate|Agent", "type": "command", "command": "$HOME/v11/hooks/fix-team-model"}]' \
     "$settings" > "$tmp" && mv "$tmp" "$settings"
 }
 
@@ -97,8 +96,7 @@ upgrade_to_v11_2() {
   echo "  + Add fix-team-model PreToolUse (TeamCreate|Agent) [V11.11: dormant safety net]"
   [ "$dry" = "true" ] && return
   local tmp="${settings}.tmp"
-  jq --arg cmd "$V11_HOME/hooks/fix-team-model" \
-    '.hooks.PreToolUse += [{"matcher": "TeamCreate|Agent", "type": "command", "command": $cmd}]' \
+  jq '.hooks.PreToolUse += [{"matcher": "TeamCreate|Agent", "type": "command", "command": "$HOME/v11/hooks/fix-team-model"}]' \
     "$settings" > "$tmp" && mv "$tmp" "$settings"
 }
 
@@ -107,8 +105,7 @@ upgrade_to_v11_5() {
   echo "  + Add post-compact PostToolUse hook"
   [ "$dry" = "true" ] && return
   local tmp="${settings}.tmp"
-  jq --arg cmd "$V11_HOME/hooks/post-compact" \
-    '.hooks.PostToolUse += [{"type": "command", "command": $cmd}]' \
+  jq '.hooks.PostToolUse += [{"type": "command", "command": "$HOME/v11/hooks/post-compact"}]' \
     "$settings" > "$tmp" && mv "$tmp" "$settings"
 }
 

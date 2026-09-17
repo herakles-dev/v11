@@ -1,0 +1,236 @@
+#!/usr/bin/env python3
+"""
+check-registry-drift — drift guard: ~/.claude/agents/*.md (maxdepth 1)
+frontmatter names vs ~/.agent-registry/agents.json keys vs ~/.agent-metrics/
+ledger/*.jsonl distinct actor labels (improvements/38-registry-vs-ledger-
+roster-gap.md → v11.37 W2-T3 sibling drift check).
+
+ROOT CAUSE this defends: an agent added on disk without registry entry is
+invisible to DAAO / scorecard / effectiveness queries. The v11.37 W1-T1
+reconciler cleaned the current state; this check catches recurrence in
+future sprints. Also flags ledger-active labels with no `.md` file
+(rename/alias drift) and registered entries that no longer have a `.md`
+(pruned agents that got re-added by mistake).
+
+ARCHIVE POLICY (v11.37 W1-T5): `~/.claude/agents/archive/*.md` files are
+inactive-by-convention and EXCLUDED from all disk scans (maxdepth 1). See
+docs/DRIFT_CHECKS.md § `~/.claude/agents/archive/` policy.
+
+Exit codes:
+  0 = PASS (registry ↔ disk match; ledger noise below threshold)
+  1 = FAIL (disk `.md` missing from registry — CRITICAL, hides live agents)
+  2 = WARN (ledger-active-not-on-disk OR registered-not-on-disk)
+
+Rollback: V11_REGISTRY_CHECK=off (no-op, exit 0).
+Debug: V11_DRIFT_CHECK_DEBUG=on prints per-agent context.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import sys
+from pathlib import Path
+
+DEFAULT_AGENTS_DIR = Path.home() / ".claude" / "agents"
+DEFAULT_REGISTRY = Path.home() / ".agent-registry" / "agents.json"
+DEFAULT_LEDGER_DIR = Path.home() / ".agent-metrics" / "ledger"
+
+# `name:` frontmatter — same shape as scripts/reconcile-agent-registry uses.
+FRONTMATTER_NAME_RE = re.compile(r"^name:\s*(.+)$", re.MULTILINE)
+
+# Ledger-active label = distinct value across owner + metadata.agent +
+# recommended_agent. Meta-labels (self, main, user, me, orchestrator, claude)
+# and Claude Code built-ins (Explore, general-purpose) are attribution-noise,
+# not real subagents; excluded from the compare.
+LEDGER_LABEL_IGNORE = {
+    "self",
+    "main",
+    "user",
+    "me",
+    "orchestrator",
+    "orchestrator-self",
+    "orchestrator-direct",
+    "claude",
+    "Explore",
+    "explore",
+    "general-purpose",
+}
+# Labels matching these patterns are task-IDs / sprint tags / formation names
+# that got written into agent-attribution fields (a separate bug in the
+# ledger writers — see v11.38 seed). Not real agents; excluded from the check.
+TASK_LIKE_RE = re.compile(
+    r"^(W\d+-T|S\d+-|CLOSE-T|F\d+-|R\d+-|T\d+|G\d+-|Wave|Round|Sprint|Task)",
+    re.IGNORECASE,
+)
+# Composite labels like "database-engineer+ci-cd-architect" or "foo & bar":
+# these are formation shorthand, not a single agent.
+COMPOSITE_RE = re.compile(r"[+&]| and ")
+
+
+def _env_off(name: str) -> bool:
+    return os.environ.get(name, "on").strip().lower() == "off"
+
+
+def debug(msg: str) -> None:
+    if os.environ.get("V11_DRIFT_CHECK_DEBUG", "off") == "on":
+        sys.stderr.write(f"[debug] {msg}\n")
+
+
+def _extract_name(md_path: Path) -> str | None:
+    try:
+        text = md_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    m = FRONTMATTER_NAME_RE.search(text)
+    if not m:
+        return None
+    val = m.group(1).strip()
+    # strip enclosing quotes
+    if len(val) >= 2 and val[0] == val[-1] and val[0] in ("'", '"'):
+        val = val[1:-1]
+    return val or None
+
+
+def enumerate_disk(agents_dir: Path) -> set[str]:
+    """maxdepth 1 only; archive/ excluded."""
+    names: set[str] = set()
+    if not agents_dir.is_dir():
+        return names
+    for entry in agents_dir.iterdir():
+        if entry.is_dir():
+            continue
+        if entry.suffix != ".md":
+            continue
+        n = _extract_name(entry)
+        if n:
+            names.add(n)
+    return names
+
+
+def enumerate_registry(registry_path: Path) -> set[str]:
+    if not registry_path.is_file():
+        return set()
+    try:
+        with registry_path.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return set()
+    return set((data.get("agents") or {}).keys())
+
+
+def enumerate_ledger_labels(ledger_dir: Path, since_days: int) -> set[str]:
+    """Distinct actor labels from the last N days of ledger events."""
+    if not ledger_dir.is_dir():
+        return set()
+    labels: set[str] = set()
+    # cheap "since" filter: compare ISO ts prefix (YYYY-MM-DD)
+    from datetime import datetime, timedelta, timezone
+
+    cutoff = datetime.now(timezone.utc) - timedelta(days=since_days)
+    cutoff_prefix = cutoff.strftime("%Y-%m-%d")
+    for f in ledger_dir.glob("*.jsonl"):
+        try:
+            with f.open("r", encoding="utf-8", errors="replace") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    if line[:10] < cutoff_prefix:
+                        # cheap pre-filter; still parse if we want to be sure
+                        # but skip on old rows for speed
+                        pass
+                    try:
+                        ev = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    ts = ev.get("ts") or ""
+                    if ts[:10] < cutoff_prefix:
+                        continue
+                    for field in ("owner", "recommended_agent"):
+                        v = ev.get(field)
+                        if isinstance(v, str) and v:
+                            labels.add(v)
+                    md = ev.get("metadata") or {}
+                    v = md.get("agent")
+                    if isinstance(v, str) and v:
+                        labels.add(v)
+        except OSError:
+            continue
+    result: set[str] = set()
+    for lbl in labels:
+        if lbl in LEDGER_LABEL_IGNORE:
+            continue
+        if TASK_LIKE_RE.match(lbl):
+            continue
+        if COMPOSITE_RE.search(lbl):
+            continue
+        result.add(lbl)
+    return result
+
+
+def main() -> int:
+    if _env_off("V11_REGISTRY_CHECK"):
+        return 0
+
+    parser = argparse.ArgumentParser(
+        description="v11.37 W2-T3 registry drift check (3-way)"
+    )
+    parser.add_argument("--agents-dir", type=Path, default=DEFAULT_AGENTS_DIR)
+    parser.add_argument("--registry", type=Path, default=DEFAULT_REGISTRY)
+    parser.add_argument("--ledger-dir", type=Path, default=DEFAULT_LEDGER_DIR)
+    parser.add_argument(
+        "--ledger-since-days",
+        type=int,
+        default=30,
+        help="ledger label scan window (days)",
+    )
+    args = parser.parse_args()
+
+    disk = enumerate_disk(args.agents_dir)
+    registry = enumerate_registry(args.registry)
+    ledger = enumerate_ledger_labels(args.ledger_dir, args.ledger_since_days)
+
+    disk_missing = sorted(disk - registry)
+    dead_registry = sorted(registry - disk)
+    ledger_orphans = sorted(ledger - disk - registry)
+
+    if not disk_missing and not dead_registry and not ledger_orphans:
+        debug(
+            f"registry ↔ disk in sync ({len(disk)} agents); "
+            f"ledger clean ({len(ledger)} distinct labels)"
+        )
+        return 0
+
+    for name in disk_missing:
+        sys.stderr.write(
+            f"⚠ REGISTRY_DRIFT[FAIL]: {name} — on disk (maxdepth 1) but MISSING from ~/.agent-registry/agents.json. "
+            f"Run: scripts/reconcile-agent-registry --dry-run\n"
+        )
+    for name in dead_registry:
+        sys.stderr.write(
+            f"⚠ REGISTRY_DRIFT[WARN]: {name} — registered but no `.md` at ~/.claude/agents/ (maxdepth 1). "
+            f"Dead entry OR moved to archive/. Reconcile to prune.\n"
+        )
+    for name in ledger_orphans:
+        sys.stderr.write(
+            f"⚠ REGISTRY_DRIFT[WARN]: {name} — active in ledger (last {args.ledger_since_days}d) but no `.md` file AND not registered. "
+            f"Likely rename/alias drift — investigate.\n"
+        )
+
+    if disk_missing:
+        sys.stderr.write(
+            f"check-registry-drift: {len(disk_missing)} FAIL + {len(dead_registry) + len(ledger_orphans)} WARN. "
+            f"Rollback: V11_REGISTRY_CHECK=off.\n"
+        )
+        return 1
+    sys.stderr.write(
+        f"check-registry-drift: {len(dead_registry) + len(ledger_orphans)} WARN. Rollback: V11_REGISTRY_CHECK=off.\n"
+    )
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

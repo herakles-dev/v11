@@ -14,9 +14,9 @@
 
 set -euo pipefail
 
-V11_WORKSPACE_ROOT="${V11_WORKSPACE_ROOT:-$HOME/.v11}"
-SESSIONS_ROOT="${SESSIONS_ROOT:-$V11_WORKSPACE_ROOT/sessions}"
-METRICS_DIR="$V11_WORKSPACE_ROOT/.agent-metrics"
+HERCULES_ROOT="${HERCULES_ROOT:-$HOME}"
+SESSIONS_ROOT="${SESSIONS_ROOT:-$HERCULES_ROOT/sessions}"
+METRICS_DIR="$HERCULES_ROOT/.agent-metrics"
 AUDIT_LOG="$METRICS_DIR/autonomy-audit.jsonl"
 
 # --- CLI flags ---
@@ -82,6 +82,8 @@ if [ "$SHOW_STATS" = true ]; then
 
     echo "By project:"
     jq -r '.project // "unknown"' "$AUDIT_LOG" | sort | uniq -c | sort -rn | head -10
+    NULL_PROJECT=$(jq '[select(.project == null or .project == "")] | length' "$AUDIT_LOG" 2>/dev/null)
+    echo "  (null/empty project: $NULL_PROJECT / $TOTAL)"
     echo ""
 
     echo "By action:"

@@ -39,8 +39,28 @@ RISK_LEVEL=$(v11_risk_level)
 mkdir -p "$METRICS_DIR"
 
 # Outcome
+# v11.44 G2: the runtime-error layer was dormant fleet-wide (0/13966 rows had
+# outcome=="error") because V11_ERROR reads a top-level .error that current Claude
+# Code payloads never populate — the real tool result (and its is_error flag) lives
+# at .tool_response (captured as V11_TOOL_OUTPUT by v11_parse_input). Detect failure
+# there too. Rollback: V11_RUNTIME_ERROR_CAPTURE=off restores the legacy .error-only
+# check (identical pre-v11.44 behavior). is_error detection cannot false-positive on a
+# success (success responses omit it); worst case a shape mismatch captures nothing.
 OUTCOME="success"
-[ -n "$V11_ERROR" ] && [ "$V11_ERROR" != "null" ] && OUTCOME="error"
+if [ -n "$V11_ERROR" ] && [ "$V11_ERROR" != "null" ]; then
+    OUTCOME="error"
+elif [ "${V11_RUNTIME_ERROR_CAPTURE:-on}" != "off" ]; then
+    _te=$(printf '%s' "${V11_TOOL_OUTPUT:-}" \
+        | jq -r 'if type=="object" then (.is_error // .error // empty) else empty end' 2>/dev/null || true)
+    if [ -n "$_te" ] && [ "$_te" != "false" ] && [ "$_te" != "null" ]; then
+        OUTCOME="error"
+        # Surface a short error string for recent_errors / the audit row's error field.
+        V11_ERROR="$(printf '%s' "${V11_TOOL_OUTPUT:-}" \
+            | jq -r 'if type=="object" then ((.error // .stderr // .message // "tool_error")|tostring) else "tool_error" end' 2>/dev/null | head -c 200 || true)"
+        [ -z "$V11_ERROR" ] && V11_ERROR="tool_error"
+    fi
+    unset _te
+fi
 
 # Category from file extension or command
 CATEGORY="other"
@@ -64,18 +84,19 @@ fi
 NOW=$(date -Iseconds)
 
 # Detect project from file path or command (moved before state file determination)
-v11_detect_project "$V11_FILE_PATH"
+# 15-F3: use attribution-aware detection that resolves NON_PROJECTS dirs by path
+_v11_detect_project_for_attribution "$V11_FILE_PATH"
 if [ -z "$V11_PROJECT" ] && [ -n "$V11_COMMAND" ]; then
-    CMD_PATH=$(printf '%s' "$V11_COMMAND" | grep -oE "$V11_WORKSPACE_ROOT/[^ ]+" | head -1)
-    [ -n "$CMD_PATH" ] && v11_detect_project "$CMD_PATH"
+    CMD_PATH=$(printf '%s' "$V11_COMMAND" | grep -oE "$HERCULES_ROOT/[^ ]+" | head -1)
+    [ -n "$CMD_PATH" ] && _v11_detect_project_for_attribution "$CMD_PATH"
 fi
 
-# Write to project-local state if project detected, else NOOP (don't track)
-if [ -n "$V11_PROJECT" ]; then
+# Write to project-local state if project detected AND it's a real project
+# (NON_PROJECTS dirs get attributed correctly but don't have autonomy state)
+if [ -n "$V11_PROJECT" ] && [ "$V11_DETECTION_METHOD" != "non-project" ]; then
     STATE_FILE="$SESSIONS_ROOT/$V11_PROJECT/.autonomy-state"
     mkdir -p "$(dirname "$STATE_FILE")"
 else
-    # No project context — skip state update (safety fallback)
     STATE_FILE=""
 fi
 
@@ -95,7 +116,10 @@ else
         high_risk_history:[], recent_errors:[], last_updated:$t}')
 fi
 
-CURRENT_LEVEL=$(printf '%s' "$STATE" | jq -r '.level // 0')
+# V11.34.3: normalize via common.sh so a display-form level ("A3") can't break
+# the escalation/de-escalation arithmetic below (it would have failed every
+# comparison silently, freezing the level).
+CURRENT_LEVEL=$(v11_normalize_autonomy_level "$(printf '%s' "$STATE" | jq -r '.level // 0')")
 SUCCESSFUL=$(printf '%s' "$STATE" | jq -r '.successful // 0')
 ERRORS=$(printf '%s' "$STATE" | jq -r '.errors // 0')
 
@@ -193,10 +217,10 @@ esac
 
 # === V11.4: Enriched audit fields ===
 
-# Fallback project detection: if v11_detect_project missed (e.g. NON_PROJECTS dir),
-# use the active-project file set by detect-project hook.
-# SEC-C-02: sanitized read — rejects path-traversal / metacharacter payloads.
-if [ -z "$V11_PROJECT" ]; then
+# Fallback project detection: only when no path was available at all.
+# 15-F3: NON_PROJECTS dirs now resolve by path (method="non-project"),
+# so this fallback fires only for pathless commands.
+if [ -z "$V11_PROJECT" ] && [ "${V11_ATTRIBUTE_BY_PATH:-on}" = "on" ]; then
     V11_PROJECT="$(v11_read_active_project)"
 fi
 

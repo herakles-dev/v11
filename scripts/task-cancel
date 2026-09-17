@@ -1,0 +1,192 @@
+#!/usr/bin/env bash
+# V11 Script: task-cancel
+#
+# Sanctioned writer for appending a "cancelled" event to a project's durable
+# ledger (~/.agent-metrics/ledger/$PROJECT.jsonl). Closes the tooling gap
+# left by improvement #17: that fix sanctioned "append a cancelled event" as
+# the remediation for mis-attributed/foreign tasks, but shipped no tooling —
+# sessions hand-appended events missing subject_norm/create_seq, which broke
+# replay keying (improvement #24, now fixed reader-side).
+#
+# This script always appends through v11_ledger_append (hooks/lib/common.sh)
+# so the envelope is validated and the cancel event carries the SAME
+# identity fields (subject_norm, create_seq) as the task's `created` event —
+# the fold keys records by (project, subject_norm, create_seq); a cancel
+# event with mismatched identity fields lands on the wrong record (or a
+# phantom one).
+#
+# DELIBERATE: no counters_delta on the emitted event. The replay's realign
+# derivation (common.sh ~§3.3, "counters realigned to per-identity set")
+# re-derives pending/in_progress/completed/blocked strictly from record
+# status and overwrites the additive fold on any drift — a cancelled record
+# leaves the open buckets by status match alone, and `total` semantics
+# (cancelled tasks REMAIN in total) are governed by the derivation, never by
+# deltas. A counters_delta here would be a post-realign no-op; do not "fix"
+# this by adding one.
+#
+# Usage:
+#   task-cancel PROJECT TASK_ID SESSION_UUID [--reason "..."] [--dry-run]
+#
+#   PROJECT      Project name (^[a-zA-Z0-9._-]{1,64}$)
+#   TASK_ID      Session-local task id (as recorded on the `created` event)
+#   SESSION_UUID Session UUID that created the task (exact match required —
+#                task_id alone is reused across sessions and is not a
+#                stable identity)
+#   --reason     Cancellation reason (default: "task-cancel script")
+#   --dry-run    Print the event that WOULD be appended; do not write
+#
+# Finds the most recent `created` event for (task_id, session_uuid) in the
+# project's ledger, copies its v/subject_norm/create_seq, and appends a
+# cancelled event via v11_ledger_append. If no matching `created` event is
+# found, prints near-miss candidates (same task_id, other sessions) and
+# exits 1.
+#
+# Exit codes: 0 success (dry-run print or real append), 1 no match / usage error.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+V11_HOME="${V11_HOME:-$(dirname "$SCRIPT_DIR")}"
+HERCULES_ROOT="${HERCULES_ROOT:-$HOME}"
+METRICS_DIR="${METRICS_DIR:-$HERCULES_ROOT/.agent-metrics}"
+
+usage() {
+    sed -n '/^# V11 Script: task-cancel/,/^set -euo/p' "$0" | grep -v '^set' | sed 's/^# \?//'
+    exit 1
+}
+
+if [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ]; then
+    usage
+fi
+
+# --- Arg parsing: 3 required positionals + optional flags ---
+REASON="task-cancel script"
+DRY_RUN=false
+POSITIONAL=()
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --reason)
+            REASON="${2:-}"
+            shift 2
+            ;;
+        --dry-run)
+            DRY_RUN=true
+            shift
+            ;;
+        -h|--help)
+            usage
+            ;;
+        --)
+            shift
+            break
+            ;;
+        -*)
+            echo "task-cancel: unknown option '$1'" >&2
+            exit 1
+            ;;
+        *)
+            POSITIONAL+=("$1")
+            shift
+            ;;
+    esac
+done
+
+if [ "${#POSITIONAL[@]}" -lt 3 ]; then
+    echo "Usage: task-cancel PROJECT TASK_ID SESSION_UUID [--reason \"...\"] [--dry-run]" >&2
+    exit 1
+fi
+
+PROJECT="${POSITIONAL[0]}"
+TASK_ID="${POSITIONAL[1]}"
+SESSION_UUID="${POSITIONAL[2]}"
+
+# SEC-C-02 (mirrors v11_ledger_append's own guard) — validate before any
+# filesystem path construction.
+if ! printf '%s' "$PROJECT" | grep -qE '^[a-zA-Z0-9._-]{1,64}$'; then
+    echo "task-cancel: invalid project name '$PROJECT' (must match ^[a-zA-Z0-9._-]{1,64}\$)" >&2
+    exit 1
+fi
+
+if [ -z "$TASK_ID" ] || [ -z "$SESSION_UUID" ]; then
+    echo "Usage: task-cancel PROJECT TASK_ID SESSION_UUID [--reason \"...\"] [--dry-run]" >&2
+    exit 1
+fi
+
+LEDGER_FILE="${METRICS_DIR}/ledger/${PROJECT}.jsonl"
+
+if [ ! -f "$LEDGER_FILE" ]; then
+    echo "task-cancel: no ledger file for project '$PROJECT' at $LEDGER_FILE" >&2
+    exit 1
+fi
+
+# --- Find the most recent `created` event for this exact (task_id, session_uuid) ---
+MATCHES=$(jq -c --arg tid "$TASK_ID" --arg sid "$SESSION_UUID" \
+    'select(.ev == "created" and .task_id == $tid and .session_uuid == $sid)' \
+    "$LEDGER_FILE" 2>/dev/null || true)
+
+if [ -z "$MATCHES" ]; then
+    echo "task-cancel: no 'created' event found in $LEDGER_FILE for task_id='$TASK_ID' session_uuid='$SESSION_UUID'" >&2
+    NEAR_MISSES=$(jq -c --arg tid "$TASK_ID" \
+        'select(.ev == "created" and .task_id == $tid) | {session_uuid, subject: (.subject // .subject_norm), ts}' \
+        "$LEDGER_FILE" 2>/dev/null | sort -u || true)
+    if [ -n "$NEAR_MISSES" ]; then
+        echo "" >&2
+        echo "Near-miss candidates (same task_id, other sessions):" >&2
+        printf '%s\n' "$NEAR_MISSES" | jq -r '"  session_uuid=" + .session_uuid + "  ts=" + .ts + "  subject=\"" + .subject + "\""' >&2
+    else
+        echo "  (no 'created' events found for task_id='$TASK_ID' in any session)" >&2
+    fi
+    exit 1
+fi
+
+# Most recent = last line in file order (ledger is append-only).
+MATCH=$(printf '%s\n' "$MATCHES" | tail -n 1)
+
+SUBJECT_NORM=$(printf '%s' "$MATCH" | jq -r '.subject_norm // ""')
+CREATE_SEQ=$(printf '%s' "$MATCH" | jq -r '.create_seq // empty')
+LEDGER_V=$(printf '%s' "$MATCH" | jq -r '.v // empty')
+
+if [ -z "$CREATE_SEQ" ]; then
+    echo "task-cancel: matched 'created' event has no create_seq — refusing to build an unsafe cancel event (project=$PROJECT task_id=$TASK_ID session_uuid=$SESSION_UUID)" >&2
+    exit 1
+fi
+if [ -z "$LEDGER_V" ]; then
+    LEDGER_V=1
+fi
+
+NOW="$(date -Iseconds)"
+
+EVENT_JSON=$(jq -cn \
+    --argjson v "$LEDGER_V" \
+    --arg ts "$NOW" \
+    --arg project "$PROJECT" \
+    --arg task_id "$TASK_ID" \
+    --arg session_uuid "$SESSION_UUID" \
+    --arg subject_norm "$SUBJECT_NORM" \
+    --argjson create_seq "$CREATE_SEQ" \
+    --arg reason "$REASON" \
+    '{
+        v: $v,
+        ev: "cancelled",
+        ts: $ts,
+        project: $project,
+        task_id: $task_id,
+        session_uuid: $session_uuid,
+        subject_norm: $subject_norm,
+        create_seq: $create_seq,
+        reason: $reason
+    }')
+
+if [ "$DRY_RUN" = true ]; then
+    echo "task-cancel: DRY RUN — would append the following event to $LEDGER_FILE:" >&2
+    printf '%s\n' "$EVENT_JSON" | jq '.'
+    exit 0
+fi
+
+# shellcheck source=../hooks/lib/common.sh
+source "$V11_HOME/hooks/lib/common.sh"
+
+v11_ledger_append "$PROJECT" "$EVENT_JSON" || true
+
+echo "task-cancel: appended cancelled event — project=$PROJECT task_id=$TASK_ID subject_norm=\"$SUBJECT_NORM\""

@@ -1,9 +1,9 @@
 #!/bin/bash
 # V11 commit-msg hook shim — git surface for validation tag linting.
 # Install per-repo with:
-#   git config core.hooksPath /path/to/v11/hooks/git-hooks
+#   git config core.hooksPath $HOME/v11/hooks/git-hooks
 # Or symlink directly:
-#   ln -sf /path/to/v11/hooks/commit-msg-validation .git/hooks/commit-msg
+#   ln -sf $HOME/v11/hooks/commit-msg-validation .git/hooks/commit-msg
 #
 # This script receives the commit message file path as $1 (standard git hook interface).
 #

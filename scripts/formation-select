@@ -15,9 +15,9 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 V11_HOME="${V11_HOME:-$(dirname "$SCRIPT_DIR")}"
-V11_WORKSPACE_ROOT="${V11_WORKSPACE_ROOT:-$HOME/.v11}"
-SESSIONS_ROOT="${SESSIONS_ROOT:-$V11_WORKSPACE_ROOT/sessions}"
-TASK_STATE_DIR="${TASK_STATE_DIR:-$V11_WORKSPACE_ROOT/.agent-metrics/task-state}"
+HERCULES_ROOT="${HERCULES_ROOT:-$HOME}"
+SESSIONS_ROOT="${SESSIONS_ROOT:-$HERCULES_ROOT/sessions}"
+TASK_STATE_DIR="${TASK_STATE_DIR:-$HERCULES_ROOT/.agent-metrics/task-state}"
 
 # --- Self-test ---
 if [ "${1:-}" == "--test" ]; then

@@ -24,7 +24,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 V11_HOME="${V11_HOME:-$(dirname "$SCRIPT_DIR")}"
-V11_WORKSPACE_ROOT="${V11_WORKSPACE_ROOT:-$HOME/.v11}"
+HERCULES_ROOT="${HERCULES_ROOT:-$HOME}"
 # shellcheck source=../hooks/lib/common.sh
 source "$V11_HOME/hooks/lib/common.sh"
 

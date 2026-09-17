@@ -1,0 +1,310 @@
+#!/usr/bin/env python3
+"""
+v11.43 — Build-timing calibration: re-derive empirical build durations from the
+durable task ledger so planning estimates anchor to reality, not calendar feel.
+
+Reads `~/.agent-metrics/ledger/*.jsonl`, matches `created`→`completed` by
+(project, create_seq), and reports:
+  - same-day task cycle time (the honest "how long is a task" number),
+  - active-days (distinct calendar dates with events) and active-hours
+    (Σ of inter-event gaps clamped at 30 min) per project,
+  - a baked ANCHOR band table (single task / point-release / sprint / MVP)
+    plus the live aggregate, so drift between the two is visible.
+
+Cross-session dormancy (a task created, left, then completed weeks later after a
+rehydrate) inflates raw created→completed durations into the 100k-minute range.
+Those are reported separately as `dormant_*` and NEVER folded into the median.
+
+Usage:
+    scripts/build-timing                      # calibration table across all ledgers
+    scripts/build-timing --since 120d         # window the events
+    scripts/build-timing --project v11        # single project
+    scripts/build-timing --estimate 12        # band for a 12-task plan (planning aid)
+    scripts/build-timing --json               # machine-readable (retro INPUT)
+    scripts/build-timing --test               # self-test: prints version, exits 0
+
+Exit codes:
+    0  success
+    1  usage / no data
+"""
+
+from __future__ import annotations
+
+import argparse
+import glob
+import json
+import os
+import re
+import statistics as st
+import sys
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+VERSION = "build-timing v1.0"
+
+METRICS_DIR = Path(os.environ.get("METRICS_DIR", str(Path.home() / ".agent-metrics")))
+DEFAULT_LEDGER_DIR = METRICS_DIR / "ledger"
+
+IDLE_CAP_SEC = 1800  # gaps longer than this are "away"; clamped when summing active time
+
+# Baked empirical anchors (derived 2026-09, ~130 projects, 2026-05→09). The live
+# aggregate below is computed each run; when it drifts materially from these,
+# refresh docs/BUILD_TIMING.md. Estimate in ACTIVE time, never calendar weeks.
+ANCHORS = [
+    # (label, task_count, wall_clock_band, detail)
+    ("single task",              "1",     "30–60 min",          "one sitting; p75 ~2h, p90 ~6h"),
+    ("point release / fixes",    "3–10",  "<1 hr – ~1 evening", "1–3 active-hrs, one sitting"),
+    ("named sprint / version",   "10–20", "an evening or two",  "3–7 active-hrs across 1–2 active-days"),
+    ("app / MVP",                "20+",   "a few active-days",  "7–25 active-hrs across 2–5 active-days"),
+    ("flagship",                 "100+",  "weeks of active work","the exception (e.g. example-project: 120h / 50 active-days)"),
+]
+
+
+def parse_since(s: str) -> datetime | None:
+    if not s:
+        return None
+    m = re.match(r"^(\d+)([dhm])$", s.strip())
+    if m:
+        n = int(m.group(1))
+        unit = m.group(2)
+        delta = {"d": timedelta(days=n), "h": timedelta(hours=n), "m": timedelta(minutes=n)}[unit]
+        return datetime.now(timezone.utc) - delta
+    try:
+        return datetime.fromisoformat(s)
+    except ValueError:
+        return None
+
+
+def parse_ts(s: str | None) -> datetime | None:
+    if not s:
+        return None
+    try:
+        return datetime.fromisoformat(s.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def estimate_band(n_tasks: int) -> dict:
+    """Map a planned task count to an active-time band. Planning aid — the STEP 4c
+    wall-clock line and any 'how long' answer should anchor here."""
+    if n_tasks <= 3:
+        return {"tasks": n_tasks, "band": "under an hour, one sitting", "active_hrs": "0.5–1"}
+    if n_tasks <= 10:
+        return {"tasks": n_tasks, "band": "~1 evening", "active_hrs": "1–3"}
+    if n_tasks <= 20:
+        return {"tasks": n_tasks, "band": "an evening or two", "active_hrs": "3–7"}
+    if n_tasks <= 60:
+        return {"tasks": n_tasks, "band": "a few active-days", "active_hrs": "7–25"}
+    return {"tasks": n_tasks, "band": "multiple active-days / weeks", "active_hrs": "25+"}
+
+
+def analyze_file(path: Path, since_dt: datetime | None) -> dict | None:
+    evs = []
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    o = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                t = parse_ts(o.get("ts"))
+                if t is None:
+                    continue
+                if since_dt is not None and t < since_dt:
+                    continue
+                evs.append((t, o.get("ev") or o.get("event") or "?", o))
+    except OSError:
+        return None
+    if not evs:
+        return None
+    evs.sort(key=lambda x: x[0])
+
+    active = 0.0
+    for i in range(1, len(evs)):
+        gap = (evs[i][0] - evs[i - 1][0]).total_seconds()
+        if gap > 0:
+            active += min(gap, IDLE_CAP_SEC)
+    active_days = len({e[0].date() for e in evs})
+
+    created: dict = {}
+    completed: dict = {}
+    n_created = n_completed = 0
+    for t, ev, o in evs:
+        cs = o.get("create_seq")
+        if ev == "created":
+            n_created += 1
+            if cs is not None and cs not in created:
+                created[cs] = (t, o)
+        elif ev == "completed":
+            n_completed += 1
+            if cs is not None:
+                completed[cs] = (t, o)
+
+    same_day = []   # minutes — the honest headline
+    dormant = []    # minutes — cross-session dormancy, reported but never in the median
+    for cs, (ct, _co) in created.items():
+        if cs in completed:
+            dt = completed[cs][0]
+            mins = (dt - ct).total_seconds() / 60.0
+            if mins < 0:
+                continue
+            if ct.date() == dt.date():
+                same_day.append(mins)
+            else:
+                dormant.append(mins)
+
+    return {
+        "project": path.stem,
+        "first": evs[0][0].isoformat(),
+        "last": evs[-1][0].isoformat(),
+        "cal_days": (evs[-1][0].date() - evs[0][0].date()).days + 1,
+        "active_days": active_days,
+        "active_hrs": round(active / 3600.0, 1),
+        "tasks_created": n_created,
+        "tasks_completed": n_completed,
+        "same_day_cycles_min": same_day,
+        "dormant_cycles_min": dormant,
+    }
+
+
+def pct(xs: list[float], p: float) -> float:
+    if not xs:
+        return float("nan")
+    xs = sorted(xs)
+    k = int(round((p / 100) * (len(xs) - 1)))
+    return xs[k]
+
+
+def med(xs: list[float]) -> float:
+    return st.median(xs) if xs else float("nan")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="v11.43 build-timing calibration (read-only)")
+    parser.add_argument("--ledger-dir", type=Path, default=DEFAULT_LEDGER_DIR)
+    parser.add_argument("--project", help="single-project scope")
+    parser.add_argument("--since", help="time filter: 30d / 24h / 60m / ISO-8601")
+    parser.add_argument("--estimate", type=int, metavar="N", help="print the active-time band for an N-task plan and exit")
+    parser.add_argument("--min-completed", type=int, default=3, help="per-project table floor (default 3)")
+    parser.add_argument("--json", action="store_true", help="machine-readable output")
+    parser.add_argument("--test", action="store_true", help="self-test: print version and exit 0")
+    args = parser.parse_args()
+
+    if args.test:
+        print(VERSION)
+        return 0
+
+    if args.estimate is not None:
+        band = estimate_band(args.estimate)
+        if args.json:
+            json.dump(band, sys.stdout, indent=2)
+            sys.stdout.write("\n")
+        else:
+            print(f"{band['tasks']} tasks → {band['band']}  (~{band['active_hrs']} active-hrs)")
+            print("Calendar time only if blocked on an external gate (deploy / review / funded spend).")
+        return 0
+
+    since_dt = parse_since(args.since) if args.since else None
+
+    if args.project:
+        files = [args.ledger_dir / f"{args.project}.jsonl"]
+    else:
+        files = sorted(args.ledger_dir.glob("*.jsonl"))
+
+    rows = []
+    for f in files:
+        if not f.exists():
+            continue
+        r = analyze_file(f, since_dt)
+        if r:
+            rows.append(r)
+
+    if not rows:
+        sys.stderr.write("build-timing: no ledger data in scope\n")
+        return 1
+
+    # aggregate — pool SAME-DAY cycles only (the honest task-cycle signal)
+    all_sameday = [m for r in rows for m in r["same_day_cycles_min"]]
+    all_dormant = [m for r in rows for m in r["dormant_cycles_min"]]
+    n_matched = len(all_sameday) + len(all_dormant)
+    aggregate = {
+        "projects": len(rows),
+        "tasks_completed": sum(r["tasks_completed"] for r in rows),
+        "matched_tasks": n_matched,
+        "same_day_pct": round(100.0 * len(all_sameday) / n_matched, 0) if n_matched else None,
+        "median_task_min": round(med(all_sameday), 0) if all_sameday else None,
+        "p75_task_min": round(pct(all_sameday, 75), 0) if all_sameday else None,
+        "p90_task_min": round(pct(all_sameday, 90), 0) if all_sameday else None,
+        "median_active_days": round(med([r["active_days"] for r in rows]), 0),
+        "median_active_hrs": round(med([r["active_hrs"] for r in rows]), 1),
+        "median_cal_days": round(med([r["cal_days"] for r in rows]), 0),
+        "dormant_tasks": len(all_dormant),
+    }
+
+    if args.json:
+        out = {
+            "anchors": [
+                {"label": a[0], "tasks": a[1], "wall_clock": a[2], "detail": a[3]}
+                for a in ANCHORS
+            ],
+            "aggregate": aggregate,
+            "per_project": [
+                {
+                    "project": r["project"],
+                    "first": r["first"],
+                    "active_days": r["active_days"],
+                    "active_hrs": r["active_hrs"],
+                    "cal_days": r["cal_days"],
+                    "tasks_completed": r["tasks_completed"],
+                    "median_task_min": round(med(r["same_day_cycles_min"]), 0)
+                    if r["same_day_cycles_min"] else None,
+                }
+                for r in sorted(rows, key=lambda x: x["active_hrs"], reverse=True)
+                if r["tasks_completed"] >= args.min_completed
+            ],
+        }
+        json.dump(out, sys.stdout, indent=2)
+        sys.stdout.write("\n")
+        return 0
+
+    print(VERSION)
+    if args.since:
+        print(f"  window: since {args.since}")
+    if args.project:
+        print(f"  project: {args.project}")
+    print()
+    print("ANCHORS — estimate in ACTIVE time, not calendar weeks:")
+    print(f"  {'unit':<26} {'tasks':<7} {'wall-clock':<20} detail")
+    for a in ANCHORS:
+        print(f"  {a[0]:<26} {a[1]:<7} {a[2]:<20} {a[3]}")
+    print()
+    print("LIVE AGGREGATE (this ledger scope):")
+    if aggregate["median_task_min"] is not None:
+        print(f"  task cycle (same-day): median {aggregate['median_task_min']:.0f} min "
+              f"| p75 {aggregate['p75_task_min']:.0f} | p90 {aggregate['p90_task_min']:.0f} min "
+              f"| same-day {aggregate['same_day_pct']:.0f}%")
+    print(f"  per-effort medians: {aggregate['median_active_days']:.0f} active-days, "
+          f"{aggregate['median_active_hrs']:.1f} active-hrs, "
+          f"vs {aggregate['median_cal_days']:.0f} calendar-days  ← the gap that fools estimates")
+    print(f"  {aggregate['projects']} projects, {aggregate['tasks_completed']} tasks completed, "
+          f"{aggregate['dormant_tasks']} cross-session/dormant tasks (excluded from median)")
+    print()
+    print("TOP EFFORTS BY ACTIVE-HOURS:")
+    print(f"  {'project':<34} {'first':<11} {'ad':>3} {'hrs':>6} {'done':>5}  medTask")
+    for r in sorted(rows, key=lambda x: x["active_hrs"], reverse=True):
+        if r["tasks_completed"] < args.min_completed:
+            continue
+        mt = med(r["same_day_cycles_min"])
+        mt_s = f"{mt:.0f}m" if mt == mt else "  –"  # nan check
+        print(f"  {r['project'][:34]:<34} {r['first'][:10]:<11} {r['active_days']:>3} "
+              f"{r['active_hrs']:>6.1f} {r['tasks_completed']:>5}  {mt_s}")
+    print()
+    print("Anchor doc: docs/BUILD_TIMING.md. Suppress the STEP 4c estimate: V11_TIMING_ANCHOR=off.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

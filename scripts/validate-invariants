@@ -27,7 +27,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 V11_HOME="${V11_HOME:-$(dirname "$SCRIPT_DIR")}"
-V11_WORKSPACE_ROOT="${V11_WORKSPACE_ROOT:-$HOME/.v11}"
+HERCULES_ROOT="${HERCULES_ROOT:-$HOME}"
 
 if [ "${1:-}" == "--test" ]; then
     echo "validate-invariants v1.0 (V11.8, S2-6)"
@@ -76,7 +76,7 @@ if [[ -z "$PROJECT" ]] || [[ "$PROJECT" == *".."* ]] || [[ "$PROJECT" == *"/"* ]
     exit 2
 fi
 
-PROJECT_DIR="$V11_WORKSPACE_ROOT/$PROJECT"
+PROJECT_DIR="$HERCULES_ROOT/$PROJECT"
 if [ ! -d "$PROJECT_DIR" ]; then
     echo "Error: Project directory not found: $PROJECT_DIR" >&2
     exit 2

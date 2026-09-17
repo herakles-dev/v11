@@ -108,8 +108,8 @@ if [ -z "$REPORT_FILE" ]; then
         exit 1
     fi
     # Try the existing scripts/wave-review output first, then the V11.20 convention
-    CAND1="${SESSIONS_ROOT:-$V11_WORKSPACE_ROOT/sessions}/$PROJECT/reviews/wave-${WAVE}.json"
-    CAND2="${SESSIONS_ROOT:-$V11_WORKSPACE_ROOT/sessions}/$PROJECT/wave-reports/wave-${WAVE}-review.json"
+    CAND1="${SESSIONS_ROOT:-$HERCULES_ROOT/sessions}/$PROJECT/reviews/wave-${WAVE}.json"
+    CAND2="${SESSIONS_ROOT:-$HERCULES_ROOT/sessions}/$PROJECT/wave-reports/wave-${WAVE}-review.json"
     if [ -f "$CAND1" ]; then
         REPORT_FILE="$CAND1"
     elif [ -f "$CAND2" ]; then
@@ -133,13 +133,13 @@ CALLER_KIND=$(v11_caller_kind 2>/dev/null || true)
 V11_WRA_PROJECT="$PROJECT" \
 V11_WRA_WAVE="${WAVE:-}" \
 V11_WRA_REPORT="$REPORT_FILE" \
-V11_WRA_METRICS="${METRICS_DIR:-$V11_WORKSPACE_ROOT/.agent-metrics}" \
+V11_WRA_METRICS="${METRICS_DIR:-$HERCULES_ROOT/.agent-metrics}" \
 V11_WRA_DRY_RUN="$DRY_RUN" \
 V11_WRA_QUIET="$QUIET" \
 V11_WRA_MARK_DONE="$MARK_DONE" \
 V11_WRA_CALLER_KIND="$CALLER_KIND" \
-V11_WRA_TASK_STATE_DIR="${TASK_STATE_DIR:-$V11_WORKSPACE_ROOT/.agent-metrics/task-state}" \
-V11_WRA_V11_WORKSPACE_ROOT="${V11_WORKSPACE_ROOT:-$HOME/.v11}" \
+V11_WRA_TASK_STATE_DIR="${TASK_STATE_DIR:-$HERCULES_ROOT/.agent-metrics/task-state}" \
+V11_WRA_HERCULES_ROOT="${HERCULES_ROOT:-$HOME}" \
 V11_WRA_V11_HOME="$V11_HOME" \
 V11_WRA_REVIEW_QUEUE_SCRIPT="$V11_HOME/scripts/review-queue" \
 python3 - <<'PYEOF'
@@ -157,8 +157,8 @@ quiet         = os.environ.get("V11_WRA_QUIET", "false") == "true"
 mark_done     = os.environ.get("V11_WRA_MARK_DONE", "false") == "true"
 caller_kind   = os.environ.get("V11_WRA_CALLER_KIND", "") or ""
 task_state_dir = pathlib.Path(os.environ["V11_WRA_TASK_STATE_DIR"])
-workspace_root = os.environ.get("V11_WRA_V11_WORKSPACE_ROOT", os.path.expanduser("~/.v11")).rstrip("/")
-v11_home      = os.environ.get("V11_WRA_V11_HOME", os.path.expanduser("~/.v11/v11")).rstrip("/")
+hercules_root = os.environ.get("V11_WRA_HERCULES_ROOT", "$HOME").rstrip("/")
+v11_home      = os.environ.get("V11_WRA_V11_HOME", "$HOME/v11").rstrip("/")
 review_queue  = os.environ.get("V11_WRA_REVIEW_QUEUE_SCRIPT", "")
 
 LAYER = "wave"
@@ -238,11 +238,11 @@ def resolve_file_to_task(file_):
     if file_.startswith("/"):
         if file_.startswith(v11_home + "/"):
             cand.add(file_[len(v11_home)+1:])
-        if file_.startswith(workspace_root + "/"):
-            cand.add(file_[len(workspace_root)+1:])
+        if file_.startswith(hercules_root + "/"):
+            cand.add(file_[len(hercules_root)+1:])
     else:
         cand.add(f"{v11_home}/{file_}")
-        cand.add(f"{workspace_root}/{file_}")
+        cand.add(f"{hercules_root}/{file_}")
     basename = os.path.basename(file_) if "/" in file_ else file_
 
     matches = []  # (quality, completed_at, tid_num, tid_str)
@@ -454,15 +454,19 @@ if not dry_run:
     append_jsonl(metrics / "unattributed-findings.jsonl", unattributed_to_append)
 
     if mark_done and review_queue and per_task_max_sev:
+        session_uuid = os.environ.get("V11_SESSION_ID", "")
         for tid, sev in per_task_max_sev.items():
             try:
+                cmd = [review_queue, "mark-done", project, str(tid), sev]
+                if session_uuid:
+                    cmd.append(session_uuid)
                 subprocess.run(
-                    [review_queue, "mark-done", project, str(tid), sev],  # positional SEV (V11.28.1: was "--severity" sev → flag leaked into the value)
+                    cmd,
                     timeout=10, check=False,
                     stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                 )
             except Exception:
-                pass  # Best-effort; never fail the attribute script over this
+                pass
 
 # --- Summary ---
 agents_covered = len({l["agent_id"] for l in errors_to_append})

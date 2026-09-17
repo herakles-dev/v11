@@ -6,7 +6,7 @@
 
 ## State Storage Architecture (V11.16 — durable ledger)
 
-The canonical model is in [CLAUDE.md §4](../CLAUDE.md). Summary:
+The canonical model is in CLAUDE.md §4. Summary:
 
 ```
 TaskCreate/Update/List (per-session Source of Truth, in Claude Code)

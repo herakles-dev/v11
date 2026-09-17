@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "task-metadata.schema.json",
+  "$id": "https://herakles.dev/v11/schemas/task-metadata.schema.json",
   "title": "V11 Task Metadata",
   "description": "Schema for task metadata including artifact handoffs",
   "type": "object",

@@ -31,7 +31,7 @@ The two rules are in tension and the resolution is unspecified.
 
 ## Root cause
 
-The review-queue contract was written assuming each session is the sole writer for the project. The reality on this box is that multiple Claude sessions can run concurrently against the same project (one in photos, one in sofly-eyes). The queue mixes their concerns.
+The review-queue contract was written assuming each session is the sole writer for the project. The reality on this Hercules box is that multiple Claude sessions can run concurrently against the same project (one in photos, one in sofly-eyes). The queue mixes their concerns.
 
 There's no per-session scoping, no "skip files owned by a concurrent session," and no graceful "drain what you can, skip what's in flight."
 

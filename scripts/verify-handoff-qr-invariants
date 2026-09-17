@@ -1,0 +1,198 @@
+#!/usr/bin/env bash
+# verify-handoff-qr-invariants: scorecard for v11-handoff-quality-remediation
+# QR-1..QR-7 invariants. Run against an emitted handoff.md +
+# .handoff-confidence.json + handoff-tasks.json to confirm the CLOSE-side
+# quality fixes held on the receiving session.
+#
+# Usage:
+#   scripts/verify-handoff-qr-invariants PROJECT           # human-readable
+#   scripts/verify-handoff-qr-invariants PROJECT --json    # machine-readable
+#
+# Exit: 0 = all invariants pass, N = failure count.
+
+set -uo pipefail
+
+PROJECT="${1:-}"
+JSON=0
+shift 2>/dev/null || true
+for arg in "$@"; do
+    [ "$arg" = "--json" ] && JSON=1
+done
+
+if [ -z "$PROJECT" ]; then
+    echo "Usage: $0 PROJECT [--json]" >&2
+    exit 99
+fi
+
+SESSIONS_ROOT="${SESSIONS_ROOT:-$HOME/sessions}"
+SD="$SESSIONS_ROOT/$PROJECT"
+HO_MD="$SD/handoff.md"
+HO_JSON="$SD/handoff-tasks.json"
+CONF_JSON="$SD/.handoff-confidence.json"
+
+if [ ! -f "$HO_MD" ]; then
+    echo "FAIL: $HO_MD not found — did you run scripts/handoff $PROJECT?" >&2
+    exit 99
+fi
+
+declare -A RESULT
+declare -A DETAIL
+FAILS=0
+
+_pass() { RESULT[$1]="PASS"; DETAIL[$1]="$2"; }
+_fail() { RESULT[$1]="FAIL"; DETAIL[$1]="$2"; FAILS=$((FAILS + 1)); }
+_skip() { RESULT[$1]="SKIP"; DETAIL[$1]="$2"; }
+
+# --- QR-1: header vs Next-Up pending counts agree ---
+HEADER_P=$(grep -oE '^- Pending: [0-9]+' "$HO_MD" | grep -oE '[0-9]+' | head -1)
+NEXTUP_P=$(grep -oE '^  - (Then|Next pending: lowest-ID of): [0-9]+ pending' "$HO_MD" | grep -oE '[0-9]+' | head -1)
+if [ -z "$HEADER_P" ]; then
+    _skip QR-1 "no header 'Pending: N' line found"
+elif [ -z "$NEXTUP_P" ]; then
+    _pass QR-1 "header=$HEADER_P; no Next-Up pending line (0-pending case)"
+elif [ "$HEADER_P" = "$NEXTUP_P" ]; then
+    _pass QR-1 "header=$HEADER_P == Next-Up=$NEXTUP_P"
+else
+    _fail QR-1 "header=$HEADER_P != Next-Up=$NEXTUP_P"
+fi
+
+# --- QR-2: COMPLETE category renders when all tasks completed ---
+if [ -f "$HO_JSON" ] && jq empty "$HO_JSON" 2>/dev/null; then
+    OPEN_COUNT=$(jq -r '(.open_tasks // []) | length' "$HO_JSON" 2>/dev/null || echo -1)
+else
+    OPEN_COUNT=-1
+fi
+CAT_BANNER=$(grep -oE '\*\*Category: [A-Z_]+\*\*' "$HO_MD" | head -1 | grep -oE '[A-Z_]+' | tail -1)
+if [ "$OPEN_COUNT" = "-1" ]; then
+    _skip QR-2 "handoff-tasks.json unreadable"
+elif [ "$OPEN_COUNT" = "0" ] && grep -qE '^- Progress: [0-9]+/[0-9]+ tasks \(100%\)' "$HO_MD"; then
+    if [ "$CAT_BANNER" = "COMPLETE" ]; then
+        _pass QR-2 "COMPLETE fires for finished sprint"
+    else
+        _fail QR-2 "finished sprint labeled '$CAT_BANNER' not COMPLETE"
+    fi
+else
+    _pass QR-2 "not-a-finished-sprint case; category=$CAT_BANNER (open=$OPEN_COUNT)"
+fi
+
+# --- QR-3: .handoff-confidence.json .category populated ---
+if [ ! -f "$CONF_JSON" ]; then
+    _fail QR-3 ".handoff-confidence.json not written"
+elif ! jq empty "$CONF_JSON" 2>/dev/null; then
+    _fail QR-3 ".handoff-confidence.json is invalid JSON"
+else
+    CAT_FIELD=$(jq -r '.category // "MISSING"' "$CONF_JSON" 2>/dev/null)
+    if [ "$CAT_FIELD" = "MISSING" ] || [ "$CAT_FIELD" = "null" ]; then
+        _fail QR-3 ".category is null/missing"
+    else
+        _pass QR-3 ".category=$CAT_FIELD"
+    fi
+fi
+
+# --- QR-4: no template markers in session-summary ---
+SS_FILE="$SD/.session-summary.md"
+if [ ! -f "$SS_FILE" ]; then
+    _skip QR-4 "no .session-summary.md"
+else
+    STUB_HITS=0
+    for marker in \
+        "_Generated stub — edit before" \
+        "[Describe what this session accomplished]" \
+        "[What key decisions were made and why?]" \
+        "[What is the current state" \
+        "[Any other blockers" \
+        "- ? → ?" ; do
+        if grep -qF "$marker" "$SS_FILE" 2>/dev/null; then
+            STUB_HITS=$((STUB_HITS + 1))
+        fi
+    done
+    # Also check what the state machine decided
+    IS_STUB_FIELD=$(jq -r '.conditions.summary_is_unedited_stub // "unknown"' "$CONF_JSON" 2>/dev/null)
+    if [ "$STUB_HITS" -eq 0 ] && [ "$IS_STUB_FIELD" != "true" ]; then
+        _pass QR-4 "no template markers, state-machine agrees not-stub"
+    elif [ "$STUB_HITS" -gt 0 ] && [ "$IS_STUB_FIELD" = "true" ]; then
+        _pass QR-4 "$STUB_HITS marker(s) present, correctly flagged is_stub=true"
+    else
+        _fail QR-4 "markers=$STUB_HITS, is_stub=$IS_STUB_FIELD — detector disagreed with content"
+    fi
+fi
+
+# --- QR-5: no foreign session paths in Key Files ---
+KF_SECTION=$(awk '/^## Key Files Modified/{f=1;next} /^## /{f=0} f' "$HO_MD" 2>/dev/null || true)
+if [ -z "$KF_SECTION" ]; then
+    _skip QR-5 "no Key Files section in handoff.md"
+else
+    _SR="${SESSIONS_ROOT%/}"
+    FOREIGN=$(printf '%s' "$KF_SECTION" \
+        | grep -oE "$_SR/[^/]+/" \
+        | awk -v proj="$PROJECT" -v sr="$_SR/" '
+            { p=substr($0, length(sr)+1); gsub(/\/$/, "", p); if (p != proj) print }' \
+        | sort -u)
+    if [ -z "$FOREIGN" ]; then
+        _pass QR-5 "no foreign session paths in Key Files"
+    else
+        _fail QR-5 "leaked: $(printf '%s' "$FOREIGN" | tr '\n' ',')"
+    fi
+fi
+
+# --- QR-6: handoff-tasks.json.bak.* count within cap ---
+BAK_CAP="${V11_BAK_CAP:-5}"
+BAK_COUNT=$(find "$SD" -maxdepth 1 -name 'handoff-tasks.json.bak.*' -type f 2>/dev/null | wc -l | tr -d '[:space:]')
+if [ "$BAK_COUNT" -le "$BAK_CAP" ]; then
+    _pass QR-6 "$BAK_COUNT bak files (cap $BAK_CAP)"
+else
+    _fail QR-6 "$BAK_COUNT bak files > cap $BAK_CAP"
+fi
+
+# --- QR-7: autoemit-proposed sidecar age vs GC cap ---
+PROP="$SD/handoff-tasks.json.autoemit-proposed.json"
+GC_DAYS="${V11_HANDOFF_AUTOEMIT_GC_DAYS:-14}"
+if [ ! -f "$PROP" ]; then
+    _pass QR-7 "no autoemit-proposed sidecar"
+else
+    AGE=$(python3 -c "
+import os, sys, time
+try:
+    print(int((time.time() - os.path.getmtime(sys.argv[1])) // 86400))
+except Exception:
+    print(-1)
+" "$PROP" 2>/dev/null || echo -1)
+    if [ "$AGE" -lt 0 ]; then
+        _fail QR-7 "could not stat $PROP"
+    elif [ "$AGE" -ge "$GC_DAYS" ]; then
+        _fail QR-7 "$PROP is ${AGE}d old (> cap ${GC_DAYS}d) — should have been GC'd"
+    else
+        _pass QR-7 "$PROP present, ${AGE}d old (within cap)"
+    fi
+fi
+
+# --- Output ---
+PASSES=0
+for k in QR-1 QR-2 QR-3 QR-4 QR-5 QR-6 QR-7; do
+    [ "${RESULT[$k]}" = "PASS" ] && PASSES=$((PASSES + 1))
+done
+
+if [ "$JSON" -eq 1 ]; then
+    printf '{'
+    printf '"project":"%s",' "$PROJECT"
+    printf '"passes":%d,"fails":%d,' "$PASSES" "$FAILS"
+    printf '"invariants":{'
+    first=1
+    for k in QR-1 QR-2 QR-3 QR-4 QR-5 QR-6 QR-7; do
+        [ "$first" = 0 ] && printf ','
+        first=0
+        printf '"%s":{"result":"%s","detail":"%s"}' \
+            "$k" "${RESULT[$k]}" "${DETAIL[$k]//\"/\\\"}"
+    done
+    printf '}}\n'
+else
+    echo "Handoff QR invariants scorecard — project: $PROJECT"
+    echo "---"
+    for k in QR-1 QR-2 QR-3 QR-4 QR-5 QR-6 QR-7; do
+        printf '%-6s %-4s  %s\n' "$k" "${RESULT[$k]}" "${DETAIL[$k]}"
+    done
+    echo "---"
+    echo "Total: $PASSES pass, $FAILS fail (SKIP not counted)"
+fi
+
+exit "$FAILS"

@@ -1,15 +1,69 @@
 # Enforcement — Detailed Reference
 
-> Extracted from V11 CLAUDE.md Section 13. Hook table below reflects V11.11 reforms.
+> Extracted from V11 CLAUDE.md Section 13. CLAUDE.md §13 keeps only names + counts + env
+> knobs for context-budget reasons (v11.35.5, W2-2) — this file is the canonical source for
+> per-hook Trigger/Purpose detail, the git-event cooperation note, and dormant-hook rationale.
+
+---
+
+## Current Hook Table (22 wired: 20 tool-event + 2 git-event)
+
+### Tool-Event Hooks
+
+| Hook | Trigger | Purpose |
+|------|---------|---------|
+| `detect-project` | Pre: Read | Set active project context |
+| `guard-write-gates` | Pre: Write/Edit | Task-state: blocks on genuine stall, advises on fresh session (V11.34); plan mode: file-count advisory |
+| `guard-enforcement` | Pre: Write/Edit/Bash | Risk + autonomy + tool policy cascade |
+| `require-producer-script` | Pre: Bash | Block git commit when validation artifacts lack sibling producer scripts |
+| `guard-effort` | Pre: Task | Effort level advisory (never blocks) |
+| `enforce-test-coverage` | Pre: Bash | Block deploy without tests |
+| `guard-validation-lint` | Pre: Bash | Validate `Validation:` tag on `git commit` commands; warn/block per severity matrix (V11.25) |
+| `verify-syntax` | Post: Write/Edit | Check syntax of written files |
+| `completion-hint` | Post: Write/Edit | Emit completion-hint suggestion when an edit likely resolves the current in_progress task |
+| `track-autonomy` | Post: Write/Edit/Bash | Update autonomy state + audit log + `caller_kind` (V11.20) |
+| `guard-fat-read` | Post: Read | Advisory when a Read pulls a heavy payload into the main session's context — image >100KB on-disk, or any other file >50KB (v11.35.5); rate-limited to ~1 advisory per 5 qualifying Reads/session. Rollback: `V11_FAT_READ_ADVISORY=off` |
+| `sync-tasks` | Post: TaskCreate/Update/List/Get | Task state, artifacts, review queue, durable ledger, attribution |
+| `guard-agent-stall` | Post: TaskList | Detect stalled agents by task-state timestamps (advisory) |
+| `guard-stale-task` | Post: TaskList | Detect zombie-task pattern: in_progress tasks with recent edits but no completion event (V11.23 §H9) |
+| `track-agents` | Post: Task | Agent metrics + escalation |
+| `guard-worktree-isolation` | Post: Task/Agent, TaskList | `isolation:"worktree"` silent no-op safety net (improvements/12 H1): records a worktree-count baseline at spawn, reconciles at the next TaskList fire once a grace period elapses |
+| `fix-team-model` | Pre+Post: TeamCreate/Agent | Dormant safety net for legacy TeamCreate |
+| `post-compact` | PostCompact | Re-inject V11 state after context compaction |
+| `session-end` | Stop | Save session summary + auto-handoff |
+| `spawn-claude-window.py` | Post: Skill | Zeus spawn handoff bootstrap — re-reads handoff.md, extracts V11.28 steer span, prepends `/v11` (host-level hook at `~/.claude/hooks/`, unversioned; wired in `v11/.claude/settings.json`) |
+
+Tool-event hooks fire automatically in scaffolded projects. For manual adoption: copy `v11/.claude/settings.json` to project. Hooks should **not** be added to `~/.claude/settings.json` globally — they would fire on every project across the platform, causing false enforcement.
+
+### Git-Event Hooks
+
+These hooks are installed in `.git/hooks/` per-project and fire on git events — not Claude Code tool events. No Claude Code matcher is involved; commits made from any surface (IDE, CLI, scripts) trigger them.
+
+| Hook | Trigger | Purpose |
+|------|---------|---------|
+| `commit-msg-validation` | git commit-msg | Validate `Validation:` tag on every commit message regardless of surface; shares validator with `guard-validation-lint` (V11.25) |
+| `post-commit-close-tasks` | git post-commit | Auto-close in_progress tasks whose `S{N}-T{M}:` prefix matches HEAD commit subject (V11.25) |
+
+Install per-project: `./scripts/install-postcommit-hook <project>` and `./scripts/install-validation-lint-hook <project>`. V11-scaffolded projects get this automatically.
+Env knobs: `V11_POSTCOMMIT_AUTOCLOSE=off` (disable), `V11_POSTCOMMIT_DRYRUN=on` (log only, no writes).
+Closures carry `caller_kind:"hook"` — counted in project throughput but NOT in any agent scorecard.
+
+> **Post-commit / validation-lint cooperation**: When a commit body contains `Validation: HYPOTHESIZED` followed by `Pairs: T<ids>`, the post-commit hook excludes those task IDs from auto-close, keeping them open until a follow-up commit carries a `MEASURED-LIVE-PARTIAL` or `LIVE` tag. This means discipline mechanisms cooperate rather than deadlock: you can iterate on an unmeasured claim across multiple commits without the hook prematurely closing the work task.
+
+### Dormant Hook Scripts
+
+Present in `hooks/` but intentionally NOT wired — presence-without-wiring is deliberate, not missing config:
+- `guard-teammate-timeout` — superseded by `guard-agent-stall`; kept for reference.
+- `refresh-freshness-tags` — auto-refreshes `<!-- Validated: -->` markers at session-end; opt-in only since it mutates files (wire to `Stop` + `V11_FRESHNESS_REFRESH=on` to enable).
+- `enforce-subagent` (S42) — warn-only delegation advisor, but it warns per *open task* on every spawn (the Agent payload carries no task_id, so it can't correlate a spawn to its task → fires N advisories per spawn). **Needs spawn→task correlation before it's wirable**; a `V11_ENFORCE_SUBAGENT=off` guard is already in place for when it is.
 
 ---
 
 ## Hook Table (historical V11.11 snapshot)
 
 > ⚠ This table is a **V11.11-era snapshot** kept for the per-hook "V11.11 Change" rationale
-> column. It is NOT the current hook inventory. **The canonical, current hook list lives in
-> [CLAUDE.md §13](../CLAUDE.md)** (18 tool-event + 2 git-event as of v11.33). Do not treat the
-> count below as authoritative — restating hook counts across docs is a known drift source.
+> column. It is NOT the current hook inventory — see "Current Hook Table" above. Do not treat
+> the count below as authoritative — restating hook counts across docs is a known drift source.
 
 At V11.11: 13 hooks — `guard-agent-stall` replaced `guard-teammate-timeout`.
 
@@ -37,8 +91,8 @@ Hooks fire automatically in projects created with `./scripts/scaffold` (each pro
 
 **For manually-adopted projects** (existing codebases not created with scaffold):
 ```bash
-mkdir -p ~/sessions/YOUR_PROJECT/.claude
-cp ~/v11/.claude/settings.json ~/sessions/YOUR_PROJECT/.claude/settings.json
+mkdir -p /path/to/operator-home/sessions/YOUR_PROJECT/.claude
+cp /path/to/v11/.claude/settings.json /path/to/operator-home/sessions/YOUR_PROJECT/.claude/settings.json
 ```
 Hooks should **not** be added to `~/.claude/settings.json` globally — they would fire on every project across the platform, causing false enforcement.
 

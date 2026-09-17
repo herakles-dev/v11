@@ -42,8 +42,8 @@ except ImportError:
 # ── config ────────────────────────────────────────────────────────────────────
 
 CLAUDE_MODEL    = "claude-sonnet-4-6"
-REPO_CACHE_DIR  = Path(os.path.expanduser("~/v11/swebench-repos"))
-PRED_DIR        = Path(os.path.expanduser("~/v11/swebench-predictions/claude-baseline"))
+REPO_CACHE_DIR  = Path("/path/to/v11/swebench-repos")
+PRED_DIR        = Path("/path/to/v11/swebench-predictions/claude-baseline")
 MAX_CONTEXT_CHARS = 100_000  # ~25K tokens
 MAX_FILE_CHARS    = 20_000   # per file
 MAX_FILE_LINES    = 600      # max lines per file
@@ -426,7 +426,7 @@ def main():
 
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
-        sys.exit("Set ANTHROPIC_API_KEY environment variable (source your secrets env file, e.g. ~/.secrets/api-keys.env)")
+        sys.exit("Set ANTHROPIC_API_KEY environment variable (source ~/.secrets/app.env)")
     client = anthropic.Anthropic(api_key=api_key)
 
     print(f"\nRunning one-shot inference on {len(instances)} instances with {CLAUDE_MODEL}")

@@ -201,6 +201,156 @@ if [ "$REGRESSION" = true ] || [ "$REGRESSION_EXTENDED" = true ] || [ "$FAST" !=
             [ "$PYTEST_EXIT" -eq 0 ] && PYTEST_EXIT="$STAMP_EXIT"
         fi
     fi
+
+    # W2-T6 — class-included guard: a class/function referenced in source without a
+    # matching #Include/import line. Exit 1 = confirmed FAIL (soft-blocks like the
+    # other drift checks above); exit 2 = heuristic WARN (advisory only — does NOT
+    # touch PYTEST_EXIT, so it never shadows a real pytest failure).
+    # Scoped to --project v11 (CLOSE-T5 fix): unlike check-stamp-drift's deliberate
+    # framework-wide anchor scan, this is a per-project check whose unscoped default
+    # scans every sessions/*/ — non-deterministic regression output that depends on
+    # whatever unrelated project happens to have drift right now (was surfacing WARN
+    # noise for worldforge/manifold-viz). "v11" is this framework's own session dir;
+    # it has no project-root config today so this is currently a silent no-op, but
+    # stays available for the framework's own future dogfooding.
+    # Rollback: V11_CLASS_INCLUDED_CHECK=off.
+    CLASS_INCLUDED_SCRIPT="$V11_ROOT/scripts/check-class-included"
+    if [ -x "$CLASS_INCLUDED_SCRIPT" ]; then
+        echo "---"
+        echo "W2-T6 check-class-included:"
+        if "$CLASS_INCLUDED_SCRIPT" --project v11; then
+            :
+        else
+            CLASS_INCLUDED_EXIT=$?
+            if [ "$CLASS_INCLUDED_EXIT" -eq 2 ]; then
+                echo "  WARN — see above (advisory only, does not fail the run)"
+            else
+                echo "  FAIL — see drift above"
+                [ "$PYTEST_EXIT" -eq 0 ] && PYTEST_EXIT="$CLASS_INCLUDED_EXIT"
+            fi
+        fi
+    fi
+
+    # W2-T6 — git/tasklist alignment guard: modified/untracked files at session end
+    # not tied to any completed task's metadata.artifacts. Always WARN (exit 2),
+    # never FAIL — advisory only, never touches PYTEST_EXIT.
+    # Scoped to --project v11 (CLOSE-T5 fix): see check-class-included comment above
+    # for rationale. sessions/v11/ has no project-root .git (the framework's real repo
+    # lives at v11/ itself), so this check correctly no-ops here rather than reporting
+    # on unrelated projects like worldforge/manifold-viz.
+    # Rollback: V11_GIT_TASKLIST_CHECK=off.
+    GIT_TASKLIST_SCRIPT="$V11_ROOT/scripts/check-git-tasklist-alignment"
+    if [ -x "$GIT_TASKLIST_SCRIPT" ]; then
+        echo "---"
+        echo "W2-T6 check-git-tasklist-alignment:"
+        if "$GIT_TASKLIST_SCRIPT" --project v11; then
+            :
+        else
+            GIT_TASKLIST_EXIT=$?
+            if [ "$GIT_TASKLIST_EXIT" -eq 2 ]; then
+                echo "  WARN — see above (advisory only, does not fail the run)"
+            else
+                echo "  WARN (unexpected exit $GIT_TASKLIST_EXIT — script contract is never-FAIL; treating as advisory)"
+            fi
+        fi
+    fi
+
+    # W2-T6 — hotkey-sync guard: a hotkey present on one configured surface but
+    # missing from another. Always WARN (exit 2), never FAIL — advisory only,
+    # never touches PYTEST_EXIT.
+    # Scoped to --project v11 (CLOSE-T5 fix): see check-class-included comment above
+    # for rationale.
+    # Rollback: V11_HOTKEY_SYNC_CHECK=off.
+    HOTKEY_SYNC_SCRIPT="$V11_ROOT/scripts/check-hotkey-sync"
+    if [ -x "$HOTKEY_SYNC_SCRIPT" ]; then
+        echo "---"
+        echo "W2-T6 check-hotkey-sync:"
+        if "$HOTKEY_SYNC_SCRIPT" --project v11; then
+            :
+        else
+            HOTKEY_SYNC_EXIT=$?
+            if [ "$HOTKEY_SYNC_EXIT" -eq 2 ]; then
+                echo "  WARN — see above (advisory only, does not fail the run)"
+            else
+                echo "  WARN (unexpected exit $HOTKEY_SYNC_EXIT — script contract is never-FAIL; treating as advisory)"
+            fi
+        fi
+    fi
+
+    # v11.37 W2-T4 — index-body status consistency check. Framework-wide
+    # (scans improvements/ globally). WARN advisory; FAIL if missing ticket
+    # file or missing README row (real doc-integrity breakage — propagates to
+    # PYTEST_EXIT matching check-changelog-drift/check-stamp-drift precedent;
+    # fixed post-CLOSE per review-w2-t4 E1).
+    # Rollback: V11_INDEX_BODY_CHECK=off.
+    INDEX_BODY_SCRIPT="$V11_ROOT/scripts/check-index-body-status-consistency"
+    if [ -x "$INDEX_BODY_SCRIPT" ]; then
+        echo "---"
+        echo "v11.37 W2-T1 check-index-body-status-consistency:"
+        if "$INDEX_BODY_SCRIPT"; then
+            :
+        else
+            IDX_BODY_EXIT=$?
+            if [ "$IDX_BODY_EXIT" -eq 1 ]; then
+                echo "  FAIL — see above"
+                [ "$PYTEST_EXIT" -eq 0 ] && PYTEST_EXIT="$IDX_BODY_EXIT"
+            elif [ "$IDX_BODY_EXIT" -eq 2 ]; then
+                echo "  WARN — see above (advisory only, does not fail the run)"
+            else
+                echo "  WARN (unexpected exit $IDX_BODY_EXIT)"
+            fi
+        fi
+    fi
+
+    # v11.37 W2-T4 — rollback-lever drift check. Framework-wide (scans
+    # scripts/+hooks/ vs docs/ROLLBACK_REFERENCE.md). FAIL = doc-lie (a
+    # documented lever with zero code reads); propagates to PYTEST_EXIT
+    # (fixed post-CLOSE per review-w2-t4 E1). WARN = silent-lever advisory.
+    # Rollback: V11_ROLLBACK_LEVER_CHECK=off.
+    ROLLBACK_LEVER_SCRIPT="$V11_ROOT/scripts/check-rollback-lever-drift"
+    if [ -x "$ROLLBACK_LEVER_SCRIPT" ]; then
+        echo "---"
+        echo "v11.37 W2-T2 check-rollback-lever-drift:"
+        if "$ROLLBACK_LEVER_SCRIPT"; then
+            :
+        else
+            LEVER_EXIT=$?
+            if [ "$LEVER_EXIT" -eq 1 ]; then
+                echo "  FAIL — see above"
+                [ "$PYTEST_EXIT" -eq 0 ] && PYTEST_EXIT="$LEVER_EXIT"
+            elif [ "$LEVER_EXIT" -eq 2 ]; then
+                echo "  WARN — see above (advisory only, does not fail the run)"
+            else
+                echo "  WARN (unexpected exit $LEVER_EXIT)"
+            fi
+        fi
+    fi
+
+    # v11.37 W2-T4 — registry drift check. Framework-wide (scans
+    # ~/.claude/agents/*.md vs ~/.agent-registry/agents.json vs ledger).
+    # FAIL = on-disk .md missing from registry — CRITICAL-class (this is the
+    # exact drift that led to #38's CRITICAL amplification when
+    # adversarial-lite-reviewer processed 781 tasks unregistered). Propagates
+    # to PYTEST_EXIT (fixed post-CLOSE per review-w2-t4 E1).
+    # Rollback: V11_REGISTRY_CHECK=off.
+    REGISTRY_CHECK_SCRIPT="$V11_ROOT/scripts/check-registry-drift"
+    if [ -x "$REGISTRY_CHECK_SCRIPT" ]; then
+        echo "---"
+        echo "v11.37 W2-T3 check-registry-drift:"
+        if "$REGISTRY_CHECK_SCRIPT"; then
+            :
+        else
+            REG_EXIT=$?
+            if [ "$REG_EXIT" -eq 1 ]; then
+                echo "  FAIL — see above"
+                [ "$PYTEST_EXIT" -eq 0 ] && PYTEST_EXIT="$REG_EXIT"
+            elif [ "$REG_EXIT" -eq 2 ]; then
+                echo "  WARN — see above (advisory only, does not fail the run)"
+            else
+                echo "  WARN (unexpected exit $REG_EXIT)"
+            fi
+        fi
+    fi
 fi
 set -e
 

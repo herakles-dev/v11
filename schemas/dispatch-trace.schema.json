@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "dispatch-trace.schema.json",
+  "$id": "https://herakles.dev/v11/schemas/dispatch-trace.schema.json",
   "title": "V11.21 Dispatch-Trace Line",
   "description": "Schema for ONE line of ~/.agent-metrics/dispatch-trace.jsonl. Appended by scripts/dispatch-trace-append once per orchestrator Phase 4 spawn (skill-level, NOT a Claude Code hook). Captures routing intent vs reality so V11.22 can calibrate META_MAP/COMPLEXITY_ROUTING from real dogfood data. Line size cap: 4096 bytes (override_reason truncated first when over). Rollback: V11_DISPATCH_TRACE=off.",
   "type": "object",

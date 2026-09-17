@@ -136,7 +136,7 @@ A hand-written `.session-summary.md` always trumps the stub for review quality. 
 
 ## Project scope discipline (V11.23 Layer 3)
 
-> Background: handoff bug report at `reports/bug-handoff-cross-project-scope-leak-20260601.md` documented a HIGH-severity leak: `handoff-tasks.json` for `atlas-terminal` contained 19 open tasks, only 4 of which were legitimately for that project. The other 15 belonged to portfolio / eigen-opus / music-corpus sessions whose contributing Claude orchestrator had `active-project=atlas-terminal`.
+> Background: handoff bug report at `reports/bug-handoff-cross-project-scope-leak-20260601.md` documented a HIGH-severity leak: `handoff-tasks.json` for `herakles-terminal` contained 19 open tasks, only 4 of which were legitimately for that project. The other 15 belonged to portfolio / eigen-opus / music-corpus sessions whose contributing Claude orchestrator had `active-project=herakles-terminal`.
 
 V11.23 closes the leak with three coordinated layers:
 
@@ -148,7 +148,7 @@ V11.23 closes the leak with three coordinated layers:
 
 **Counter handling**: open counters (pending/in_progress/blocked) recomputed from filtered open_tasks. `completed` is summed only from sessions where `session.project == $project` — under-counts slightly for cross-project sessions (acceptable; user-visible bug is OPEN-task accuracy). Fallback: when a session has zero open_tasks at all (TaskList-only counter reconciliation), trust the session's scalar counters directly.
 
-**Going forward**: new tasks routed correctly. The atlas-terminal aggregate stops growing with foreign tasks. Cross-project sessions correctly contribute their tasks to multiple project aggregates.
+**Going forward**: new tasks routed correctly. The herakles-terminal aggregate stops growing with foreign tasks. Cross-project sessions correctly contribute their tasks to multiple project aggregates.
 
 **Legacy contamination**: pre-V11.23 aggregates may carry tasks from sessions that were since deleted. Layer 3 rebuild can't recover orphan-source tasks (no live data to walk). Options:
 - **Manual**: delete the aggregate file (`$TASK_STATE_DIR/$PROJECT.json`) and let sync-tasks rebuild it on next TaskUpdate. Loses orphan-session counters but produces a clean aggregate from current live sessions.
@@ -161,7 +161,7 @@ V11.23 closes the leak with three coordinated layers:
 
 **Rollback** (each independent): `V11_TASK_ROUTE_BY_METADATA=off` reverts Layer 3 to per-session Bug-H quarantine; `V11_HANDOFF_LIVE_RECONCILE=off` disables Layer 2 stamping; `V11_HANDOFF_CATEGORY=off` disables HANDOFF_CATEGORY banner; `V11_GATE_SUBSTANCE=off` disables substance check; `V11_GUARD_STALE_TASK=off` disables zombie-task hook (from swarm-studio audit §H9).
 
-**What CAN'T be auto-detected**: tasks whose `metadata.project` LIES (explicit stamp but for the wrong project). The smoking-gun cc0bbe64 case had 16 tasks all stamped `project=atlas-terminal` while actually targeting portfolio/eigen-opus/music. Both Layer 1 and Layer 3 trust the explicit metadata. The bug report acknowledges this requires manual reconciliation via file-reference heuristics (subject/description mentions terminal source files vs portfolio source files). Going forward, the orchestrator should set `metadata.project` correctly at TaskCreate time — this is the contract V11 already requires.
+**What CAN'T be auto-detected**: tasks whose `metadata.project` LIES (explicit stamp but for the wrong project). The smoking-gun cc0bbe64 case had 16 tasks all stamped `project=herakles-terminal` while actually targeting portfolio/eigen-opus/music. Both Layer 1 and Layer 3 trust the explicit metadata. The bug report acknowledges this requires manual reconciliation via file-reference heuristics (subject/description mentions terminal source files vs portfolio source files). Going forward, the orchestrator should set `metadata.project` correctly at TaskCreate time — this is the contract V11 already requires.
 
 ---
 

@@ -22,7 +22,7 @@ handoff_to:
 # Spec Implementer V11 (Lean)
 
 > Implementation specialist for V11 spec-driven development: write code, implement features, create business logic.
-> Full V11 task protocol (TaskList/TaskUpdate discipline, effort levels, risk/autonomy, verification steps) lives in `$HOME/v11/CLAUDE.md` — this def assumes you already have it loaded and states only what's implementer-specific.
+> Full V11 task protocol (TaskList/TaskUpdate discipline, effort levels, risk/autonomy, verification steps) lives in `/path/to/v11/CLAUDE.md` — this def assumes you already have it loaded and states only what's implementer-specific.
 
 ## Code Standards
 

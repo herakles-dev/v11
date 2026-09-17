@@ -1,6 +1,6 @@
 # Docker Compose Templates
 
-> Standard docker-compose patterns for V10 projects.
+> Standard docker-compose patterns for V10 Hercules projects.
 
 ---
 
@@ -15,7 +15,7 @@ services:
       context: .
       dockerfile: Dockerfile
     ports:
-      - "${PORT:-3000}:8000"
+      - "${PORT:-8090}:8000"
     environment:
       - NODE_ENV=production
       - DATABASE_URL=${DATABASE_URL}
@@ -26,11 +26,11 @@ services:
       retries: 3
       start_period: 10s
     networks:
-      - app-network
+      - hercules-network
     restart: unless-stopped
 
 networks:
-  app-network:
+  hercules-network:
     external: true
 ```
 
@@ -47,7 +47,7 @@ services:
       context: .
       dockerfile: Dockerfile.dev
     ports:
-      - "${PORT:-3000}:8000"
+      - "${PORT:-8090}:8000"
     volumes:
       - .:/app                    # Hot reload
       - /app/node_modules         # Preserve node_modules
@@ -62,11 +62,11 @@ services:
       retries: 3
       start_period: 10s
     networks:
-      - app-network
+      - hercules-network
     restart: unless-stopped
 
 networks:
-  app-network:
+  hercules-network:
     external: true
 ```
 
@@ -93,7 +93,7 @@ services:
       timeout: 5s
       retries: 5
     networks:
-      - app-network
+      - hercules-network
     restart: unless-stopped
 
   # Backend API
@@ -102,7 +102,7 @@ services:
       context: ./backend
       dockerfile: Dockerfile
     ports:
-      - "${BACKEND_PORT:-3001}:8000"
+      - "${BACKEND_PORT:-8091}:8000"
     environment:
       - DATABASE_URL=postgresql://app:${DB_PASSWORD}@postgres:5432/${DB_NAME:-app}
       - JWT_SECRET=${JWT_SECRET}
@@ -117,7 +117,7 @@ services:
       retries: 3
       start_period: 10s
     networks:
-      - app-network
+      - hercules-network
     restart: unless-stopped
 
   # Frontend
@@ -126,7 +126,7 @@ services:
       context: ./frontend
       dockerfile: Dockerfile
     ports:
-      - "${FRONTEND_PORT:-3000}:3000"
+      - "${FRONTEND_PORT:-8090}:3000"
     environment:
       - VITE_API_URL=${BACKEND_URL}
     depends_on:
@@ -139,11 +139,11 @@ services:
       retries: 3
       start_period: 10s
     networks:
-      - app-network
+      - hercules-network
     restart: unless-stopped
 
 networks:
-  app-network:
+  hercules-network:
     external: true
 
 volumes:
@@ -173,7 +173,7 @@ services:
       timeout: 5s
       retries: 5
     networks:
-      - app-network
+      - hercules-network
 
   redis:
     image: redis:7-alpine
@@ -184,7 +184,7 @@ services:
       timeout: 5s
       retries: 5
     networks:
-      - app-network
+      - hercules-network
 
   # Core service (Layer 2)
   auth-service:
@@ -192,7 +192,7 @@ services:
       context: ./auth-service
       dockerfile: Dockerfile
     ports:
-      - "${AUTH_PORT:-3001}:8000"
+      - "${AUTH_PORT:-8091}:8000"
     environment:
       - DATABASE_URL=postgresql://app:${DB_PASSWORD}@postgres:5432/app
       - REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379
@@ -209,7 +209,7 @@ services:
       retries: 3
       start_period: 10s
     networks:
-      - app-network
+      - hercules-network
 
   # Business service (Layer 3)
   user-service:
@@ -217,7 +217,7 @@ services:
       context: ./user-service
       dockerfile: Dockerfile
     ports:
-      - "${USER_PORT:-3002}:8000"
+      - "${USER_PORT:-8092}:8000"
     environment:
       - DATABASE_URL=postgresql://app:${DB_PASSWORD}@postgres:5432/app
       - REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379
@@ -236,7 +236,7 @@ services:
       retries: 3
       start_period: 10s
     networks:
-      - app-network
+      - hercules-network
 
   # API Gateway (Layer 4)
   api-gateway:
@@ -244,7 +244,7 @@ services:
       context: ./api-gateway
       dockerfile: Dockerfile
     ports:
-      - "${GATEWAY_PORT:-3000}:8000"
+      - "${GATEWAY_PORT:-8090}:8000"
     environment:
       - AUTH_SERVICE_URL=http://auth-service:8000
       - USER_SERVICE_URL=http://user-service:8000
@@ -260,10 +260,10 @@ services:
       retries: 3
       start_period: 10s
     networks:
-      - app-network
+      - hercules-network
 
 networks:
-  app-network:
+  hercules-network:
     external: true
 
 volumes:
@@ -288,7 +288,7 @@ services:
   postgres:
     # No ports section - internal only
     networks:
-      - app-network
+      - hercules-network
 ```
 
 ### 2. Use Environment Variables
@@ -426,11 +426,11 @@ services:
 
 ## Network Patterns
 
-### External Network (Platform Standard)
+### External Network (Hercules Standard)
 
 ```yaml
 networks:
-  app-network:
+  hercules-network:
     external: true  # Created separately, shared across all services
 ```
 
@@ -438,7 +438,7 @@ networks:
 
 ```yaml
 networks:
-  app-network:
+  hercules-network:
     external: true
 
   project-internal:
@@ -447,7 +447,7 @@ networks:
 services:
   gateway:
     networks:
-      - app-network   # External access
+      - hercules-network   # External access
       - project-internal   # Internal routing
 
   backend:

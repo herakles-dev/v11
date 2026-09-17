@@ -137,7 +137,7 @@ If 3+ flagged → mandatory pause, reframe decision from scratch.
 ```bash
 # 1. Pull raw frameworks from Athenaeum (programmatic, NEVER /chat)
 for doc_id in 290 291 309 312 313 316 321 323 324 325; do
-  curl -s "http://localhost:3000/api/libraries/42/documents/$doc_id" | jq -r '.full_text' >> /tmp/frameworks.md
+  curl -s "http://localhost:8140/api/libraries/42/documents/$doc_id" | jq -r '.full_text' >> /tmp/frameworks.md
 done
 
 # 2. Claude synthesizes into project-specific protocol

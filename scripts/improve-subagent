@@ -39,11 +39,11 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 V11_HOME="${V11_HOME:-$(dirname "$SCRIPT_DIR")}"
-V11_WORKSPACE_ROOT="${V11_WORKSPACE_ROOT:-$HOME/.v11}"
-METRICS_DIR="${METRICS_DIR:-$V11_WORKSPACE_ROOT/.agent-metrics}"
-AGENTS_DIR="${AGENTS_DIR:-$V11_WORKSPACE_ROOT/.claude/agents}"
-JOURNAL_DIR="${JOURNAL_DIR:-$V11_WORKSPACE_ROOT/.claude/skills/team-orchestrator/journal}"
-SESSIONS_ROOT="${SESSIONS_ROOT:-$V11_WORKSPACE_ROOT/sessions}"
+HERCULES_ROOT="${HERCULES_ROOT:-$HOME}"
+METRICS_DIR="${METRICS_DIR:-$HERCULES_ROOT/.agent-metrics}"
+AGENTS_DIR="${AGENTS_DIR:-$HERCULES_ROOT/.claude/agents}"
+JOURNAL_DIR="${JOURNAL_DIR:-$HERCULES_ROOT/.claude/skills/team-orchestrator/journal}"
+SESSIONS_ROOT="${SESSIONS_ROOT:-$HERCULES_ROOT/sessions}"
 
 usage() {
     sed -n '/^# V11/,/^set -euo/p' "$0" | grep -v '^set' | sed 's/^# \?//'

@@ -9,7 +9,7 @@
 #              Mirrors scripts/install-postcommit-hook's approach (H1a):
 #                - No existing commit-msg hook       → symlink directly to the V11 validator.
 #                - Existing commit-msg hook is itself a symlink to a tracked source file
-#                  (husky/lefthook/demo-service pattern)  → replace with a chain-wrapper script
+#                  (husky/lefthook/example-project pattern)  → replace with a chain-wrapper script
 #                  that delegates to BOTH the original tracked hook and the V11 validator.
 #                  The tracked source file is verified byte-identical (md5) after install —
 #                  it is never modified.
@@ -273,7 +273,7 @@ if [ -n "${V11_HOME:-}" ] && [ -x "${V11_HOME}/hooks/commit-msg-validation" ]; t
     "${V11_HOME}/hooks/commit-msg-validation" "$@"
     exit $?
 elif [ -x "$HOME/v11/hooks/commit-msg-validation" ]; then
-    "$HOME/v11/hooks/commit-msg-validation" "$@"
+    $HOME/v11/hooks/commit-msg-validation "$@"
     exit $?
 fi
 SHIM

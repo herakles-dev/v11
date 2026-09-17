@@ -79,8 +79,8 @@ if [ ! -d "$SESSIONS_ROOT/$PROJECT" ]; then
 fi
 
 # Read formation definition from V11 agent registry
-V11_WORKSPACE_ROOT="${V11_WORKSPACE_ROOT:-$HOME/.v11}"
-V11_REGISTRY="$V11_WORKSPACE_ROOT/v11/agents/V11_AGENT_REGISTRY.json"
+HERCULES_ROOT="${HERCULES_ROOT:-$HOME}"
+V11_REGISTRY="$HERCULES_ROOT/v11/agents/V11_AGENT_REGISTRY.json"
 
 if [ ! -f "$V11_REGISTRY" ]; then
     echo "ERROR: V11 agent registry not found: $V11_REGISTRY" >&2

@@ -36,10 +36,10 @@
 
 set -euo pipefail
 
-V11_WORKSPACE_ROOT="${V11_WORKSPACE_ROOT:-$HOME/.v11}"
-SESSIONS_ROOT="${SESSIONS_ROOT:-$V11_WORKSPACE_ROOT/sessions}"
-V11_HOME="${V11_HOME:-$V11_WORKSPACE_ROOT/v11}"
-METRICS_DIR="$V11_WORKSPACE_ROOT/.agent-metrics"
+HERCULES_ROOT="${HERCULES_ROOT:-$HOME}"
+SESSIONS_ROOT="${SESSIONS_ROOT:-$HERCULES_ROOT/sessions}"
+V11_HOME="${V11_HOME:-$HERCULES_ROOT/v11}"
+METRICS_DIR="$HERCULES_ROOT/.agent-metrics"
 TASK_STATE_DIR="$METRICS_DIR/task-state"
 ACTIVE_PROJECT_FILE="$METRICS_DIR/active-project"
 
@@ -73,9 +73,19 @@ _v11_ledger_subject_map() {
     local ledger_file="$METRICS_DIR/ledger/${project}.jsonl"
     [ -n "$project" ] || { echo "{}"; return 0; }
     [ -f "$ledger_file" ] || { echo "{}"; return 0; }
+    # task #21: reject the literal "unknown" as a recovered subject. Status-only
+    # TaskUpdates land ledger rows through writers that default `.subject //
+    # "unknown"` (e.g. hooks/lib/common.sh:2132), so the LATEST row for a task
+    # routinely carries the placeholder while an earlier `created` row holds the
+    # real subject. Latest-wins therefore "recovered" the placeholder and
+    # rendered "Task #N: unknown". Fixing the reader (not the writer) also
+    # repairs the rows already on disk.
     jq -s -c '
         reduce .[] as $ev ({};
-            if (($ev.task_id // "") != "") and (($ev.subject // null) != null) and (($ev.subject // "") != "") then
+            if (($ev.task_id // "") != "")
+               and (($ev.subject // null) != null)
+               and (($ev.subject // "") != "")
+               and ($ev.subject != "unknown") then
                 .[$ev.task_id] = $ev.subject
             else . end
         )
@@ -85,13 +95,29 @@ _v11_ledger_subject_map() {
 # R2.3 (W1-T2): fill null .subject fields in a JSON array of {id, subject, ...}
 # task objects using the ledger subject map above. Never fails — returns the
 # input array unchanged on any jq error.
+# task #21: also treat the literal "unknown" placeholder as fillable — a third
+# subject-fill path was surfacing "Task #N: unknown" because
+# v11_apply_reconcile_markers (hooks/lib/common.sh) writes .subject = "unknown"
+# (not null) when a reconcile marker line lacks a subject, so recent_completed
+# entries built from that path never tripped the null/"" check below. On no
+# ledger hit, .subject is reset to null (not left as "unknown") so downstream
+# `// "untitled"`/`// "blocked task"` placeholders render instead of the
+# swallowed literal.
 _v11_fill_null_subjects() {
     local tasks_json="$1" project="$2"
-    local map
+    local map mapf
     map=$(_v11_ledger_subject_map "$project")
-    printf '%s' "$tasks_json" | jq -c --argjson lsm "$map" '
-        map(if (.subject == null or .subject == "") then (.subject = ($lsm[.id] // .subject)) else . end)
+    [ -n "$map" ] || map='{}'
+    # improvements/23: --slurpfile, never --argjson, for payloads that scale
+    # with task/ledger size — a single execve argument is capped at
+    # MAX_ARG_STRLEN (128KB); builtins (printf >file) are not.
+    mapf=$(mktemp) || { printf '%s' "$tasks_json"; return; }
+    printf '%s' "$map" > "$mapf"
+    printf '%s' "$tasks_json" | jq -c --slurpfile lsm_sf "$mapf" '
+        (($lsm_sf[0]) // {}) as $lsm
+        | map(if (.subject == null or .subject == "" or .subject == "unknown") then (.subject = ($lsm[.id] // null)) else . end)
     ' 2>/dev/null || printf '%s' "$tasks_json"
+    rm -f "$mapf" 2>/dev/null || true
 }
 
 # Fix A: synthetic summary when .session-summary.md is absent or empty.
@@ -249,7 +275,7 @@ V11_NL=$'\n'
 if [ "${1:-}" == "--help" ] || [ "${1:-}" == "-h" ]; then
     echo "V11 Handoff - Generate session continuation context"
     echo ""
-    echo "Usage: ./scripts/handoff [project] [--copy] [--json] [--file PATH] [--spawn] [--spawn-anyway] [--steer TEXT]"
+    echo "Usage: ./scripts/handoff [project] [--copy] [--json] [--file PATH] [--spawn] [--spawn-anyway] [--force] [--steer TEXT]"
     echo ""
     echo "Options:"
     echo "  --copy           Copy prompt to clipboard"
@@ -257,6 +283,11 @@ if [ "${1:-}" == "--help" ] || [ "${1:-}" == "-h" ]; then
     echo "  --file           Write to file instead of stdout"
     echo "  --spawn          Spawn new Zeus Terminal window with context"
     echo "  --spawn-anyway   Bypass thin-handoff quality gate (use sparingly)"
+    echo "  --force          Bypass ticket #41 mtime-guard: regenerate handoff.md even"
+    echo "                   if it is newer than the .session-summary.md trigger basis."
+    echo "                   The /handoff skill passes this implicitly (user-in-loop);"
+    echo "                   hooks (session-end auto-emit) omit it so a hand-authored"
+    echo "                   handoff.md is preserved. Rollback: V11_HANDOFF_MTIME_GUARD=off."
     echo "  --no-stub        Don't auto-generate .session-summary.md stub when missing"
     echo "  --steer TEXT     Inject an orchestrator grounding/steering prompt into the"
     echo "                   next session's first message. For multi-line steering, write"
@@ -289,6 +320,8 @@ FILE_PATH=""
 SPAWN_FLAG=""
 SPAWN_ANYWAY_FLAG=""
 NO_STUB_FLAG=""
+FORCE_FLAG=""     # Ticket #41 F1: bypass mtime-guard for user-in-loop paths
+SKIP_DRIFT_FLAG="" # v11.37 W2-T4: bypass all check-*-drift siblings at handoff
 STEER_INLINE=""   # V11.28: orchestrator steering prompt (inline --steer convenience path)
 for arg in "$@"; do
     case "$arg" in
@@ -297,6 +330,8 @@ for arg in "$@"; do
         --spawn) SPAWN_FLAG="1" ;;
         --spawn-anyway) SPAWN_FLAG="1"; SPAWN_ANYWAY_FLAG="1" ;;
         --no-stub) NO_STUB_FLAG="1" ;;
+        --force) FORCE_FLAG="1" ;;
+        --skip-drift-checks) SKIP_DRIFT_FLAG="1" ;;
         --file) FILE_PATH="__NEXT__" ;;
         --steer=*) STEER_INLINE="${arg#--steer=}" ;;
         --steer) STEER_INLINE="__NEXT__" ;;
@@ -480,10 +515,31 @@ fi
 # common.sh under `set -euo pipefail` (line 44). Best-effort: a rebuild
 # failure leaves the prior aggregate in place (no worse than before V11.16).
 if [ "$STATE_SOURCE" = "aggregate" ]; then
-    V11_WORKSPACE_ROOT="$V11_WORKSPACE_ROOT" \
+    HERCULES_ROOT="$HERCULES_ROOT" \
     METRICS_DIR="$METRICS_DIR" \
-    V11_HOME="$V11_WORKSPACE_ROOT/v11" \
+    V11_HOME="$HERCULES_ROOT/v11" \
     timeout 25 bash -c \
+        'source "$V11_HOME/hooks/lib/common.sh" 2>/dev/null && v11_rebuild_project_aggregate "$1"' \
+        _ "$PROJECT" >/dev/null 2>&1 || true
+fi
+
+# L1.2 (v11-handoff-cross-session-loop, sprint-01): extend the aggregate
+# rebuild to the per-session path too. The block above only fires when
+# STATE_SOURCE=aggregate; per-session paths leave the durable aggregate
+# stale — evidence (2026-09-01 dogfood): v11 project aggregate was 11 days
+# stale on this box before Effort A. L2.1 boot-delta and L2.3 rehydrate
+# verification both read the aggregate; they need current state whichever
+# state source the sending session used. Tighter timeout (5s vs 25s above)
+# since per-session projects are typically smaller ledgers and the function
+# is REGRESSION-GUARD safe (see hooks/lib/common.sh:186+).
+# Rollback: V11_HANDOFF_FORCE_RECONCILE=off restores per-session-skip.
+if [ "$STATE_SOURCE" != "aggregate" ] \
+   && [ "${V11_HANDOFF_FORCE_RECONCILE:-on}" != "off" ] \
+   && [ -n "$PROJECT" ]; then
+    HERCULES_ROOT="$HERCULES_ROOT" \
+    METRICS_DIR="$METRICS_DIR" \
+    V11_HOME="$V11_HOME" \
+    timeout 5 bash -c \
         'source "$V11_HOME/hooks/lib/common.sh" 2>/dev/null && v11_rebuild_project_aggregate "$1"' \
         _ "$PROJECT" >/dev/null 2>&1 || true
 fi
@@ -580,9 +636,13 @@ if [ -n "$LIVE_SNAP_TOTAL" ]; then
     HAS_TASK_STATE=1
     # Extract active_task_ids and active task subject from snapshot when disk state is missing/empty
     if [ -z "$ACTIVE_TASK_SUBJECT" ]; then
-        ACTIVE_TASK_SUBJECT=$(jq -r '
-            ([.tasks[]? | select(.status == "in_progress") | .subject][:1] | .[0]) // empty
-        ' "$LIVE_SNAP_FILE" 2>/dev/null || true)
+        # task #17: route through the null-subject fill helper instead of taking
+        # the raw (possibly null) .subject straight from the snapshot.
+        _ACTIVE_TASK_JSON=$(jq -c '
+            [.tasks[]? | select(.status == "in_progress") | {id: (.id // null), subject: (.subject // null)}][:1]
+        ' "$LIVE_SNAP_FILE" 2>/dev/null || echo "[]")
+        _ACTIVE_TASK_JSON=$(_v11_fill_null_subjects "$_ACTIVE_TASK_JSON" "$PROJECT")
+        ACTIVE_TASK_SUBJECT=$(printf '%s' "$_ACTIVE_TASK_JSON" | jq -r '.[0].subject // empty' 2>/dev/null || true)
         [ "$ACTIVE_TASK_SUBJECT" = "null" ] && ACTIVE_TASK_SUBJECT=""
     fi
     if [ "$ACTIVE_TASKS" = "none" ] && [ "$SNAP_IN_PROG" -gt 0 ]; then
@@ -661,6 +721,38 @@ SESSION_SUMMARY_SOURCE="missing"
 # V11.17 smoothness. Instead we note it and downgrade confidence.
 SESSION_SUMMARY_IS_STUB=0
 _STUB_FINGERPRINT="_Generated stub — edit before"  # substring of the stub's > _Generated stub… line
+
+# QR-4 (2026-09-01): expanded stub-detector marker set. Prior fingerprint
+# only matched auto-stubs whose "_Generated stub" header was still intact.
+# Audit 2026-09-01 found 3/8 template summaries where the user removed the
+# header (or filled some sections but left placeholder brackets elsewhere)
+# — bring-to-market (3 markers), v11-38-consolidation (4), claude-ahk (2).
+# Any of these placeholder strings present ⇒ treat as unedited stub.
+# Rollback: V11_HANDOFF_STUB_STRICT=off restores prior single-fingerprint check.
+_STUB_TEMPLATE_MARKERS=(
+    "_Generated stub — edit before"
+    "[Describe what this session accomplished]"
+    "[What key decisions were made and why?]"
+    "[What is the current state"
+    "[Any other blockers"
+    "- ? → ?"
+)
+_v11_summary_looks_stub() {
+    local summary_file="$1"
+    [ -f "$summary_file" ] && [ -s "$summary_file" ] || return 1
+    if grep -qF "$_STUB_FINGERPRINT" "$summary_file" 2>/dev/null; then
+        return 0
+    fi
+    if [ "${V11_HANDOFF_STUB_STRICT:-on}" = "on" ]; then
+        local marker
+        for marker in "${_STUB_TEMPLATE_MARKERS[@]}"; do
+            if grep -qF "$marker" "$summary_file" 2>/dev/null; then
+                return 0
+            fi
+        done
+    fi
+    return 1
+}
 # V11.25.1: stale-summary detection.
 # Before V11.25.1, an existing .session-summary.md was unconditionally treated as
 # canonical — there was no freshness check. Result: a summary written in session N
@@ -730,9 +822,11 @@ if [ -f "$SESSION_SUMMARY_FILE" ] && [ -s "$SESSION_SUMMARY_FILE" ]; then
     # the read content is not the canonical disk truth and confidence must downgrade.
     # V11.25.2 T6-E2: extended preserve list to include stale-unarchived.
     [ "$SESSION_SUMMARY_SOURCE" = "missing" ] && SESSION_SUMMARY_SOURCE="written"
-    # F1: check if unedited stub (V11_GATE_SUBSTANCE=off disables detection)
+    # F1: check if unedited stub (V11_GATE_SUBSTANCE=off disables detection).
+    # QR-4: delegate to _v11_summary_looks_stub which checks header fingerprint
+    # AND (under V11_HANDOFF_STUB_STRICT=on, default) template placeholder markers.
     if [ "${V11_GATE_SUBSTANCE:-on}" != "off" ]; then
-        if grep -qF "$_STUB_FINGERPRINT" "$SESSION_SUMMARY_FILE" 2>/dev/null; then
+        if _v11_summary_looks_stub "$SESSION_SUMMARY_FILE"; then
             SESSION_SUMMARY_IS_STUB=1
         fi
     fi
@@ -772,6 +866,35 @@ elif [ -z "$NO_STUB_FLAG" ] && [ "${V11_STUB_SUMMARY:-}" != "off" ]; then
 else
     echo "NOTE: No .session-summary.md found — stub generation disabled (--no-stub or V11_STUB_SUMMARY=off)." >&2
     echo "  Will synthesize inline from disk signals (does not count toward --spawn gate)." >&2
+fi
+
+# Ticket #41 F1: mtime-guard — refuse to clobber a hand-authored handoff.md.
+# When an unattended auto-run (session-end hook) fires and handoff.md is NEWER
+# than .session-summary.md (which is what the auto-run bakes in), the file has
+# been human-edited after the material was last refreshed and regenerating
+# would silently drop the narrative. --force bypasses (the /handoff skill
+# passes it; hooks omit it). Content-hash fallback: if the summary is still
+# the auto-stub, regenerate anyway — nothing to preserve. Absent handoff.md
+# also proceeds normally (no file to protect). No side effects have run yet
+# (steer sidecar consume is downstream at line ~1896), so early exit is safe.
+# Rollback: V11_HANDOFF_MTIME_GUARD=off.
+if [ "${V11_HANDOFF_MTIME_GUARD:-on}" != "off" ] \
+   && [ -z "$FORCE_FLAG" ] \
+   && [ -f "$HANDOFF_FILE" ] \
+   && [ "${SESSION_SUMMARY_IS_STUB:-0}" -eq 0 ]; then
+    _v11_hf_mt=$(stat -c %Y "$HANDOFF_FILE" 2>/dev/null || echo 0)
+    _v11_basis_mt=0
+    if [ -f "$SESSION_SUMMARY_FILE" ]; then
+        _v11_basis_mt=$(stat -c %Y "$SESSION_SUMMARY_FILE" 2>/dev/null || echo 0)
+    elif [ -f "$STATE_FILE" ]; then
+        _v11_basis_mt=$(stat -c %Y "$STATE_FILE" 2>/dev/null || echo 0)
+    fi
+    if [ "$_v11_hf_mt" -gt "$_v11_basis_mt" ] && [ "$_v11_basis_mt" -gt 0 ]; then
+        _v11_hf_iso=$(date -d "@$_v11_hf_mt" +%FT%T 2>/dev/null || echo "$_v11_hf_mt")
+        _v11_basis_iso=$(date -d "@$_v11_basis_mt" +%FT%T 2>/dev/null || echo "$_v11_basis_mt")
+        echo "handoff: handoff.md is newer than trigger basis (${_v11_hf_iso} vs ${_v11_basis_iso}) — leaving human-authored content intact. Re-run with --force to regenerate. Rollback: V11_HANDOFF_MTIME_GUARD=off." >&2
+        exit 0
+    fi
 fi
 
 # Autonomy
@@ -839,9 +962,9 @@ if [ -f "$PLAN_CONTEXT_FILE" ]; then
     [ "$PC_DOMAIN" = "null" ] && PC_DOMAIN=""
 
     PC_HYPOTHESES=$(jq -r '
-        (.hypotheses // []) | map(select(.status == "active")) |
+        (.hypotheses // []) | map(select(type == "object" and .status == "active")) |
         if length > 0 then
-            map("  - H\(.id) (\((.current // .prior // 0) * 100 | floor)%): \(.statement[:60])") | join("\n")
+            map("  - H\(.id) (\((.current // .prior // 0) * 100 | floor)%): \((.statement // "" | tostring)[:60])") | join("\n")
         else ""
         end
     ' "$PLAN_CONTEXT_FILE" 2>/dev/null)
@@ -849,7 +972,7 @@ if [ -f "$PLAN_CONTEXT_FILE" ]; then
     PC_BOTTLENECK=$(jq -r '.bottleneck.current // ""' "$PLAN_CONTEXT_FILE" 2>/dev/null)
     [ "$PC_BOTTLENECK" = "null" ] && PC_BOTTLENECK=""
 
-    PC_LAST_DECISION=$(jq -r '(.decisions // [])[-1:] | if length > 0 then .[0] | "\(.title) → \(.chosen)" else "" end' "$PLAN_CONTEXT_FILE" 2>/dev/null)
+    PC_LAST_DECISION=$(jq -r '(.decisions // [])[-1:] | if length > 0 then .[0] | if type == "object" then "\(.title // "") → \(.chosen // "")" else tostring end else "" end' "$PLAN_CONTEXT_FILE" 2>/dev/null)
     [ "$PC_LAST_DECISION" = "null" ] && PC_LAST_DECISION=""
 
     PC_NEXT_QUESTION=$(jq -r '.resume_context.next_critical_question // ""' "$PLAN_CONTEXT_FILE" 2>/dev/null)
@@ -905,38 +1028,87 @@ if [ -f "$PLAN_CONTEXT_FILE" ]; then
 fi
 
 # Key files modified (last 5 unique from audit trail)
+# QR-5 (2026-09-01): existing .project == $p filter (label-based) leaks
+# cross-project files because Bug-H class writers stamp .project with a
+# stale active-project (audit 2026-09-01: example-project listed sofly /tmp scratchpad
+# paths; free-llm listed example-project probe paths). Add a path-based sanity filter
+# that rejects paths clearly under another project's session dir or
+# per-session scratchpad. Rollback: V11_HANDOFF_PROJECT_FILE_SCOPE=off.
 KEY_FILES=""
 AUDIT_LOG="$METRICS_DIR/autonomy-audit.jsonl"
 if [ -f "$AUDIT_LOG" ]; then
-    KEY_FILES=$(tail -50 "$AUDIT_LOG" 2>/dev/null \
+    _KEY_FILES_RAW=$(tail -50 "$AUDIT_LOG" 2>/dev/null \
         | jq -r --arg p "$PROJECT" 'select(.project == $p and .file and .file != "null" and (.action == "Write" or .action == "Edit")) | .file' 2>/dev/null \
-        | grep -v '^$' | grep '^/' | sort -u | tail -5 | sed 's/^/- /' || true)
+        | grep -v '^$' | grep '^/' | sort -u || true)
+    if [ -n "$_KEY_FILES_RAW" ] && [ "${V11_HANDOFF_PROJECT_FILE_SCOPE:-on}" = "on" ]; then
+        # Sanity-filter: for each candidate path, reject if it belongs to a
+        # foreign session tree. Accept paths under $SESSIONS_ROOT/$PROJECT/,
+        # paths under the framework root ($V11_HOME), or paths that don't
+        # mention any session marker at all (may be a fresh file).
+        _KEY_FILES_FILTERED=""
+        while IFS= read -r _kf_path; do
+            [ -z "$_kf_path" ] && continue
+            _keep=1
+            # (a) Reject if the path is under a different project's session dir.
+            case "$_kf_path" in
+                "$SESSIONS_ROOT/$PROJECT/"*) : ;;   # own project — keep
+                "$SESSIONS_ROOT"/*/*)               # under SOME project — check
+                    _foreign_proj=$(printf '%s' "$_kf_path" | sed -E "s|^$SESSIONS_ROOT/([^/]+)/.*|\\1|")
+                    if [ "$_foreign_proj" != "$PROJECT" ]; then _keep=0; fi
+                    ;;
+            esac
+            # (b) Reject if the path mentions another project's /tmp scratchpad
+            # marker: /tmp/claude-*/-home-hercules-OTHERPROJECT-*/ etc.
+            if [ "$_keep" -eq 1 ] && echo "$_kf_path" | grep -qE "/-home-hercules-[a-zA-Z0-9_.-]+"; then
+                _scratch_proj=$(printf '%s' "$_kf_path" | sed -E 's|.*/-home-hercules-([a-zA-Z0-9_.-]+)/.*|\1|; t; d')
+                # Normalize: sofly-debug becomes sofly-debug; strip trailing session shard suffixes.
+                if [ -n "$_scratch_proj" ] && [ "$_scratch_proj" != "$PROJECT" ]; then
+                    _keep=0
+                fi
+            fi
+            if [ "$_keep" -eq 1 ]; then
+                _KEY_FILES_FILTERED="${_KEY_FILES_FILTERED}${_kf_path}
+"
+            fi
+        done <<<"$_KEY_FILES_RAW"
+        KEY_FILES=$(printf '%s' "$_KEY_FILES_FILTERED" | grep -v '^$' | tail -5 | sed 's/^/- /' || true)
+    else
+        KEY_FILES=$(printf '%s' "$_KEY_FILES_RAW" | tail -5 | sed 's/^/- /' || true)
+    fi
 fi
 
 # M4 (meta-improvement 2026-05): cross-session content detector.
 # Even with exact-match audit-log filtering, KEY_FILES can include paths from
-# unrelated projects when active-project drifted (e.g., an audit entry for one
-# project whose actual file lives at /path/to/another-project/foo.html). Compute the
+# unrelated projects when active-project drifted (e.g., a fiber-tree audit entry
+# whose actual file lives at $HOME/sitemap-tool/foo.html). Compute the
 # fraction of KEY_FILES paths that touch a directory matching the project name.
 # If a high fraction don't, prepend a warning so the receiving agent verifies
 # with TaskList and inspects the project context before resuming.
 CROSS_SESSION_WARNING=""
-if [ -n "$KEY_FILES" ]; then
-    _KF_TOTAL=$(printf '%s' "$KEY_FILES" | grep -c '^- /' || true)
+# QR-5 regression fix (2026-09-01): scan the UNFILTERED raw list for
+# contamination signal. My QR-5 path-scope filter removes foreign paths
+# from KEY_FILES for display, but the CROSS_SESSION_WARNING detector
+# below counts foreign paths to decide whether to warn — filtering the
+# input would silently suppress the signal (regression caught by
+# tests/test_handoff_wave.py::test_cw2_genuine_foreign_session_files_still_warn).
+_CROSS_SESSION_SOURCE="${_KEY_FILES_RAW:+$(printf '%s' "$_KEY_FILES_RAW" | sed 's/^/- /')}"
+[ -z "$_CROSS_SESSION_SOURCE" ] && _CROSS_SESSION_SOURCE="$KEY_FILES"
+if [ -n "$_CROSS_SESSION_SOURCE" ]; then
+    _KF_TOTAL=$(printf '%s' "$_CROSS_SESSION_SOURCE" | grep -c '^- /' || true)
     _KF_TOTAL="${_KF_TOTAL//[^0-9]/}"; _KF_TOTAL="${_KF_TOTAL:-0}"
     if [ "$_KF_TOTAL" -gt 0 ]; then
         # V11.15.6 (cheap win 2): use POSITIVE contamination evidence, not the
         # absence of the project name in the path. The old test ("no key file
         # contains /{project}/") false-fired on every framework/dev project,
         # whose work legitimately lives in a repo root (e.g.
-        # $V11_WORKSPACE_ROOT/v11/...) and never under sessions/{project}/. The
+        # $HERCULES_ROOT/v11/...) and never under sessions/{project}/. The
         # real drift signature (Bug E/H) is a file physically inside ANOTHER
         # project's session tree while attributed here — so count key files
         # under $SESSIONS_ROOT/<other>/ where <other> != PROJECT. Framework
         # files under the repo root are not under any sessions/<other>/ and so
         # never trip it; a genuine sessions/<other>/ leak still does.
         _SR="${SESSIONS_ROOT%/}"
-        _KF_FOREIGN=$(printf '%s' "$KEY_FILES" \
+        _KF_FOREIGN=$(printf '%s' "$_CROSS_SESSION_SOURCE" \
             | sed -n 's/^- //p' \
             | awk -v sr="$_SR/" -v proj="$PROJECT" '
                 index($0, sr) == 1 {
@@ -954,6 +1126,17 @@ if [ -n "$KEY_FILES" ]; then
         fi
     fi
 fi
+
+# V11 review-loop Q14/E1: pending_parent review-sibling tasks are counted in
+# .total (sync-tasks `.total += 1` at pairing time) but are NEVER counted in
+# .pending/.in_progress/.blocked (they are not dispatchable until the parent
+# completes and sync-tasks flips their status off pending_parent). Left
+# invisible, a rehydrating session undercounts open work (breakdown summed to
+# less than total-minus-completed). Surface the gap explicitly.
+REVIEW_PENDING=$(( TOTAL - COMPLETED - PENDING - IN_PROGRESS - BLOCKED ))
+[ "$REVIEW_PENDING" -lt 0 ] && REVIEW_PENDING=0
+_REVIEW_PENDING_SEG=""
+[ "$REVIEW_PENDING" -gt 0 ] && _REVIEW_PENDING_SEG=" | Review-pending: ${REVIEW_PENDING}"
 
 # Percent — clamp to [0,100] and flag drift when COMPLETED > TOTAL.
 # Counter drift surfaces as 100%+ values (archivestream:191%, tos-analyzer:2100%, etc).
@@ -974,6 +1157,20 @@ if [ "$TOTAL" -gt 0 ]; then
     fi
 fi
 
+# V11.35.6 (#30): provenance-gated counter display. If task state came from a
+# DIFFERENT session than the one running handoff, warn that counters are stale.
+# V11_HANDOFF_STRICT=off disables this check.
+_PROVENANCE_WARNING=""
+if [ "${V11_HANDOFF_STRICT:-on}" = "on" ]; then
+    _current_sid="${V11_SESSION_ID:-}"
+    if [ -n "$_current_sid" ] && [ -n "$SOURCE_SESSION_UUID" ] \
+       && [ "$SOURCE_SESSION_UUID" != "unknown" ] \
+       && [ "$SOURCE_SESSION_UUID" != "aggregate" ] \
+       && [ "$SOURCE_SESSION_UUID" != "$_current_sid" ]; then
+        _PROVENANCE_WARNING="⚠ Counters below are from session ${SOURCE_SESSION_UUID:0:8}, not this session (${_current_sid:0:8}). Run TaskList to get current state."
+    fi
+fi
+
 TIMESTAMP=$(date -Iseconds)
 
 # F2 (V11.W3): derive HANDOFF_CATEGORY from task state (V11_HANDOFF_CATEGORY=off disables).
@@ -988,21 +1185,48 @@ TIMESTAMP=$(date -Iseconds)
 #   requires full task scan. This heuristic is "most likely waiting on user" without
 #   adding a heavy read.
 # RESUME: normal case — pending or in-progress work exists.
-HANDOFF_CATEGORY="RESUME"
-if [ "${V11_HANDOFF_CATEGORY:-on}" != "off" ]; then
-    # V11.23 W4-E1: TO_BUILD must NOT win when BLOCKED>0. A 1-task project whose
-    # only task is BLOCKED has TOTAL<=1 + COMPLETED=0, which previously matched
-    # TO_BUILD even though the work has clearly started and is now stuck waiting
-    # on an external blocker. Add BLOCKED=0 guard so the elif PAUSED_EXTERNAL
-    # branch wins. (Originally W3 adversarial review E1.)
-    if [ -f "$SPEC_FILE" ] && [ -s "$SPEC_FILE" ] && [ "${TOTAL:-0}" -le 1 ] && [ "${COMPLETED:-0}" -eq 0 ] && [ "${BLOCKED:-0}" -eq 0 ]; then
-        HANDOFF_CATEGORY="TO_BUILD"
-    elif [ "${BLOCKED:-0}" -gt 0 ]; then
-        HANDOFF_CATEGORY="PAUSED_EXTERNAL"
-    elif [ "${IN_PROGRESS:-0}" -gt 0 ] && [ "${PENDING:-0}" -eq 0 ] && [ "${BLOCKED:-0}" -eq 0 ]; then
-        HANDOFF_CATEGORY="PAUSED_USER"
+# QR-2 (2026-09-01): category derivation extracted into a helper so it can
+# be re-invoked AFTER the task#21 reconcile block updates PENDING. Prior
+# behavior derived category once from PENDING (which may be stale from
+# live-snapshot or aggregate), then never re-derived — so COMPLETE never
+# fired on real "all done" sessions like bring-to-market (1/1) and
+# claude-ahk (12/13). Priority: COMPLETE > TO_BUILD > PAUSED_EXTERNAL > PAUSED_USER > RESUME.
+# Rollback: V11_HANDOFF_COMPLETE_CATEGORY=off restores prior 4-value taxonomy.
+_v11_derive_handoff_category() {
+    local _cat="RESUME"
+    if [ "${V11_HANDOFF_CATEGORY:-on}" = "off" ]; then
+        printf '%s' "$_cat"; return 0
     fi
-fi
+    if [ "${V11_HANDOFF_COMPLETE_CATEGORY:-on}" = "on" ] \
+       && [ "${TOTAL:-0}" -gt 0 ] \
+       && [ "${COMPLETED:-0}" -eq "${TOTAL:-0}" ] \
+       && [ "${PENDING:-0}" -eq 0 ] \
+       && [ "${IN_PROGRESS:-0}" -eq 0 ] \
+       && [ "${BLOCKED:-0}" -eq 0 ]; then
+        _cat="COMPLETE"
+    elif [ -f "$SPEC_FILE" ] && [ -s "$SPEC_FILE" ] && [ "${TOTAL:-0}" -le 1 ] && [ "${COMPLETED:-0}" -eq 0 ] && [ "${BLOCKED:-0}" -eq 0 ]; then
+        # V11.23 W4-E1: TO_BUILD must NOT win when BLOCKED>0.
+        _cat="TO_BUILD"
+    elif [ "${BLOCKED:-0}" -gt 0 ]; then
+        _cat="PAUSED_EXTERNAL"
+    elif [ "${IN_PROGRESS:-0}" -gt 0 ] && [ "${PENDING:-0}" -eq 0 ] && [ "${BLOCKED:-0}" -eq 0 ]; then
+        _cat="PAUSED_USER"
+    fi
+    printf '%s' "$_cat"
+}
+_v11_category_banner() {
+    # Emit the banner text (no trailing newline) for a given category.
+    # Keep in exact sync with the case-statement at the staging emit site.
+    case "$1" in
+        COMPLETE) printf '> **Category: COMPLETE** — all tasks completed (%s/%s). No work to resume; plan next sprint or archive the session.' "${DISPLAY_COMPLETED:-$COMPLETED}" "$TOTAL" ;;
+        TO_BUILD) printf '> **Category: TO_BUILD** — spec.md exists but no tasks created yet. Next session should plan and TaskCreate from spec, not resume existing work.' ;;
+        PAUSED_EXTERNAL) printf '> **Category: PAUSED_EXTERNAL** — work is blocked on an external dependency. Resolve blockers (see below) before continuing.' ;;
+        PAUSED_USER) printf '> **Category: PAUSED_USER** — in-progress tasks exist with no pending follow-on work; likely waiting on user input or a decision. Check task descriptions to confirm.' ;;
+        RESUME) printf '> **Category: RESUME** — pending/in-progress work is ready to continue.' ;;
+        *) : ;;
+    esac
+}
+HANDOFF_CATEGORY=$(_v11_derive_handoff_category)
 
 # F3 (V11.W3): surface external blockers at top of handoff.md when any exist.
 # Reads blocked task subjects from live-snapshot (preferred) or task-state open_tasks.
@@ -1010,18 +1234,27 @@ fi
 BLOCKER_LIST=""
 if [ "${V11_HANDOFF_CATEGORY:-on}" != "off" ] && [ "${BLOCKED:-0}" -gt 0 ]; then
     # Try live-snapshot first (freshest); fall back to per-session open_tasks
+    # task #17: route both sources through the null-subject fill helper before
+    # falling back to the "blocked task" placeholder.
     _BLOCKER_RAW=""
     if [ -f "$LIVE_SNAP_FILE" ] && [ -s "$LIVE_SNAP_FILE" ]; then
-        _BLOCKER_RAW=$(jq -r '
-            [.tasks[]? | select(.status == "blocked") | "  - #\(.id // "?"): \(.subject // "blocked task")"] | join("\n")
-        ' "$LIVE_SNAP_FILE" 2>/dev/null || echo "")
+        _BLOCKER_JSON=$(jq -c '
+            [.tasks[]? | select(.status == "blocked") | {id: (.id // null), subject: (.subject // null)}]
+        ' "$LIVE_SNAP_FILE" 2>/dev/null || echo "[]")
+        _BLOCKER_JSON=$(_v11_fill_null_subjects "$_BLOCKER_JSON" "$PROJECT")
+        _BLOCKER_RAW=$(printf '%s' "$_BLOCKER_JSON" | jq -r '.[] | "  - #\(.id // "?"): \(.subject // "blocked task")"' 2>/dev/null || echo "")
     fi
     if [ -z "$_BLOCKER_RAW" ] && [ -f "$STATE_FILE" ] && [ -s "$STATE_FILE" ]; then
-        _BLOCKER_RAW=$(jq -r '
-            (.open_tasks // {}) | to_entries[]
-            | select(.value.status == "blocked")
-            | "  - #\(.key): \(.value.subject // "blocked task")"
-        ' "$STATE_FILE" 2>/dev/null || echo "")
+        # improvements/18: .open_tasks is a dict here for the per-session
+        # state file (id is the dict key) but a list of self-describing
+        # records for the aggregate fallback (id is the .task_id field).
+        # to_entries[] works on both shapes; prefer .value.task_id when
+        # present (list shape) else fall back to .key (dict shape).
+        _BLOCKER_JSON=$(jq -c '
+            [(.open_tasks // {}) | to_entries[] | select(.value.status == "blocked") | {id: (.value.task_id // .key), subject: (.value.subject // null)}]
+        ' "$STATE_FILE" 2>/dev/null || echo "[]")
+        _BLOCKER_JSON=$(_v11_fill_null_subjects "$_BLOCKER_JSON" "$PROJECT")
+        _BLOCKER_RAW=$(printf '%s' "$_BLOCKER_JSON" | jq -r '.[] | "  - #\(.id // "?"): \(.subject // "blocked task")"' 2>/dev/null || echo "")
     fi
     if [ -n "$_BLOCKER_RAW" ]; then
         BLOCKER_LIST="$_BLOCKER_RAW"
@@ -1052,7 +1285,7 @@ if [ -n "$JSON_FLAG" ]; then
     # JSON output — use jq --arg for proper escaping of all string values
     PC_HYPO_ACTIVE=0
     if [ -f "$PLAN_CONTEXT_FILE" ]; then
-        PC_HYPO_ACTIVE=$(jq '(.hypotheses // []) | map(select(.status == "active")) | length' "$PLAN_CONTEXT_FILE" 2>/dev/null || echo "0")
+        PC_HYPO_ACTIVE=$(jq '(.hypotheses // []) | map(select(type == "object" and .status == "active")) | length' "$PLAN_CONTEXT_FILE" 2>/dev/null || echo "0")
     fi
     [[ "$PC_HYPO_ACTIVE" =~ ^[0-9]+$ ]] || PC_HYPO_ACTIVE=0
 
@@ -1243,7 +1476,7 @@ _GATE_LINE=""
 # tasks with recent file-edit activity. Honors V11_DISCIPLINE_DETECTOR=off.
 _DISC_SCRIPT="$V11_HOME/scripts/handoff-discipline-check"
 if [ -x "$_DISC_SCRIPT" ] && [ -n "$PROJECT" ]; then
-    V11_WORKSPACE_ROOT="$V11_WORKSPACE_ROOT" \
+    HERCULES_ROOT="$HERCULES_ROOT" \
     SESSIONS_ROOT="$SESSIONS_ROOT" \
     METRICS_DIR="$METRICS_DIR" \
     timeout 10 "$_DISC_SCRIPT" "$PROJECT" >/dev/null 2>&1 || true
@@ -1280,13 +1513,18 @@ if [ -f "$_DISC_LOG_FILE" ] && jq empty "$_DISC_LOG_FILE" 2>/dev/null; then
             # count-inequality heuristic.
             _DISC_OUTSIDE_SCOPE=0
             if [ "$ACTIVE_TASKS" != "none" ] && [ -n "$ACTIVE_TASKS" ]; then
+                # improvements/23: discipline log scales with task count — slurpfile, not argjson
+                _disclogf=$(mktemp)
+                printf '%s' "${_DISC_LOG_JSON:-null}" > "$_disclogf"
                 _DISC_OUTSIDE_SCOPE=$(jq -n -c \
                     --arg active "$ACTIVE_TASKS" \
-                    --argjson log "$_DISC_LOG_JSON" '
-                    ($active | split(", ")) as $ids
-                    | (($log.nudges // []) | map(.id | tostring)) as $nids
+                    --slurpfile log_sf "$_disclogf" '
+                    (($log_sf[0]) // {}) as $log
+                    | ($active | split(", ")) as $ids
+                    | ((($log.nudges? // []) | map(.id | tostring))) as $nids
                     | if ($nids - $ids | length) > 0 then 1 else 0 end
                 ' 2>/dev/null || echo 0)
+                rm -f "$_disclogf" 2>/dev/null || true
                 [[ "$_DISC_OUTSIDE_SCOPE" =~ ^[01]$ ]] || _DISC_OUTSIDE_SCOPE=0
             elif [ "$_DISC_STALE_COUNT" -gt "$IN_PROGRESS" ]; then
                 _DISC_OUTSIDE_SCOPE=1
@@ -1304,6 +1542,118 @@ ${_DISC_NUDGES}
             fi
         fi
     fi
+fi
+
+# L1.1 (v11-handoff-cross-session-loop, sprint-1): doc-drift warning.
+# Read cached .drift-scan-result.json produced by prior `/v11-drift $PROJECT`
+# runs. WARN when grade ≤ C so the receiving session knows documentation-vs-
+# code alignment has degraded before it starts editing. Cache read only —
+# never invokes v11-drift-scan itself here (that ran in an earlier ad-hoc
+# /v11-drift; re-running here would add minutes to every CLOSE). Rollback:
+# V11_HANDOFF_DOC_DRIFT=off skips the warning entirely (file untouched).
+_DOC_DRIFT_WARNING=""
+if [ "${V11_HANDOFF_DOC_DRIFT:-on}" != "off" ] && [ -n "$SESSION_DIR" ]; then
+    _DDS_FILE="$SESSION_DIR/.drift-scan-result.json"
+    if [ -f "$_DDS_FILE" ] && [ -s "$_DDS_FILE" ] && jq empty "$_DDS_FILE" 2>/dev/null; then
+        _DDS_GRADE=$(jq -r '.grade // ""' "$_DDS_FILE" 2>/dev/null || echo "")
+        _DDS_SCORE=$(jq -r '.score // 0' "$_DDS_FILE" 2>/dev/null || echo 0)
+        _DDS_FINDINGS=$(jq -r '.findings // 0' "$_DDS_FILE" 2>/dev/null || echo 0)
+        _DDS_CRITICAL=$(jq -r '.critical // 0' "$_DDS_FILE" 2>/dev/null || echo 0)
+        _DDS_HIGH=$(jq -r '.high // 0' "$_DDS_FILE" 2>/dev/null || echo 0)
+        _DDS_DATE=$(jq -r '.scan_date // "unknown"' "$_DDS_FILE" 2>/dev/null || echo "unknown")
+        case "$_DDS_GRADE" in
+            C|D|F)
+                _DOC_DRIFT_WARNING="⚠ DOC-DRIFT: cached v11-drift-scan on ${_DDS_DATE} scored ${_DDS_SCORE} (grade ${_DDS_GRADE}) — ${_DDS_FINDINGS} finding(s) (${_DDS_CRITICAL} critical, ${_DDS_HIGH} high). Documentation vs code alignment has drifted. Run:
+    /v11-drift ${PROJECT}
+…for full 5-agent analysis, or scripts/v11-drift-scan --project ${PROJECT} --fix for auto-corrections.
+
+"
+                ;;
+        esac
+    fi
+fi
+
+# V11.36 W2-T5: drift-check family — wired at the same site as
+# handoff-discipline-check above. check-stamp-drift (W2-T1) was a hidden
+# pre-existing gap (registered in run-tests --regression but never wired
+# into handoff) — added here alongside the three new W2-T2/T3/T4 siblings.
+# FAIL (check-class-included exit 1 only) sets _DRIFT_FAIL, read by the
+# --spawn pre-spawn gate below to block a spawn unless --spawn-anyway.
+# WARN (exit 2, any of the four) prints to stderr and never blocks.
+# Rollback per-script: V11_STAMP_DRIFT / V11_CLASS_INCLUDED_CHECK /
+# V11_GIT_TASKLIST_CHECK / V11_HOTKEY_SYNC_CHECK (each =off no-ops that check).
+_DRIFT_FAIL=0
+_DRIFT_RAN=0
+_DRIFT_FAIL_CT=0
+_DRIFT_WARN_CT=0
+# v11.37 W2-T4 (unified bypass per swarm S9): --skip-drift-checks (or
+# V11_SKIP_DRIFT_CHECKS=1) short-circuits the entire family. Individual
+# per-check levers (V11_STAMP_DRIFT / V11_INDEX_BODY_CHECK / etc.) still
+# work at the check-script level; this is the operator's "get me out"
+# for a stuck session.
+if [ -z "$SKIP_DRIFT_FLAG" ] && [ "${V11_SKIP_DRIFT_CHECKS:-}" != "1" ] && [ -n "$PROJECT" ]; then
+    # v11.37 W2-T4: family extended with 4 new members. First three are new
+    # ships this sprint (index-body/rollback-lever/registry). check-changelog-drift
+    # is a REWIRE of an existing check that was regression-only before —
+    # part of the v11.37 W2-T4 "wire the whole family everywhere" pattern.
+    # Rollback per-script (see docs/DRIFT_CHECKS.md):
+    #   V11_STAMP_DRIFT / V11_CLASS_INCLUDED_CHECK / V11_GIT_TASKLIST_CHECK /
+    #   V11_HOTKEY_SYNC_CHECK / V11_CHECK_CHANGELOG_DRIFT / V11_INDEX_BODY_CHECK /
+    #   V11_ROLLBACK_LEVER_CHECK / V11_REGISTRY_CHECK
+    for _DRIFT_SCRIPT_NAME in check-stamp-drift check-class-included check-git-tasklist-alignment check-hotkey-sync check-changelog-drift check-index-body-status-consistency check-rollback-lever-drift check-registry-drift; do
+        _DRIFT_SCRIPT="$V11_HOME/scripts/$_DRIFT_SCRIPT_NAME"
+        [ -x "$_DRIFT_SCRIPT" ] || continue
+        _DRIFT_RAN=$((_DRIFT_RAN + 1))
+        # &&/|| wrapper: a bare `var=$(cmd)` assignment trips `set -e` (active in
+        # this script) the instant cmd exits non-zero — exactly the FAIL/WARN case
+        # these checks exist to report — aborting the whole handoff silently before
+        # _DRIFT_RC is ever read. The trailing `|| _DRIFT_RC=$?` absorbs that so -e
+        # never fires here; _DRIFT_RC=0 on the success path.
+        case "$_DRIFT_SCRIPT_NAME" in
+            check-stamp-drift|check-changelog-drift|check-index-body-status-consistency|check-rollback-lever-drift|check-registry-drift)
+                # Framework-wide anchor checks — no --project flag.
+                _DRIFT_OUT=$(SESSIONS_ROOT="$SESSIONS_ROOT" V11_HOME="$V11_HOME" timeout 15 "$_DRIFT_SCRIPT" 2>&1) && _DRIFT_RC=0 || _DRIFT_RC=$?
+                ;;
+            *)
+                _DRIFT_OUT=$(SESSIONS_ROOT="$SESSIONS_ROOT" V11_HOME="$V11_HOME" timeout 15 "$_DRIFT_SCRIPT" --project "$PROJECT" 2>&1) && _DRIFT_RC=0 || _DRIFT_RC=$?
+                ;;
+        esac
+        if [ "$_DRIFT_RC" -eq 1 ]; then
+            _DRIFT_FAIL_CT=$((_DRIFT_FAIL_CT + 1))
+            # v11.37 W2-T4 soft-block policy: only check-class-included and
+            # check-registry-drift FAILs block --spawn (data-honesty class:
+            # a missing class import OR a live agent unreachable via registry
+            # would break downstream). Other FAILs report but don't block —
+            # they're hygiene, not correctness.
+            case "$_DRIFT_SCRIPT_NAME" in
+                check-class-included|check-registry-drift) _DRIFT_FAIL=1 ;;
+            esac
+            # v11.37 W2-T4 swarm S7: print FAIL blocks always (they're real
+            # errors), WARN blocks only under verbose. Prevents 8-block noise
+            # blow-up on quiet WARNs while keeping every FAIL visible.
+            echo "⚠ handoff drift-check FAIL ($_DRIFT_SCRIPT_NAME):" >&2
+            echo "$_DRIFT_OUT" >&2
+        elif [ "$_DRIFT_RC" -eq 2 ]; then
+            _DRIFT_WARN_CT=$((_DRIFT_WARN_CT + 1))
+            if [ "${V11_DRIFT_VERBOSE:-off}" = "on" ]; then
+                echo "⚠ handoff drift-check WARN ($_DRIFT_SCRIPT_NAME):" >&2
+                echo "$_DRIFT_OUT" >&2
+            fi
+        fi
+    done
+    # v11.37 W2-T4 (swarm S7): 1-line summary always, per-check detail
+    # gated by V11_DRIFT_VERBOSE=on (default off = concise UX). FAIL blocks
+    # always print their block regardless of verbose.
+    if [ "$_DRIFT_RAN" -gt 0 ]; then
+        _DRIFT_PASS=$((_DRIFT_RAN - _DRIFT_FAIL_CT - _DRIFT_WARN_CT))
+        _DRIFT_HINT=""
+        if [ "$_DRIFT_FAIL_CT" -gt 0 ] || [ "$_DRIFT_WARN_CT" -gt 0 ]; then
+            _DRIFT_HINT=" — V11_DRIFT_VERBOSE=on for per-check detail; --skip-drift-checks to bypass"
+        fi
+        echo "drift checks: ${_DRIFT_RAN} ran, ${_DRIFT_PASS} PASS, ${_DRIFT_WARN_CT} WARN, ${_DRIFT_FAIL_CT} FAIL${_DRIFT_HINT}" >&2
+    fi
+elif [ -n "$SKIP_DRIFT_FLAG" ] || [ "${V11_SKIP_DRIFT_CHECKS:-}" = "1" ]; then
+    echo "drift checks: skipped (--skip-drift-checks or V11_SKIP_DRIFT_CHECKS=1)" >&2
 fi
 
 # V11.18 T5 (v11-handoff-hygiene): user-curated addendum slot.
@@ -1386,6 +1736,16 @@ if [ "${V11_FOLD_FAMILIES:-on}" != "off" ] \
     # computed against the same subject data the final emit will use.
     _EARLY_OPEN_TASKS=$(_v11_fill_null_subjects "$_EARLY_OPEN_TASKS" "$PROJECT")
     [ -z "$_EARLY_OPEN_TASKS" ] && _EARLY_OPEN_TASKS="[]"
+    # Q14/E2: drop pending_parent review siblings here too (mirrors the T15
+    # filter applied later in _emit_handoff_tasks_json). Without this, the
+    # early fold count (used below to build the "N near-duplicate task
+    # subject(s) folded" caveat note) is computed against a task set that
+    # includes tasks the final emitted open_tasks array will have dropped —
+    # the note's interpolated count goes stale relative to the live array.
+    _EARLY_OPEN_TASKS=$(printf '%s' "$_EARLY_OPEN_TASKS" | jq -c '
+        map(select(((.metadata // {}).parent_status // "") != "pending_parent"))
+    ' 2>/dev/null || printf '%s' "$_EARLY_OPEN_TASKS")
+    [ -z "$_EARLY_OPEN_TASKS" ] && _EARLY_OPEN_TASKS="[]"
 
     # Run fold and write manifest
     _EARLY_FOLD=$(printf '%s' "$_EARLY_OPEN_TASKS" \
@@ -1433,6 +1793,14 @@ if [ -n "$CROSS_SESSION_WARNING" ]; then
 
 "
 fi
+# L1.1 (v11-handoff-cross-session-loop, sprint-1): fold doc-drift warning
+# into the handoff body so the receiving session sees it (stderr from CLOSE
+# is invisible to the OPEN side). Assembled between CROSS_SESSION and
+# REVIEW_QUEUE — drift is broader context that also helps interpret the
+# review-queue items downstream.
+if [ -n "$_DOC_DRIFT_WARNING" ]; then
+    _WARNING_BLOCK="${_WARNING_BLOCK}${_DOC_DRIFT_WARNING}"
+fi
 # V11.19 T6: surface pending review-queue count as a standalone warning
 # (parallel to _DISCIPLINE_WARNING). Surfaces for BOTH per-session and
 # aggregate sources — the AUTHORITATIVE/CAVEATS branch below ALSO lists
@@ -1440,10 +1808,19 @@ fi
 # suspenders pattern. Receivers see one message in PER-SESSION mode and
 # two consistent mentions in AUTHORITATIVE-WITH-CAVEATS mode.
 if [ "$_RQ_PENDING_COUNT" -gt 0 ]; then
+    # L1.4 (v11-handoff-cross-session-loop, sprint-01): when the queue is
+    # deeper than 3, per-item review is impractical — append the bulk-drain
+    # call-to-action. Threshold >3 keeps small queues quiet where per-item
+    # review is fine. drain-review-queue exists at v11/scripts/drain-review-queue.
+    _RQ_DRAIN_HINT=""
+    if [ "$_RQ_PENDING_COUNT" -gt 3 ]; then
+        _RQ_DRAIN_HINT="
+Bulk-drain (queue depth ${_RQ_PENDING_COUNT} > 3): scripts/drain-review-queue ${PROJECT} --safe --limit 10"
+    fi
     _WARNING_BLOCK="${_WARNING_BLOCK}⚠ REVIEW QUEUE: ${_RQ_PENDING_COUNT} completed task(s) in '${PROJECT}' have not been adversarially reviewed (V11.19). Run:
     scripts/review-queue pending ${PROJECT}
 …to see the list, then spawn adversarial-lite-reviewer for each. The
-review verdict is folded back into the task via TaskUpdate(metadata.artifacts.review).
+review verdict is folded back into the task via TaskUpdate(metadata.artifacts.review).${_RQ_DRAIN_HINT}
 
 "
 fi
@@ -1556,6 +1933,18 @@ if [ -r "$_HANDOFF_STATE_PY" ]; then
     _CONF_RC=$?
     if [ "$_CONF_RC" -eq 0 ] && [ -n "$_CONF_RESULT" ]; then
         _CONF_DECISION=$(printf '%s' "$_CONF_RESULT" | jq -r '.decision // ""' 2>/dev/null)
+        # QR-3 (2026-09-01): inject .category (from bash-derived HANDOFF_CATEGORY)
+        # into the emitted confidence JSON. Prior behavior: category never
+        # emitted here; every .handoff-confidence.json across 102 files carried
+        # .category=null (dead schema). Post-reconcile update happens later at
+        # the category re-derivation block. Rollback: V11_HANDOFF_CATEGORY_JSON=off
+        # writes the raw Python output as before.
+        if [ "${V11_HANDOFF_CATEGORY_JSON:-on}" = "on" ]; then
+            _CONF_RESULT_WITH_CAT=$(printf '%s' "$_CONF_RESULT" | jq --arg cat "$HANDOFF_CATEGORY" '. + {category: $cat}' 2>/dev/null)
+            if [ -n "$_CONF_RESULT_WITH_CAT" ]; then
+                _CONF_RESULT="$_CONF_RESULT_WITH_CAT"
+            fi
+        fi
         if printf '%s' "$_CONF_RESULT" > "$_CONF_TMP" 2>/dev/null && \
            [ -s "$_CONF_TMP" ] && jq empty "$_CONF_TMP" 2>/dev/null; then
             mv "$_CONF_TMP" "$_CONF_FILE"
@@ -1601,6 +1990,11 @@ esac
 # multi-line) or passing --steer "TEXT" (convenience). The steer lands in handoff.md
 # between markers so BOTH this $PROMPT and the python bootstrap (spawn-claude-window.py)
 # read from one source. Rollback: V11_HANDOFF_STEER=off.
+# NOTE (v11.40 W2-T2 / adversarial-lite-reviewer #34): after a successful
+# non-`off` bake, this script CONSUMES .handoff-steer.md — renames it to
+# .handoff-steer.md.prev (see the `mv -f` below). Task metadata authors should
+# NOT list `.handoff-steer.md` in `files_changed` after handoff completes —
+# reference `.handoff-steer.md.prev` or note the consume-semantics explicitly.
 STEER_FILE="$SESSION_DIR/.handoff-steer.md"
 STEER_TEXT=""
 STEER_SOURCE=""
@@ -1643,7 +2037,20 @@ if [ -n "$STEER_TEXT" ]; then
         | LC_ALL=C tr -d '\000-\010\013-\037\177' \
         | sed -e 's/<!-- v11-steer-start -->//g' -e 's/<!-- v11-steer-end -->//g' \
               -e 's/```*/`/g')"
-    STEER_TEXT="${STEER_TEXT:0:2000}"
+    # v11.40 W2-T2 (#1/#34): the historical hard cap `${STEER_TEXT:0:2000}` was
+    # silently truncating steers >2000 chars mid-word (observed 2026-08-29:
+    # v11.38→v11.39 handoff cut at "...do NOT re-run v11.37 or v11.38 CL" —
+    # 2334-char input, cap-boundary at char 2000). Env-var-tunable now with
+    # warn-on-truncate to stderr; set V11_STEER_MAX_CHARS=0 to disable the cap
+    # entirely. Default stays 2000 for backcompat with the prior first-message
+    # size discipline.
+    _steer_len=${#STEER_TEXT}
+    _steer_cap="${V11_STEER_MAX_CHARS:-2000}"
+    if [ "$_steer_cap" -gt 0 ] && [ "$_steer_len" -gt "$_steer_cap" ]; then
+        printf 'WARN: steer truncated at %s chars (was %s; set V11_STEER_MAX_CHARS to raise or 0 to disable cap) — tail lost: "%s"\n' \
+            "$_steer_cap" "$_steer_len" "$(printf '%s' "${STEER_TEXT:_steer_cap:80}" | tr '\n' ' ')" >&2
+        STEER_TEXT="${STEER_TEXT:0:$_steer_cap}"
+    fi
 fi
 _STEER_BLOCK=""
 if [ -n "$STEER_TEXT" ]; then
@@ -1655,12 +2062,13 @@ fi
 
 PROMPT="Continue V11 session: \"$PROJECT\"
 
-${_WARNING_BLOCK}Read: $V11_WORKSPACE_ROOT/v11/CLAUDE.md, $SPEC_FILE, TaskList
+${_WARNING_BLOCK}Read: $HERCULES_ROOT/v11/CLAUDE.md, $SPEC_FILE, TaskList
 
 ${_STEER_BLOCK}## Current State
-- Progress: ${DISPLAY_COMPLETED}/${TOTAL} tasks (${PERCENT}%)${PROGRESS_NOTE}
+${_PROVENANCE_WARNING:+${_PROVENANCE_WARNING}
+}- Progress: ${DISPLAY_COMPLETED}/${TOTAL} tasks (${PERCENT}%)${PROGRESS_NOTE}
 - Active tasks: ${ACTIVE_TASKS}
-- Pending: ${PENDING} | In progress: ${IN_PROGRESS} | Blocked: ${BLOCKED}
+- Pending: ${PENDING} | In progress: ${IN_PROGRESS} | Blocked: ${BLOCKED}${_REVIEW_PENDING_SEG}
 - Autonomy: A${AUTONOMY_LEVEL} (${AUTONOMY_NAME}) — ${AUTONOMY_SUCCESSFUL} actions, ${AUTONOMY_ERRORS} errors
 ${FORMATION_DISPLAY:+- ${FORMATION_DISPLAY}}${_SPRINT_LINE}${_GATE_LINE}
 ${_SECTIONS}
@@ -1690,8 +2098,11 @@ V11 Protocol | Generated: $TIMESTAMP
 Session: $PROJECT | ${DISPLAY_COMPLETED}/${TOTAL} complete (${PERCENT}%)${PROGRESS_NOTE}
 Task state source: $STATE_SOURCE ($SOURCE_SESSION_UUID)${LIVE_SNAP_SOURCE:+ | live-snapshot: ${LIVE_SNAP_SOURCE}}"
 
-# Write handoff.md to session directory (printf, not heredoc — immune to content injection)
+# Write handoff.md to a staging file first — only promoted to final after
+# handoff-tasks.json emits successfully. This kills the half-handoff class:
+# an abort during emit no longer leaves handoff.md shipped without tasks.
 mkdir -p "$SESSION_DIR"
+_HANDOFF_STAGING="$HANDOFF_FILE.staging.$$"
 {
     printf '# Handoff: %s\n\n' "$PROJECT"
 
@@ -1700,6 +2111,12 @@ mkdir -p "$SESSION_DIR"
     # distinct one-liner explaining what it means.
     if [ "${V11_HANDOFF_CATEGORY:-on}" != "off" ]; then
         case "$HANDOFF_CATEGORY" in
+            COMPLETE)
+                # QR-2 (2026-09-01): finished-sprint state, all tasks done. Prior
+                # behavior mislabeled these as RESUME with "No active tasks" as
+                # Next Up (semantic contradiction, audit 2026-09-01).
+                printf '> **Category: COMPLETE** — all tasks completed (%s/%s). No work to resume; plan next sprint or archive the session.\n\n' "${DISPLAY_COMPLETED:-$COMPLETED}" "$TOTAL"
+                ;;
             TO_BUILD)
                 printf '> **Category: TO_BUILD** — spec.md exists but no tasks created yet. Next session should plan and TaskCreate from spec, not resume existing work.\n\n'
                 ;;
@@ -1746,7 +2163,24 @@ mkdir -p "$SESSION_DIR"
     printf '## Quick Resume\n\n```\n'
     printf '%s\n' "$PROMPT"
     printf '```\n\n---\nGenerated: %s\n' "$TIMESTAMP"
-} > "$HANDOFF_FILE"
+} > "$_HANDOFF_STAGING"
+
+# W5: EXIT trap for tmp file cleanup + steer restore. Must be installed BEFORE
+# the steer consume block (improvements/23 test seam fires between consume and emit).
+_v11_handoff_cleanup() {
+    local _rc=$?
+    rm -f "$HANDOFF_TASKS_FILE.tmp.$$" 2>/dev/null || true
+    rm -f "$SESSION_DIR/.handoff-fold-manifest.json.tmp.$$" 2>/dev/null || true
+    rm -f "${_HANDOFF_STAGING:-/dev/null}" 2>/dev/null || true
+    # Steer restore (improvements/23 contract, preserved)
+    if [ "$_rc" -ne 0 ] && [ "${_STEER_CONSUMED_THIS_RUN:-0}" = "1" ] \
+       && [ ! -s "${STEER_FILE:-/dev/null}" ] && [ -s "${STEER_FILE:-/dev/null}.prev" ]; then
+        cp -f "${STEER_FILE}.prev" "$STEER_FILE" 2>/dev/null \
+          && echo "NOTE: nonzero exit ($_rc) after steer consume — restored .handoff-steer.md from .prev so the retry keeps its steer (improvements/23)." >&2
+    fi
+    exit $_rc
+}
+trap '_v11_handoff_cleanup' EXIT
 
 # V11.28: consume-and-clear the steer sidecar so one-shot steering never leaks into
 # a LATER handoff (same discipline as the V11.25.1 stale-summary archive). The steer
@@ -1755,7 +2189,15 @@ mkdir -p "$SESSION_DIR"
 if [ "$STEER_SOURCE" = "file" ] && [ "${V11_HANDOFF_STEER:-on}" != "off" ]; then
     if mv -f "$STEER_FILE" "${STEER_FILE}.prev" 2>/dev/null; then
         echo "NOTE: consumed .handoff-steer.md → archived to .handoff-steer.md.prev (steer baked into handoff.md)." >&2
+        _STEER_CONSUMED_THIS_RUN=1
     fi
+fi
+
+# improvements/23 test seam: deterministic failure injection AFTER the steer
+# consume, used only by the regression test to prove the restore trap.
+if [ "${V11_TEST_FAIL_AFTER_STEER:-0}" = "1" ]; then
+    echo "TEST: V11_TEST_FAIL_AFTER_STEER — forcing exit 97 (improvements/23 seam)" >&2
+    exit 97
 fi
 
 # V11.13: Emit handoff-tasks.json — structured open-task list for rehydration.
@@ -1875,11 +2317,21 @@ _emit_handoff_tasks_json() {
        && [ "$(jq -r '.ledger_source // ""' "$AGGREGATE_FILE" 2>/dev/null || echo "")" = "ledger" ]; then
         _ledger_auth=true
     fi
+    # improvements/23: alive-uuid and done-norm lists scale with session/task
+    # count — slurpfile them; a single execve argument caps at 128KB.
+    local _alivef _donef
+    _alivef=$(mktemp)
+    _donef=$(mktemp)
+    printf '%s' "${_alive_uuids:-[]}" > "$_alivef"
+    printf '%s' "${_done_norms:-[]}" > "$_donef"
     open_tasks_json=$(printf '%s' "$open_tasks_json" \
-        | jq -c --argjson alive "$_alive_uuids" \
-                --argjson done "$_done_norms" \
+        | jq -c --slurpfile alive_sf "$_alivef" \
+                --slurpfile done_sf "$_donef" \
                 --argjson ledger_auth "$_ledger_auth" '
         def nrm($s): ($s // "" | ascii_downcase | gsub("\\s+"; " ") | gsub("^ +| +$"; ""));
+        (($alive_sf[0]) // []) as $alive
+        | (($done_sf[0]) // []) as $done
+        |
         # $ns is bound BEFORE the `$done |` pipe: inside `$done | index(x)`
         # jq rebinds `.` to the $done array, so `nrm(.subject)` there would
         # run `.subject` on an array. Bind the normalized subject first.
@@ -1907,6 +2359,7 @@ _emit_handoff_tasks_json() {
           )
         | map(del(._stale))
     ' 2>/dev/null || printf '%s' "$open_tasks_json")
+    rm -f "$_alivef" "$_donef" 2>/dev/null || true
     [ -z "$open_tasks_json" ] && open_tasks_json="[]"
 
     # V11.21 (T15): review-sibling filter — MUST run BEFORE family fold.
@@ -1942,7 +2395,12 @@ _emit_handoff_tasks_json() {
                 | if ($m.parent_status // "") == "pending_parent" then
                     {_drop: true}
                   elif ($m.review_of // null) != null then
-                    . + {metadata: ($m + {is_review_sibling: true})} + {_drop: false, _tagged: true}
+                    # Kept precisely BECAUSE the parent already completed (the
+                    # pending_parent branch above is what catches still-pending
+                    # parents) — parent_status must say "completed", not the
+                    # stale "pending" sync-tasks left behind at the pairing→
+                    # activation transition (Q14/E3).
+                    . + {metadata: ($m + {is_review_sibling: true, parent_status: "completed"})} + {_drop: false, _tagged: true}
                   else
                     . + {_drop: false}
                   end
@@ -2051,13 +2509,23 @@ _emit_handoff_tasks_json() {
     fi
 
     local tmp="$HANDOFF_TASKS_FILE.tmp.$$"
+    # improvements/23 (the observed E2BIG kill site): open_tasks and the fold
+    # manifest BOTH scale with project age and were passed as single execve
+    # arguments — example-project's 115-task manifest alone blew MAX_ARG_STRLEN
+    # (128KB), exit 126, AFTER the steer was consumed. Spill to files and
+    # slurpfile them; the scalar counts below stay argjson (bounded).
+    local _otf _fmf
+    _otf=$(mktemp)
+    _fmf=$(mktemp)
+    printf '%s' "${open_tasks_json:-[]}" > "$_otf"
+    printf '%s' "${_fold_manifest_json:-null}" > "$_fmf"
     jq -n \
         --arg handoff_at "$TIMESTAMP" \
         --arg project "$PROJECT" \
         --arg source_uuid "$SOURCE_SESSION_UUID" \
         --arg source_kind "$source_kind" \
-        --argjson open_tasks "$open_tasks_json" \
-        --argjson fold_manifest "$_fold_manifest_json" \
+        --slurpfile open_tasks_sf "$_otf" \
+        --slurpfile fold_manifest_sf "$_fmf" \
         --argjson filtered_pending_parent "${_filtered_pending_parent:-0}" \
         --argjson tagged_review_siblings "${_tagged_review_siblings:-0}" \
         --arg review_filter_enabled "${_review_filter_enabled:-off}" '
@@ -2066,8 +2534,8 @@ _emit_handoff_tasks_json() {
             project: $project,
             source_session_uuid: $source_uuid,
             source_kind: $source_kind,
-            open_tasks: $open_tasks,
-            fold_manifest: $fold_manifest,
+            open_tasks: (($open_tasks_sf[0]) // []),
+            fold_manifest: (($fold_manifest_sf[0]) // null),
             review_filter: {
                 enabled: $review_filter_enabled,
                 dropped_pending_parent: $filtered_pending_parent,
@@ -2077,6 +2545,7 @@ _emit_handoff_tasks_json() {
             rehydration_note: "Run scripts/v11-resume-tasks PROJECT to print TaskCreate payloads the receiving Claude session can execute. Each entry MAY include .family_members[]: when present, the entry represents a cluster of near-duplicate subjects from multiple sessions — verify before treating as a single task."
         }
     ' > "$tmp" 2>/dev/null
+    rm -f "$_otf" "$_fmf" 2>/dev/null || true
     if [ -s "$tmp" ] && jq empty "$tmp" 2>/dev/null; then
         # Carry V5 (struck twice 2026-07-15): guard the overwrite. A session-end
         # autoemit regenerated this file from a ledger-derived aggregate and
@@ -2133,9 +2602,16 @@ _emit_handoff_tasks_json() {
         else
             # (d) Always keep a timestamped .bak of any file we're about to
             # overwrite (if one for this second doesn't already exist).
+            # 15-F2/W5: cap at 5 most recent .bak files (was unbounded — 2,616 files)
             if [ -f "$HANDOFF_TASKS_FILE" ]; then
                 local _bak="$HANDOFF_TASKS_FILE.bak.$(date +%Y%m%d%H%M%S 2>/dev/null || echo 0)"
                 [ -f "$_bak" ] || cp -f "$HANDOFF_TASKS_FILE" "$_bak" 2>/dev/null || true
+                # Prune old backups: keep 5 newest, delete the rest
+                local _bak_dir _bak_base
+                _bak_dir="$(dirname "$HANDOFF_TASKS_FILE")"
+                _bak_base="$(basename "$HANDOFF_TASKS_FILE")"
+                find "$_bak_dir" -maxdepth 1 -name "${_bak_base}.bak.*" -type f 2>/dev/null \
+                    | sort -r | tail -n +6 | xargs rm -f 2>/dev/null || true
             fi
             mv "$tmp" "$HANDOFF_TASKS_FILE"
         fi
@@ -2144,6 +2620,150 @@ _emit_handoff_tasks_json() {
     fi
 }
 _emit_handoff_tasks_json
+
+# task #21: reconcile the "Pending: N" scalar (baked into $PROMPT/$HANDOFF_FILE
+# above, at line ~1700, from the STATE_FILE/live-snapshot .pending COUNTER)
+# against the open_tasks array _emit_handoff_tasks_json just wrote to
+# $HANDOFF_TASKS_FILE. The scalar and the array are built from different
+# filters (project scope, review-sibling drop, stale-session collapse, family
+# fold) and can diverge — e.g. "Pending: 1" rendered while the emitted
+# open_tasks array had 0 pending entries. The array is the contract consumers
+# rehydrate from (scripts/v11-resume-tasks reads handoff-tasks.json, not the
+# prose scalar), so on divergence the array wins: patch the already-written
+# text in place rather than re-deriving PENDING earlier (that scalar also
+# feeds NEXT_UP/HANDOFF_CATEGORY heuristics computed upstream of the array).
+# QR-1-followup (2026-09-02): reconcile logic extracted to
+# scripts/lib/handoff_reconcile.py for unit-testability. Divergence-scenario
+# coverage lives in tests/test_handoff_reconcile.py (family-fold, review-
+# sibling pending_parent drop, stale-session id collapse). The helper:
+#   - reads handoff-tasks.json, computes true_pending from open_tasks
+#   - builds [old, new] patch pairs (header always + Next-Up lines when
+#     V11_HANDOFF_PENDING_UNIFY=on)
+#   - patches the staging file in-place
+#   - returns JSON so this caller can apply the same pairs to $PROMPT
+#     (in-memory, needed for --spawn path).
+# `reason == "reconciled"` is the true-divergence discriminator; `patched`
+# only tells whether the file physically changed (may be false on the
+# synthetic edge case where staging lacks the OLD header verbatim, but
+# PROMPT + PENDING still need the update).
+if [ -s "$HANDOFF_TASKS_FILE" ] && jq empty "$HANDOFF_TASKS_FILE" 2>/dev/null; then
+    _RECONCILE_JSON=$(python3 "$V11_HOME/scripts/lib/handoff_reconcile.py" \
+        --handoff-tasks "$HANDOFF_TASKS_FILE" \
+        --staging "${_HANDOFF_STAGING:-$HANDOFF_FILE}" \
+        --pending "${PENDING:-0}" \
+        --in-progress "${IN_PROGRESS:-0}" \
+        --blocked "${BLOCKED:-0}" \
+        --review-seg "$_REVIEW_PENDING_SEG" \
+        --mode "${V11_HANDOFF_PENDING_UNIFY:-on}" 2>/dev/null)
+    if [ -n "$_RECONCILE_JSON" ] \
+       && [ "$(printf '%s' "$_RECONCILE_JSON" | jq -r '.reason // ""' 2>/dev/null)" = "reconciled" ]; then
+        while IFS= read -r _pair; do
+            _po=$(printf '%s' "$_pair" | jq -r '.[0]' 2>/dev/null)
+            _pn=$(printf '%s' "$_pair" | jq -r '.[1]' 2>/dev/null)
+            [ -n "$_po" ] && PROMPT="${PROMPT//$_po/$_pn}"
+        done < <(printf '%s' "$_RECONCILE_JSON" | jq -c '.patches_applied[]' 2>/dev/null)
+        _TRUE_PENDING=$(printf '%s' "$_RECONCILE_JSON" | jq -r '.true_pending // ""' 2>/dev/null)
+        [ -n "$_TRUE_PENDING" ] && [ "$_TRUE_PENDING" != "null" ] && PENDING="$_TRUE_PENDING"
+    fi
+fi
+
+# QR-2 (2026-09-01): re-derive HANDOFF_CATEGORY now that PENDING (and thus
+# open-vs-completed conservation) reflects the reconciled state. Patch the
+# banner in the staged file if the category changed. Fixes finished-sprint
+# mis-labeling (bring-to-market 1/1, claude-ahk 12/13 seen as RESUME
+# because initial derivation ran with stale live-snap pending counts).
+if [ "${V11_HANDOFF_CATEGORY:-on}" != "off" ]; then
+    _POST_HANDOFF_CATEGORY=$(_v11_derive_handoff_category)
+    if [ "$_POST_HANDOFF_CATEGORY" != "$HANDOFF_CATEGORY" ] && [ -f "${_HANDOFF_STAGING:-$HANDOFF_FILE}" ]; then
+        _CAT_OLD_BANNER=$(_v11_category_banner "$HANDOFF_CATEGORY")
+        _CAT_NEW_BANNER=$(_v11_category_banner "$_POST_HANDOFF_CATEGORY")
+        if [ -n "$_CAT_OLD_BANNER" ] && [ -n "$_CAT_NEW_BANNER" ] && [ "$_CAT_OLD_BANNER" != "$_CAT_NEW_BANNER" ]; then
+            python3 - "${_HANDOFF_STAGING:-$HANDOFF_FILE}" "$_CAT_OLD_BANNER" "$_CAT_NEW_BANNER" <<'PYEOF' 2>/dev/null || true
+import sys
+p, o, n = sys.argv[1], sys.argv[2], sys.argv[3]
+with open(p, "r") as f: c = f.read()
+c = c.replace(o, n)
+with open(p, "w") as f: f.write(c)
+PYEOF
+            PROMPT="${PROMPT//$_CAT_OLD_BANNER/$_CAT_NEW_BANNER}"
+        fi
+        # QR-3 (2026-09-01): also patch .handoff-confidence.json.category so
+        # the emitted artifact reflects the reconciled category, not the
+        # stale-count initial derivation.
+        if [ "${V11_HANDOFF_CATEGORY_JSON:-on}" = "on" ] \
+           && [ -f "$_CONF_FILE" ] && [ -s "$_CONF_FILE" ]; then
+            _CONF_PATCHED=$(jq --arg cat "$_POST_HANDOFF_CATEGORY" '.category = $cat' "$_CONF_FILE" 2>/dev/null)
+            if [ -n "$_CONF_PATCHED" ]; then
+                printf '%s\n' "$_CONF_PATCHED" > "$_CONF_FILE.tmp.$$" 2>/dev/null \
+                    && mv "$_CONF_FILE.tmp.$$" "$_CONF_FILE"
+            fi
+        fi
+        HANDOFF_CATEGORY="$_POST_HANDOFF_CATEGORY"
+    fi
+fi
+
+# L1.3b (v11-handoff-cross-session-loop, sprint-01): write .loop-baseline.json
+# AFTER the QR-1 pending reconcile and QR-2 category re-derivation have
+# stabilized handoff-tasks.json, and BEFORE the staging→final promotion so
+# baseline + handoff.md + handoff-tasks.json all ship together (or all fail
+# together — the write is non-blocking, so a baseline failure never orphans
+# the handoff, but the handoff can never ship without the writer being tried).
+# Load-bearing for L2.1 boot-delta, L2.3 rehydrate verification, L2.4 loop-ack.
+# Rollback: V11_LOOP_BASELINE=off skips the write entirely.
+if [ "${V11_LOOP_BASELINE:-on}" != "off" ] \
+   && [ -n "$PROJECT" ] && [ -n "$SESSION_DIR" ] \
+   && [ -f "$V11_HOME/scripts/lib/loop_baseline.py" ]; then
+    _LB_UUID="${V11_SESSION_ID:-${CLAUDE_CODE_SESSION_ID:-unknown}}"
+    _LB_SRC="handoff_close_auto"
+    if [ -n "${SPAWN_ANYWAY_FLAG:-}" ] || [ -n "${FORCE_FLAG:-}" ]; then
+        _LB_SRC="handoff_close_forced"
+    fi
+    timeout 5 python3 "$V11_HOME/scripts/lib/loop_baseline.py" \
+        --project "$PROJECT" \
+        --session-dir "$SESSION_DIR" \
+        --session-uuid "$_LB_UUID" \
+        --source "$_LB_SRC" \
+        --handoff-at "$TIMESTAMP" \
+        --git-cwd "$V11_HOME" >/dev/null 2>&1 \
+        || echo "WARN: loop_baseline write failed (non-blocking; V11_LOOP_BASELINE=off to silence)" >&2
+fi
+
+# W5 ordering fix: promote staging → final AFTER emit + reconcile both succeed.
+# The staging pattern ensures handoff.md never ships before handoff-tasks.json,
+# killing the half-handoff class (323 observed orphans).
+if [ -f "${_HANDOFF_STAGING:-}" ]; then
+    mv -f "$_HANDOFF_STAGING" "$HANDOFF_FILE"
+fi
+
+# QR-7 (2026-09-01): lifecycle for handoff-tasks.json.autoemit-proposed.json.
+# The MANUAL-source guard and 2x magnitude breaker (handoff:2481-2526) divert
+# autoemit writes to a *.autoemit-proposed.json sidecar. Prior behavior: no
+# lifecycle — sidecars accumulate for weeks/months (audit 2026-09-01: 5
+# sessions holding stale proposed for 3-24 days; herakles-linux-opus hid
+# 9 tasks for 21+ days). Now: GC entries older than
+# V11_HANDOFF_AUTOEMIT_GC_DAYS (default 14). If fresh, WARN so the next
+# session sees the pending review. Rollback: V11_HANDOFF_AUTOEMIT_GC=off.
+_PROPOSED_FILE="$HANDOFF_TASKS_FILE.autoemit-proposed.json"
+if [ "${V11_HANDOFF_AUTOEMIT_GC:-on}" = "on" ] && [ -f "$_PROPOSED_FILE" ]; then
+    _proposed_age_days=$(python3 -c "
+import os, sys
+p = sys.argv[1]
+try:
+    age_s = __import__('time').time() - os.path.getmtime(p)
+    print(int(age_s // 86400))
+except Exception:
+    print(-1)
+" "$_PROPOSED_FILE" 2>/dev/null || echo "-1")
+    _gc_days="${V11_HANDOFF_AUTOEMIT_GC_DAYS:-14}"
+    [[ "$_gc_days" =~ ^[0-9]+$ ]] || _gc_days=14
+    if [ "$_proposed_age_days" -ge 0 ] && [ "$_proposed_age_days" -ge "$_gc_days" ]; then
+        echo "handoff: GC'd stale autoemit-proposed sidecar (${_proposed_age_days}d old ≥ ${_gc_days}d cap): $_PROPOSED_FILE" >&2
+        rm -f "$_PROPOSED_FILE" 2>/dev/null || true
+    elif [ "$_proposed_age_days" -ge 0 ]; then
+        echo "handoff: NOTE — autoemit-proposed sidecar present (${_proposed_age_days}d old, cap ${_gc_days}d): $_PROPOSED_FILE" >&2
+        echo "  Review the diff vs $HANDOFF_TASKS_FILE before it ages out. Accept: mv the .autoemit-proposed.json over the .json. Reject: rm the .autoemit-proposed.json." >&2
+    fi
+fi
 
 # F1 (V11.W3): emit stub-summary notice in the non-spawn path as well, so it is
 # ALWAYS observable regardless of whether --spawn was passed.
@@ -2203,6 +2823,18 @@ if [ -n "$SPAWN_FLAG" ]; then
             echo "NOTE: a Zeus window was already spawned for '$PROJECT' ${_spawn_age}s ago — skipping duplicate spawn (idempotent)." >&2
             echo "      handoff.md is current and the steer is intact. Use --spawn-anyway to force a new window." >&2
         fi
+    fi
+
+    # V11.36 W2-T5: pre-spawn drift gate. _DRIFT_FAIL was set above (same
+    # invocation) when check-class-included confirmed a missing #Include/import
+    # (exit 1) — the other three siblings only WARN and never set this.
+    if [ "${_DRIFT_FAIL:-0}" -eq 1 ] && [ -z "$SPAWN_ANYWAY_FLAG" ]; then
+        echo "" >&2
+        echo "ERROR: drift-check FAIL (check-class-included) — spawn blocked." >&2
+        echo "       See the drift-check output above for the missing include(s)." >&2
+        echo "  Fix the drift, or override: --spawn-anyway (use sparingly)." >&2
+        echo "" >&2
+        exit 2
     fi
 
     # Pre-spawn quality gate (Fix E + R1/R2/R4 from adversarial review): refuse
@@ -2284,11 +2916,11 @@ if [ -n "$SPAWN_FLAG" ]; then
         # Write spawn signal file (consumed by spawn-claude-window.py on read).
         # NOTE: Direct invocation below consumes the signal. If the PostToolUse hook
         # also fires, it finds no signal and exits — this is correct (no double-spawn).
-        touch "$V11_WORKSPACE_ROOT/.claude/hooks/.handoff-spawn-signal"
+        touch "$HERCULES_ROOT/.claude/hooks/.handoff-spawn-signal"
 
         # Direct invocation — the primary spawn path
         # Pass PROJECT explicitly so spawn script doesn't re-detect from stale active-project file
-        SPAWN_RESULT=$(printf '{"tool_name": "Skill", "tool_input": {"skill": "handoff", "project": "%s"}}' "$PROJECT" | python3 "$V11_WORKSPACE_ROOT/.claude/hooks/spawn-claude-window.py" 2>&1) || true
+        SPAWN_RESULT=$(printf '{"tool_name": "Skill", "tool_input": {"skill": "handoff", "project": "%s"}}' "$PROJECT" | python3 "$HERCULES_ROOT/.claude/hooks/spawn-claude-window.py" 2>&1) || true
         # Match only the python script's success systemMessage: "Spawned Claude window: ..."
         # Previously matched "success" which false-positives on {"success": false} error payloads.
         if echo "$SPAWN_RESULT" | grep -q 'Spawned Claude window'; then

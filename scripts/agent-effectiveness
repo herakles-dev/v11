@@ -27,8 +27,10 @@
 
 set -euo pipefail
 
-V11_WORKSPACE_ROOT="${V11_WORKSPACE_ROOT:-$HOME/.v11}"
-METRICS_DIR="${METRICS_DIR:-$V11_WORKSPACE_ROOT/.agent-metrics}"
+HERCULES_ROOT="${HERCULES_ROOT:-$HOME}"
+METRICS_DIR="${METRICS_DIR:-$HERCULES_ROOT/.agent-metrics}"
+# v11.44: own dir so the Python heredoc can import scripts/lib/actor_canonical.py
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]:-$0}")")" && pwd)"
 
 if [ "${1:-}" == "--test" ]; then
     echo "agent-effectiveness v1.0 (V11.15)"
@@ -57,8 +59,8 @@ done
 
 # V11.20: validate filter values
 case "$LAYER" in
-    all|lite|wave|swarm|runtime) ;;
-    *) echo "agent-effectiveness: --layer must be all|lite|wave|swarm|runtime (got: $LAYER)" >&2; exit 2 ;;
+    all|lite|wave|swarm|runtime|brief) ;;
+    *) echo "agent-effectiveness: --layer must be all|lite|wave|swarm|runtime|brief (got: $LAYER)" >&2; exit 2 ;;
 esac
 case "$CALLER_KIND" in
     all|orchestrator|subagent|unknown) ;;
@@ -76,8 +78,19 @@ V11_AE_JSON="$JSON" V11_AE_AGENT="$AGENT" V11_AE_SINCE="$SINCE" \
 V11_AE_PROJECT="$PROJECT" V11_AE_RANK="$RANK" \
 V11_AE_LAYER="$LAYER" V11_AE_CALLER_KIND="$CALLER_KIND" \
 V11_AE_TASK_STATE_DIR="$METRICS_DIR/task-state" \
+V11_AE_LIBDIR="$SCRIPT_DIR/lib" \
 python3 - <<'PYEOF'
 import os, json, datetime, sys
+
+# v11.44: shared read-side actor canonicalization (same fold-table the bash
+# v11_canonical_actor and agent-scorecard read). Folds the orchestrator family into
+# one row; non-family names pass through. V11_ORCH_QUALITY=off => identity.
+sys.path.insert(0, os.environ.get("V11_AE_LIBDIR", ""))
+try:
+    from actor_canonical import canonical_actor as _canon
+except Exception:
+    def _canon(x):
+        return x
 
 def env(k, d=""):
     return os.environ.get(k, d)
@@ -87,7 +100,7 @@ eff_path    = env("V11_AE_EFF")
 usage_path  = env("V11_AE_USAGE")
 trace_path  = env("V11_AE_TRACE")   # W3-T13
 as_json     = env("V11_AE_JSON") == "true"
-only_agent  = env("V11_AE_AGENT") or None
+only_agent  = _canon(env("V11_AE_AGENT")) or None  # v11.44: fold target (team-orchestrator == orchestrator)
 since_raw   = env("V11_AE_SINCE") or None
 only_proj   = env("V11_AE_PROJECT") or None
 rank        = env("V11_AE_RANK") == "true"
@@ -177,30 +190,58 @@ def slot(aid):
         "error_types": {},
         "trend": "stable",
         "launches": 0,
+        # V11.34.3: INV-3 calibration fields live HERE, not in a later init
+        # loop. The self-review pass calls slot(executor) and can create a
+        # brand-new slot for an executor that appears only in task-state
+        # self_review data (never in the audit/launch sources scanned above).
+        # A loop over agents.values() cannot reach those, so `+= 1` raised
+        # KeyError: 'self_review_paired' and killed the whole dashboard the
+        # moment real paired data started existing.
+        "self_review_paired": 0,
+        "self_review_miss": 0,
+        "self_review_miss_rate": 0.0,
     })
 
-# Latest snapshot per agent = authoritative rolling-window scorecard
+# Latest snapshot per agent = authoritative rolling-window scorecard.
+# v11.44: key by RAW agent_id (no data loss on fold), filter by canonical target.
 latest = {}
 for s in snaps:
-    aid = s.get("agent_id")
-    if not aid or not in_window(s):
+    raw_aid = s.get("agent_id")
+    if not raw_aid or not in_window(s):
         continue
-    if only_agent and aid != only_agent:
+    if only_agent and _canon(raw_aid) != only_agent:
         continue
     ts = parse_ts(s.get("timestamp")) or datetime.datetime.min
-    cur = latest.get(aid)
+    cur = latest.get(raw_aid)
     if cur is None or (parse_ts(cur.get("timestamp")) or datetime.datetime.min) <= ts:
-        latest[aid] = s
+        latest[raw_aid] = s
 
-for aid, s in latest.items():
-    sl = slot(aid)
-    sl["tasks_completed"]  = s.get("tasks_completed", 0)
-    sl["tasks_error_free"] = s.get("tasks_error_free", 0)
-    sl["success_rate"]     = s.get("success_rate", 0.0)
-    sl["avg_difficulty"]   = s.get("avg_difficulty", 0.0)
-    sl["error_count"]      = s.get("error_count", 0)
-    sl["error_types"]      = s.get("error_types", {}) or {}
-    sl["trend"]            = s.get("trend", "stable")
+# v11.44: fold each raw agent's latest snapshot into its CANONICAL slot. Count fields
+# ACCUMULATE (a family like orchestrator + orchestrator-self must SUM, not latest-wins);
+# rate/trend take the dominant (most-tasks) member as baseline. Single-contributor
+# slots (every non-orchestrator agent) therefore behave byte-identically to pre-v11.44.
+for raw_aid, s in latest.items():
+    sl = slot(_canon(raw_aid))
+    sl["_contrib"] = sl.get("_contrib", 0) + 1
+    sl["tasks_completed"]  += s.get("tasks_completed", 0)
+    sl["tasks_error_free"] += s.get("tasks_error_free", 0)
+    sl["error_count"]      += s.get("error_count", 0)
+    for k, v in (s.get("error_types", {}) or {}).items():
+        sl["error_types"][k] = sl["error_types"].get(k, 0) + v
+    _tc = s.get("tasks_completed", 0)
+    if _tc >= sl.get("_dom_tc", -1):
+        sl["_dom_tc"]        = _tc
+        sl["success_rate"]   = s.get("success_rate", 0.0)
+        sl["avg_difficulty"] = s.get("avg_difficulty", 0.0)
+        sl["trend"]          = s.get("trend", "stable")
+
+# For slots that folded >1 raw agent, the dominant member's stored success_rate
+# understates the merged actor — recompute it from the summed counts.
+for sl in agents.values():
+    if sl.get("_contrib", 0) > 1 and sl["tasks_completed"] > 0:
+        sl["success_rate"] = sl["tasks_error_free"] / sl["tasks_completed"]
+    sl.pop("_contrib", None)
+    sl.pop("_dom_tc", None)
 
 # Error ledger refinement: recompute error_types / counts when any per-line
 # filter is active (--project, --layer, --caller-kind). Snapshots are agnostic
@@ -210,7 +251,7 @@ if only_proj or _REFINE:
         sl["error_types"] = {}
         sl["error_count"] = 0
     for e in errors:
-        aid = e.get("agent_id")
+        aid = _canon(e.get("agent_id"))  # v11.44: fold orchestrator family into one row
         if not aid or not in_window(e):
             continue
         if only_agent and aid != only_agent:
@@ -228,7 +269,7 @@ if only_proj or _REFINE:
 
 # Launch volume from usage.jsonl for context
 for u in usage:
-    aid = u.get("agent")
+    aid = _canon(u.get("agent"))  # v11.44: fold so launches don't resurrect a raw orchestrator-self row
     if not aid or not in_window(u):
         continue
     if only_agent and aid != only_agent:
@@ -247,7 +288,7 @@ for t in traces:
     tok = t.get("tokens")
     if not isinstance(tok, (int, float)) or isinstance(tok, bool):
         continue
-    aid = t.get("spawned_agent")
+    aid = _canon(t.get("spawned_agent"))  # v11.44: fold orchestrator family for token stats
     if not aid:
         continue
     if not in_window(t, ts_key="ts"):
@@ -307,11 +348,10 @@ def _read_task_state_aggregates(d):
         except Exception:
             continue
 
-# Initialize self-review fields per agent
-for sl in agents.values():
-    sl["self_review_paired"] = 0
-    sl["self_review_miss"] = 0
-    sl["self_review_miss_rate"] = 0.0
+# Self-review fields are initialized in slot() (V11.34.3) so that slots
+# late-created by the pass below are covered too. No init loop here: one over
+# agents.values() only reaches agents already known at this point, which is
+# exactly the bug that made this dashboard crash.
 
 for project, state in _read_task_state_aggregates(task_state_dir):
     if only_proj and (state.get("project") or project) != only_proj:
@@ -335,12 +375,12 @@ for project, state in _read_task_state_aggregates(task_state_dir):
         sev = (sr.get("severity") or "").upper()
         if sev not in (SEV_RANK):
             continue
-        executor = (
+        executor = _canon(
             sr.get("agent_id")
             or arts.get("agent_id")
             or rec_agents.get(str(tid))
             or "unknown"
-        )
+        )  # v11.44: fold orchestrator family
         if only_agent and executor != only_agent:
             continue
         # since_dt window filter on completed_at

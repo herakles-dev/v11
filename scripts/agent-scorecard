@@ -30,8 +30,10 @@
 
 set -euo pipefail
 
-V11_WORKSPACE_ROOT="${V11_WORKSPACE_ROOT:-$HOME/.v11}"
-METRICS_DIR="${METRICS_DIR:-$V11_WORKSPACE_ROOT/.agent-metrics}"
+HERCULES_ROOT="${HERCULES_ROOT:-$HOME}"
+METRICS_DIR="${METRICS_DIR:-$HERCULES_ROOT/.agent-metrics}"
+# v11.44: own dir, so the Python heredoc can import scripts/lib/actor_canonical.py
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]:-$0}")")" && pwd)"
 
 if [ "${1:-}" == "--test" ]; then
     echo "agent-scorecard v1.0 (V11.20)"
@@ -69,8 +71,8 @@ if [ -z "$AGENT" ] && [ "$ROUTING" != "true" ]; then
 fi
 
 case "$LAYER" in
-    all|runtime|lite|wave|swarm) ;;
-    *) echo "agent-scorecard: --layer must be all|runtime|lite|wave|swarm (got: $LAYER)" >&2; exit 2 ;;
+    all|runtime|lite|wave|swarm|brief) ;;
+    *) echo "agent-scorecard: --layer must be all|runtime|lite|wave|swarm|brief (got: $LAYER)" >&2; exit 2 ;;
 esac
 
 case "$CALLER_KIND" in
@@ -86,14 +88,26 @@ V11_AS_ERRORS="$METRICS_DIR/agent-errors.jsonl" \
 V11_AS_TASK_STATE_DIR="$METRICS_DIR/task-state" \
 V11_AS_TRACE="$METRICS_DIR/dispatch-trace.jsonl" \
 V11_AS_LEDGER_DIR="$METRICS_DIR/ledger" \
+V11_AS_LIBDIR="$SCRIPT_DIR/lib" \
 python3 - <<'PYEOF'
 import os, sys, json, datetime, re
 from collections import Counter
 
+# v11.44: shared read-side actor canonicalization. Single source of truth is
+# hooks/lib/actor-canonical.json — the SAME table the bash v11_canonical_actor reads.
+# Folds the orchestrator family -> "orchestrator"; non-family names pass through.
+# V11_ORCH_QUALITY=off makes _canon the identity (legacy literal-string match).
+sys.path.insert(0, os.environ.get("V11_AS_LIBDIR", ""))
+try:
+    from actor_canonical import canonical_actor as _canon
+except Exception:
+    def _canon(x):
+        return x
+
 def env(k, d=""):
     return os.environ.get(k, d)
 
-agent       = env("V11_AS_AGENT")
+agent       = _canon(env("V11_AS_AGENT"))  # v11.44: fold target so e.g. team-orchestrator == orchestrator
 as_json     = env("V11_AS_JSON") == "true"
 since_raw   = env("V11_AS_SINCE") or None
 only_proj   = env("V11_AS_PROJECT") or None
@@ -104,7 +118,7 @@ errors_path = env("V11_AS_ERRORS")
 task_state_dir = env("V11_AS_TASK_STATE_DIR")
 trace_path  = env("V11_AS_TRACE")   # W3-T13
 
-LAYERS = ["runtime", "lite", "wave", "swarm"]
+LAYERS = ["runtime", "lite", "wave", "swarm", "brief"]  # v11.44: +brief (orchestrator briefing findings)
 SEV_ORDER = ["CRITICAL", "HIGH", "MEDIUM", "LOW"]
 
 def parse_ts(s):
@@ -175,6 +189,7 @@ if routing_mode:
         sa = rec.get("spawned_agent") or None
         if not ra or not sa:
             continue
+        ra = _canon(ra); sa = _canon(sa)  # v11.44: fold orchestrator family into one routing bucket
         if only_proj and rec.get("project") != only_proj:
             continue
         if not in_window(rec, ts_key="ts"):
@@ -250,6 +265,8 @@ def empty_layer():
         "by_severity": {s: 0 for s in SEV_ORDER},
         "error_types": Counter(),
         "caller_kind": Counter(),
+        "cause_kind": Counter(),   # v11.44: briefing_defect | briefing_risk | execution_defect
+        "reasons": Counter(),      # v11.44: brief-layer reason tags (unscoped / no_agent_assigned / …)
         "trend": "no_data",
         "recent": [],        # last 5 errors with timestamps
     }
@@ -268,7 +285,7 @@ def caller_kind_pass(rec_kind):
 if only_layer in ("all", "runtime"):
     sl = layers["runtime"]
     for rec in read_jsonl(audit_path):
-        if rec.get("agent_id") != agent:
+        if _canon(rec.get("agent_id")) != agent:
             continue
         if not in_window(rec):
             continue
@@ -296,7 +313,7 @@ if only_layer in ("all", "runtime"):
 
 # --- Layers 2/3/4: lite/wave/swarm from agent-errors ---
 for rec in read_jsonl(errors_path):
-    if rec.get("agent_id") != agent:
+    if _canon(rec.get("agent_id")) != agent:
         continue
     if not in_window(rec):
         continue
@@ -317,6 +334,12 @@ for rec in read_jsonl(errors_path):
         sl["by_severity"][sev] += 1
     et = rec.get("error_type") or "unknown"
     sl["error_types"][et] += 1
+    # v11.44: brief-layer detail (cause_kind + reason tags) for the Brief Quality section
+    _ckd = rec.get("cause_kind")
+    if _ckd:
+        sl["cause_kind"][_ckd] += 1
+    for _rsn in (rec.get("reasons") or []):
+        sl["reasons"][_rsn] += 1
     ck = rec.get("caller_kind")
     sl["caller_kind"][ck if ck else "unknown"] += 1
     sl["recent"].append({
@@ -344,7 +367,7 @@ def count_in(records, start, end, ts_key="timestamp"):
 # Layer 1 trend from autonomy-audit
 audit_for_agent = [
     r for r in read_jsonl(audit_path)
-    if r.get("agent_id") == agent
+    if _canon(r.get("agent_id")) == agent
     and r.get("outcome") == "error"
     and (not only_proj or r.get("project") == only_proj)
     and caller_kind_pass(r.get("caller_kind"))
@@ -352,7 +375,7 @@ audit_for_agent = [
 # L2-L4 trend from agent-errors
 errors_for_agent = [
     r for r in read_jsonl(errors_path)
-    if r.get("agent_id") == agent
+    if _canon(r.get("agent_id")) == agent
     and (not only_proj or r.get("project") == only_proj)
     and caller_kind_pass(r.get("caller_kind"))
 ]
@@ -466,7 +489,7 @@ def _self_review_records_for_agent():
                 or rec_agents.get(str(tid))
                 or "unknown"
             )
-            if exec_agent != agent:
+            if _canon(exec_agent) != agent:
                 continue
             ts = completed_ts.get(str(tid))
             if since_dt is not None:
@@ -883,6 +906,18 @@ if _token_count > 0:   # W3-T13: omitted entirely when no token data
 # S1-D2: always present (nulls when no data) — never omitted, never fabricated
 _out["tokens_per_task"] = tokens_per_task_block
 
+# v11.44: Brief Quality — orchestrator authoring signal from found_by_layer="brief".
+_bq = layers["brief"]
+brief_quality_block = {
+    "findings": _bq["errors"],
+    "briefing_defect": _bq["cause_kind"].get("briefing_defect", 0),
+    "briefing_risk": _bq["cause_kind"].get("briefing_risk", 0),
+    "top_reasons": [{"reason": k, "count": v} for k, v in _bq["reasons"].most_common(5)],
+    "trend": _bq["trend"],
+    "detail_hint": "per-brief detail + % scoped/right-agent: scripts/grade-briefs <project>",
+}
+_out["brief_quality"] = brief_quality_block
+
 if as_json:
     print(json.dumps(_out, indent=2))
     sys.exit(0)
@@ -974,6 +1009,18 @@ if calibration_block["advisory"]:
                   f"self={ex['self_severity']} vs adv={ex['adversarial_severity']} "
                   f"({(ex.get('completed_at') or '')[:19]})")
 print()
+
+# v11.44 — Brief Quality (orchestrator authoring signal). Shown for the orchestrator,
+# or for any agent that has brief-layer findings on record.
+if agent == "orchestrator" or brief_quality_block["findings"] > 0:
+    bq = brief_quality_block
+    print("  Brief Quality (v11.44 — orchestrator authoring signal):")
+    print(f"    briefing findings: {bq['findings']}  "
+          f"(defect {bq['briefing_defect']}, risk {bq['briefing_risk']})   trend: {bq['trend']}")
+    if bq["top_reasons"]:
+        print("    top reasons: " + ", ".join(f"{r['reason']}:{r['count']}" for r in bq["top_reasons"]))
+    print(f"    {bq['detail_hint']}")
+    print()
 
 # W3-T13 — avg tokens/spawn (dispatch-trace completion events)
 print("  Token usage (W3-T13, from dispatch-trace completion events):")

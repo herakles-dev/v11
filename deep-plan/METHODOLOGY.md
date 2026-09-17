@@ -140,10 +140,10 @@ For every technology, assumption, and unknown in VISION.md:
 
 1. **Create Athenaeum library** for the project
    ```bash
-   curl -s -X POST "http://localhost:3000/api/libraries" \
+   curl -s -X POST "http://localhost:8140/api/libraries" \
      -H "Content-Type: application/json" \
-     -H "Remote-User: user@example.com" \
-     -d '{"name": "Project Research", "slug": "project-slug", "description": "...", "owner": "user", "visibility": "public"}'
+     -H "Remote-User: hercules@herakles.dev" \
+     -d '{"name": "Project Research", "slug": "project-slug", "description": "...", "owner": "hercules", "visibility": "public"}'
    ```
 
 2. **Write research documents** — one per topic
@@ -153,8 +153,8 @@ For every technology, assumption, and unknown in VISION.md:
 3. **Ingest all docs to Athenaeum**
    ```bash
    for f in research/*.md; do
-     curl -s -X POST "http://localhost:3000/api/libraries/ID/upload" \
-       -H "Remote-User: user@example.com" -F "file=@$f"
+     curl -s -X POST "http://localhost:8140/api/libraries/ID/upload" \
+       -H "Remote-User: hercules@herakles.dev" -F "file=@$f"
    done
    ```
 
@@ -335,7 +335,7 @@ Pull raw content from Athenaeum's Advanced Problem-Solving library (ID: 42):
 ```bash
 # Get framework content programmatically (NEVER use /chat endpoint)
 for doc_id in 290 291 309 312 313 316 321 323 324 325; do
-  curl -s "http://localhost:3000/api/libraries/42/documents/$doc_id" | jq -r '.full_text'
+  curl -s "http://localhost:8140/api/libraries/42/documents/$doc_id" | jq -r '.full_text'
 done
 ```
 
@@ -419,7 +419,7 @@ jq '.' .claude/athenaeum.json > /dev/null && echo "athenaeum: VALID"
 # Library IDs are correct
 
 # 5. Athenaeum live check
-curl -s "http://localhost:3000/api/libraries/ID" | jq '{documents: .document_count, chunks: .chunk_count}'
+curl -s "http://localhost:8140/api/libraries/ID" | jq '{documents: .document_count, chunks: .chunk_count}'
 ```
 
 ### Git Init

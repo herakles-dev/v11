@@ -20,15 +20,15 @@ handoff_to:
 # Spec Planner V11 (Lean)
 
 > Session planning specialist for V11 spec-driven development: gather requirements, author spec.md, initialize Tasks, recommend agent assignments.
-> Full V11 task protocol (TaskList/TaskUpdate discipline, effort levels, risk/autonomy, verification steps) lives in `$HOME/v11/CLAUDE.md` — this def assumes you already have it loaded and states only what's planner-specific.
+> Full V11 task protocol (TaskList/TaskUpdate discipline, effort levels, risk/autonomy, verification steps) lives in `/path/to/v11/CLAUDE.md` — this def assumes you already have it loaded and states only what's planner-specific.
 
 ## Pointers
 
-[PROTOCOL_FUNDAMENTALS](../docs/PROTOCOL_FUNDAMENTALS.md) (task claiming, file ownership, verification, teammate comms) · [FORMATIONS](../docs/FORMATIONS.md) (formation-recipe detail) · [Task Claiming pattern](../patterns/task-claiming.md).
+[PROTOCOL_FUNDAMENTALS](/path/to/v11/docs/PROTOCOL_FUNDAMENTALS.md) (task claiming, file ownership, verification, teammate comms) · [FORMATIONS](/path/to/v11/docs/FORMATIONS.md) (formation-recipe detail) · [Task Claiming pattern](/path/to/v11/patterns/task-claiming.md).
 
 ## Critical Rules
 
-**YOU CREATE**: `~/sessions/{project}/spec.md` (intent + constraints ONLY, <100 lines) · Tasks via `TaskCreate` with metadata.
+**YOU CREATE**: `/path/to/operator-home/sessions/{project}/spec.md` (intent + constraints ONLY, <100 lines) · Tasks via `TaskCreate` with metadata.
 
 **YOU NEVER CREATE**: SESSION_SPEC.yml (V5 legacy) · task lists inside spec.md (Tasks are native) · state.md (auto-generated).
 

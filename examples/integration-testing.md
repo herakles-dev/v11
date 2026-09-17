@@ -13,14 +13,14 @@ Task: "Configure docker-compose for auth-service, user-service, and api-gateway 
 ## Step 1: Service Discovery
 
 ```bash
-# Check the port registry for available ports
+# Check PORT_REGISTRY for available ports
 jq '.allocations' ~/config/port-registry.json
 
 # Check active containers
 docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
 
-# Check app-network
-docker network inspect app-network | jq '.[].Containers | keys'
+# Check hercules-network
+docker network inspect hercules-network | jq '.[].Containers | keys'
 ```
 
 ---
@@ -35,11 +35,11 @@ docker network inspect app-network | jq '.[].Containers | keys'
 ### Services Involved
 | Service | Role | Port | Network |
 |---------|------|------|---------|
-| api-gateway | Entry point, routing | 3000 | app-network |
-| auth-service | Authentication | 3001 | app-network |
-| user-service | User management | 3002 | app-network |
-| postgres | Shared database | internal | app-network |
-| redis | Session storage | internal | app-network |
+| api-gateway | Entry point, routing | 8090 | hercules-network |
+| auth-service | Authentication | 8091 | hercules-network |
+| user-service | User management | 8092 | hercules-network |
+| postgres | Shared database | internal | hercules-network |
+| redis | Session storage | internal | hercules-network |
 
 ### Integration Points
 1. api-gateway -> auth-service (JWT validation)
@@ -88,7 +88,7 @@ services:
       timeout: 5s
       retries: 5
     networks:
-      - app-network
+      - hercules-network
 
   redis:
     image: redis:7-alpine
@@ -99,7 +99,7 @@ services:
       timeout: 5s
       retries: 5
     networks:
-      - app-network
+      - hercules-network
 
   # Layer 2: Core service (auth)
   auth-service:
@@ -107,7 +107,7 @@ services:
       context: ./auth-service
       dockerfile: Dockerfile
     ports:
-      - "3001:8000"
+      - "8091:8000"
     environment:
       - DATABASE_URL=postgresql://app:${DB_PASSWORD}@postgres:5432/app
       - REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379
@@ -124,7 +124,7 @@ services:
       retries: 3
       start_period: 10s
     networks:
-      - app-network
+      - hercules-network
 
   # Layer 3: Business service (depends on auth)
   user-service:
@@ -132,7 +132,7 @@ services:
       context: ./user-service
       dockerfile: Dockerfile
     ports:
-      - "3002:8000"
+      - "8092:8000"
     environment:
       - DATABASE_URL=postgresql://app:${DB_PASSWORD}@postgres:5432/app
       - REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379
@@ -151,7 +151,7 @@ services:
       retries: 3
       start_period: 10s
     networks:
-      - app-network
+      - hercules-network
 
   # Layer 4: Gateway (depends on all)
   api-gateway:
@@ -159,7 +159,7 @@ services:
       context: ./api-gateway
       dockerfile: Dockerfile
     ports:
-      - "3000:8000"
+      - "8090:8000"
     environment:
       - AUTH_SERVICE_URL=http://auth-service:8000
       - USER_SERVICE_URL=http://user-service:8000
@@ -175,10 +175,10 @@ services:
       retries: 3
       start_period: 10s
     networks:
-      - app-network
+      - hercules-network
 
 networks:
-  app-network:
+  hercules-network:
     external: true
 
 volumes:
@@ -250,7 +250,7 @@ async def readiness(
 ```nginx
 # nginx/project.conf
 upstream api_gateway {
-    server 127.0.0.1:3000;
+    server 127.0.0.1:8090;
     keepalive 32;
 }
 
@@ -312,9 +312,9 @@ docker exec api-gateway curl -sf http://auth-service:8000/health
 docker exec api-gateway curl -sf http://user-service:8000/health
 
 # Test readiness checks
-curl -sf http://localhost:3000/health/ready | jq .
-curl -sf http://localhost:3001/health/ready | jq .
-curl -sf http://localhost:3002/health/ready | jq .
+curl -sf http://localhost:8090/health/ready | jq .
+curl -sf http://localhost:8091/health/ready | jq .
+curl -sf http://localhost:8092/health/ready | jq .
 ```
 
 ---
@@ -327,9 +327,9 @@ curl -sf http://localhost:3002/health/ready | jq .
 ### Task: Configure multi-service docker-compose
 
 ### Services Configured
-- api-gateway: 3000 ✓
-- auth-service: 3001 ✓
-- user-service: 3002 ✓
+- api-gateway: 8090 ✓
+- auth-service: 8091 ✓
+- user-service: 8092 ✓
 - postgres: internal ✓
 - redis: internal ✓
 
@@ -345,7 +345,7 @@ curl -sf http://localhost:3002/health/ready | jq .
 ### Health Checks
 - All services: healthy ✓
 - Dependencies: connected ✓
-- Network: app-network ✓
+- Network: hercules-network ✓
 
 ### Files Created
 - docker-compose.yml (120 lines)
@@ -374,8 +374,8 @@ HANDOFF: spec-tester-v10 for L3 integration tests
 
   "integration": {
     "services_configured": 5,
-    "networks": ["app-network"],
-    "ports_allocated": [3000, 3001, 3002],
+    "networks": ["hercules-network"],
+    "ports_allocated": [8090, 8091, 8092],
     "health_checks": "all_passing"
   },
 
@@ -412,7 +412,7 @@ HANDOFF: spec-tester-v10 for L3 integration tests
 
 ```bash
 # Check network membership
-docker network inspect app-network | jq '.[].Containers'
+docker network inspect hercules-network | jq '.[].Containers'
 
 # Test DNS resolution
 docker exec api-gateway nslookup auth-service
@@ -425,8 +425,8 @@ docker exec api-gateway curl -v http://auth-service:8000/health
 
 ```bash
 # Check what's using the port
-lsof -i :3001
-netstat -tlnp | grep 3001
+lsof -i :8091
+netstat -tlnp | grep 8091
 
 # Find available port
 jq '.metadata.port_ranges' ~/config/port-registry.json

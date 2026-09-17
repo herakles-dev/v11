@@ -50,9 +50,9 @@ except ImportError:
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-CLAUDE_BIN      = os.path.expanduser("~/.local/bin/claude")
-REPO_CACHE_DIR  = Path(os.path.expanduser("~/v11/swebench-repos"))
-DEFAULT_PRED_DIR = Path(os.path.expanduser("~/v11/swebench-predictions/v11-claude-code"))
+CLAUDE_BIN      = "/path/to/operator-home/.local/bin/claude"
+REPO_CACHE_DIR  = Path("/path/to/v11/swebench-repos")
+DEFAULT_PRED_DIR = Path("/path/to/v11/swebench-predictions/v11-claude-code")
 WORKTREE_BASE   = Path("/tmp/swe-worktrees")
 
 DEFAULT_MODEL   = "claude-opus-4-6"
@@ -256,7 +256,7 @@ def run_claude_cli(prompt: str, worktree_path: Path, budget_usd: float,
     env.pop("CLAUDE_CODE_ENTRYPOINT", None)
 
     if not env.get("ANTHROPIC_API_KEY"):
-        raise RuntimeError("ANTHROPIC_API_KEY not set. Run: source your secrets env file, e.g. ~/.secrets/api-keys.env")
+        raise RuntimeError("ANTHROPIC_API_KEY not set. Run: source ~/.secrets/app.env")
 
     cmd = [
         CLAUDE_BIN,
@@ -654,7 +654,7 @@ Examples:
 
     # Validate prerequisites
     if not os.environ.get("ANTHROPIC_API_KEY"):
-        sys.exit("ANTHROPIC_API_KEY not set. Run: source your secrets env file, e.g. ~/.secrets/api-keys.env")
+        sys.exit("ANTHROPIC_API_KEY not set. Run: source ~/.secrets/app.env")
     if not Path(CLAUDE_BIN).exists():
         sys.exit(f"Claude CLI not found at {CLAUDE_BIN}")
 

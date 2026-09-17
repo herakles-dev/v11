@@ -1,0 +1,217 @@
+#!/usr/bin/env bash
+# check-class-included — drift guard: a class/function referenced in source without a
+# matching #Include/import line (improvements/35-pre-handoff-drift-check.md, case #2).
+#
+# ROOT CAUSE this defends: a constructor call (e.g. `ControlCenterGUI(...)`) survives in
+# source after its `#Include`/`import` line gets commented out or deleted. Dynamic
+# languages (AHK, Python) don't catch this at parse time — it only surfaces, or silently
+# degrades, at runtime. Nothing greps for it today.
+#
+# Sibling of check-stamp-drift / check-changelog-drift — same shape, same conventions.
+#
+# Per-project config: sessions/{project}/.class-scan-config.json (absent = no-op exit 0):
+#   {
+#     "scans": [
+#       {"lang": "ahk", "root": "client/Main.ahk",
+#        "reference_pattern": "([A-Z][A-Za-z0-9]+)\\(",
+#        "include_pattern": "^#Include\\s+\"lib\\\\\\1\\.ahk\""}
+#     ]
+#   }
+#
+# For each scan: extract identifiers matching reference_pattern's capture group 1 from
+# `root` (path relative to the project dir); for each unique identifier, check whether a
+# LINE in `root` matches include_pattern with the literal two-character placeholder `\1`
+# substituted for the identifier (regex-escaped) — IMPORTANT: `\1` here is a template
+# placeholder replaced BEFORE regex compilation, not a live regex backreference (there is
+# no capture group inside include_pattern itself for `\1` to refer to). include_pattern is
+# matched with MULTILINE `^` semantics, so a commented-out include (";#Include...",
+# "# import...") does NOT satisfy it — that is exactly how case #2 gets caught.
+#
+# Heuristic fallback: a reference immediately preceded by "." (e.g. `self.Foo(`,
+# `mod.Bar(`) is an attribute/method call, not necessarily a class needing its own
+# include — WARN "cannot verify" instead of a confident FAIL.
+#
+# Exit: 0 = PASS/skip, 1 = FAIL (confirmed missing include), 2 = WARN only (heuristic
+# misses / config problems), never both — FAIL takes priority when both occur.
+# Rollback: V11_CLASS_INCLUDED_CHECK=off.
+set -uo pipefail
+
+SESSIONS_ROOT="${SESSIONS_ROOT:-$HOME/sessions}"
+
+say() { printf '%s\n' "$*" >&2; }
+debug() { [ "${V11_DRIFT_CHECK_DEBUG:-off}" = "on" ] && say "[debug] $*"; }
+
+usage() {
+    cat <<'USAGE'
+check-class-included — flag a referenced class/function whose #Include/import is
+missing or commented out.
+
+Usage:
+  check-class-included [--project NAME] [--help]
+
+Config (optional, per project): sessions/{project}/.class-scan-config.json
+  Absent config = no-op (exit 0) for that project. Default (no --project): scans
+  every sessions/*/.
+
+Env:
+  V11_CLASS_INCLUDED_CHECK=off   Disable entirely (no-op, exit 0).
+  V11_DRIFT_CHECK_DEBUG=on       Verbose per-scan debug output on stderr.
+
+Exit: 0 = PASS/skip, 1 = FAIL (confirmed missing include), 2 = WARN only.
+USAGE
+}
+
+PROJECT_FILTER=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --help|-h) usage; exit 0 ;;
+        --project) PROJECT_FILTER="${2:-}"; shift 2 ;;
+        *) shift ;;
+    esac
+done
+
+if [ "${V11_CLASS_INCLUDED_CHECK:-on}" = "off" ]; then
+    say "check-class-included: disabled (V11_CLASS_INCLUDED_CHECK=off) — no-op."
+    exit 0
+fi
+
+PROJECTS=()
+if [ -n "$PROJECT_FILTER" ]; then
+    if [ ! -d "$SESSIONS_ROOT/$PROJECT_FILTER" ]; then
+        say "⚠ check-class-included: project not found: $SESSIONS_ROOT/$PROJECT_FILTER"
+        exit 0
+    fi
+    PROJECTS=("$PROJECT_FILTER")
+else
+    while IFS= read -r -d '' d; do
+        PROJECTS+=("$(basename "$d")")
+    done < <(find "$SESSIONS_ROOT" -mindepth 1 -maxdepth 1 -type d -print0 2>/dev/null)
+fi
+
+DBG=0
+[ "${V11_DRIFT_CHECK_DEBUG:-off}" = "on" ] && DBG=1
+
+OVERALL=0
+SCANNED=0
+
+for proj in "${PROJECTS[@]}"; do
+    proj_dir="$SESSIONS_ROOT/$proj"
+    config="$proj_dir/.class-scan-config.json"
+    if [ ! -f "$config" ]; then
+        debug "no .class-scan-config.json for $proj, skipping"
+        continue
+    fi
+    SCANNED=$((SCANNED + 1))
+    python3 - "$proj_dir" "$config" "$DBG" <<'PYEOF'
+import json, os, re, sys
+
+proj_dir, config_path, debug = sys.argv[1], sys.argv[2], sys.argv[3] == '1'
+proj_name = os.path.basename(proj_dir.rstrip('/'))
+
+
+def dbg(msg):
+    if debug:
+        print(f"[debug] {msg}", file=sys.stderr)
+
+
+try:
+    cfg = json.load(open(config_path))
+except Exception as e:
+    print(f"⚠ check-class-included[{proj_name}]: could not parse {config_path}: {e}", file=sys.stderr)
+    sys.exit(0)
+
+scans = cfg.get('scans', [])
+if not isinstance(scans, list) or not scans:
+    dbg(f"{proj_name}: no scans configured")
+    sys.exit(0)
+
+fail = False
+warn = False
+
+for i, scan in enumerate(scans):
+    root = scan.get('root')
+    ref_pat = scan.get('reference_pattern')
+    inc_pat = scan.get('include_pattern')
+    lang = scan.get('lang', '?')
+    if not (root and ref_pat and inc_pat):
+        print(f"⚠ check-class-included[{proj_name}]: scan #{i} ({lang}) missing root/reference_pattern/include_pattern — skipping.", file=sys.stderr)
+        warn = True
+        continue
+
+    # Format-validation gate: reject absolute paths and any ".." traversal
+    # component BEFORE the path reaches a file sink (mirrors check-stamp-drift's
+    # config-path guard — config path outside project boundary is rejected, not read).
+    if root.startswith('/') or '..' in root:
+        print(f"⚠ check-class-included[{proj_name}]: rejecting unsafe root path in .class-scan-config.json (outside project boundary): {root}", file=sys.stderr)
+        warn = True
+        continue
+
+    root_path = os.path.join(proj_dir, root)
+    if not os.path.isfile(root_path):
+        dbg(f"{proj_name}: scan #{i} ({lang}) root not found, skipping: {root_path}")
+        continue
+
+    try:
+        content = open(root_path, encoding='utf-8', errors='replace').read()
+    except OSError as e:
+        print(f"⚠ check-class-included[{proj_name}]: could not read {root_path}: {e}", file=sys.stderr)
+        warn = True
+        continue
+
+    try:
+        ref_re = re.compile(ref_pat)
+    except re.error as e:
+        print(f"⚠ check-class-included[{proj_name}]: scan #{i} reference_pattern invalid: {e}", file=sys.stderr)
+        warn = True
+        continue
+
+    seen = set()
+    for m in ref_re.finditer(content):
+        ident = m.group(1) if m.lastindex else m.group(0)
+        if ident in seen:
+            continue
+        seen.add(ident)
+
+        gstart = m.start(1) if m.lastindex else m.start()
+        prev_char = content[gstart - 1] if gstart > 0 else ''
+        line_no = content.count('\n', 0, gstart) + 1
+
+        this_inc_pat = inc_pat.replace('\\1', re.escape(ident))
+        try:
+            inc_re = re.compile(this_inc_pat, re.MULTILINE)
+        except re.error as e:
+            print(f"⚠ check-class-included[{proj_name}]: scan #{i} include_pattern invalid after substituting '{ident}': {e}", file=sys.stderr)
+            warn = True
+            continue
+
+        if inc_re.search(content):
+            dbg(f"{proj_name}: scan #{i} '{ident}' OK (included) in {root}")
+            continue
+
+        if prev_char == '.':
+            warn = True
+            print(f"⚠ check-class-included[{proj_name}]: '{ident}' referenced at {root}:{line_no} looks like an attribute/method call (preceded by '.') — cannot confirm an include is required, WARN only.", file=sys.stderr)
+        else:
+            fail = True
+            print(f"❌ CLASS_NOT_INCLUDED[{proj_name}]: class {ident} referenced at {root}:{line_no} but not included (scan #{i}, {lang}).", file=sys.stderr)
+
+if not fail and not warn:
+    print(f"✓ check-class-included[{proj_name}]: all referenced classes have matching includes ({len(scans)} scan(s)).", file=sys.stderr)
+
+sys.exit(1 if fail else (2 if warn else 0))
+PYEOF
+    rc=$?
+    if [ "$rc" -eq 1 ]; then
+        OVERALL=1
+    elif [ "$rc" -eq 2 ] && [ "$OVERALL" -ne 1 ]; then
+        OVERALL=2
+    fi
+done
+
+if [ "$SCANNED" -eq 0 ]; then
+    debug "no .class-scan-config.json found in any scanned project — no-op."
+elif [ "$OVERALL" -eq 0 ]; then
+    say "check-class-included: no drift found (${SCANNED} project(s) with config scanned)."
+fi
+
+exit "$OVERALL"

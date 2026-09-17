@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "tool-policy.schema.json",
+  "$id": "https://herakles.dev/v11/schemas/tool-policy.schema.json",
   "title": "V11 Tool Policy",
   "description": "Schema for tool group taxonomy, profile presets, and deny-wins policy cascade",
   "type": "object",

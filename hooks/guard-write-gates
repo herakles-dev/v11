@@ -44,7 +44,7 @@ v11_is_metadata_file "$V11_FILE_PATH" && exit 0
 # active-project file and get blocked by unrelated project task state.
 # Note: "sessions" and "portfolio-platform" are in NON_PROJECTS but CONTAIN
 # real projects, so we skip them from this check.
-if [[ "$V11_FILE_PATH" =~ ^$V11_WORKSPACE_ROOT/([^/]+) ]]; then
+if [[ "$V11_FILE_PATH" =~ ^$HERCULES_ROOT/([^/]+) ]]; then
     _GWG_CANDIDATE="${BASH_REMATCH[1]}"
     if [[ "$_GWG_CANDIDATE" != "sessions" && "$_GWG_CANDIDATE" != "portfolio-platform" ]]; then
         for _np in $NON_PROJECTS; do
@@ -75,7 +75,7 @@ v11_detect_project "$V11_FILE_PATH"
 # Fallback 1: Walk up directory tree looking for .task-state.json
 if [ -z "$V11_PROJECT" ]; then
     DIR=$(dirname "$V11_FILE_PATH")
-    while [ "$DIR" != "/" ] && [ "$DIR" != "$V11_WORKSPACE_ROOT" ] && [ ${#DIR} -gt ${#V11_WORKSPACE_ROOT} ]; do
+    while [ "$DIR" != "/" ] && [ "$DIR" != "$HERCULES_ROOT" ] && [ ${#DIR} -gt ${#HERCULES_ROOT} ]; do
         if [ -f "$DIR/.task-state.json" ]; then
             V11_PROJECT=$(basename "$DIR")
             V11_DETECTION_METHOD="walk-up .task-state.json"

@@ -6,13 +6,15 @@
 
 ## Project Size Classification
 
-| Size | Tasks | Timeline | Structure | Formation |
+| Size | Tasks | Active build¹ | Structure | Formation |
 |------|-------|----------|-----------|-----------|
-| **Tiny** | 1-10 | <1 day | Flat task list | Direct work, no formation |
-| **Small** | 11-50 | 1-5 days | Sprint metadata | Single formation |
-| **Medium** | 51-150 | 1-3 weeks | Sprint + gates | Multiple formations |
-| **Large** | 151-500 | 2-6 months | Multi-sprint + gates | Formation chains |
-| **Enterprise** | 500+ | 6+ months | Multi-project split | Consult orchestrator |
+| **Tiny** | 1-10 | <1 evening | Flat task list | Direct work, no formation |
+| **Small** | 11-50 | 1 evening – a few active-days | Sprint metadata | Single formation |
+| **Medium** | 51-150 | a few active-days | Sprint + gates | Multiple formations |
+| **Large** | 151-500 | 1-3 active-weeks | Multi-sprint + gates | Formation chains |
+| **Enterprise** | 500+ | multi-week+ | Multi-project split | Consult orchestrator |
+
+> ¹ **Active build** = hands-on work time (empirical — see [docs/BUILD_TIMING.md](../docs/BUILD_TIMING.md)), NOT calendar span. Calendar runs longer only when blocked on external gates (deploy, human review, funded spend). Estimating in calendar weeks is the 4–8× over-estimation this replaces.
 
 ---
 

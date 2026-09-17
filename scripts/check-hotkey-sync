@@ -1,0 +1,197 @@
+#!/usr/bin/env bash
+# check-hotkey-sync — drift guard: a hotkey defined on one surface (e.g. Config.ahk) but
+# missing from another (e.g. the CLAUDE.md hotkey table)
+# (improvements/35-pre-handoff-drift-check.md, case #4).
+#
+# ROOT CAUSE this defends: adding a hotkey touches N surfaces by convention (defaults
+# file, registration/handler file, doc table, ...) and nothing enforces that a hotkey
+# present on one surface is present on all of them — a partial edit ships silently.
+#
+# Sibling of check-stamp-drift / check-changelog-drift — same shape, same conventions.
+#
+# Per-project config: sessions/{project}/.hotkey-sync-config.json (absent = no-op exit 0):
+#   {
+#     "surfaces": [
+#       {"path": "client/Config.ahk", "hotkey_pattern": "^([A-Z][a-zA-Z]+):=\\s*\\{"},
+#       {"path": "client/Main.ahk", "hotkey_pattern": "^([A-Z][a-zA-Z]+)_Hotkey"},
+#       {"path": "CLAUDE.md", "hotkey_pattern": "\\| ([A-Z][a-zA-Z]+) \\|"}
+#     ]
+#   }
+#
+# For each surface: extract hotkey names via hotkey_pattern's capture group 1 (MULTILINE,
+# so `^` anchors work), applied to `path` (relative to the project dir). Build the union of
+# hotkey names across all surfaces, then flag any hotkey absent from at least one resolved
+# surface (a surface file that doesn't exist on disk is skipped, not treated as "missing
+# every hotkey").
+#
+# Always WARN (never FAIL) — surface convention drift, not a correctness violation.
+# Exit: 0 = PASS/skip, 2 = WARN (at least one hotkey missing from at least one surface).
+# Rollback: V11_HOTKEY_SYNC_CHECK=off.
+set -uo pipefail
+
+SESSIONS_ROOT="${SESSIONS_ROOT:-$HOME/sessions}"
+
+say() { printf '%s\n' "$*" >&2; }
+debug() { [ "${V11_DRIFT_CHECK_DEBUG:-off}" = "on" ] && say "[debug] $*"; }
+
+usage() {
+    cat <<'USAGE'
+check-hotkey-sync — flag a hotkey present on one configured surface but missing
+from another.
+
+Usage:
+  check-hotkey-sync [--project NAME] [--help]
+
+Config (optional, per project): sessions/{project}/.hotkey-sync-config.json
+  Absent config = no-op (exit 0) for that project. Default (no --project): scans
+  every sessions/*/.
+
+Env:
+  V11_HOTKEY_SYNC_CHECK=off      Disable entirely (no-op, exit 0).
+  V11_DRIFT_CHECK_DEBUG=on       Verbose per-surface debug output on stderr.
+
+Exit: 0 = PASS/skip, 2 = WARN (hotkey missing from a surface). Never FAILs.
+USAGE
+}
+
+PROJECT_FILTER=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --help|-h) usage; exit 0 ;;
+        --project) PROJECT_FILTER="${2:-}"; shift 2 ;;
+        *) shift ;;
+    esac
+done
+
+if [ "${V11_HOTKEY_SYNC_CHECK:-on}" = "off" ]; then
+    say "check-hotkey-sync: disabled (V11_HOTKEY_SYNC_CHECK=off) — no-op."
+    exit 0
+fi
+
+PROJECTS=()
+if [ -n "$PROJECT_FILTER" ]; then
+    if [ ! -d "$SESSIONS_ROOT/$PROJECT_FILTER" ]; then
+        say "⚠ check-hotkey-sync: project not found: $SESSIONS_ROOT/$PROJECT_FILTER"
+        exit 0
+    fi
+    PROJECTS=("$PROJECT_FILTER")
+else
+    while IFS= read -r -d '' d; do
+        PROJECTS+=("$(basename "$d")")
+    done < <(find "$SESSIONS_ROOT" -mindepth 1 -maxdepth 1 -type d -print0 2>/dev/null)
+fi
+
+DBG=0
+[ "${V11_DRIFT_CHECK_DEBUG:-off}" = "on" ] && DBG=1
+
+OVERALL=0
+SCANNED=0
+
+for proj in "${PROJECTS[@]}"; do
+    proj_dir="$SESSIONS_ROOT/$proj"
+    config="$proj_dir/.hotkey-sync-config.json"
+    if [ ! -f "$config" ]; then
+        debug "no .hotkey-sync-config.json for $proj, skipping"
+        continue
+    fi
+    SCANNED=$((SCANNED + 1))
+    python3 - "$proj_dir" "$config" "$DBG" <<'PYEOF'
+import json, os, re, sys
+
+proj_dir, config_path, debug = sys.argv[1], sys.argv[2], sys.argv[3] == '1'
+proj_name = os.path.basename(proj_dir.rstrip('/'))
+
+
+def dbg(msg):
+    if debug:
+        print(f"[debug] {msg}", file=sys.stderr)
+
+
+try:
+    cfg = json.load(open(config_path))
+except Exception as e:
+    print(f"⚠ check-hotkey-sync[{proj_name}]: could not parse {config_path}: {e}", file=sys.stderr)
+    sys.exit(0)
+
+surfaces = cfg.get('surfaces', [])
+if not isinstance(surfaces, list) or len(surfaces) < 2:
+    dbg(f"{proj_name}: fewer than 2 surfaces configured — nothing to cross-reference")
+    sys.exit(0)
+
+warn = False
+surface_hotkeys = {}
+
+for i, surf in enumerate(surfaces):
+    path = surf.get('path')
+    pat = surf.get('hotkey_pattern')
+    if not (path and pat):
+        print(f"⚠ check-hotkey-sync[{proj_name}]: surface #{i} missing path/hotkey_pattern — skipping.", file=sys.stderr)
+        warn = True
+        continue
+
+    # Format-validation gate: reject absolute paths and any ".." traversal
+    # component BEFORE the path reaches a file sink (mirrors check-stamp-drift's
+    # config-path guard — config path outside project boundary is rejected, not read).
+    if path.startswith('/') or '..' in path:
+        print(f"⚠ check-hotkey-sync[{proj_name}]: rejecting unsafe path in .hotkey-sync-config.json (outside project boundary): {path}", file=sys.stderr)
+        warn = True
+        continue
+
+    full = os.path.join(proj_dir, path)
+    if not os.path.isfile(full):
+        dbg(f"{proj_name}: surface #{i} not found, skipping: {full}")
+        continue
+
+    try:
+        content = open(full, encoding='utf-8', errors='replace').read()
+        rex = re.compile(pat, re.MULTILINE)
+    except OSError as e:
+        print(f"⚠ check-hotkey-sync[{proj_name}]: surface #{i} ({path}) unreadable: {e}", file=sys.stderr)
+        warn = True
+        continue
+    except re.error as e:
+        print(f"⚠ check-hotkey-sync[{proj_name}]: surface #{i} ({path}) hotkey_pattern invalid: {e}", file=sys.stderr)
+        warn = True
+        continue
+
+    names = set()
+    for m in rex.finditer(content):
+        names.add(m.group(1) if m.lastindex else m.group(0))
+    surface_hotkeys[path] = names
+    dbg(f"{proj_name}: {path} -> {sorted(names)}")
+
+if len(surface_hotkeys) < 2:
+    dbg(f"{proj_name}: fewer than 2 surfaces resolved on disk — nothing to cross-reference")
+    sys.exit(2 if warn else 0)
+
+all_hotkeys = set()
+for names in surface_hotkeys.values():
+    all_hotkeys |= names
+
+missing_found = False
+for hk in sorted(all_hotkeys):
+    present_in = [p for p, names in surface_hotkeys.items() if hk in names]
+    missing_from = [p for p in surface_hotkeys if p not in present_in]
+    if missing_from:
+        missing_found = True
+        warn = True
+        print(f"⚠ HOTKEY_DRIFT[{proj_name}]: '{hk}' defined in {', '.join(present_in)} but missing from {', '.join(missing_from)}.", file=sys.stderr)
+
+if not missing_found and not warn:
+    print(f"✓ check-hotkey-sync[{proj_name}]: {len(all_hotkeys)} hotkey(s) consistent across {len(surface_hotkeys)} surface(s).", file=sys.stderr)
+
+sys.exit(2 if warn else 0)
+PYEOF
+    rc=$?
+    if [ "$rc" -eq 2 ]; then
+        OVERALL=2
+    fi
+done
+
+if [ "$SCANNED" -eq 0 ]; then
+    debug "no .hotkey-sync-config.json found in any scanned project — no-op."
+elif [ "$OVERALL" -eq 0 ]; then
+    say "check-hotkey-sync: no drift found (${SCANNED} project(s) with config scanned)."
+fi
+
+exit "$OVERALL"

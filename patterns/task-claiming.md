@@ -320,7 +320,7 @@ if missing_dependency:
 ```python
 TaskCreate(
     subject="BREAKING: Docker network configuration changed",
-    description="All services now use project-internal network in addition to app-network. Update your service configs.\n\nAffected: implementers, integrator, tester",
+    description="All services now use project-internal network in addition to hercules-network. Update your service configs.\n\nAffected: implementers, integrator, tester",
     metadata={
         "broadcast": True,
         "affected_agents": ["implementer", "integrator", "tester"]
@@ -409,7 +409,7 @@ TaskCreate(
     subject="Implement DTW algorithm",
     description="Add dynamic time warping with Sakoe-Chiba band",
     metadata={
-        "file_ownership": "~/sessions/audio-suite/src/dtw",
+        "file_ownership": "/path/to/operator-home/sessions/audio-suite/src/dtw",
         "estimated_completion": "2026-02-13T15:00:00Z"
     }
 )
@@ -479,7 +479,7 @@ TaskCreate(
     subject="Build Rust service",
     description="Compile rust-backend service (takes ~20 min)",
     metadata={
-        "file_ownership": "~/sessions/project/rust-backend",
+        "file_ownership": "/path/to/operator-home/sessions/project/rust-backend",
         "expected_duration_minutes": 25
     }
 )

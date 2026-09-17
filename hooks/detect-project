@@ -101,6 +101,232 @@ if [ -n "$V11_PROJECT" ]; then
                 fi
             fi
         fi
+        # L2.3b (v11-handoff-cross-session-loop, sprint-02): rehydrate
+        # verification. Piggyback on the same hook that fires the handoff
+        # nudge above — same session-scope, same first-Read timing. Compare
+        # sessions/{project}/.loop-baseline.json.expected_open_tasks_count
+        # (recorded at emit by the SENDING session, L1.3b) vs the live
+        # per-session task-state.json count. On divergence, discriminate the
+        # failure_mode and append a rehydrate_missed event to
+        # ~/.agent-metrics/loop-events.jsonl via scripts/lib/loop_events.py.
+        # Fire-once via marker: .rehydrate-verify-done. Opt-out:
+        # V11_REHYDRATE_VERIFY=off.
+        #
+        # Failure_mode discrimination (from the 2026-09-01 dogfood + user steer):
+        #   manual_override  — live TaskList already carries work; user wins
+        #   gate_off         — V11_AUTO_REHYDRATE=off (user disabled rehydrate)
+        #   skill_not_invoked— .handoff-surfaced marker exists AND live count=0
+        #                      (the dogfood signature: /v11 didn't route)
+        #   identity_mismatch— counts match but (session, task_id) sets differ
+        #                      (v11.24 Bug-H-class ghost-task resurrection)
+        #   script_error     — every other divergence (fallback)
+        # Outer guard: enter when ANY of L2.1/L2.2/L2.3 is enabled. Sub-features
+        # gate independently inside the block. Refined from initial
+        # V11_REHYDRATE_VERIFY-only guard (broke L2.1/L2.2 tests that isolate
+        # boot-delta/freshness by turning V11_REHYDRATE_VERIFY off).
+        if [ -n "${V11_SESSION_ID:-}" ] \
+           && { [ "${V11_REHYDRATE_VERIFY:-}" != "off" ] \
+                || [ "${V11_LOOP_BOOT_DELTA:-on}" != "off" ] \
+                || [ "${V11_HANDOFF_FRESHNESS_GATE:-on}" != "off" ]; }; then
+            _RV_MARKER="$METRICS_DIR/sessions/$V11_SESSION_ID/.rehydrate-verify-done"
+            _RV_BASELINE="$SESSIONS_ROOT/$V11_PROJECT/.loop-baseline.json"
+            if [ ! -f "$_RV_MARKER" ] && [ -f "$_RV_BASELINE" ] && [ -s "$_RV_BASELINE" ] \
+               && jq empty "$_RV_BASELINE" 2>/dev/null; then
+                _RV_EXPECTED=$(jq -r '.expected_open_tasks_count // -1' "$_RV_BASELINE" 2>/dev/null || echo -1)
+                [[ "$_RV_EXPECTED" =~ ^-?[0-9]+$ ]] || _RV_EXPECTED=-1
+
+                # L2.2 (v11-handoff-cross-session-loop, sprint-02): freshness
+                # gate. If handoff.md is older than V11_HANDOFF_MAX_AGE_DAYS
+                # (default 7), prepend a stale-handoff warning. Emits via the
+                # same additionalContext buffer as L2.1 so the receiving
+                # session actually sees it. Rollback:
+                # V11_HANDOFF_FRESHNESS_GATE=off (disables the check entirely,
+                # keeping V11_HANDOFF_MAX_AGE_DAYS free as a tightening knob).
+                _RV_FRESHNESS_WARN=""
+                if [ "${V11_HANDOFF_FRESHNESS_GATE:-on}" != "off" ]; then
+                    _RV_HANDOFF_MD="$SESSIONS_ROOT/$V11_PROJECT/handoff.md"
+                    _RV_MAX_DAYS="${V11_HANDOFF_MAX_AGE_DAYS:-7}"
+                    [[ "$_RV_MAX_DAYS" =~ ^[0-9]+$ ]] || _RV_MAX_DAYS=7
+                    if [ "$_RV_MAX_DAYS" -gt 0 ] && [ -f "$_RV_HANDOFF_MD" ]; then
+                        _RV_HANDOFF_AGE_S=$(( $(date +%s) - $(stat -c %Y "$_RV_HANDOFF_MD" 2>/dev/null || echo 0) ))
+                        _RV_HANDOFF_AGE_DAYS=$(( _RV_HANDOFF_AGE_S / 86400 ))
+                        if [ "$_RV_HANDOFF_AGE_DAYS" -gt "$_RV_MAX_DAYS" ]; then
+                            _RV_FRESHNESS_WARN="⚠ STALE HANDOFF: handoff.md is ${_RV_HANDOFF_AGE_DAYS} days old (cap ${_RV_MAX_DAYS}d) — verify state before resuming."
+                        fi
+                    fi
+                fi
+
+                # L2.1 (v11-handoff-cross-session-loop, sprint-02): boot-delta
+                # computation. Read baseline once, compute diff vs current
+                # disk, build per-field lines + comma-joined field list (the
+                # latter reused as L2.4 handoff_ack.baseline_delta_fields).
+                # Emitted at end of hook via hookSpecificOutput.additionalContext
+                # so the receiving session actually SEES it — stderr is
+                # invisible to the model (learned from 2026-09-01 dogfood).
+                # Rollback: V11_LOOP_BOOT_DELTA=off skips both compute + emit.
+                _RV_DELTA_LINES=""
+                _RV_DELTA_FIELDS=""
+                _RV_B_HANDOFF_AT=$(jq -r '.handoff_at // ""' "$_RV_BASELINE" 2>/dev/null || echo "")
+                if [ "${V11_LOOP_BOOT_DELTA:-on}" != "off" ]; then
+                    _RV_B_GIT_HEAD=$(jq -r '.git_head // ""' "$_RV_BASELINE" 2>/dev/null || echo "")
+                    _RV_B_SPEC_MTIME=$(jq -r '.spec_md_mtime // 0' "$_RV_BASELINE" 2>/dev/null || echo 0)
+                    _V11_HOME_LOCAL="${V11_HOME:-$(dirname "$(dirname "$(readlink -f "${BASH_SOURCE[0]:-$0}")")")}"
+                    _RV_CUR_GIT_HEAD=$(cd "$_V11_HOME_LOCAL" 2>/dev/null && git rev-parse HEAD 2>/dev/null || echo "")
+                    if [ -n "$_RV_B_GIT_HEAD" ] && [ -n "$_RV_CUR_GIT_HEAD" ] \
+                       && [ "$_RV_B_GIT_HEAD" != "$_RV_CUR_GIT_HEAD" ]; then
+                        _RV_DELTA_LINES="${_RV_DELTA_LINES}  - git HEAD advanced (${_RV_B_GIT_HEAD:0:7} → ${_RV_CUR_GIT_HEAD:0:7})
+"
+                        _RV_DELTA_FIELDS="${_RV_DELTA_FIELDS}git_head,"
+                    fi
+                    _RV_SPEC="$SESSIONS_ROOT/$V11_PROJECT/spec.md"
+                    _RV_CUR_SPEC_MTIME=0
+                    [ -f "$_RV_SPEC" ] && _RV_CUR_SPEC_MTIME=$(stat -c %Y "$_RV_SPEC" 2>/dev/null || echo 0)
+                    if [ "$_RV_CUR_SPEC_MTIME" -gt 0 ] && [ "${_RV_B_SPEC_MTIME%.*}" != "$_RV_CUR_SPEC_MTIME" ]; then
+                        _RV_SPEC_AGE_S=$(( $(date +%s) - _RV_CUR_SPEC_MTIME ))
+                        if [ "$_RV_SPEC_AGE_S" -lt 60 ]; then _RV_SPEC_AGE_TEXT="${_RV_SPEC_AGE_S}s"
+                        elif [ "$_RV_SPEC_AGE_S" -lt 3600 ]; then _RV_SPEC_AGE_TEXT="$((_RV_SPEC_AGE_S/60))m"
+                        elif [ "$_RV_SPEC_AGE_S" -lt 86400 ]; then _RV_SPEC_AGE_TEXT="$((_RV_SPEC_AGE_S/3600))h"
+                        else _RV_SPEC_AGE_TEXT="$((_RV_SPEC_AGE_S/86400))d"
+                        fi
+                        _RV_DELTA_LINES="${_RV_DELTA_LINES}  - spec.md modified ${_RV_SPEC_AGE_TEXT} ago
+"
+                        _RV_DELTA_FIELDS="${_RV_DELTA_FIELDS}spec_md_mtime,"
+                    fi
+                    if [ "$_RV_EXPECTED" -gt 0 ]; then
+                        _RV_DELTA_LINES="${_RV_DELTA_LINES}  - handoff-tasks.json open_tasks length = ${_RV_EXPECTED}
+"
+                    fi
+                fi
+
+                # L2.3-specific: rehydrate verification + event emission.
+                # Gated separately from L2.1/L2.2 so operators can disable
+                # verification while keeping the boot-delta and freshness
+                # banners live.
+                if [ "${V11_REHYDRATE_VERIFY:-}" != "off" ]; then
+                _RV_LIVE_STATE="$METRICS_DIR/sessions/$V11_SESSION_ID/task-state.json"
+                _RV_ACTUAL=0
+                _RV_COMPLETED=0
+                if [ -f "$_RV_LIVE_STATE" ] && [ -s "$_RV_LIVE_STATE" ] && jq empty "$_RV_LIVE_STATE" 2>/dev/null; then
+                    _RV_ACTUAL=$(jq -r '[(.open_tasks // {}) | to_entries[] | select(.value.status != "completed")] | length' "$_RV_LIVE_STATE" 2>/dev/null || echo 0)
+                    [[ "$_RV_ACTUAL" =~ ^[0-9]+$ ]] || _RV_ACTUAL=0
+                    _RV_COMPLETED=$(jq -r '.completed // 0' "$_RV_LIVE_STATE" 2>/dev/null || echo 0)
+                    [[ "$_RV_COMPLETED" =~ ^[0-9]+$ ]] || _RV_COMPLETED=0
+                fi
+
+                if [ "$_RV_EXPECTED" -ge 0 ]; then
+                    _RV_MARKER_SEEN_BIT=0
+                    [ -f "$METRICS_DIR/sessions/$V11_SESSION_ID/.handoff-surfaced" ] && _RV_MARKER_SEEN_BIT=1
+                    _RV_AUTO_ENV="unset"
+                    case "${V11_AUTO_REHYDRATE-__UNSET__}" in
+                        on) _RV_AUTO_ENV="on" ;;
+                        off) _RV_AUTO_ENV="off" ;;
+                        __UNSET__) _RV_AUTO_ENV="unset" ;;
+                        *) _RV_AUTO_ENV="unset" ;;
+                    esac
+
+                    _RV_MODE=""
+                    _RV_IDENTITY_DELTA=""
+                    if [ "$_RV_EXPECTED" != "$_RV_ACTUAL" ]; then
+                        # gate_off wins first — user explicitly disabled the
+                        # mechanism, divergence is expected not a bug.
+                        if [ "$_RV_AUTO_ENV" = "off" ]; then
+                            _RV_MODE="gate_off"
+                        # manual_override: user has evidence of activity —
+                        # either completed tasks OR more open tasks than the
+                        # baseline expected (added on top). Refined from
+                        # the initial "any live task" heuristic which wrongly
+                        # caught partial-rehydrate as manual override.
+                        elif [ "$_RV_COMPLETED" -gt 0 ] || [ "$_RV_ACTUAL" -gt "$_RV_EXPECTED" ]; then
+                            _RV_MODE="manual_override"
+                        elif [ "$_RV_MARKER_SEEN_BIT" = "1" ] && [ "$_RV_ACTUAL" -eq 0 ]; then
+                            _RV_MODE="skill_not_invoked"
+                        else
+                            # Fallback bucket: partial rehydrate, missing marker,
+                            # any other divergence not covered above.
+                            _RV_MODE="script_error"
+                        fi
+                    else
+                        # Counts match — check identity (v11.24). Compare id sets
+                        # from handoff-tasks.json.open_tasks[].id vs live state
+                        # open_tasks keys. Only fires when counts equal AND expected>0.
+                        if [ "$_RV_EXPECTED" -gt 0 ]; then
+                            _RV_HO_TASKS="$SESSIONS_ROOT/$V11_PROJECT/handoff-tasks.json"
+                            if [ -f "$_RV_HO_TASKS" ] && [ -f "$_RV_LIVE_STATE" ]; then
+                                _RV_EXPECTED_IDS=$(jq -r '[(.open_tasks // [])[] | (.id // "") | tostring] | sort | @csv' "$_RV_HO_TASKS" 2>/dev/null || echo "")
+                                _RV_ACTUAL_IDS=$(jq -r '[((.open_tasks // {}) | keys[])] | sort | @csv' "$_RV_LIVE_STATE" 2>/dev/null || echo "")
+                                if [ -n "$_RV_EXPECTED_IDS" ] && [ "$_RV_EXPECTED_IDS" != "$_RV_ACTUAL_IDS" ]; then
+                                    _RV_MODE="identity_mismatch"
+                                    _RV_IDENTITY_DELTA=$(jq -n \
+                                        --argjson exp "$(printf '%s' "$_RV_EXPECTED_IDS" | jq -R 'split(",") | map(gsub("\""; ""))')" \
+                                        --argjson act "$(printf '%s' "$_RV_ACTUAL_IDS" | jq -R 'split(",") | map(gsub("\""; ""))')" \
+                                        '{missing: ($exp - $act), extra: ($act - $exp)}' 2>/dev/null || echo "")
+                                fi
+                            fi
+                        fi
+                    fi
+
+                    if [ -n "$_RV_MODE" ] && [ "$_RV_MODE" != "manual_override" ]; then
+                        _V11_HOME_LOCAL="${V11_HOME:-$(dirname "$(dirname "$(readlink -f "${BASH_SOURCE[0]:-$0}")")")}"
+                        _RV_LOOP_EVENTS="$_V11_HOME_LOCAL/scripts/lib/loop_events.py"
+                        if [ -f "$_RV_LOOP_EVENTS" ]; then
+                            _RV_EXTRA_ARGS=()
+                            if [ -n "$_RV_IDENTITY_DELTA" ]; then
+                                _RV_EXTRA_ARGS+=(--identity-delta "$_RV_IDENTITY_DELTA")
+                            fi
+                            timeout 5 python3 "$_RV_LOOP_EVENTS" \
+                                --project "$V11_PROJECT" \
+                                --session-id "$V11_SESSION_ID" \
+                                --kind rehydrate_missed \
+                                --expected "$_RV_EXPECTED" \
+                                --actual "$_RV_ACTUAL" \
+                                --marker-seen "$_RV_MARKER_SEEN_BIT" \
+                                --auto-rehydrate-env "$_RV_AUTO_ENV" \
+                                --failure-mode "$_RV_MODE" \
+                                "${_RV_EXTRA_ARGS[@]}" \
+                                >/dev/null 2>&1 || true
+                        fi
+                    elif [ -z "$_RV_MODE" ] && [ "${V11_LOOP_ACK_EVENT:-on}" != "off" ]; then
+                        # L2.4 (v11-handoff-cross-session-loop, sprint-02):
+                        # SUCCESS path — verification passed (counts + IDs
+                        # match, no divergence). Emit handoff_ack so the
+                        # loop-events.jsonl carries a receipt of a healthy
+                        # cross-session cycle. Reuses L2.1's _RV_DELTA_FIELDS
+                        # (comma-joined) so baseline_delta_fields captures
+                        # what changed since the sending session's emit
+                        # without a second compute. Rollback:
+                        # V11_LOOP_ACK_EVENT=off silences receipts without
+                        # affecting rehydrate_missed emission.
+                        _V11_HOME_LOCAL="${V11_HOME:-$(dirname "$(dirname "$(readlink -f "${BASH_SOURCE[0]:-$0}")")")}"
+                        _RV_LOOP_EVENTS="$_V11_HOME_LOCAL/scripts/lib/loop_events.py"
+                        if [ -f "$_RV_LOOP_EVENTS" ] && [ -n "$_RV_B_HANDOFF_AT" ]; then
+                            # baseline_delta_fields defaults to empty list when
+                            # nothing changed — L2.4 contract says the field is
+                            # always present so consumers can grep for '[]'.
+                            _RV_ACK_DELTAS="${_RV_DELTA_FIELDS%,}"  # strip trailing comma
+                            timeout 5 python3 "$_RV_LOOP_EVENTS" \
+                                --project "$V11_PROJECT" \
+                                --session-id "$V11_SESSION_ID" \
+                                --kind handoff_ack \
+                                --expected "$_RV_EXPECTED" \
+                                --actual "$_RV_ACTUAL" \
+                                --prev-handoff-at "$_RV_B_HANDOFF_AT" \
+                                --identity-matched 1 \
+                                --baseline-delta-fields "$_RV_ACK_DELTAS" \
+                                >/dev/null 2>&1 || true
+                        fi
+                    fi
+
+                fi
+                fi  # V11_REHYDRATE_VERIFY gate close
+
+                # Fire-once regardless of which sub-feature ran (L2.1 boot-delta,
+                # L2.2 freshness, and/or L2.3 rehydrate verification). Written
+                # only when the block actually entered — under all-off env the
+                # outer guard already short-circuits.
+                mkdir -p "$(dirname "$_RV_MARKER")" 2>/dev/null || true
+                : > "$_RV_MARKER" 2>/dev/null || true
+            fi
+        fi
         # V11 S1 (v11-ledger-integrity): DETECT reconciliation surface.
         # Consolidates four half-wired control-loop signals into one JSON block
         # on stderr. Default off — opt-in by setting V11_DETECT_RECONCILE to
@@ -182,6 +408,47 @@ if [ -f "$(dirname "${BASH_SOURCE[0]}")/lib/get-chicago-time.sh" ]; then
     inject_chicago_time &  # Background — don't slow down hook
     disown $! 2>/dev/null || true
   fi
+fi
+
+# L2.1 / L2.2 emit (v11-handoff-cross-session-loop, sprint-02): surface
+# freshness gate + boot-delta banner to the model via additionalContext.
+# stderr from this hook is invisible to the model (the 2026-09-01 dogfood
+# finding); stdout JSON of shape
+# {"hookSpecificOutput":{"hookEventName":"PreToolUse","additionalContext":"..."}}
+# is the ONLY channel the model actually reads. Pattern mirrors
+# hooks/sync-tasks:3164-3208 (S1-B1 prescope advisories). This hook has no
+# other stdout producer, so no arbitration is needed here.
+if [ -n "${_RV_FRESHNESS_WARN:-}" ] || [ -n "${_RV_DELTA_LINES:-}" ]; then
+    _RV_ADDL_CTX=""
+    if [ -n "${_RV_FRESHNESS_WARN:-}" ]; then
+        _RV_ADDL_CTX="${_RV_FRESHNESS_WARN}
+"
+    fi
+    if [ -n "${_RV_DELTA_LINES:-}" ] && [ -n "${_RV_B_HANDOFF_AT:-}" ]; then
+        _RV_ELAPSED_TEXT=""
+        _RV_ELAPSED_S=$(python3 -c "
+import datetime, sys
+try:
+    a = datetime.datetime.fromisoformat(sys.argv[1])
+    b = datetime.datetime.now().astimezone()
+    print(int((b - a).total_seconds()))
+except Exception:
+    print(0)
+" "$_RV_B_HANDOFF_AT" 2>/dev/null || echo 0)
+        [[ "$_RV_ELAPSED_S" =~ ^[0-9]+$ ]] || _RV_ELAPSED_S=0
+        if [ "$_RV_ELAPSED_S" -lt 60 ]; then _RV_ELAPSED_TEXT="${_RV_ELAPSED_S}s"
+        elif [ "$_RV_ELAPSED_S" -lt 3600 ]; then _RV_ELAPSED_TEXT="$((_RV_ELAPSED_S/60))m"
+        elif [ "$_RV_ELAPSED_S" -lt 86400 ]; then _RV_ELAPSED_TEXT="$((_RV_ELAPSED_S/3600))h"
+        else _RV_ELAPSED_TEXT="$((_RV_ELAPSED_S/86400))d"
+        fi
+        _RV_ADDL_CTX="${_RV_ADDL_CTX}⚡ SINCE LAST HANDOFF (${_RV_B_HANDOFF_AT} → now, ${_RV_ELAPSED_TEXT}):
+${_RV_DELTA_LINES%$'\n'}"
+    fi
+    if [ -n "$_RV_ADDL_CTX" ]; then
+        jq -n -c --arg ctx "$_RV_ADDL_CTX" \
+            '{hookSpecificOutput: {hookEventName: "PreToolUse", additionalContext: $ctx}}' \
+            2>/dev/null || true
+    fi
 fi
 
 exit 0

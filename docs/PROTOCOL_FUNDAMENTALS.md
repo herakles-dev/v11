@@ -53,7 +53,7 @@ TaskCreate(
 - `scope`: small|medium|large (code change volume)
 - `parallelizable`: true|false (can background agents work in parallel?)
 
-See [CLAUDE.md Section 4](../CLAUDE.md#4-state-management) for complete field definitions and validation rules.
+See CLAUDE.md Section 4 for complete field definitions and validation rules.
 
 ### During Work
 

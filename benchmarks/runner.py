@@ -70,13 +70,13 @@ def fire_hooks(event_type: str, matcher_tool: str, payload: dict,
 # ── V11 project scaffold (from test_e2e_v11_pipeline.py) ──────────────────────
 
 def scaffold_v11_project(tmp_path: Path, project_name: str = "bench") -> tuple[Path, Path, dict]:
-    """Create a realistic V11 project structure. Returns (project_dir, workspace_root, env)."""
-    workspace_root = tmp_path / "workspace"
-    sessions = workspace_root / "sessions"
+    """Create a realistic V11 project structure. Returns (project_dir, hercules_root, env)."""
+    hercules = tmp_path / "hercules"
+    sessions = hercules / "sessions"
     project = sessions / project_name
     src_dir = project / "src"
     tests_dir = project / "tests"
-    metrics_dir = workspace_root / ".agent-metrics"
+    metrics_dir = hercules / ".agent-metrics"
     task_state_dir = metrics_dir / "task-state"
 
     for d in [src_dir, tests_dir, metrics_dir, task_state_dir]:
@@ -126,13 +126,13 @@ def scaffold_v11_project(tmp_path: Path, project_name: str = "bench") -> tuple[P
     env = {
         **os.environ,
         "SESSIONS_ROOT": str(sessions),
-        "V11_WORKSPACE_ROOT": str(workspace_root),
+        "HERCULES_ROOT": str(hercules),
         "V11_SESSION_PROJECT": project_name,
-        "HOME": str(workspace_root),
+        "HOME": str(hercules),
         "NO_COLOR": "1",
         "TERM": "dumb",
     }
-    return project, workspace_root, env
+    return project, hercules, env
 
 
 # ── YAML task loader ──────────────────────────────────────────────────────────
@@ -220,7 +220,7 @@ def _exec_hook_chain(task: dict, project: Path, env: dict) -> dict:
 def _exec_task_lifecycle(task: dict, project: Path, env: dict) -> dict:
     """Execute a task-lifecycle benchmark (create, claim, complete)."""
     errors = []
-    task_state_dir = Path(env["V11_WORKSPACE_ROOT"]) / ".agent-metrics" / "task-state"
+    task_state_dir = Path(env["HERCULES_ROOT"]) / ".agent-metrics" / "task-state"
 
     # Create
     fire_hooks("PostToolUse", "TaskCreate", {
@@ -412,7 +412,7 @@ def _exec_live_cli(task: dict, project: Path, env: dict) -> dict:
         pass
 
     # Check assertions
-    audit_log = Path(env["V11_WORKSPACE_ROOT"]) / ".agent-metrics" / "autonomy-audit.jsonl"
+    audit_log = Path(env["HERCULES_ROOT"]) / ".agent-metrics" / "autonomy-audit.jsonl"
     for assertion in assertions:
         atype = assertion.get("type")
         if atype == "file_exists":
@@ -569,7 +569,7 @@ def run_benchmark(
 
         # Create a fresh project for each task
         with tempfile.TemporaryDirectory() as tmp:
-            project, workspace_root, env = scaffold_v11_project(Path(tmp), project_name="bench")
+            project, hercules, env = scaffold_v11_project(Path(tmp), project_name="bench")
             task_start = time.monotonic()
             try:
                 result = executor(task, project, env)

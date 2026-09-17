@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "autonomy-state.schema.json",
+  "$id": "https://herakles.dev/v11/schemas/autonomy-state.schema.json",
   "title": "V11 Autonomy State",
   "description": "Schema for .autonomy-state — per-project autonomy level and grants. Field names match hooks/track-autonomy writes verbatim (Wave 3b alignment).",
   "type": "object",

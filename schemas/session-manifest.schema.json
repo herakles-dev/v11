@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "session-manifest.schema.json",
+  "$id": "https://herakles.dev/v11/schemas/session-manifest.schema.json",
   "title": "V11 Session Manifest",
   "description": "Index of all session artifacts with scope-based requirements",
   "type": "object",

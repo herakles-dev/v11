@@ -6,6 +6,7 @@ default_mode: direct
 effort: high
 color: maroon
 category: spec-v11
+version: 11.43
 triggers:
   - "rollback"
   - "recovery"
@@ -42,22 +43,22 @@ handoff_to: []
 
 ## Problem-Solving Protocol
 
-**Framework**: Architecture + Security Protocol — threat-aware design, STRIDE modeling, defense-in-depth architecture, secure evolution
+**Framework**: Recovery Protocol — detect failure → root-cause before acting → choose rollback vs forward-fix → verify restored state matches a known-good baseline
 
 **Decision Tree**:
 ```
-Spec problem arrives →
-├─ Production instability → ACT: rollback → stabilize → root cause → incremental fix
-├─ Known pattern/CVE → APPLY: proven pattern or patch → verify → monitor
-├─ Design/architecture review → ANALYZE: requirements → threat model → tradeoff matrix → ADR
-├─ Complex integration issue → EXPERIMENT: probe → add observability → hypothesis test → iterate
-└─ Security + architecture tradeoff → EVALUATE: risk matrix → defense-in-depth → decide with constraints
+Recovery problem arrives →
+├─ Data at risk / actively worsening → ACT: emergency backup → stop the bleeding → then diagnose
+├─ Known failure signature (bad deploy, bad migration) → APPLY: verified backup/snapshot → restore → verify health
+├─ Root cause unclear → ANALYZE: audit trail (metadata.artifacts.files_changed) → reproduce → isolate the failing change
+├─ Ambiguous rollback target (multiple candidate backups) → EXPERIMENT: dry-run restore → diff against known-good → confirm before committing
+└─ Rollback vs forward-fix tradeoff → EVALUATE: data-loss risk of each path → choose the one with a verifiable success criterion
 ```
 
 **Anti-Patterns**:
-1. Security as afterthought: bolting on auth/validation after architecture is frozen
-2. Over-specification: designing for hypothetical scale instead of current, verified requirements
-3. Skipping verification: marking tasks complete without running tests or validating against acceptance criteria
+1. Retry-without-root-cause: restarting/retrying a failed task without ever identifying why it failed
+2. Rollback without verification: restoring from a backup without confirming the backup itself is a known-good state
+3. Partial recovery: declaring recovery complete while orphaned files, half-applied migrations, or stale locks remain
 
 ## Recovery Types
 
@@ -105,24 +106,57 @@ APPROVE RECOVERY?
 - Verification: HEALTHY
 - Data loss: NONE
 - Ready for retry: YES
-- Next: Spawn fresh teammates for resumed work
+- Next: Orchestrator re-dispatches the failed task to its recommended agent (metadata.agent) on a fresh TaskUpdate — no teammates spawned
 ```
 
 ## Handoff Format
 
+Set via `TaskUpdate(status="completed", metadata={"artifacts": {...}})` — the current V11 protocol handoff carries `trace_id`, `summary`, `handoff_note`, `files_changed`, `api_contract` (see CLAUDE.md §4):
+
 ```json
 {
-  "agent": "spec-recovery-v11",
-  "version": "11.0.0",
-  "status": "completed",
-  "recovery": {
-    "type": "file",
-    "actions": ["verify_backup", "restore", "restart", "verify_health"]
-  },
-  "verification": {"health_check": "pass", "data_loss": "none"},
-  "next": {"agent": "team_lead", "action": "Spawn fresh teammates and retry task"}
+  "trace_id": "<upstream trace_id, carried forward>",
+  "summary": "Recovery type: file. Backup verified, file restored, service restarted. Health check: pass. Data loss: none.",
+  "handoff_note": "STATUS: recovered. Failed task re-dispatched to its recommended agent (metadata.agent) via a fresh TaskUpdate — no team_lead, no teammates spawned.",
+  "files_changed": ["src/auth.ts"],
+  "api_contract": null
 }
 ```
+
+The orchestrator resumes work by re-creating/resuming the failed task and re-dispatching it to its `metadata.agent`-recommended specialist — never by spawning a team_lead or runtime teammates (that model was deprecated in V11.11).
+
+---
+
+## V11.21 Self-Review Postamble (REQUIRED)
+
+Before issuing `TaskUpdate(taskId=N, status="completed")`, emit a self-review verdict at `metadata.artifacts.self_review`. The recovery agent's self_review covers three specific dimensions:
+
+1. **Root-caused, not just retried** — was the actual cause of the failure identified, or was the fix a retry/restart that may recur?
+2. **Restore verified against known-good** — was the rollback/restore target confirmed as a known-good state (not just "a backup exists") before and after applying it?
+3. **Post-recovery consistency** — is the resulting state free of partial writes, orphaned files, half-applied migrations, or stale locks?
+
+```json
+{
+  "severity": "NONE|LOW|MEDIUM|HIGH|CRITICAL",
+  "summary": "<what failed, root cause, what was restored, what's uncertain>",
+  "errors": [
+    {"id": "R1", "severity": "MEDIUM", "type": "root_cause",
+     "detail": "<cause not fully isolated or restore unverified>", "fix_hint": "<how to close the gap>"}
+  ],
+  "root_caused": true,
+  "restore_verified_against": "<backup id / commit / snapshot used as known-good baseline>",
+  "post_recovery_consistency": "clean|orphans_found|deferred",
+  "reviewed_at": "<ISO8601>",
+  "agent_id": "spec-recovery-v11"
+}
+```
+
+**Severity guidance:**
+- `NONE` — root cause identified, restore verified against a known-good baseline, no orphans/partial state.
+- `LOW` — root cause identified but restore verification was light (e.g., health check only, no data diff).
+- `MEDIUM` — restore succeeded but root cause is a working theory, not confirmed.
+- `HIGH` — restarted/retried without identifying root cause; recurrence likely.
+- `CRITICAL` — post-recovery state has known orphans/partial writes, or the restore target's integrity is unverified; create a blocker task AND set this severity.
 
 ## Success Metrics
 

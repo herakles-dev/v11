@@ -1,0 +1,316 @@
+#!/usr/bin/env python3
+"""
+check-index-body-status-consistency — drift guard: improvements/README.md
+table row status text vs improvements/{N}-*.md body **Status:** line
+(improvements/42-index-body-status-consistency-check.md).
+
+ROOT CAUSE this defends: authoring convention keeps two surfaces in sync (the
+index table row and the ticket-file body Status line) but nothing enforces
+that. The v11.36 W1-Rev sweep fixed one direction (body-SHIPPED but
+index-PROPOSED). The v11.37 alignment review's L3 lens found 8 drifts in
+the reverse direction (index-SHIPPED but body-PROPOSED). W1-T3 flipped
+those. This check catches the class going forward.
+
+Sibling of `check-stamp-drift` / `check-changelog-drift` / `check-hotkey-sync`
+— same shape (v11.36 W2 pattern), same conventions.
+
+Schema contract (v11.37 W1-T5, docs/DRIFT_CHECKS.md § Index-body canonical
+status schema):
+  - Body has EXACTLY ONE `**Status:**` line in frontmatter. Second line = WARN.
+  - Primary token: PROPOSED / OPEN / PARTIAL / SHIPPED / DEFERRED / HISTORICAL.
+  - README row col-2 contains prose with SHIPPED / PROPOSED / OPEN as top-axis
+    tokens; check compares first-hit token.
+  - Multi-phase tickets encode per-phase state inline; primary token is the
+    umbrella (e.g. `SHIPPED {F0, F1} · PROPOSED {F3}` → primary = SHIPPED).
+  - When either surface uses PARTIAL, the OTHER must ALSO use PARTIAL or WARN.
+
+Exit codes:
+  0 = PASS / skip
+  1 = FAIL (missing ticket file for indexed number OR missing README row for
+      on-disk ticket file — the harder-to-detect drift; blocks handoff --spawn
+      as a soft-block).
+  2 = WARN (status token divergence; advisory, does not block).
+
+Rollback: V11_INDEX_BODY_CHECK=off (no-op, exit 0).
+
+Debug: V11_DRIFT_CHECK_DEBUG=on prints per-ticket details.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import sys
+from pathlib import Path
+
+V11_HOME = Path(os.environ.get("V11_HOME", "/path/to/v11"))
+DEFAULT_IMPROVEMENTS = V11_HOME / "improvements"
+
+# Primary status tokens, in the priority order used for tie-breaking.
+# EXECUTED and APPROVED are used in older tickets (#7-#12 era) synonymously
+# with SHIPPED; we accept them as equivalent for the drift check.
+STATUS_TOKENS = [
+    "SHIPPED",
+    "EXECUTED",
+    "APPROVED",
+    "PARTIAL",
+    "OPEN",
+    "PROPOSED",
+    "DEFERRED",
+    "HISTORICAL",
+]
+# Normalize legacy tokens to the canonical set for cross-surface comparison.
+CANONICAL = {
+    "EXECUTED": "SHIPPED",
+    "APPROVED": "SHIPPED",
+}
+# Case-insensitive match on word-boundary tokens.
+TOKEN_RE = re.compile(r"\b(" + "|".join(STATUS_TOKENS) + r")\b", re.IGNORECASE)
+# Ticket-file basename pattern
+TICKET_FILE_RE = re.compile(r"^(\d+)-[a-z0-9-]+\.md$")
+# **Status:** line pattern (allow leading `- ` list marker, allow trailing text)
+STATUS_LINE_RE = re.compile(r"^(?:-\s+)?\*\*Status:\*\*\s*(.+)$", re.MULTILINE)
+# README table row pattern (only the improvements table): `| N | [title](file.md) | SEV | STATUS PROSE |`
+README_ROW_RE = re.compile(
+    r"^\|\s*(\d+)\s*\|\s*(.+?)\s*\|\s*([^|]+?)\s*\|\s*(.+?)\s*\|\s*$",
+    re.MULTILINE,
+)
+
+
+def _env_off(name: str) -> bool:
+    return os.environ.get(name, "on").strip().lower() == "off"
+
+
+def debug(msg: str) -> None:
+    if os.environ.get("V11_DRIFT_CHECK_DEBUG", "off") == "on":
+        sys.stderr.write(f"[debug] {msg}\n")
+
+
+def find_primary_token(text: str) -> str | None:
+    """Return the primary status token in text.
+
+    Contract: multi-token prose (typical in README rows describing a ticket's
+    history — "was PROPOSED... now SHIPPED... overall SHIPPED") is resolved
+    to a single umbrella token:
+      - if BOTH strict-SHIPPED and strict-PROPOSED appear → PARTIAL (some
+        of the work still open even though other parts shipped)
+      - if only SHIPPED (or synonyms EXECUTED/APPROVED) → SHIPPED
+      - if only PROPOSED / OPEN → PROPOSED
+      - if only DEFERRED or HISTORICAL → that token
+      - if PARTIAL explicitly present → PARTIAL
+    Case-normalized. Legacy tokens canonicalized. Returns None if no token.
+    """
+    tokens_found: list[str] = []
+    for m in TOKEN_RE.finditer(text):
+        tok = m.group(1).upper()
+        tokens_found.append(CANONICAL.get(tok, tok))
+    if not tokens_found:
+        return None
+    unique = set(tokens_found)
+    if "PARTIAL" in unique:
+        return "PARTIAL"
+    has_shipped = "SHIPPED" in unique
+    has_open = "PROPOSED" in unique or "OPEN" in unique
+    if has_shipped and has_open:
+        return "PARTIAL"
+    if has_shipped:
+        return "SHIPPED"
+    if has_open:
+        return "PROPOSED"
+    # Deferred/historical: return first-hit
+    for tok in tokens_found:
+        if tok in ("DEFERRED", "HISTORICAL"):
+            return tok
+    return tokens_found[0]
+
+
+def extract_body_status(ticket_path: Path) -> tuple[str | None, int, str]:
+    """Return (primary_token, status_line_count, first_status_line_text)."""
+    try:
+        text = ticket_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None, 0, ""
+    matches = STATUS_LINE_RE.findall(text)
+    if not matches:
+        return None, 0, ""
+    first = matches[0].strip()
+    primary = find_primary_token(first)
+    return primary, len(matches), first
+
+
+def enumerate_tickets(improvements_dir: Path) -> dict[int, Path]:
+    """{ticket_number: ticket_file_path}"""
+    tickets: dict[int, Path] = {}
+    for entry in improvements_dir.iterdir():
+        if not entry.is_file() or entry.suffix != ".md":
+            continue
+        if entry.name == "README.md":
+            continue
+        m = TICKET_FILE_RE.match(entry.name)
+        if not m:
+            continue
+        n = int(m.group(1))
+        tickets[n] = entry
+    return tickets
+
+
+def enumerate_readme_rows(readme_path: Path) -> dict[int, str]:
+    """{ticket_number: status_prose_text_from_col4} — extracts only rows that
+    look like improvements-index table rows (leading `| N | [title](...) |`)."""
+    rows: dict[int, str] = {}
+    try:
+        text = readme_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return rows
+    for m in README_ROW_RE.finditer(text):
+        # skip header rows (title col contains "Title" literal) and separator rows
+        title_col = m.group(2)
+        if title_col.strip() in ("Title", "---", ":---:"):
+            continue
+        try:
+            n = int(m.group(1))
+        except ValueError:
+            continue
+        status_col = m.group(4).strip()
+        rows[n] = status_col
+    return rows
+
+
+def diff_ticket(
+    n: int,
+    ticket_path: Path | None,
+    readme_status_prose: str | None,
+) -> list[tuple[str, str]]:
+    """Return list of (verdict, message) where verdict is FAIL/WARN."""
+    findings: list[tuple[str, str]] = []
+    if ticket_path is None and readme_status_prose is not None:
+        findings.append(
+            (
+                "FAIL",
+                f"#{n}: README row exists but no ticket file `improvements/{n}-*.md` on disk",
+            )
+        )
+        return findings
+    if ticket_path is not None and readme_status_prose is None:
+        findings.append(
+            (
+                "FAIL",
+                f"#{n}: ticket file `{ticket_path.name}` exists but no matching README row",
+            )
+        )
+        return findings
+    # both exist → compare tokens
+    if ticket_path is None or readme_status_prose is None:
+        return findings  # unreachable, satisfies type-check
+    body_token, body_status_count, body_first = extract_body_status(ticket_path)
+    if body_status_count > 1:
+        findings.append(
+            (
+                "WARN",
+                f"#{n}: ticket body has {body_status_count} `**Status:**` lines — schema requires exactly one",
+            )
+        )
+    if body_token is None:
+        findings.append(
+            (
+                "WARN",
+                f"#{n}: ticket body has no recognizable status token in `{body_first[:60]}...`",
+            )
+        )
+        return findings
+    readme_token = find_primary_token(readme_status_prose)
+    if readme_token is None:
+        findings.append(
+            (
+                "WARN",
+                f"#{n}: README status column has no recognizable status token",
+            )
+        )
+        return findings
+    debug(f"#{n}: body={body_token} readme={readme_token}")
+    if body_token == readme_token:
+        return findings
+    # PARTIAL must appear on both sides if either has it
+    if body_token == "PARTIAL" or readme_token == "PARTIAL":
+        findings.append(
+            (
+                "WARN",
+                f"#{n}: PARTIAL token on one side only — body={body_token}, README={readme_token}",
+            )
+        )
+        return findings
+    # standard mismatch
+    findings.append(
+        (
+            "WARN",
+            f"#{n}: status token drift — body says {body_token}, README says {readme_token}",
+        )
+    )
+    return findings
+
+
+def main() -> int:
+    if _env_off("V11_INDEX_BODY_CHECK"):
+        return 0
+
+    parser = argparse.ArgumentParser(
+        description="v11.37 W2-T1 index-vs-body status consistency check",
+    )
+    parser.add_argument(
+        "--improvements-dir",
+        type=Path,
+        default=DEFAULT_IMPROVEMENTS,
+        help=f"default: {DEFAULT_IMPROVEMENTS}",
+    )
+    args = parser.parse_args()
+
+    improvements_dir = args.improvements_dir
+    if not improvements_dir.is_dir():
+        sys.stderr.write(
+            f"check-index-body-status-consistency: improvements dir not found: {improvements_dir}\n"
+        )
+        return 0  # graceful skip
+
+    readme_path = improvements_dir / "README.md"
+    if not readme_path.is_file():
+        sys.stderr.write(
+            f"check-index-body-status-consistency: README.md not found in {improvements_dir}\n"
+        )
+        return 0
+
+    tickets = enumerate_tickets(improvements_dir)
+    readme_rows = enumerate_readme_rows(readme_path)
+    all_ns = sorted(set(tickets.keys()) | set(readme_rows.keys()))
+
+    fails: list[str] = []
+    warns: list[str] = []
+    for n in all_ns:
+        for verdict, msg in diff_ticket(n, tickets.get(n), readme_rows.get(n)):
+            if verdict == "FAIL":
+                fails.append(msg)
+            elif verdict == "WARN":
+                warns.append(msg)
+
+    if not fails and not warns:
+        debug(f"all {len(all_ns)} tickets in sync (index ↔ body)")
+        return 0
+
+    for msg in fails:
+        sys.stderr.write(f"⚠ INDEX_BODY_DRIFT[FAIL]: {msg}\n")
+    for msg in warns:
+        sys.stderr.write(f"⚠ INDEX_BODY_DRIFT[WARN]: {msg}\n")
+
+    if fails:
+        sys.stderr.write(
+            f"check-index-body-status-consistency: {len(fails)} FAIL + {len(warns)} WARN across {len(all_ns)} tickets. Rollback: V11_INDEX_BODY_CHECK=off.\n"
+        )
+        return 1
+    sys.stderr.write(
+        f"check-index-body-status-consistency: {len(warns)} WARN across {len(all_ns)} tickets. Rollback: V11_INDEX_BODY_CHECK=off.\n"
+    )
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

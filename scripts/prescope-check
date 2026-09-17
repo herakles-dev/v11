@@ -6,10 +6,10 @@
 #         TASK_ID (optional) limits the scan to a single task.
 #
 # Reads (never writes):
-#   SESSIONS_ROOT/PROJECT/.task-state.json  (default SESSIONS_ROOT=$V11_WORKSPACE_ROOT/sessions)
+#   SESSIONS_ROOT/PROJECT/.task-state.json  (default SESSIONS_ROOT=$HERCULES_ROOT/sessions)
 #     -> the "open_tasks" bucket (pending/in_progress tasks; same bucket
 #        wave-check's collect_wave_tasks() consults for its work/review split)
-#   $V11_WORKSPACE_ROOT/.agent-metrics/ledger/PROJECT.jsonl
+#   $HERCULES_ROOT/.agent-metrics/ledger/PROJECT.jsonl
 #     -> ev:"prescope" rows appended by sync-tasks S1-B2
 #        (_v11_prescope_ledger_event in hooks/lib/common.sh)
 #
@@ -58,8 +58,8 @@ EXIT_FLAGGED = 11
 EXIT_BAD_USAGE = 4
 
 HOME = Path.home()
-WORKSPACE_ROOT = Path(os.environ.get("V11_WORKSPACE_ROOT", str(HOME)))
-SESSIONS_ROOT = Path(os.environ.get("SESSIONS_ROOT", str(WORKSPACE_ROOT / "sessions")))
+HERCULES = Path(os.environ.get("HERCULES_ROOT", str(HOME)))
+SESSIONS_ROOT = Path(os.environ.get("SESSIONS_ROOT", str(HERCULES / "sessions")))
 
 # Reason code -> short split-axis hint. Unknown/future reason codes fall
 # back to DEFAULT_SUGGEST rather than erroring — this script must never
@@ -83,11 +83,11 @@ def task_state_path(project: str) -> Path:
     primary = SESSIONS_ROOT / project / ".task-state.json"
     if primary.exists():
         return primary
-    return WORKSPACE_ROOT / ".agent-metrics" / "task-state" / f"{project}.json"
+    return HERCULES / ".agent-metrics" / "task-state" / f"{project}.json"
 
 
 def ledger_path(project: str) -> Path:
-    return WORKSPACE_ROOT / ".agent-metrics" / "ledger" / f"{project}.jsonl"
+    return HERCULES / ".agent-metrics" / "ledger" / f"{project}.jsonl"
 
 
 def suggest_for(reason: str) -> str:
@@ -96,16 +96,23 @@ def suggest_for(reason: str) -> str:
 
 def collect_open_tasks(state: dict[str, Any]) -> dict[str, dict[str, Any]]:
     """Open (pending/in_progress) tasks keyed by task_id, from the
-    "open_tasks" bucket. Defensive isinstance(dict) guard mirrors
-    wave-check's collect_wave_tasks() — aggregates occasionally carry
-    sibling keys (e.g. "completed") as plain ints/lists rather than task
-    maps, so only a genuine task-map bucket is consulted."""
+    "open_tasks" bucket. Two accepted shapes: dict[task_id]->record
+    (per-session state) or list[record] with each record carrying its own
+    "task_id" field (improvements/18 — the cross-session aggregate's flat
+    view, collision-safe). Anything else is treated as empty, mirroring
+    wave-check's collect_wave_tasks() defensive guard — aggregates
+    occasionally carry sibling keys (e.g. "completed") as plain ints/lists
+    rather than task maps, so only a genuine task bucket is consulted."""
     out: dict[str, dict[str, Any]] = {}
     bucket = state.get("open_tasks")
-    if not isinstance(bucket, dict):
+    if isinstance(bucket, dict):
+        items = bucket.items()
+    elif isinstance(bucket, list):
+        items = ((t.get("task_id"), t) for t in bucket if isinstance(t, dict))
+    else:
         return out
-    for tid, t in bucket.items():
-        if not isinstance(t, dict):
+    for tid, t in items:
+        if tid is None or not isinstance(t, dict):
             continue
         status = t.get("status") or "pending"
         if status in ("pending", "in_progress"):

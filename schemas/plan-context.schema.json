@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "plan-context.schema.json",
+  "$id": "https://herakles.dev/v11/schemas/plan-context.schema.json",
   "title": "V11 Plan Context",
   "description": "Structured reasoning artifact that persists planning context across sessions",
   "type": "object",

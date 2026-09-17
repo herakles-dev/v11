@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "review-config.schema.json",
+  "$id": "https://herakles.dev/v11/schemas/review-config.schema.json",
   "title": "V11 Per-Task Review Config",
   "description": "Optional per-project knob at sessions/{project}/.review-config.json (V11.15). Controls the post-task adversarial-lite review loop. Absent file = all defaults = review every completed task (user-decided default).",
   "type": "object",

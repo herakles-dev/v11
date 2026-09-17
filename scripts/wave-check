@@ -27,6 +27,7 @@
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import re
@@ -43,12 +44,12 @@ EXIT_CRITICAL_BLOCKING = 3
 EXIT_BAD_USAGE = 4
 
 HOME = Path.home()
-WORKSPACE_ROOT = Path(os.environ.get("V11_WORKSPACE_ROOT", HOME))
+HERCULES = Path(os.environ.get("HERCULES_ROOT", HOME))
 
 
 def task_state_path(project: str) -> Path:
     """Return the path to read task-state from, preferring the per-session mirror."""
-    primary = WORKSPACE_ROOT / "sessions" / project / ".task-state.json"
+    primary = HERCULES / "sessions" / project / ".task-state.json"
     if primary.exists():
         return primary
     fallback = HOME / ".agent-metrics" / "task-state" / f"{project}.json"
@@ -120,11 +121,20 @@ def collect_wave_tasks(state: dict[str, Any], wave: str) -> list[tuple[str, dict
     for key in ("open_tasks", "completed", "blocked_tasks"):
         bucket = state.get(key) or {}
         if isinstance(bucket, dict):
-            for tid, t in bucket.items():
-                if not isinstance(t, dict):
-                    continue
-                if sprint_matches_wave((t.get("metadata") or {}).get("sprint"), wave):
-                    out.append((str(tid), t))
+            items = bucket.items()
+        elif key == "open_tasks" and isinstance(bucket, list):
+            # improvements/18: open_tasks may be a list[record] (the
+            # cross-session aggregate's collision-safe flat view, each
+            # record carrying its own task_id field) instead of
+            # dict[task_id]->record.
+            items = ((t.get("task_id"), t) for t in bucket if isinstance(t, dict))
+        else:
+            continue
+        for tid, t in items:
+            if tid is None or not isinstance(t, dict):
+                continue
+            if sprint_matches_wave((t.get("metadata") or {}).get("sprint"), wave):
+                out.append((str(tid), t))
     # De-duplicate (a task may appear in multiple buckets across cycles)
     seen: set[str] = set()
     uniq: list[tuple[str, dict[str, Any]]] = []
@@ -137,11 +147,22 @@ def collect_wave_tasks(state: dict[str, Any], wave: str) -> list[tuple[str, dict
 
 
 def v11_home_dir() -> Path:
-    return Path(os.environ.get("V11_HOME", str(WORKSPACE_ROOT / "v11")))
+    return Path(os.environ.get("V11_HOME", str(HERCULES / "v11")))
 
 
 def ledger_path(project: str) -> Path:
-    return WORKSPACE_ROOT / ".agent-metrics" / "ledger" / f"{project}.jsonl"
+    return HERCULES / ".agent-metrics" / "ledger" / f"{project}.jsonl"
+
+
+def wave_check_lock_path(project: str) -> Path:
+    """Dedicated flock target for the autoclose critical section (fcntl idiom,
+    matching scripts/swarm-review-attribute's append_jsonl helper). Deliberately
+    distinct from the ledger's own <project>.jsonl.lock (FD-207 in
+    hooks/lib/common.sh v11_ledger_append): append_gate_close_event shells out
+    to v11_ledger_append, which takes that lock itself for each event, so
+    holding it here too would self-deadlock across the subprocess boundary.
+    """
+    return HERCULES / ".agent-metrics" / "ledger" / f"{project}.wave-check.lock"
 
 
 def print_review_queue_pending(project: str) -> None:
@@ -229,7 +250,7 @@ def append_gate_close_event(project: str, event: dict[str, Any]) -> bool:
     event_json = json.dumps(event)
     wrapper = 'source "$1"; v11_ledger_append "$2" "$3"'
     env = dict(os.environ)
-    env["V11_WORKSPACE_ROOT"] = str(WORKSPACE_ROOT)
+    env["HERCULES_ROOT"] = str(HERCULES)
     env["V11_HOME"] = str(v11_home_dir())
     try:
         result = subprocess.run(
@@ -261,6 +282,36 @@ def close_terminal_but_open_tasks(
     ev=completed, caller_kind="hook". Never closes a task whose paired
     review sibling (metadata.review_of pointing at it) is open or carries
     an unresolved CRITICAL adversarial verdict.
+
+    Concurrency: the whole read-decide-append critical section is serialized
+    behind a dedicated flock (acquired BEFORE the ledger replay read, not
+    after) so two concurrent wave-check invocations for the same project
+    can't both read the pre-close ledger state and double-append close
+    events for the same task_id. The lock is released once this function
+    returns, whether or not any events were appended.
+    """
+    lock_path = wave_check_lock_path(project)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_fh = open(lock_path, "a")
+    try:
+        fcntl.flock(lock_fh, fcntl.LOCK_EX)
+        _close_terminal_but_open_tasks_locked(project, wave, work_tasks, review_tasks)
+    finally:
+        fcntl.flock(lock_fh, fcntl.LOCK_UN)
+        lock_fh.close()
+
+
+def _close_terminal_but_open_tasks_locked(
+    project: str,
+    wave: str,
+    work_tasks: list[tuple[str, dict[str, Any]]],
+    review_tasks: list[tuple[str, dict[str, Any]]],
+) -> None:
+    """Body of close_terminal_but_open_tasks, run while wave_check_lock_path
+    is held. Re-reading the ledger here (rather than reusing a snapshot taken
+    before the lock) is what makes a second, lock-losing caller idempotent:
+    once it acquires the lock, it sees the first caller's close events and
+    skips them via the rec.get("status") == "completed" check below.
     """
     records = replay_ledger_by_task_id(ledger_path(project), project)
     if not records:

@@ -60,8 +60,13 @@ norm() {
 # --- Anchor: derive from git log, NEVER trust in-repo strings ---
 # --no-merges: default merge subjects embed the branch name (e.g. "into v11.28-handoff-steer"),
 # which pollutes the anchor with the branch's version, not the protocol's (found live 2026-07-11).
+# Recency-preserving but subject-safe: take the MOST RECENT subject containing a
+# version token, then the semver-MAX token WITHIN that subject — a subject that
+# mentions an old version before the current one ("stale v11.33 ref -> v11.34.4")
+# must not poison the anchor (found live 2026-07-29).
 ANCHOR_RAW="$(cd "$V11_ROOT" && git log -60 --no-merges --format='%s' 2>/dev/null \
-    | grep -oiE 'V11\.[0-9]+(\.[0-9]+)?' | head -1)"
+    | grep -im1 -E 'V11\.[0-9]+(\.[0-9]+)?' \
+    | grep -oiE 'V11\.[0-9]+(\.[0-9]+)?' | sort -Vr | head -1)"
 ANCHOR="$(printf '%s' "$ANCHOR_RAW" | tr '[:upper:]' '[:lower:]')"
 ANCHOR_MINOR="$(norm "$ANCHOR")"
 
@@ -191,8 +196,148 @@ print(json.dumps({'file': '$file', 'field': '$field', 'found': '$found', 'expect
 done
 FINDINGS_JSON+="]"
 
+# =====================================================================
+# Independent phase (W2-T1): per-project version-file consistency via
+# sessions/{project}/.stamp-drift-extra.json. NOT merged into the
+# git-log anchor comparison above — an extra version file is a
+# project-owned app version (e.g. an AHK client build number vs a
+# Python server build number in the SAME project) with no relationship
+# to the V11.x protocol anchor, so the "extract -> compare-to-anchor"
+# shape above does not fit. This runs as its own self-consistency
+# check instead: every successfully-extracted entry in one project's
+# list must match every other entry in that same list. Per the
+# runbook's 2-attempt cap ("if the extra config schema conflicts with
+# the existing anchor format... add support as an additional
+# independent phase (not merged into existing anchors)") — the
+# semantic mismatch is decided up front rather than burning attempts
+# on a merge that can't work.
+#
+# Absent .stamp-drift-extra.json (or absent "version_files" key) for a
+# project = no-op for that project — this phase only ever ADDS rows,
+# it never touches SURFACES/ROWS/TABLE_LINES/FINDINGS_JSON above, so a
+# project (or a whole repo) with zero extra-config files reproduces
+# check-stamp-drift's pre-W2-T1 output byte-for-byte.
+# =====================================================================
+SESSIONS_ROOT="${SESSIONS_ROOT:-$(cd "$V11_ROOT/.." && pwd)/sessions}"
+
+extract_by_pattern() {
+    # Extract capture group 1 (or the whole match, if the pattern has
+    # no group) of $2 from file $1. argv-passed, never shell-interpolated
+    # into the python source — the pattern string is untrusted-ish
+    # (project-authored JSON) and must not be able to break out of a
+    # quoted literal.
+    local f="$1" pat="$2"
+    python3 - "$f" "$pat" <<'PYEOF'
+import re, sys
+f, pat = sys.argv[1], sys.argv[2]
+try:
+    with open(f) as fh:
+        content = fh.read()
+except Exception:
+    sys.exit(0)
+try:
+    m = re.search(pat, content)
+except re.error:
+    sys.exit(0)
+if not m:
+    sys.exit(0)
+print(m.group(1) if m.groups() else m.group(0))
+PYEOF
+}
+
+json_row() {
+    # Same argv-passed contract as extract_by_pattern — avoids hand-built
+    # JSON string concatenation around values that may contain quotes.
+    python3 - "$@" <<'PYEOF'
+import json, sys
+project, label, path, version, status = sys.argv[1:6]
+print(json.dumps({'project': project, 'label': label, 'path': path, 'version': version, 'status': status}))
+PYEOF
+}
+
+PROJECT_TABLE_LINES=()
+PROJECT_FINDINGS_JSON="["
+first_project_json=1
+project_fail=0
+
+if [ -d "$SESSIONS_ROOT" ]; then
+    for extra_file in "$SESSIONS_ROOT"/*/.stamp-drift-extra.json; do
+        [ -f "$extra_file" ] || continue
+        project_dir="$(dirname "$extra_file")"
+        project="$(basename "$project_dir")"
+
+        ENTRY_LABELS=()
+        ENTRY_VERSIONS=()
+        while IFS= read -r item; do
+            [ -n "$item" ] || continue
+            vpath="$(jq -r '.path // empty' <<<"$item")"
+            vpattern="$(jq -r '.pattern // empty' <<<"$item")"
+            vlabel="$(jq -r '.label // .path // empty' <<<"$item")"
+            [ -n "$vpath" ] && [ -n "$vpattern" ] || continue
+
+            # Format-validation gate: reject absolute paths and any ".."
+            # traversal component BEFORE the path reaches a file sink.
+            case "$vpath" in
+                /*|*..*)
+                    say "⚠ check-stamp-drift: rejecting unsafe path in $project/.stamp-drift-extra.json: $vpath"
+                    continue
+                    ;;
+            esac
+
+            target="$project_dir/$vpath"
+            if [ ! -f "$target" ]; then
+                say "⚠ check-stamp-drift: $project/.stamp-drift-extra.json references missing file: $vpath"
+                PROJECT_TABLE_LINES+=("$(printf '%-20s %-20s %-30s %-12s %s' "$project" "$vlabel" "$vpath" "MISSING" "WARN")")
+                continue
+            fi
+
+            found="$(extract_by_pattern "$target" "$vpattern")"
+            if [ -z "$found" ]; then
+                say "⚠ check-stamp-drift: pattern did not match in $project: $vpath"
+                PROJECT_TABLE_LINES+=("$(printf '%-20s %-20s %-30s %-12s %s' "$project" "$vlabel" "$vpath" "NO-MATCH" "WARN")")
+                continue
+            fi
+
+            ENTRY_LABELS+=("$vlabel|$vpath")
+            ENTRY_VERSIONS+=("$found")
+        done < <(jq -c '.version_files[]?' "$extra_file" 2>/dev/null)
+
+        n="${#ENTRY_VERSIONS[@]}"
+        [ "$n" -eq 0 ] && continue
+
+        status="OK"
+        if [ "$n" -ge 2 ]; then
+            mismatch=0
+            for v in "${ENTRY_VERSIONS[@]}"; do
+                [ "$v" != "${ENTRY_VERSIONS[0]}" ] && mismatch=1
+            done
+            if [ "$mismatch" -eq 1 ]; then
+                status="MISMATCH"
+                project_fail=1
+            fi
+        fi
+
+        for i in "${!ENTRY_VERSIONS[@]}"; do
+            IFS='|' read -r lbl pth <<<"${ENTRY_LABELS[$i]}"
+            row_status="$status"
+            [ "$n" -eq 1 ] && row_status="OK (single entry)"
+            PROJECT_TABLE_LINES+=("$(printf '%-20s %-20s %-30s %-12s %s' "$project" "$lbl" "$pth" "${ENTRY_VERSIONS[$i]}" "$row_status")")
+            if [ "$first_project_json" -eq 1 ]; then
+                first_project_json=0
+            else
+                PROJECT_FINDINGS_JSON+=","
+            fi
+            PROJECT_FINDINGS_JSON+="$(json_row "$project" "$lbl" "$pth" "${ENTRY_VERSIONS[$i]}" "$row_status")"
+        done
+    done
+fi
+PROJECT_FINDINGS_JSON+="]"
+
+anchor_fail="$fail"
+fail=$(( fail || project_fail ))
+
 if [ "$JSON_MODE" -eq 1 ]; then
-    printf '{"anchor":"%s","findings":%s}\n' "$ANCHOR_MINOR" "$FINDINGS_JSON"
+    printf '{"anchor":"%s","findings":%s,"project_extras":%s}\n' "$ANCHOR_MINOR" "$FINDINGS_JSON" "$PROJECT_FINDINGS_JSON"
 else
     say "check-stamp-drift: anchor = v${ANCHOR_MINOR} (derived from git log)"
     say ""
@@ -200,12 +345,23 @@ else
     for line in "${TABLE_LINES[@]}"; do
         say "$line"
     done
+    if [ "${#PROJECT_TABLE_LINES[@]}" -gt 0 ]; then
+        say ""
+        say "Per-project version-file consistency (.stamp-drift-extra.json):"
+        say "$(printf '%-20s %-20s %-30s %-12s %s' "PROJECT" "LABEL" "PATH" "VERSION" "STATUS")"
+        for line in "${PROJECT_TABLE_LINES[@]}"; do
+            say "$line"
+        done
+    fi
     say ""
-    if [ "$fail" -eq 0 ]; then
+    if [ "$anchor_fail" -eq 0 ]; then
         say "✓ check-stamp-drift: all surfaces match anchor v${ANCHOR_MINOR}."
     else
         say "❌ STAMP_DRIFT: one or more surfaces disagree with anchor v${ANCHOR_MINOR}."
         say "   This is a report of a symptom the sweep (W2-T7) must fix — this tool does not write files."
+    fi
+    if [ "$project_fail" -eq 1 ]; then
+        say "❌ STAMP_DRIFT (per-project): one or more sessions/{project}/.stamp-drift-extra.json version files disagree with each other."
     fi
 fi
 

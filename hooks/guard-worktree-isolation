@@ -1,0 +1,177 @@
+#!/bin/bash
+# V11 Hook: guard-worktree-isolation (PostToolUse — Task|Agent, TaskList)
+#
+# improvements/12 H1: isolation:"worktree" can silently no-op — the Agent
+# tool accepts the param, returns success, and creates no worktree. No
+# error, no warning, no signal of any kind (confirmed live: A1's commit
+# d1a2db6 landed on a production branch after a requested worktree spawn).
+# Nothing built since (scripts/worktree-sweep only judges mergeability of an
+# ALREADY-REGISTERED worktree) has a code path for "isolation was requested
+# but never happened." spec.md Decision #3: fix must be hook-enforced, not
+# prompt-only.
+#
+# Verified this session (direct transcript inspection, not assumed):
+# tool_input.isolation IS exposed on both foreground and background Agent
+# calls (it's the original call param, always present).
+#
+# Design (two trigger points, one hook file):
+#   1. Task|Agent fire (spawn time — always fires, sync or async): record
+#      an expectation row with a worktree-COUNT baseline taken THIS
+#      instant. Deliberately does NOT try to check "did it work" in the
+#      SAME hook invocation — for a foreground completion, tool_response
+#      already reflects the finished agent, so a "before" and "after"
+#      count taken back-to-back within one hook fire are the same
+#      measurement twice (proven false-positive in manual testing: an
+#      agent that correctly used its worktree still tripped the alert,
+#      because both counts were sampled AFTER the worktree already
+#      existed). There is no reliable Pre-hook baseline either — parallel
+#      Agent spawns in one turn can fire multiple PreToolUse events before
+#      any PostToolUse returns, so a single shared scratch file would
+#      cross-contaminate. Recording-only here sidesteps both problems.
+#   2. TaskList fire (periodic — reuses guard-agent-stall's existing
+#      trigger point rather than inventing new polling infra): reconcile
+#      every still-pending expectation (sync or async alike) older than a
+#      grace period against the CURRENT worktree count. By the time the
+#      orchestrator's next TaskList call lands, real wall-clock time has
+#      passed since the spawn-time baseline, making the comparison
+#      meaningful regardless of whether the spawn was sync or async.
+#
+# This is a coarse, count-based signal (not a perfect per-agent
+# correlation — no such correlation key is exposed) — appropriate for the
+# actual failure mode being defended against: isolation being SYSTEMICALLY
+# broken (never creates any worktree, ever), not a rare per-spawn flake.
+# "Exact mechanism... gets worked out during implementation, not this
+# spec" (spec.md Decision #3) — this is that implementation.
+#
+# Exit codes: 0 always (PostToolUse hooks never block; advisory only).
+# Rollback: V11_WORKTREE_ISOLATION_GUARD=off (default on) disables entirely.
+
+source "$(dirname "${BASH_SOURCE[0]}")/lib/common.sh"
+
+if [ "$1" == "--test" ]; then
+    echo "guard-worktree-isolation v1 (improvements/12 H1)"
+    exit 0
+fi
+
+[ "${V11_WORKTREE_ISOLATION_GUARD:-on}" == "off" ] && exit 0
+
+v11_parse_input
+
+GRACE_SECONDS="${V11_WORKTREE_GRACE_SECONDS:-120}"
+REGISTRY="$METRICS_DIR/worktree-expectations.jsonl"
+
+# Count non-main worktrees for the repo at $1. Empty/non-numeric on any
+# failure (not a git repo, git missing, etc.) normalizes to 0 — the whole
+# check degrades to a harmless no-op for non-git working directories.
+_worktree_count() {
+    local root="${1:-.}" n
+    n="$(git -C "$root" worktree list 2>/dev/null | tail -n +2 | wc -l | tr -d ' ')"
+    [[ "$n" =~ ^[0-9]+$ ]] && printf '%s' "$n" || printf '0'
+}
+
+_repo_root() {
+    local cwd="${V11_CWD:-$(pwd)}"
+    git -C "$cwd" rev-parse --show-toplevel 2>/dev/null || printf '%s' "$cwd"
+}
+
+case "$V11_TOOL_NAME" in
+
+  Task|Agent)
+    ISOLATION="$(printf '%s' "$V11_RAW_INPUT" | jq -r '.tool_input.isolation // empty' 2>/dev/null)"
+    [ "$ISOLATION" != "worktree" ] && exit 0
+
+    REPO_ROOT="$(_repo_root)"
+    AGENT_ID="$(printf '%s' "$V11_RAW_INPUT" | jq -r '.tool_response.agentId // empty' 2>/dev/null)"
+    SUBAGENT_TYPE="$(printf '%s' "$V11_RAW_INPUT" | jq -r '.tool_input.subagent_type // "unknown"' 2>/dev/null)"
+    DESCRIPTION="$(printf '%s' "$V11_RAW_INPUT" | jq -r '.tool_input.description // ""' 2>/dev/null | head -c 200)"
+    IS_ASYNC="$(printf '%s' "$V11_RAW_INPUT" | jq -r '.tool_response.isAsync // false' 2>/dev/null)"
+    [ "$IS_ASYNC" == "true" ] && IS_ASYNC_JSON=true || IS_ASYNC_JSON=false
+    V11_PROJECT="$(v11_read_active_project 2>/dev/null || true)"
+    COUNT_AT_SPAWN="$(_worktree_count "$REPO_ROOT")"
+    HEAD_AT_SPAWN="$(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null || echo "unknown")"
+
+    mkdir -p "$METRICS_DIR"
+    jq -nc \
+        --arg ts "$(date -Iseconds)" \
+        --arg agent_id "$AGENT_ID" \
+        --arg subagent_type "$SUBAGENT_TYPE" \
+        --arg description "$DESCRIPTION" \
+        --arg project "$V11_PROJECT" \
+        --arg repo_root "$REPO_ROOT" \
+        --arg head_at_spawn "$HEAD_AT_SPAWN" \
+        --argjson is_async "$IS_ASYNC_JSON" \
+        --argjson count_at_spawn "$COUNT_AT_SPAWN" \
+        '{ts:$ts, agent_id:$agent_id, subagent_type:$subagent_type,
+          description:$description, project:$project, repo_root:$repo_root,
+          head_at_spawn:$head_at_spawn,
+          is_async:$is_async, count_at_spawn:$count_at_spawn, status:"pending"}' \
+        >> "$REGISTRY" 2>/dev/null
+    # Deliberately no immediate check here — see header note. Reconciliation
+    # happens uniformly at the next TaskList fire, once real time has passed.
+    ;;
+
+  TaskList)
+    [ -f "$REGISTRY" ] || exit 0
+    NOW_EPOCH="$(date +%s)"
+    REPO_ROOT="$(_repo_root)"
+    NOW_COUNT="$(_worktree_count "$REPO_ROOT")"
+    TMP="$REGISTRY.tmp.$$"
+    : > "$TMP"
+
+    while IFS= read -r line; do
+        [ -z "$line" ] && continue
+        STATUS="$(printf '%s' "$line" | jq -r '.status // "pending"' 2>/dev/null)"
+        if [ "$STATUS" != "pending" ]; then
+            printf '%s\n' "$line" >> "$TMP"
+            continue
+        fi
+        ROW_TS="$(printf '%s' "$line" | jq -r '.ts // ""' 2>/dev/null)"
+        ROW_COUNT="$(printf '%s' "$line" | jq -r '.count_at_spawn // 0' 2>/dev/null)"
+        [[ "$ROW_COUNT" =~ ^[0-9]+$ ]] || ROW_COUNT=0
+        ROW_EPOCH="$(date -d "$ROW_TS" +%s 2>/dev/null || echo "$NOW_EPOCH")"
+        AGE=$(( NOW_EPOCH - ROW_EPOCH ))
+
+        # Rows younger than the grace period haven't had a fair chance to
+        # actually start (or finish creating a worktree) yet — leave pending.
+        if [ "$AGE" -lt "$GRACE_SECONDS" ]; then
+            printf '%s\n' "$line" >> "$TMP"
+            continue
+        fi
+
+        if [ "$NOW_COUNT" -gt "$ROW_COUNT" ]; then
+            # At least one new worktree has appeared since this row's
+            # baseline — best-effort "not obviously broken" signal (not a
+            # per-agent guarantee, no correlation key exists for that).
+            printf '%s\n' "$line" | jq -c '.status = "resolved"' >> "$TMP"
+            # V11.35.6 (#27): stale-ref advisory — if HEAD moved since spawn,
+            # the worktree forked from a stale ref. Advisory only, exit 0.
+            ROW_HEAD="$(printf '%s' "$line" | jq -r '.head_at_spawn // "unknown"' 2>/dev/null)"
+            CURRENT_HEAD="$(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null || echo "unknown")"
+            if [ "$ROW_HEAD" != "unknown" ] && [ "$CURRENT_HEAD" != "unknown" ] \
+               && [ "$ROW_HEAD" != "$CURRENT_HEAD" ]; then
+                SUBJ="$(printf '%s' "$line" | jq -r '.description // ""' 2>/dev/null)"
+                echo "STALE-REF ADVISORY (#27): agent ($SUBJ) worktree forked from ${ROW_HEAD:0:8}, HEAD is now ${CURRENT_HEAD:0:8}. Agent may be working against stale code." >&2
+            fi
+        else
+            SUBJ="$(printf '%s' "$line" | jq -r '.description // ""' 2>/dev/null)"
+            AGENT_T="$(printf '%s' "$line" | jq -r '.subagent_type // "unknown"' 2>/dev/null)"
+            {
+                echo ""
+                echo "WORKTREE ISOLATION ALERT: background agent '$AGENT_T' ($SUBJ), spawned"
+                echo "  $(( AGE / 60 ))m ago requesting isolation:\"worktree\", still shows no new worktree"
+                echo "  (count then=$ROW_COUNT, now=$NOW_COUNT). Possible silent no-op (improvements/12 H1)."
+                echo "  Check: git -C \"$REPO_ROOT\" worktree list"
+                echo ""
+            } >&2
+            # Alert once, not repeated every TaskList call — matches
+            # guard-agent-stall's existing anti-spam convention.
+            printf '%s\n' "$line" | jq -c '.status = "alerted"' >> "$TMP"
+        fi
+    done < "$REGISTRY"
+
+    mv "$TMP" "$REGISTRY"
+    ;;
+
+esac
+
+exit 0
