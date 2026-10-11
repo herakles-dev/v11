@@ -7,7 +7,7 @@
 # With --json, prints the raw JSON estimate dict.
 
 SCRIPTS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-LIB_DIR="${SCRIPTS_DIR}/lib"
+LIB_DIR="$(cygpath -m "${SCRIPTS_DIR}/lib" 2>/dev/null || echo "${SCRIPTS_DIR}/lib")"
 
 exec python3 - "$@" <<PYEOF
 import sys, os

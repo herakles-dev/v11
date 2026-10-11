@@ -28,7 +28,15 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import enum
-import fcntl
+try:
+    import fcntl  # POSIX advisory file locking
+except ImportError:  # Windows: no fcntl — degrade to no-op advisory locks (single-user; see windows-portability notes)
+    class _NoFcntl:
+        LOCK_EX = LOCK_SH = LOCK_NB = LOCK_UN = 0
+        @staticmethod
+        def flock(*_a, **_k):
+            return None
+    fcntl = _NoFcntl()
 import json
 import os
 import sys

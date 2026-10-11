@@ -42,7 +42,7 @@ V11_HOME="${V11_HOME:-$HERCULES_ROOT/v11}"
 # S1-T4 (#81): the rehydrate command handoff emits is absolute. A resumed
 # session runs from the project directory, where ./scripts/ does not exist.
 case "$V11_HOME" in
-    /*) _V11_RESUME_CMD="$V11_HOME/scripts/v11-resume-tasks" ;;
+    /* | [A-Za-z]:* | \\\\*) _V11_RESUME_CMD="$V11_HOME/scripts/v11-resume-tasks" ;;
     *)  _V11_RESUME_CMD="$PWD/$V11_HOME/scripts/v11-resume-tasks" ;;
 esac
 _V11_RESUME_CMD=$(printf '%q' "$_V11_RESUME_CMD")
