@@ -7,12 +7,30 @@ frontmatter `name:` values under `-maxdepth 1` at `~/.claude/agents/`.
 Archived agents (`~/.claude/agents/archive/*.md`) are inactive-by-convention
 and excluded from the registry (per v11.37 archive/ policy).
 
+v11.46 D0-5 (#88): existing entries are also field-synced. For every agent
+registered AND on disk, the .md frontmatter owns SYNC_FIELDS (description,
+model, tools, triggers, version): a declared value the entry does not match
+is written over it (a key the entry lacks is added). A field the .md does not
+declare is left as the registry has it, and every other entry key (file,
+status, category, color, handoff_to, ...) is registry-owned and never touched
+or removed. Frontmatter is read with scripts/lib/roster.py's parser, so YAML
+lists (`[a, b]` and `- item`) survive; a file that parser rejects falls back
+to the legacy top-level scalar reader, still counts for add/prune, and is not
+field-synced (reported as a warning).
+
+Version stamps: an added entry takes the .md `version:`, else the current V11
+version (see current_v11_version(): CLAUDE.md §17 "**Current: vX.Y" pointer,
+fallback VERSION.md newest heading), else no `version` key. Never a
+hardcoded constant (was "11.37.0").
+
 Usage:
     scripts/reconcile-agent-registry [--dry-run|--apply|--revert]
                                      [--registry PATH] [--agents-dir PATH]
 
 Modes:
-    --dry-run   (default) print planned adds + prunes; no writes.
+    --dry-run   (default) print planned adds + prunes + per-field updates;
+                writes 0 bytes (shared lock on an existing lock file, which
+                it never creates).
     --apply     compute plan, write `.bak`, generate new registry to a
                 staging file, atomic `mv` into place. NOTE: `.bak` is
                 overwritten unconditionally on each --apply — if you need
@@ -63,41 +81,53 @@ from typing import Any
 DEFAULT_REGISTRY = Path.home() / ".agent-registry" / "agents.json"
 DEFAULT_AGENTS_DIR = Path.home() / ".claude" / "agents"
 ARCHIVE_SUBDIR = "archive"
+V11_ROOT = Path(__file__).resolve().parent.parent
+LIB_DIR = V11_ROOT / "scripts" / "lib"
 
 # Fields the frontmatter carries that we surface into the registry entry.
 # Order matters for stable diffs.
-REGISTRY_ENTRY_KEYS = ("file", "model", "status", "category", "description", "version", "color")
+REGISTRY_ENTRY_KEYS = (
+    "file", "model", "status", "category", "description", "version", "color",
+    "triggers", "tools",
+)
+
+# Fields the .md owns: an existing entry is updated to match (D0-5, #88).
+SYNC_FIELDS = ("description", "model", "tools", "triggers", "version")
 
 FRONTMATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n", re.DOTALL)
+# Same pattern scripts/check-changelog-drift reads the §17 pointer with.
+CURRENT_VERSION_RE = re.compile(r"\*\*Current:\s*v?(\d+\.\d+(?:\.\d+)?)")
+VERSION_MD_HEAD_RE = re.compile(r"^##\s+v(\d+\.\d+(?:\.\d+)?)\b", re.MULTILINE)
+
+
+def _load_roster_lib() -> Any:
+    sys.path.insert(0, str(LIB_DIR))
+    try:
+        import roster  # noqa: PLC0415
+    finally:
+        sys.path.remove(str(LIB_DIR))
+    return roster
+
+
+_roster = _load_roster_lib()
 
 
 def _env_off(name: str) -> bool:
     return os.environ.get(name, "on").strip().lower() == "off"
 
 
-def parse_frontmatter(md_path: Path) -> dict[str, Any] | None:
-    """Return a dict of frontmatter fields, or None if no valid frontmatter."""
-    try:
-        text = md_path.read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return None
+def _legacy_scalar_frontmatter(text: str) -> dict[str, Any] | None:
+    """Top-level `k: v` scalars only (the pre-D0-5 reader). Kept as the
+    fallback for files roster.py's stricter parser rejects, so add/prune
+    behave exactly as before for them."""
     m = FRONTMATTER_RE.match(text)
     if not m:
         return None
-    body = m.group(1)
     fields: dict[str, Any] = {}
-    key: str | None = None
-    for raw_line in body.splitlines():
+    for raw_line in m.group(1).splitlines():
         line = raw_line.rstrip()
-        if not line:
-            continue
-        # simple k: v parser — sufficient for our schema (name, description,
-        # model, color, category, status). Multi-line and list values are
-        # ignored — we only need the scalar fields for the registry entry.
-        if line[0] in (" ", "\t", "-"):
-            continue  # continuation / list item — not a top-level key
-        if ":" not in line:
-            continue
+        if not line or line[0] in (" ", "\t", "-") or ":" not in line:
+            continue  # blank / continuation / list item / not a key
         k, _, v = line.partition(":")
         k = k.strip()
         v = v.strip()
@@ -105,8 +135,30 @@ def parse_frontmatter(md_path: Path) -> dict[str, Any] | None:
         if len(v) >= 2 and v[0] == v[-1] and v[0] in ("'", '"'):
             v = v[1:-1]
         fields[k] = v
-        key = k
     return fields
+
+
+def parse_frontmatter(md_path: Path) -> dict[str, Any] | None:
+    """Return a dict of frontmatter fields (YAML lists as lists, via
+    scripts/lib/roster.py's parser), or None if no valid frontmatter.
+
+    A file roster.py rejects falls back to the legacy scalar reader and is
+    marked `_fallback: True`: it still counts for add/prune, but its fields
+    are not synced (a lenient read can truncate multi-line values)."""
+    try:
+        text = md_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    try:
+        fm_text, _body = _roster.split_frontmatter(text)
+        if fm_text is None:
+            return None
+        return _roster.parse_frontmatter(fm_text)
+    except _roster.FrontmatterError:
+        fields = _legacy_scalar_frontmatter(text)
+        if fields is not None:
+            fields["_fallback"] = True
+        return fields
 
 
 def discover_disk_agents(agents_dir: Path) -> dict[str, dict[str, Any]]:
@@ -124,7 +176,7 @@ def discover_disk_agents(agents_dir: Path) -> dict[str, dict[str, Any]]:
         if fm is None:
             continue
         name = fm.get("name")
-        if not name:
+        if not isinstance(name, str) or not name:
             # skip .md files without a name: frontmatter (READMEs, drafts)
             continue
         # canonical file field: basename relative to agents_dir
@@ -140,19 +192,65 @@ def load_registry(registry_path: Path) -> dict[str, Any]:
         return json.load(f)
 
 
-def build_registry_entry(fm: dict[str, Any]) -> dict[str, Any]:
-    """Build a canonical registry entry from parsed frontmatter."""
+def current_v11_version(v11_root: Path = V11_ROOT) -> str | None:
+    """The V11 version an added entry is stamped with when its .md declares
+    none, as MAJOR.MINOR.PATCH. Canonical source: the CLAUDE.md §17
+    "**Current: vX.Y" pointer (bumped every release, enforced by
+    scripts/check-changelog-drift). Fallback: the newest "## vX.Y" heading in
+    VERSION.md, which is bumped only intermittently. None if neither has one."""
+    for name, rx in (("CLAUDE.md", CURRENT_VERSION_RE), ("VERSION.md", VERSION_MD_HEAD_RE)):
+        try:
+            m = rx.search((v11_root / name).read_text(encoding="utf-8"))
+        except OSError:
+            continue
+        if m:
+            parts = m.group(1).split(".")
+            return ".".join(parts + ["0"] * (3 - len(parts)))
+    return None
+
+
+def synced_fields(fm: dict[str, Any]) -> dict[str, Any]:
+    """The SYNC_FIELDS values an .md declares, normalised the way
+    scripts/lib/roster.py reads them (triggers/tools as lists of strings;
+    tools "All tools" -> ["*"]). An undeclared or null field is absent."""
+    out: dict[str, Any] = {}
+    for key in ("description", "model", "version"):
+        v = fm.get(key)
+        if isinstance(v, str) and v.strip():
+            out[key] = v.strip()
+    if fm.get("_fallback"):
+        return out  # the legacy reader drops list values
+    tools = next(
+        (fm[k] for k in ("tools", "allowed-tools", "allowed_tools") if fm.get(k) is not None),
+        None,
+    )
+    if tools is not None:
+        out["tools"] = _roster._tool_surface(tools)
+    if fm.get("triggers") is not None:
+        out["triggers"] = _roster._as_list(fm["triggers"])
+    return out
+
+
+def build_registry_entry(fm: dict[str, Any], default_version: str | None = None) -> dict[str, Any]:
+    """Build a canonical registry entry from parsed frontmatter. `version` is
+    the .md's, else default_version, else omitted."""
+    synced = synced_fields(fm)
     entry: dict[str, Any] = {"file": fm.get("_file", "")}
-    if fm.get("model"):
-        entry["model"] = fm["model"]
+    if synced.get("model"):
+        entry["model"] = synced["model"]
     entry["status"] = "active"  # default for freshly-added agents
-    if fm.get("category"):
+    if isinstance(fm.get("category"), str) and fm["category"]:
         entry["category"] = fm["category"]
-    if fm.get("description"):
-        entry["description"] = fm["description"]
-    entry["version"] = "11.37.0"  # this reconciler stamps its own version
-    if fm.get("color"):
+    if synced.get("description"):
+        entry["description"] = synced["description"]
+    version = synced.get("version") or default_version
+    if version:
+        entry["version"] = version
+    if isinstance(fm.get("color"), str) and fm["color"]:
         entry["color"] = fm["color"]
+    for key in ("triggers", "tools"):
+        if key in synced:
+            entry[key] = synced[key]
     return entry
 
 
@@ -193,20 +291,49 @@ def compute_plan(
     return adds, prunes
 
 
+def compute_updates(
+    disk: dict[str, dict[str, Any]], registry: dict[str, Any]
+) -> dict[str, dict[str, tuple[Any, Any]]]:
+    """{name: {field: (old, new)}} for agents both registered and on disk
+    whose .md declares a SYNC_FIELDS value the entry does not match. `old` is
+    None when the entry lacks the key (the update adds it). Fallback-parsed
+    files are skipped."""
+    reg_agents = registry.get("agents", {})
+    updates: dict[str, dict[str, tuple[Any, Any]]] = {}
+    for name in sorted(set(disk) & set(reg_agents)):
+        entry = reg_agents[name]
+        if disk[name].get("_fallback") or not isinstance(entry, dict):
+            continue
+        diff = {
+            k: (entry.get(k), v)
+            for k, v in synced_fields(disk[name]).items()
+            if entry.get(k) != v
+        }
+        if diff:
+            updates[name] = diff
+    return updates
+
+
 def apply_plan(
     registry: dict[str, Any],
     disk: dict[str, dict[str, Any]],
     adds: list[str],
     prunes: list[str],
+    updates: dict[str, dict[str, tuple[Any, Any]]] | None = None,
+    default_version: str | None = None,
 ) -> dict[str, Any]:
     """Return a new registry dict with adds inserted + prunes removed +
-    metadata.total_agents recomputed. Does NOT mutate input."""
+    updates' new values written + metadata.total_agents recomputed. Does NOT
+    mutate input. Updates only set keys; no key is ever removed from an entry."""
     new = json.loads(json.dumps(registry))  # deep copy via serialization
     agents = new.setdefault("agents", {})
     for name in adds:
-        agents[name] = build_registry_entry(disk[name])
+        agents[name] = build_registry_entry(disk[name], default_version)
     for name in prunes:
         agents.pop(name, None)
+    for name, diff in (updates or {}).items():
+        for key, (_old, value) in diff.items():
+            agents[name][key] = json.loads(json.dumps(value))
     meta = new.setdefault("metadata", {})
     meta["total_agents"] = len(agents)
     meta["active_agents"] = sum(
@@ -263,14 +390,25 @@ def revert_from_bak(target: Path) -> None:
     )
 
 
-def _acquire_lock(registry_path: Path) -> Any:
-    """Acquire an exclusive non-blocking lock on the registry file's directory
+def _acquire_lock(registry_path: Path, shared: bool = False) -> Any:
+    """Acquire a non-blocking lock on the registry file's directory
     (avoid locking the target itself since we'll mv over it). Returns the fh
-    to hold until process exit."""
+    to hold until process exit.
+
+    shared=True (--dry-run) takes LOCK_SH on an EXISTING lock file opened
+    read-only and creates nothing, so a dry run writes 0 bytes; it still
+    refuses while an --apply/--revert holds LOCK_EX. With no lock file there
+    is no holder, so it returns None."""
     lock_path = registry_path.parent / ".reconcile.lock"
-    fh = lock_path.open("w")
+    if shared:
+        try:
+            fh = lock_path.open("r")
+        except FileNotFoundError:
+            return None
+    else:
+        fh = lock_path.open("w")
     try:
-        fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(fh.fileno(), (fcntl.LOCK_SH if shared else fcntl.LOCK_EX) | fcntl.LOCK_NB)
     except BlockingIOError:
         fh.close()
         sys.stderr.write(
@@ -280,32 +418,64 @@ def _acquire_lock(registry_path: Path) -> Any:
     return fh
 
 
+# Fields short enough to show as `old -> new` in the plan.
+_SHOW_VALUES = ("model", "version")
+
+
 def render_plan(
     adds: list[str],
     prunes: list[str],
     disk: dict[str, dict[str, Any]],
     old_total: int,
     new_total: int,
+    updates: dict[str, dict[str, tuple[Any, Any]]] | None = None,
 ) -> str:
+    updates = updates or {}
     lines = []
     lines.append(f"reconcile-agent-registry plan:")
     lines.append(f"  registry currently: {old_total} entries")
     lines.append(f"  disk (maxdepth 1):  {len(disk)} agents")
     lines.append(
-        f"  planned:  +{len(adds)} add, -{len(prunes)} prune  →  {new_total} entries"
+        f"  planned:  +{len(adds)} add, -{len(prunes)} prune, ~{len(updates)} update"
+        f"  →  {new_total} entries"
     )
     if adds:
         lines.append("")
         lines.append("  ADD (on disk, not registered):")
         for name in adds:
-            desc = disk[name].get("description", "")[:80]
+            desc = str(disk[name].get("description") or "")[:80]
             lines.append(f"    + {name}: {desc}")
     if prunes:
         lines.append("")
         lines.append("  PRUNE (registered, no .md at maxdepth 1):")
         for name in prunes:
             lines.append(f"    - {name}")
+    if updates:
+        lines.append("")
+        lines.append(f"  UPDATE (fields synced from .md frontmatter): {len(updates)} entries")
+        per_field = {f: sum(1 for d in updates.values() if f in d) for f in SYNC_FIELDS}
+        lines.append("    per field: " + ", ".join(f"{f} {n}" for f, n in per_field.items()))
+        for name, diff in updates.items():
+            parts = []
+            for field, (old, new) in diff.items():
+                if field in _SHOW_VALUES:
+                    parts.append(f"{field} {old} -> {new}")
+                elif old is None:
+                    parts.append(f"{field} (added)")
+                else:
+                    parts.append(field)
+            lines.append(f"    ~ {name}: " + "; ".join(parts))
     return "\n".join(lines)
+
+
+def render_fallbacks(disk: dict[str, dict[str, Any]]) -> str:
+    names = sorted(n for n, fm in disk.items() if fm.get("_fallback"))
+    if not names:
+        return ""
+    return (
+        f"  WARN: {len(names)} .md file(s) rejected by roster.py's YAML parser — "
+        "counted for add/prune, NOT field-synced: " + ", ".join(names)
+    )
 
 
 def main() -> int:
@@ -316,14 +486,14 @@ def main() -> int:
         return 0
 
     parser = argparse.ArgumentParser(
-        description="v11.37 W1-T1 agent-registry reconciler",
+        description="agent-registry reconciler (add/prune + .md field-sync)",
         epilog="Default is --dry-run. Use --apply to write.",
     )
     parser.add_argument(
         "--apply", action="store_true", help="write the change (with .bak + atomic mv)"
     )
     parser.add_argument(
-        "--dry-run", action="store_true", help="print plan; no writes (default)"
+        "--dry-run", action="store_true", help="print plan; writes 0 bytes (default)"
     )
     parser.add_argument(
         "--revert",
@@ -345,7 +515,8 @@ def main() -> int:
         sys.stderr.write("pick one of --apply / --dry-run / --revert\n")
         return 2
 
-    lock_fh = _acquire_lock(args.registry)  # noqa: F841 — must hold to exit
+    dry_run = not (args.apply or args.revert)
+    lock_fh = _acquire_lock(args.registry, shared=dry_run)  # noqa: F841 — must hold to exit
 
     if args.revert:
         revert_from_bak(args.registry)
@@ -355,14 +526,22 @@ def main() -> int:
     registry = load_registry(args.registry)
     old_total = len(registry.get("agents", {}))
     adds, prunes = compute_plan(disk, registry, agents_dir=args.agents_dir)
+    updates = compute_updates(disk, registry)
+    fallback_text = render_fallbacks(disk)
 
-    if not adds and not prunes:
+    if not adds and not prunes and not updates:
+        if fallback_text:
+            sys.stderr.write(fallback_text + "\n")
         sys.stderr.write("reconcile-agent-registry: registry in sync — nothing to do.\n")
         return 0
 
-    new_registry = apply_plan(registry, disk, adds, prunes)
+    new_registry = apply_plan(
+        registry, disk, adds, prunes, updates, default_version=current_v11_version()
+    )
     new_total = len(new_registry["agents"])
-    plan_text = render_plan(adds, prunes, disk, old_total, new_total)
+    plan_text = render_plan(adds, prunes, disk, old_total, new_total, updates)
+    if fallback_text:
+        plan_text += "\n\n" + fallback_text
 
     if args.apply:
         # write .bak first — reversible even on interrupt

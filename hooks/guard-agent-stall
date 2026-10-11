@@ -31,6 +31,351 @@ DEBUG_STALL=${DEBUG_STALL:-false}
 PROJECT="$(v11_read_active_project)"
 [ -z "$PROJECT" ] && exit 0
 
+# ── Background wait contract (#70, S1-T7) ────────────────────────────────────
+# A subagent that idles on its own background job (pytest, remote run, another
+# agent) writes ~/.agent-metrics/waiting/<project>/<agent>-waiting.json before
+# idling and removes it once it reports:
+#   {what, pid?, path?, pid_or_path?, started?, expect_by?, done_marker?}
+#   pid_or_path (legacy): all digits → pid, else → path. path = absolute log file.
+#   started/expect_by: ISO-8601 (Z or offset; naive = local time) or epoch seconds.
+#   done_marker: literal string, or list of up to 5, checked on top of TERMINAL_RE.
+# Nudge when the pid is gone (or reused by a process started after the marker),
+# a done_marker appears in the last 64KB of the log, the log's last non-empty
+# line matches TERMINAL_RE (only when no live pid: a live pid outranks the
+# heuristic), or expect_by has passed; a live pid within expect_by stays silent.
+# A marker with nothing to report but over STALL_WAIT_STALE_HOURS old and no
+# expect_by gets one STALE line (the waiting agent may be gone). A marker
+# gets at most STALL_WAIT_MAX_NUDGES nudges, STALL_WAIT_RENUDGE_MINUTES apart,
+# then one STALE line and silence (the agent may have finished without removing
+# it); a file older than STALL_WAIT_STALE_HOURS goes straight to STALE. Malformed
+# markers are reported once. Rewriting a marker (new mtime) re-arms it. Newest
+# markers are scanned first, so leftovers can't crowd out a live wait.
+# Scanned BEFORE the in_progress==0 exit: a waiting agent often has no task
+# in_progress. Only runs on the orchestrator's TaskList (see monitor.md §5f);
+# with two orchestrator sessions on one project, whichever scans first gets
+# the line (<dir>/.reported.lock serialises scans, so never both).
+# Emitted as PostToolUse additionalContext (plain stdout never reaches the
+# model); skipped when the TaskList came from a subagent (input has agent_id).
+# One python3 pass, spawned only when a marker exists. Fails open.
+# Rollback: V11_BG_WAIT_CONTRACT=off.
+STALL_WAIT_RENUDGE_MINUTES=${STALL_WAIT_RENUDGE_MINUTES:-30}
+STALL_WAIT_STALE_HOURS=${STALL_WAIT_STALE_HOURS:-24}
+STALL_WAIT_MAX_MARKERS=${STALL_WAIT_MAX_MARKERS:-20}
+STALL_WAIT_MAX_NUDGES=${STALL_WAIT_MAX_NUDGES:-3}
+WAIT_UINT_ERE='^[0-9]{1,6}$'
+[[ "$STALL_WAIT_RENUDGE_MINUTES" =~ $WAIT_UINT_ERE ]] || STALL_WAIT_RENUDGE_MINUTES=30
+[[ "$STALL_WAIT_STALE_HOURS" =~ $WAIT_UINT_ERE ]] || STALL_WAIT_STALE_HOURS=24
+[[ "$STALL_WAIT_MAX_MARKERS" =~ $WAIT_UINT_ERE ]] || STALL_WAIT_MAX_MARKERS=20
+[[ "$STALL_WAIT_MAX_NUDGES" =~ $WAIT_UINT_ERE ]] || STALL_WAIT_MAX_NUDGES=3
+WAIT_DIR="$METRICS_DIR/waiting/$PROJECT"
+
+# Print one advisory line per new or re-nudged finding; rewrite the tracker.
+_wait_scan() {
+    python3 - "$WAIT_DIR" "$STALL_WAIT_RENUDGE_MINUTES" "$STALL_WAIT_STALE_HOURS" \
+        "$STALL_WAIT_MAX_MARKERS" "$STALL_WAIT_MAX_NUDGES" <<'WAIT_PYEOF'
+import fcntl, glob, json, os, re, stat, sys, tempfile, time
+from datetime import datetime
+
+wait_dir = sys.argv[1]
+renudge_s, stale_s, max_markers = int(sys.argv[2]) * 60, int(sys.argv[3]) * 3600, int(sys.argv[4])
+max_nudges = int(sys.argv[5])
+AGENT_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$')
+PID_RE = re.compile(r'^[0-9]{1,10}$')
+EPOCH_RE = re.compile(r'^[0-9]{9,11}(\.[0-9]+)?$')
+ISO_RE = re.compile(r'^[0-9]{4}-[0-9]{2}-[0-9]{2}([T ][0-9]{2}:[0-9]{2}(:[0-9]{2}(\.[0-9]+)?)?)?(Z|[+-][0-9]{2}(:?[0-9]{2})?)?$')
+# ALL_CAPS sentinels (PIPELINE_DONE, TRAIN_FAILED, ...) and the pytest summary line.
+TERMINAL_RE = re.compile(
+    r'\b[A-Z][A-Z0-9_]*_(?:DONE|FAILED|FINISHED|COMPLETE|COMPLETED|ABORTED)\b'
+    r'|(?<![0-9])[0-9]+ (?:passed|failed|errors?)(?:, [0-9]+ [a-z ]+)* in [0-9.]+s')
+MAX_BYTES = 65536
+now = int(time.time())
+tracker = os.path.join(wait_dir, '.reported')
+REUSE_SLACK_S = 5
+
+
+def text(v):
+    """Field → display string: control chars to spaces, 200-char cap."""
+    if v is None:
+        return ''
+    if isinstance(v, float) and v.is_integer():
+        v = int(v)
+    if not isinstance(v, str):
+        v = json.dumps(v) if isinstance(v, (bool, dict, list)) else str(v)
+    return ''.join(' ' if ord(c) < 32 or ord(c) == 127 else c for c in v)[:200]
+
+
+def shown(f):
+    """Marker path for display. Any local writer picks the filename, which can hold
+    newlines and ~250 bytes: escape it (JSON, ASCII) and cap it at 80 chars, under
+    the known wait_dir. A valid <agent>-waiting.json name (<=77 chars) is unchanged."""
+    base = json.dumps(os.path.basename(f))[1:-1]
+    return os.path.join(wait_dir, base if len(base) <= 80 else base[:77] + '...')
+
+
+def epoch(v):
+    """ISO-8601 or epoch seconds → int, else None."""
+    if EPOCH_RE.match(v):
+        return int(v.split('.')[0])
+    if not ISO_RE.match(v):
+        return None
+    try:
+        return int(datetime.fromisoformat(v.replace('Z', '+00:00')).timestamp())
+    except ValueError:
+        return None
+
+
+def proc_start(pid):
+    """Process start as epoch seconds (Linux /proc), or None."""
+    try:
+        with open('/proc/%d/stat' % pid) as fh:
+            fields = fh.read().rsplit(')', 1)[1].split()
+        with open('/proc/stat') as fh:
+            btime = next(int(l.split()[1]) for l in fh if l.startswith('btime '))
+        return btime + int(fields[19]) / os.sysconf('SC_CLK_TCK')
+    except (OSError, IndexError, ValueError, StopIteration):
+        return None
+
+
+def pid_alive(pid):
+    try:
+        with open('/proc/%d/status' % pid) as fh:
+            for line in fh:
+                if line.startswith('State:'):
+                    return line.split()[1] not in ('Z', 'X')
+        return True
+    except FileNotFoundError:
+        if os.path.isdir('/proc/self'):
+            return False
+    except OSError:
+        pass
+    try:
+        os.kill(pid, 0)
+        return True
+    except PermissionError:
+        return True
+    except (OSError, OverflowError, ValueError):
+        return False
+
+
+def log_tail(path):
+    """Last 64KB of a regular file (O_NONBLOCK: a FIFO can't hang us), or None."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+    except OSError:
+        return None
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            return None
+        os.lseek(fd, max(0, st.st_size - MAX_BYTES), os.SEEK_SET)
+        return os.read(fd, MAX_BYTES).decode('utf-8', 'replace')
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+
+
+def last_line(text):
+    return next((l for l in reversed(text.splitlines()) if l.strip()), '')
+
+
+def check(f):
+    """→ (code, detail, agent, what, started_epoch); code None = silent."""
+    agent = os.path.basename(f)[:-len('-waiting.json')]
+    st = os.lstat(f)
+    if not stat.S_ISREG(st.st_mode):
+        return 'malformed', 'not a regular file', agent, '', None
+    if not AGENT_RE.match(agent):
+        return 'malformed', 'agent name must match ' + AGENT_RE.pattern, agent, '', None
+    if st.st_size > MAX_BYTES:
+        return 'malformed', 'larger than 64KB', agent, '', None
+    if st.st_size == 0:
+        return 'malformed', 'empty', agent, '', None
+    try:
+        with open(f, 'rb') as fh:
+            doc = json.loads(fh.read(MAX_BYTES + 1).decode('utf-8'))
+    except (ValueError, UnicodeDecodeError):
+        return 'malformed', 'invalid JSON', agent, '', None
+    if not isinstance(doc, dict):
+        return 'malformed', 'not a JSON object', agent, '', None
+    what = text(doc.get('what'))
+    pid, path = text(doc.get('pid')), text(doc.get('path'))
+    legacy = text(doc.get('pid_or_path'))
+    if legacy and PID_RE.match(legacy):
+        pid = pid or legacy
+    elif legacy:
+        path = path or legacy
+    expect_by, started = text(doc.get('expect_by')), text(doc.get('started'))
+    markers = doc.get('done_marker') or []
+    markers = [markers] if isinstance(markers, str) else markers if isinstance(markers, list) else []
+    markers = [text(m) for m in markers if isinstance(m, str) and m][:5]
+    if pid and not PID_RE.match(pid):
+        return 'malformed', "pid '%s' is not an integer" % pid, agent, what, None
+    if path and not path.startswith('/'):
+        return 'malformed', "path '%s' is not absolute" % path, agent, what, None
+    exp = epoch(expect_by) if expect_by else None
+    if expect_by and exp is None:
+        return 'malformed', "expect_by '%s' is not ISO-8601 or epoch seconds" % expect_by, agent, what, None
+    if not (pid or path or expect_by):
+        return 'malformed', 'no pid, path or expect_by to check', agent, what, None
+
+    reasons = []
+    pid_live = False
+    if pid:
+        pid_live = pid_alive(int(pid))
+        born = proc_start(int(pid)) if pid_live else None
+        if born is not None and born > st.st_mtime + REUSE_SLACK_S:
+            pid_live = False  # the pid now belongs to a process newer than the marker
+            reasons.append('pid %s is gone (reused by a newer process)' % pid)
+        elif not pid_live:
+            reasons.append('pid %s is gone' % pid)
+    if path:
+        tail = log_tail(path)
+        if tail is not None:
+            # done_marker is the agent's own word: anywhere in the tail, live pid or not.
+            # TERMINAL_RE is a heuristic: last non-empty line only, and a live pid outranks
+            # it (a multi-phase run prints a pytest summary per phase).
+            hit = next((d for d in markers if d in tail), '')
+            if not hit and not pid_live:
+                m = TERMINAL_RE.search(last_line(tail))
+                hit = m.group(0) if m else ''
+            if hit:
+                reasons.append('terminal marker "%s" in %s' % (hit, path))
+    if exp is not None and now > exp:
+        reasons.append('expect_by passed %dm ago' % ((now - exp) // 60))
+    if not reasons:
+        if exp is None and now - int(st.st_mtime) >= stale_s:
+            state = 'pid %s still alive' % pid if pid_live else 'no terminal marker yet'
+            return 'stale', state + ', no expect_by', agent, what, None
+        return None, '', agent, what, None
+    return 'nudge', '; '.join(reasons), agent, what, epoch(started) if started else None
+
+
+# One scan at a time per project: a concurrent TaskList skips (no duplicate lines).
+try:
+    lock_fd = os.open(os.path.join(wait_dir, '.reported.lock'),
+                      os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
+    fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except OSError:
+    sys.exit(0)
+
+old = log_tail(tracker)  # regular file only, O_NONBLOCK: a FIFO here can't hang the hook
+seen = {}
+for line in (old or '').splitlines():
+    parts = line.split('\t') + ['1']  # 4-column rows: count 1
+    if len(parts) >= 5 and parts[3].isdigit() and parts[4].isdigit():
+        seen[tuple(parts[:3])] = (int(parts[3]), int(parts[4]))
+
+def newest_first(path):
+    try:
+        return -os.lstat(path).st_mtime, path
+    except OSError:
+        return 0, path
+
+
+def remember(key, ts, count):
+    kept.append(key + (str(ts), str(count)))
+
+
+kept = []
+markers = glob.glob(os.path.join(glob.escape(wait_dir), '*-waiting.json'))
+for f in sorted(markers, key=newest_first)[:max_markers]:
+    try:
+        code, detail, agent, what, started = check(f)
+        mtime = int(os.lstat(f).st_mtime)
+    except FileNotFoundError:  # removed mid-scan: the agent just reported
+        continue
+    except Exception as exc:  # fail open: one bad marker never hides the rest
+        code, detail, agent, what, started = 'malformed', 'unreadable (%s)' % type(exc).__name__, '?', '', None
+        mtime = 0
+    if code is None:
+        continue
+    name = re.sub(r'[^A-Za-z0-9._-]', '_', os.path.basename(f))
+    stale_why = ''
+    if code == 'stale':
+        stale_why = 'over %dh old' % (stale_s // 3600)
+    if code == 'nudge':
+        nkey = (name, str(mtime), 'nudge')
+        ts, count = seen.get(nkey, (None, 0))
+        if now - mtime >= stale_s:
+            code, stale_why = 'stale', 'over %dh old' % (stale_s // 3600)
+        elif count >= max_nudges:
+            if ts is not None:
+                remember(nkey, ts, count)
+            code, stale_why = 'stale', 'no report after %d nudges' % count
+        elif ts is not None and now - ts < renudge_s:
+            remember(nkey, ts, count)
+            continue
+        else:
+            took = ' for %dm' % ((now - started) // 60) if started is not None and now >= started else ''
+            print("WAIT NUDGE: agent '%s' is idle-waiting%s on \"%s\", but its wait target is finished "
+                  "or dead: %s. SendMessage it to report now, or restart it (nudge %d/%d). Marker: %s"
+                  % (agent, took, what or '?', detail, count + 1, max_nudges, shown(f)))
+            remember(nkey, now, count + 1)
+            continue
+    key = (name, str(mtime), code)
+    if key in seen:  # stale and malformed are reported once per marker version
+        remember(key, *seen[key])
+        continue
+    if code == 'stale':
+        print("WAIT MARKER STALE: %s: %s (%s). If agent '%s' has reported or is gone, remove "
+              "the marker; silent from now on." % (shown(f), stale_why, detail, agent))
+    else:
+        print('WAIT MARKER MALFORMED: %s: %s. Fix or remove it; reported once.' % (shown(f), detail))
+    remember(key, now, 1)
+
+# Rewrite the tracker from this scan only (drops entries for removed markers).
+body = ''.join('\t'.join(k) + '\n' for k in kept)
+try:
+    if not body:
+        if os.path.lexists(tracker):
+            os.unlink(tracker)
+    elif old != body:
+        fd, tmp = tempfile.mkstemp(dir=wait_dir, prefix='.reported.')
+        try:
+            with os.fdopen(fd, 'w') as fh:
+                fh.write(body)
+            os.replace(tmp, tracker)
+        finally:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+except OSError:
+    pass
+WAIT_PYEOF
+}
+
+_wait_emit() {
+    [ -n "$WAIT_NUDGE" ] || return 0
+    jq -n -c --arg ctx "$WAIT_NUDGE" \
+        '{hookSpecificOutput: {hookEventName: "PostToolUse", additionalContext: $ctx}}' 2>/dev/null \
+        || printf '%s\n' "$WAIT_NUDGE"
+}
+
+WAIT_NUDGE=""
+case "${V11_BG_WAIT_CONTRACT:-on}" in
+    off) ;;
+    *)
+        shopt -s nullglob
+        WAIT_MARKERS=("$WAIT_DIR"/*-waiting.json)
+        shopt -u nullglob
+        # No markers left → drop the tracker; otherwise scan. Only the
+        # orchestrator acts on a nudge: a subagent's TaskList must not consume it.
+        if [ "${#WAIT_MARKERS[@]}" -eq 0 ]; then
+            [ -f "$WAIT_DIR/.reported" ] && rm -f "$WAIT_DIR/.reported" 2>/dev/null
+        elif [ -z "$(printf '%s' "$V11_RAW_INPUT" | jq -r '.agent_id // empty' 2>/dev/null)" ]; then
+            WAIT_NUDGE="$(_wait_scan 2>/dev/null)" || WAIT_NUDGE=""
+        fi
+        ;;
+esac
+# Every exit below goes through _stall_exit, which flushes the nudge as one JSON
+# object; the stall advisory folds into it when both fire (two objects on stdout
+# would parse as neither). Explicit calls, not an EXIT trap: a trap would replace
+# any EXIT trap set before it.
+_stall_exit() {
+    _wait_emit
+    exit 0
+}
+
 # Find task state file
 STATE_FILE=""
 if [ -f "$TASK_STATE_DIR/${PROJECT}.json" ]; then
@@ -38,15 +383,25 @@ if [ -f "$TASK_STATE_DIR/${PROJECT}.json" ]; then
 elif [ -f "$SESSIONS_ROOT/$PROJECT/.task-state.json" ]; then
     STATE_FILE="$SESSIONS_ROOT/$PROJECT/.task-state.json"
 fi
-[ -z "$STATE_FILE" ] || [ ! -f "$STATE_FILE" ] && exit 0
+[ -z "$STATE_FILE" ] || [ ! -f "$STATE_FILE" ] && _stall_exit
 
 # Check if any tasks are in_progress
 IN_PROGRESS=$(jq -r '.in_progress // 0' "$STATE_FILE" 2>/dev/null)
-[ "$IN_PROGRESS" -eq 0 ] 2>/dev/null && exit 0
+[ "$IN_PROGRESS" -eq 0 ] 2>/dev/null && _stall_exit
 
-# Read last_updated from state file
-LAST_UPDATED=$(jq -r '.last_updated // ""' "$STATE_FILE" 2>/dev/null)
-[ -z "$LAST_UPDATED" ] && exit 0
+# Read the progress clock (#87). sync-tasks bumps .last_updated on every
+# TaskList/TaskGet poll (plus real progress), so a stall clock that reads it
+# gets reset by the same TaskList call that is checking for a stall — whichever
+# hook wins the parallel-hook race, the elapsed time reads ~0. .last_progress_at
+# is written only on TaskCreate/TaskUpdate status changes (sync-tasks), so it
+# reflects true elapsed time regardless of hook execution order.
+# Rollback: V11_STALL_PROGRESS_CLOCK=off reads .last_updated as before.
+if [ "${V11_STALL_PROGRESS_CLOCK:-on}" != "off" ]; then
+    LAST_UPDATED=$(jq -r '.last_progress_at // .last_updated // ""' "$STATE_FILE" 2>/dev/null)
+else
+    LAST_UPDATED=$(jq -r '.last_updated // ""' "$STATE_FILE" 2>/dev/null)
+fi
+[ -z "$LAST_UPDATED" ] && _stall_exit
 
 # Portable ISO 8601 → epoch conversion
 _to_epoch() {
@@ -72,7 +427,7 @@ elif [ "$MINUTES_ELAPSED" -ge "$STALL_WARNING_MINUTES" ]; then
 fi
 
 # No stall detected
-[ -z "$SEVERITY" ] && exit 0
+[ -z "$SEVERITY" ] && _stall_exit
 
 # Check stall alert tracking to prevent spam
 STALL_TRACKER="$METRICS_DIR/stall-alerts-${PROJECT}.json"
@@ -87,14 +442,14 @@ if [ -f "$STALL_TRACKER" ]; then
         ALERT_AGO=$(( (NOW - ALERT_TS) / 60 ))
         if [ "$ALERT_AGO" -lt 60 ]; then
             [ "$DEBUG_STALL" == "true" ] && echo "[guard-agent-stall] Cooldown active ($ALERT_AGO min since last alert)" >&2
-            exit 0
+            _stall_exit
         fi
     fi
 
     # Max alerts
     if [ "$ALERT_COUNT" -ge "$MAX_STALL_ALERTS_PER_TASK" ]; then
         [ "$DEBUG_STALL" == "true" ] && echo "[guard-agent-stall] Max alerts reached ($ALERT_COUNT)" >&2
-        exit 0
+        _stall_exit
     fi
 fi
 
@@ -105,7 +460,7 @@ COMPLETED=$(jq -r '.completed // 0' "$STATE_FILE" 2>/dev/null)
 ACTIVE_AGENT=$(jq -r '.active_agent_id // "unknown"' "$STATE_FILE" 2>/dev/null)
 
 # Emit advisory warning
-case "$SEVERITY" in
+STALL_MSG="$(case "$SEVERITY" in
     WARNING)
         cat <<EOF
 
@@ -133,7 +488,14 @@ STALL CRITICAL: No task progress for ${MINUTES_ELAPSED}m
   Task likely stalled. Options: 1) Check agent  2) Reassign  3) Mark complete  4) Create blocker
 EOF
         ;;
-esac
+    *)
+        ;;
+esac)"
+if [ -n "$WAIT_NUDGE" ]; then
+    WAIT_NUDGE="${WAIT_NUDGE}"$'\n'"${STALL_MSG}"
+else
+    printf '%s\n' "$STALL_MSG"
+fi
 
 # Update stall tracker
 mkdir -p "$METRICS_DIR"
@@ -147,4 +509,4 @@ jq -n \
 
 [ "$DEBUG_STALL" == "true" ] && echo "[guard-agent-stall] Stall $SEVERITY alert #$((ALERT_COUNT + 1)) emitted" >&2
 
-exit 0
+_stall_exit

@@ -125,7 +125,7 @@ if [ -n "$REGISTRY" ]; then
 
             if [ -n "$FULL_DIR" ] && [ -d "$FULL_DIR" ]; then
                 # Find most recently modified file using stat
-                RECENT_MOD=$(find "$FULL_DIR" -type f -printf '%T@\n' 2>/dev/null | sort -rn | head -1)
+                RECENT_MOD=$(find "$FULL_DIR" -type f -printf '%T@\n' 2>/dev/null | sort -rn | head -1 || true)
                 RECENT_MOD="${RECENT_MOD%.*}"  # Truncate to integer seconds
                 if [ -n "$RECENT_MOD" ] && [ "${RECENT_MOD:-0}" -gt "$LAST_MOD" ] 2>/dev/null; then
                     LAST_MOD="$RECENT_MOD"

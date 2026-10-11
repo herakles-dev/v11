@@ -184,6 +184,12 @@ if [ -n "$V11_PROJECT" ]; then
                         exit 0
                     fi
 
+                    # improvements/76: the harness scratchpad and the /handoff
+                    # skill's own sessions/<project>/ files are never project
+                    # source — allow them without a task in_progress.
+                    # Rollback: V11_WRITE_GATE_SCRATCH_EXEMPT=off.
+                    v11_is_write_gate_exempt "$V11_FILE_PATH" && exit 0
+
                     # V11.34 (F3): warn mode — advisory only, never blocks.
                     if [ "$WRITE_GATE_MODE" = "warn" ]; then
                         cat >&2 << EOF
@@ -202,6 +208,10 @@ EOF
                         exit 0
                     fi
 
+                    # improvements/82: the half-applied line is generic. A
+                    # PreToolUse hook sees one call; the other calls of the
+                    # same turn may run before, alongside or after it, and
+                    # naming their files would mean parsing the transcript.
                     cat >&2 << EOF
 TASK SYSTEM VIOLATION: No task in_progress
 
@@ -210,6 +220,10 @@ Before modifying files in project "$V11_PROJECT", you must:
 2. Start a task: TaskUpdate(taskId="<id>", status="in_progress")
 3. Then modify files
 4. When done: TaskUpdate(taskId="<id>", status="completed")
+
+Possible half-applied change: other tool calls issued in this turn were not
+gated by this check. If any of them (for example a Bash script) wrote related
+changes, run git status and git diff and reconcile before retrying this edit.
 
 ---
 Project: $V11_PROJECT | Tasks: $TOTAL total, 0 in_progress (this session)

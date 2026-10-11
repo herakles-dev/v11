@@ -28,6 +28,28 @@
 # subagent_tokens/tool_uses/duration_ms; absent flags -> byte-identical pre-W3-T12 line
 # shape. Rollback: V11_TOKEN_CAPTURE=off ignores the new flags silently (old shape only).
 #
+# D0-3 (#88): optional --advice-id ID (or "advice_id" in --json) joins this spawn line to
+# its dispatch-advice.jsonl record (written by scripts/dispatch-advise, D0-2) on
+# (advice_id, project, task_id). Absent or empty -> no advice_id key at all
+# (byte-identical pre-D0-3 line shape). Otherwise the value is stripped and must be a
+# dispatch-advise id, ^[0-9a-f]{16}$; anything else exits 2 and writes nothing.
+#
+# S2-T0b-2 (#113, design D5): optional --session-uuid SID --tl-epoch N (or
+# "session_uuid"/"tl_epoch" in --json) name the session and the TaskList epoch
+# the task id belongs to: a task id is only unique within one session's epoch.
+# hooks/sync-tasks (auto-emit) and hooks/track-agents pass them. When they are
+# not given, the session defaults to $V11_SESSION_ID, else $CLAUDE_CODE_SESSION_ID
+# (set in every Bash tool subprocess, so the orchestrator's own Phase 4 calls
+# carry it), and tl_epoch to that session's current epoch from
+# $METRICS_DIR/tasklist-epochs (scripts/lib/task_epoch.py; a task carried into
+# it keeps the epoch it was created in, review #26). sync-tasks' auto-emit
+# dedupes on (project, session_uuid, tl_epoch, task_id) and matches a row
+# without a session only when it is dated at or after the task's create (review
+# #19 C8, #26), so a spawn line without them would usually read as a
+# self-executed task. A malformed value exits 2 and writes nothing. tl_epoch is
+# written as an integer. V11_TASKLIST_EPOCH=off: no defaults (the explicit flags
+# still apply).
+#
 # V11.21 — gate-1 (T4). Authored by spec-implementer-v11.
 
 from __future__ import annotations
@@ -36,6 +58,7 @@ import argparse
 import fcntl
 import json
 import os
+import re
 import sys
 import time
 from datetime import datetime, timezone
@@ -81,6 +104,67 @@ def _parse_batch_review_ids(raw: str | None) -> list[str] | None:
             f"--batch-review-ids must be a comma-separated list of non-empty ids, got {raw!r}"
         )
     return ids
+
+
+ADVICE_ID_RE = re.compile(r"^[0-9a-f]{16}$")
+SESSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+TL_EPOCH_RE = re.compile(r"^[1-9][0-9]{0,15}$")
+
+
+def _default_epoch_fields(record: dict[str, Any]) -> None:
+    """S2-T0b-2: fill session_uuid / tl_epoch the caller left out (see header)."""
+    if os.environ.get("V11_TASKLIST_EPOCH", "on") == "off":
+        return
+    if "session_uuid" not in record:
+        sid = (os.environ.get("V11_SESSION_ID") or os.environ.get("CLAUDE_CODE_SESSION_ID") or "").strip()
+        if SESSION_RE.match(sid) and sid != "legacy-cli":
+            record["session_uuid"] = sid
+    if "tl_epoch" not in record and record.get("session_uuid"):
+        try:
+            sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
+            from task_epoch import epoch_for_task, read_epoch_record
+            rec = read_epoch_record(record["session_uuid"], str(METRICS_DIR))
+            # a task carried into the current epoch keeps its own (review #26)
+            tle = epoch_for_task(rec, record.get("task_id"))
+        except Exception:
+            tle = None
+        if tle is not None:
+            record["tl_epoch"] = tle
+
+
+def _parse_epoch_fields(session: Any, tl_epoch: Any) -> dict[str, Any]:
+    """S2-T0b-2: {session_uuid?, tl_epoch?} from --session-uuid/--tl-epoch or a
+    --json blob. None or "" leaves a key out; anything malformed raises
+    ValueError so main() exits 2 without writing a line that could never join."""
+    out: dict[str, Any] = {}
+    if session not in (None, ""):
+        if not isinstance(session, str) or not SESSION_RE.match(session.strip()):
+            raise ValueError(f"session_uuid must match {SESSION_RE.pattern}, got {session!r}")
+        out["session_uuid"] = session.strip()
+    if tl_epoch not in (None, ""):
+        if isinstance(tl_epoch, bool) or not TL_EPOCH_RE.match(str(tl_epoch).strip()):
+            raise ValueError(f"tl_epoch must be a positive integer, got {tl_epoch!r}")
+        out["tl_epoch"] = int(str(tl_epoch).strip())
+    return out
+
+
+def _parse_advice_id(raw: Any) -> str | None:
+    """D0-3: normalise an advice_id from --advice-id or a --json blob.
+
+    Returns None when raw is None or "" (flag not passed, or an unset shell var
+    interpolated as --advice-id "$ADVICE_ID") so the key stays absent and the
+    line is byte-identical to the pre-D0-3 shape. Otherwise the value is
+    stripped and must match ^[0-9a-f]{16}$ (a dispatch-advise id); a
+    non-string, blank or malformed value raises ValueError so main() exits 2
+    without writing a line that could never join."""
+    if raw is None or raw == "":
+        return None
+    if not isinstance(raw, str) or not raw.strip():
+        raise ValueError(f"advice_id must be a non-empty string, got {raw!r}")
+    value = raw.strip()
+    if not ADVICE_ID_RE.match(value):
+        raise ValueError(f"advice_id must be 16 lowercase hex characters (dispatch-advise), got {raw!r}")
+    return value
 
 
 def _apply_token_capture_from_args(record: dict[str, Any], ns: argparse.Namespace) -> None:
@@ -145,6 +229,10 @@ def _build_record_from_args(ns: argparse.Namespace) -> dict[str, Any]:
     batch_ids = _parse_batch_review_ids(ns.batch_review_ids)
     if batch_ids is not None:
         record["batch_review_ids"] = batch_ids
+    advice_id = _parse_advice_id(getattr(ns, "advice_id", None))
+    if advice_id is not None:
+        record["advice_id"] = advice_id
+    record.update(_parse_epoch_fields(getattr(ns, "session_uuid", None), getattr(ns, "tl_epoch", None)))
     _apply_token_capture_from_args(record, ns)
     return record
 
@@ -173,6 +261,10 @@ def _build_record_from_json(blob: str) -> dict[str, Any]:
                 f"batch_review_ids must be a non-empty list of non-empty strings, got {bri!r}"
             )
         record["batch_review_ids"] = bri
+    advice_id = _parse_advice_id(obj.get("advice_id"))
+    if advice_id is not None:
+        record["advice_id"] = advice_id
+    record.update(_parse_epoch_fields(obj.get("session_uuid"), obj.get("tl_epoch")))
     _apply_token_capture_from_json(record, obj)
     return record
 
@@ -281,6 +373,13 @@ def main() -> int:
                    help="R6: comma-separated task-id list, e.g. '12,13,14'. Set when one reviewer "
                         "spawn covers K review tasks (batch-claim mode). Omit for single-review "
                         "dispatch (default, backward compatible).")
+    p.add_argument("--advice-id", default=None,
+                   help="D0-3: advice_id (16 lowercase hex) of the dispatch-advice.jsonl record (scripts/dispatch-advise) "
+                        "this spawn acted on. Optional — omit for byte-identical pre-D0-3 lines.")
+    p.add_argument("--session-uuid", default=None,
+                   help="S2-T0b-2: the session whose TaskList the task id belongs to. Optional.")
+    p.add_argument("--tl-epoch", default=None,
+                   help="S2-T0b-2: that session's TaskList epoch (tl_epoch, an integer). Optional.")
     p.add_argument("--tokens", type=int, default=None,
                    help="W3-T12: total tokens reported for this spawn (harness task-notification "
                         "subagent_tokens). Optional — omit for byte-identical pre-W3-T12 lines.")
@@ -300,6 +399,7 @@ def main() -> int:
         print(f"[dispatch-trace] bad input: {e}", file=sys.stderr)
         return 2
 
+    _default_epoch_fields(record)
     err = _validate(record)
     if err:
         print(f"[dispatch-trace] {err}", file=sys.stderr)

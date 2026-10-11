@@ -165,17 +165,22 @@ for i, scan in enumerate(scans):
         warn = True
         continue
 
-    seen = set()
+    # #40 F1: collect EVERY occurrence per identifier first (not just the
+    # first) — the include check itself doesn't depend on which occurrence
+    # triggered it (inc_re.search(content) scans the whole file regardless),
+    # but the attribute-call heuristic (prev_char == '.') is per-occurrence
+    # and a confirmed missing-include FAIL must not silently downgrade to a
+    # heuristic WARN just because an unrelated attribute-call reference of
+    # the same identifier happened to appear first in the file.
+    occurrences: dict[str, list[tuple[int, str]]] = {}
     for m in ref_re.finditer(content):
         ident = m.group(1) if m.lastindex else m.group(0)
-        if ident in seen:
-            continue
-        seen.add(ident)
-
         gstart = m.start(1) if m.lastindex else m.start()
         prev_char = content[gstart - 1] if gstart > 0 else ''
         line_no = content.count('\n', 0, gstart) + 1
+        occurrences.setdefault(ident, []).append((line_no, prev_char))
 
+    for ident, occs in occurrences.items():
         this_inc_pat = inc_pat.replace('\\1', re.escape(ident))
         try:
             inc_re = re.compile(this_inc_pat, re.MULTILINE)
@@ -188,12 +193,19 @@ for i, scan in enumerate(scans):
             dbg(f"{proj_name}: scan #{i} '{ident}' OK (included) in {root}")
             continue
 
-        if prev_char == '.':
-            warn = True
-            print(f"⚠ check-class-included[{proj_name}]: '{ident}' referenced at {root}:{line_no} looks like an attribute/method call (preceded by '.') — cannot confirm an include is required, WARN only.", file=sys.stderr)
-        else:
+        # Strictest verdict across ALL occurrences: any occurrence NOT
+        # preceded by '.' is a confirmed missing include (FAIL), and that
+        # dominates regardless of how many ambiguous attribute-call
+        # occurrences (WARN-only) of the same identifier also appear.
+        confirmed = [(ln, pc) for (ln, pc) in occs if pc != '.']
+        if confirmed:
             fail = True
+            line_no = confirmed[0][0]
             print(f"❌ CLASS_NOT_INCLUDED[{proj_name}]: class {ident} referenced at {root}:{line_no} but not included (scan #{i}, {lang}).", file=sys.stderr)
+        else:
+            warn = True
+            line_no = occs[0][0]
+            print(f"⚠ check-class-included[{proj_name}]: '{ident}' referenced at {root}:{line_no} looks like an attribute/method call (preceded by '.') — cannot confirm an include is required, WARN only.", file=sys.stderr)
 
 if not fail and not warn:
     print(f"✓ check-class-included[{proj_name}]: all referenced classes have matching includes ({len(scans)} scan(s)).", file=sys.stderr)

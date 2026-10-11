@@ -17,11 +17,36 @@
 #   --quiet / -q    Minimal output
 #   --help          Show this message
 #
+# S0-T1 regression lock (--regression / --regression-extended only):
+#   V11_REGRESSION_LOCK          on|off (default on). Serializes the entire
+#                                 regression run (pytest + honesty/drift lints +
+#                                 the --regression-extended slow-tier phase 2)
+#                                 behind a host-global flock. =off runs without
+#                                 the lock — concurrent regression runs allowed.
+#   V11_REGRESSION_LOCK_FILE     Lock file path (default: $HOME/.cache/v11/regression.lock).
+#                                 Host-global by design — worktrees have different
+#                                 V11_ROOTs and must still serialize against each other.
+#   V11_REGRESSION_LOCK_TIMEOUT  Seconds to wait for a busy lock before giving up
+#                                 (default 1800). Exceeding it exits 75.
+#   V11_REGRESSION_LOCK_PROBE    Set to 1 to print REGRESSION_LOCK_ACQUIRED (or
+#                                 REGRESSION_LOCK_BYPASSED when the lock is off)
+#                                 and exit 0 immediately after the lock step,
+#                                 before pytest/lints run. Test seam only.
+#
+# S1-R3a lint gate (every mode except --fast):
+#   V11_LINT_HONESTY_GATE        hard|soft (default hard). A lint-test-honesty
+#                                 violation, or a missing lint script, fails
+#                                 the run even when pytest passed. =soft
+#                                 prints a WARN and leaves the exit code alone.
+#   The lints/checks run with V11_HOME=<this tree> (pytest does not), so a
+#   run from a worktree checks the worktree, not master.
+#
 # Exit codes:
 #   0  All tests passed
 #   1  One or more tests failed
 #   2  Coverage below threshold
 #   3  Setup error (missing deps, bad args)
+#   75 Regression lock not acquired before timeout
 
 set -euo pipefail
 
@@ -60,6 +85,49 @@ while [[ $# -gt 0 ]]; do
     esac
     shift
 done
+
+# S0-T1 (v11-leverage-program) — exclusive regression lock. Two concurrent
+# --regression / --regression-extended runs on the same host stomp on each
+# other's REPORT_FILE and pytest-xdist workers, producing flaky/false
+# results. An flock-based lock around the ENTIRE regression run — pytest,
+# the honesty/drift lints that run "alongside" it, and the
+# --regression-extended slow-tier phase 2 — serializes them instead.
+# Host-global by design (not repo-relative): a worktree has its own
+# V11_ROOT, so a repo-relative lock file would let two worktrees race.
+# Rollback: V11_REGRESSION_LOCK=off skips the lock entirely (pre-S0-T1
+# behavior — concurrent regression runs race again). See
+# docs/ROLLBACK_REFERENCE.md.
+if $REGRESSION || $REGRESSION_EXTENDED; then
+    if [ "${V11_REGRESSION_LOCK:-on}" = "off" ]; then
+        if [ "${V11_REGRESSION_LOCK_PROBE:-}" = "1" ]; then
+            echo "REGRESSION_LOCK_BYPASSED"
+            exit 0
+        fi
+    else
+        LOCK_FILE="${V11_REGRESSION_LOCK_FILE:-$HOME/.cache/v11/regression.lock}"
+        LOCK_TIMEOUT="${V11_REGRESSION_LOCK_TIMEOUT:-1800}"
+        HOLDER_FILE="${LOCK_FILE}.holder"
+        mkdir -p "$(dirname "$LOCK_FILE")"
+
+        exec 9>>"$LOCK_FILE"
+        if ! flock -n 9; then
+            echo "Regression lock busy — waiting up to ${LOCK_TIMEOUT}s (held by: $(cat "$HOLDER_FILE" 2>/dev/null || echo unknown))" >&2
+            if ! flock -w "$LOCK_TIMEOUT" 9; then
+                echo "ERROR: regression lock not acquired after ${LOCK_TIMEOUT}s (held by $(cat "$HOLDER_FILE" 2>/dev/null || echo unknown)); set V11_REGRESSION_LOCK=off to bypass" >&2
+                exit 75
+            fi
+        fi
+        LOCK_MODE_NAME=$($REGRESSION_EXTENDED && echo regression-extended || echo regression)
+        printf 'pid=%s mode=%s started=%s root=%s\n' "$$" "$LOCK_MODE_NAME" \
+            "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$V11_ROOT" > "$HOLDER_FILE"
+        trap 'rm -f "$HOLDER_FILE"' EXIT
+
+        if [ "${V11_REGRESSION_LOCK_PROBE:-}" = "1" ]; then
+            echo "REGRESSION_LOCK_ACQUIRED"
+            exit 0
+        fi
+    fi
+fi
 
 # Change to V11 root
 cd "$V11_ROOT"
@@ -132,7 +200,11 @@ echo "Mode: $([ $FAST = true ] && echo fast || [ $REGRESSION_EXTENDED = true ] &
 echo "---"
 
 set +e
-python3 -m pytest "${PYTEST_ARGS[@]}"
+# 9>&- : close the inherited regression-lock fd in the child. The parent
+# shell still holds the flock (fd 9 stays open here) until it exits — this
+# only stops a pytest descendant that outlives run-tests (e.g. an orphaned
+# xdist worker) from keeping the lock held after the parent is gone.
+python3 -m pytest "${PYTEST_ARGS[@]}" 9>&-
 PYTEST_EXIT=$?
 
 # W4-1c: extended-tier phase 2 — slow tests serial (-n0). Deterministic by
@@ -145,26 +217,53 @@ if $REGRESSION_EXTENDED; then
     python3 -m pytest "tests/" \
         "--json-report" "--json-report-file=$SLOW_REPORT_FILE" \
         "-m" "slow and not benchmark" "-n0" "--timeout=120" \
-        $($QUIET && echo "-q" || echo "-v") "${EXTRA_ARGS[@]}"
+        $($QUIET && echo "-q" || echo "-v") "${EXTRA_ARGS[@]}" \
+        9>&-
     SLOW_EXIT=$?
     [ "$PYTEST_EXIT" -eq 0 ] && PYTEST_EXIT="$SLOW_EXIT"
 fi
 
 # V11.26 — test-honesty lint runs alongside the regression suite.
 # Catches the false-green patterns shipped in V11.18/V11.25.1/V11.25.2 before
-# they recur. Soft-block: lint failure surfaces but does NOT clobber a pytest
-# failure for the operator. Rollback: V11_LINT_TEST_HONESTY=off.
+# they recur. S1-R3a (s0-close F7): hard gate. A violation — or a missing or
+# non-executable lint script — fails the run even when pytest passed, and is
+# named again after the summary so it can't hide behind another red check.
+# V11_LINT_HONESTY_GATE=soft → WARN only, exit code untouched.
+# Rollback of the lint itself: V11_LINT_TEST_HONESTY=off.
+LINT_GATE_FAILED=false
 if [ "$REGRESSION" = true ] || [ "$REGRESSION_EXTENDED" = true ] || [ "$FAST" != true ]; then
+    # Every lint/check below scans THIS tree. The V11_HOME readers
+    # (lint-test-honesty, check-rollback-lever-drift,
+    # check-index-body-status-consistency) default to $HOME/v11, so a
+    # run from a worktree used to check master — that is how S0-T6's missing
+    # `*)` passed its per-task gate. Exported here, after pytest, so the test
+    # suite's environment is unchanged.
+    export V11_HOME="$V11_ROOT"
+
     LINT_SCRIPT="$V11_ROOT/scripts/lint-test-honesty"
+    LINT_FAIL_WHY=""
     if [ -x "$LINT_SCRIPT" ]; then
         echo "---"
         echo "V11.26 lint-test-honesty:"
-        if "$LINT_SCRIPT"; then
+        if "$LINT_SCRIPT" 9>&-; then
             echo "  PASS — no false-green test patterns detected"
         else
             LINT_EXIT=$?
-            echo "  FAIL — see violations above"
-            # Surface lint failure only if pytest itself passed (don't shadow real test errors)
+            LINT_FAIL_WHY="see violations above"
+        fi
+    elif [ "${V11_LINT_TEST_HONESTY:-on}" != "off" ]; then
+        echo "---"
+        echo "V11.26 lint-test-honesty:"
+        LINT_EXIT=1
+        LINT_FAIL_WHY="$LINT_SCRIPT is missing or not executable"
+    fi
+    if [ -n "$LINT_FAIL_WHY" ]; then
+        if [ "${V11_LINT_HONESTY_GATE:-hard}" = "soft" ]; then
+            echo "  WARN — $LINT_FAIL_WHY (V11_LINT_HONESTY_GATE=soft: does not fail the run)"
+        else
+            echo "  FAIL — $LINT_FAIL_WHY (hard gate)"
+            LINT_GATE_FAILED=true
+            # Keep a real pytest failure's exit code; the run fails either way.
             [ "$PYTEST_EXIT" -eq 0 ] && PYTEST_EXIT="$LINT_EXIT"
         fi
     fi
@@ -176,7 +275,7 @@ if [ "$REGRESSION" = true ] || [ "$REGRESSION_EXTENDED" = true ] || [ "$FAST" !=
     if [ -x "$DRIFT_SCRIPT" ]; then
         echo "---"
         echo "V11.28.1 check-changelog-drift:"
-        if "$DRIFT_SCRIPT"; then
+        if "$DRIFT_SCRIPT" 9>&-; then
             :
         else
             DRIFT_EXIT=$?
@@ -193,7 +292,7 @@ if [ "$REGRESSION" = true ] || [ "$REGRESSION_EXTENDED" = true ] || [ "$FAST" !=
     if [ -x "$STAMP_SCRIPT" ]; then
         echo "---"
         echo "W2-T6 check-stamp-drift:"
-        if "$STAMP_SCRIPT"; then
+        if "$STAMP_SCRIPT" 9>&-; then
             :
         else
             STAMP_EXIT=$?
@@ -218,7 +317,7 @@ if [ "$REGRESSION" = true ] || [ "$REGRESSION_EXTENDED" = true ] || [ "$FAST" !=
     if [ -x "$CLASS_INCLUDED_SCRIPT" ]; then
         echo "---"
         echo "W2-T6 check-class-included:"
-        if "$CLASS_INCLUDED_SCRIPT" --project v11; then
+        if "$CLASS_INCLUDED_SCRIPT" --project v11 9>&-; then
             :
         else
             CLASS_INCLUDED_EXIT=$?
@@ -243,7 +342,7 @@ if [ "$REGRESSION" = true ] || [ "$REGRESSION_EXTENDED" = true ] || [ "$FAST" !=
     if [ -x "$GIT_TASKLIST_SCRIPT" ]; then
         echo "---"
         echo "W2-T6 check-git-tasklist-alignment:"
-        if "$GIT_TASKLIST_SCRIPT" --project v11; then
+        if "$GIT_TASKLIST_SCRIPT" --project v11 9>&-; then
             :
         else
             GIT_TASKLIST_EXIT=$?
@@ -265,7 +364,7 @@ if [ "$REGRESSION" = true ] || [ "$REGRESSION_EXTENDED" = true ] || [ "$FAST" !=
     if [ -x "$HOTKEY_SYNC_SCRIPT" ]; then
         echo "---"
         echo "W2-T6 check-hotkey-sync:"
-        if "$HOTKEY_SYNC_SCRIPT" --project v11; then
+        if "$HOTKEY_SYNC_SCRIPT" --project v11 9>&-; then
             :
         else
             HOTKEY_SYNC_EXIT=$?
@@ -287,7 +386,7 @@ if [ "$REGRESSION" = true ] || [ "$REGRESSION_EXTENDED" = true ] || [ "$FAST" !=
     if [ -x "$INDEX_BODY_SCRIPT" ]; then
         echo "---"
         echo "v11.37 W2-T1 check-index-body-status-consistency:"
-        if "$INDEX_BODY_SCRIPT"; then
+        if "$INDEX_BODY_SCRIPT" 9>&-; then
             :
         else
             IDX_BODY_EXIT=$?
@@ -311,7 +410,7 @@ if [ "$REGRESSION" = true ] || [ "$REGRESSION_EXTENDED" = true ] || [ "$FAST" !=
     if [ -x "$ROLLBACK_LEVER_SCRIPT" ]; then
         echo "---"
         echo "v11.37 W2-T2 check-rollback-lever-drift:"
-        if "$ROLLBACK_LEVER_SCRIPT"; then
+        if "$ROLLBACK_LEVER_SCRIPT" 9>&-; then
             :
         else
             LEVER_EXIT=$?
@@ -337,7 +436,7 @@ if [ "$REGRESSION" = true ] || [ "$REGRESSION_EXTENDED" = true ] || [ "$FAST" !=
     if [ -x "$REGISTRY_CHECK_SCRIPT" ]; then
         echo "---"
         echo "v11.37 W2-T3 check-registry-drift:"
-        if "$REGISTRY_CHECK_SCRIPT"; then
+        if "$REGISTRY_CHECK_SCRIPT" 9>&-; then
             :
         else
             REG_EXIT=$?
@@ -360,7 +459,7 @@ if [[ -f "$REPORT_FILE" ]] && command -v python3 &>/dev/null; then
 import sys, json
 # Aggregate across all report files (extended tier writes a second,
 # phase-2 slow-tier report — W4-1c).
-total = passed = failed = skipped = 0
+total = passed = failed = errors = skipped = 0
 duration = 0.0
 for path in sys.argv[1:]:
     try:
@@ -371,10 +470,12 @@ for path in sys.argv[1:]:
     total += summary.get("total", 0)
     passed += summary.get("passed", 0)
     failed += summary.get("failed", 0)
+    errors += summary.get("error", 0)
     skipped += summary.get("skipped", 0)
     duration += data.get("duration", 0)
 print(f"\nResults: {passed}/{total} passed"
       + (f", {failed} failed" if failed else "")
+      + (f", {errors} errors" if errors else "")
       + (f", {skipped} skipped" if skipped else "")
       + f" in {duration:.2f}s")
 PYEOF
@@ -396,6 +497,11 @@ if failed:
     for t in failed:
         print(f"  FAIL  {t['nodeid']}")
 PYEOF
+fi
+
+if $LINT_GATE_FAILED; then
+    echo "" >&2
+    echo "lint-test-honesty HARD GATE: FAIL — fix the violations listed above (V11_LINT_HONESTY_GATE=soft downgrades to a warning)" >&2
 fi
 
 exit $PYTEST_EXIT

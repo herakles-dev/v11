@@ -193,6 +193,39 @@ def attribution_key(ev: dict) -> str:
     return hashlib.sha256(material.encode("utf-8")).hexdigest()
 
 
+def invalidate_status_sync_marker(ledger_path: str) -> None:
+    """S2-T5 (v11-leverage-program) staleness fix. This tool's --apply and
+    --revert both rewrite the ledger file wholesale (os.replace, below),
+    bypassing hooks/lib/common.sh v11_ledger_append -- the only writer that
+    keeps the per-identity status map (<project>.seq `status`/
+    `status_version`, used by TaskCreate continuation decisions) in sync,
+    via a `<project>.status-sync` staleness marker it touches on every
+    append. Note: this tool only ever fills empty owner/metadata.agent/
+    recommended_agent slots (has_attribution/apply_attribution above), and
+    --revert only restores that exact prior state -- neither touches
+    ev/subject_norm/create_seq/seqno/session_uuid/task_id, the fields the
+    status map actually depends on, so the map's CONTENT stays correct
+    either way. Deleting the marker regardless is precautionary blanket
+    policy ("any full ledger rewrite invalidates it"), matching
+    scripts/ledger-archive and align_aggregate.py, so a future change to
+    this tool that DID touch one of those fields would not need a second
+    audit of this function to stay safe. v11_ledger_append rebuilds the map
+    from the ledger, at the old always-slurp cost, on the next
+    continuation-needing call after a missing/stale marker -- never a
+    re-mint or renumber.
+    """
+    project = os.path.basename(ledger_path)
+    if project.endswith(".jsonl"):
+        project = project[: -len(".jsonl")]
+    marker = os.path.join(os.path.dirname(ledger_path), f"{project}.status-sync")
+    try:
+        os.remove(marker)
+    except FileNotFoundError:
+        pass
+    except OSError:
+        pass
+
+
 def acquire_lock(target_path: str, timeout: float = 5.0, exclusive: bool = True) -> Optional[object]:
     """Acquire fcntl lock on the target's .lock sidecar.
 
@@ -390,6 +423,7 @@ def process_file(path: str, dry_run: bool, sink_path: str) -> dict:
             for ln in out_lines:
                 tf.write(ln + "\n")
         os.replace(tmp, path)
+        invalidate_status_sync_marker(path)
         stats["written"] = stats["resolved_via_reviewer_promo"] + stats["resolved_via_create_lookup"]
         if unresolved_events:
             appended, skipped_dup, _oversized = append_to_sink(sink_path, unresolved_events)
@@ -421,6 +455,7 @@ def revert_file(path: str) -> dict:
             with open(tmp, "w", encoding="utf-8") as tf:
                 tf.write(bf.read())
         os.replace(tmp, path)
+        invalidate_status_sync_marker(path)
         return {"file": path, "reverted_from": bak, "pre_revert_snapshot": pre}
     finally:
         try:

@@ -98,3 +98,6 @@ $ /handoff sofly
 ## Why this matters
 
 A signal that says "you should reflect" but never gets seen is worse than no signal. The current implementation is a Maxwell's demon — perfectly designed to never disturb the user even when reflection is overdue. Calibrate the threshold OR give the user a real chance to see the prompt at a natural moment. Don't ship a feature that's invisible in practice.
+
+**Addendum (2026-09-25, R3 lens D): the premise is wrong.** `.retro-counter` goes up on every **Stop**, i.e. every assistant turn (`session-end:306-330`; #90),
+not once per task or session (archivestream: 533). Fix #90 first, so the counter moves at SessionEnd; then recalibrate.

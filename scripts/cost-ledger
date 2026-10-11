@@ -1,0 +1,1098 @@
+#!/usr/bin/env python3
+# V11 S1-T9 (#72): cost-ledger — tokens and a $ estimate per task, agent or sprint,
+# with an honest capture rate.
+#
+# Usage:
+#   scripts/cost-ledger PROJECT [--sprint S] [--by task|agent|sprint] [--json] [--since DATE]
+#   scripts/cost-ledger PROJECT --check-notifications [--json]
+#   scripts/cost-ledger --test
+#
+# Read-only and opt-in by invocation: no hook, no lever, writes nothing (bytecode included).
+#
+# Spawn register: ~/.agent-metrics/dispatch-trace.jsonl rows for PROJECT. Two writers land there:
+#   - the orchestrator (dispatch-trace-append, no `event` key): task_id is the task it spawned for;
+#     batch rows (same ts + agent + batch_review_ids) collapse to one spawn.
+#   - hooks/track-agents (`event` set): one row per Agent tool call. Its task_id is
+#     .active_task_ids[0] at fire time, so it is never used for attribution.
+#   spawned_agent "orchestrator" rows record self-executed tasks: no subagent, so they are
+#   counted as self_executed and left out of the spawn denominator.
+# Rows for the same spawn merge when they resolve to the same Agent tool call.
+#
+# Joins use exact keys only. An ambiguous or missing match stays unresolved and is counted.
+#   hook row      -> Agent tool call (parent or subagent transcript of a project session) with the
+#                    same subagent_type and its tool_result 15s before..2s after the row ts;
+#                    model, totalTokens, then usage.jsonl `description` break a tie. One exception
+#                    to "ambiguous -> unresolved": k token-less hook rows for one agent+model, each
+#                    within 2s of the previous (a burst of parallel spawns), with exactly k calls
+#                    left, are identical but for ts, so they pair 1:1 in result order. Each call
+#                    keeps its own transcript: no tokens move between spawns.
+#   dispatch row  -> call with the same subagent_type, 30m before..5m after the row ts, whose teammate
+#                    name is the ledger `owner` of (session, task_id) or whose prompt's "task #N" set
+#                    contains, or is contained in, the row's task ids. With no such call, a teammate
+#                    spawned earlier whose name is that ledger owner is a resume (SendMessage):
+#                    the row joins that spawn instead of counting as a new one.
+#   call          -> transcript: toolUseResult.agentId, else meta toolUseId, else teammate meta name
+#                    (first line 5s before..10m after the call). A call whose tool_result is an error
+#                    spawned nothing and gets no transcript. A transcript still reached by more than
+#                    one call is left unresolved for all of them (warning), never priced twice.
+# Project sessions = ledger session_uuids + transcripts under a `*-sessions-<project>` projects dir.
+#
+# Task identity (S2-T0b-3, #113): a task id is local to one TaskList, and a session that resumed
+# reuses ids, so a spawn's task id binds through scripts/lib/task_epoch.py, the resolver the other
+# readers share: in the spawn's session (the trace row's session_uuid and
+# tl_epoch when stamped, else the Agent call's session, else none: R3 across sessions), at the first
+# dispatch row that names the id (a resumed teammate's later task is created after the spawn). --by task
+# groups on the identity, key "<subject_norm>#<create_seq>" labelled with the ledger subject; an id
+# that names several tasks at that point keys "?<task_id>" (group ambiguous:true, candidates); one
+# that names none keys "unresolved:<session8|->:<task_id>". Rows carry the keys as task_keys.
+# Ledger facts (subject, sprint, artifacts.tokens) are keyed on identity. A task older than the
+# ledger has no `created`, only identity-bearing status rows (TaskIndex's legacy claims), and they
+# may all come after the dispatch (a lone `completed`): when the spawn's session holds only such
+# claims under the id (or, with no session of its own, every session that claimed it does) and they
+# name one task, they bind whatever their position (review #23). A status row with no identity at
+# all claims nothing: that task keys unresolved and gets no ledger artifacts.tokens. Rollback:
+# V11_TASK_RESOLVER=legacy (bare task ids, the v1 bytes).
+#
+# token_source per spawn, best first:
+#   subagent_transcript  subagents/agent-<id>.jsonl message.usage, one entry per message.id (streamed
+#                        duplicates keep the max output), per message.model; nested subagents not
+#                        registered as their own spawn are rolled in. A fork (meta isFork) replays its
+#                        source's turns under the same message ids: those are its source's cost, skipped.
+#   task_notification    <usage><subagent_tokens> in a transcript (scripts/lib/task_notification.py)
+#   dispatch_trace       row `tokens` (foreground toolUseResult.totalTokens)
+#   ledger_artifacts     completed-event artifacts.tokens of the spawn's only task
+# The last three are one collapsed number that equals the LAST assistant turn's
+# input+output+cache tokens (26/26 notifications and the one foreground totalTokens on disk matched
+# their transcript's last turn on 2026-09-26, Claude Code 2.1.283): final context size, not tokens
+# billed over the run. `--check-notifications` re-runs that comparison on the current harness.
+# They count toward capture (tokens_basis=final_turn_context) but stay out of tokens_total and $.
+#
+# Pricing: config/model-pricing.json ($/Mtok). $ is the API list-price equivalent
+# (pricing.basis in --json): Claude Code on a subscription is not billed per token. Scope is
+# subagent spawns only (pricing.scope): the orchestrator's own session tokens are not included.
+# Unknown model -> usd null + warning. A usage block without the 5m/1h cache_creation split
+# prices every cache write at the 5m rate and is flagged in the warnings.
+# capture rate = spawns with any token data / spawns.
+# Every transcript field read here is undocumented Claude Code internals: parsing fails open.
+#
+# Env: METRICS_DIR (~/.agent-metrics), CLAUDE_PROJECTS_DIR (~/.claude/projects),
+#      V11_MODEL_PRICING (<repo>/config/model-pricing.json); Jev logs: $METRICS_DIR/typesafe-usage.jsonl,
+#      ~/.typesafe/usage.jsonl. ~ is $HOME.
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import sys
+from collections import Counter, defaultdict
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+sys.dont_write_bytecode = True  # read-only: no scripts/lib/__pycache__ either
+sys.path.insert(0, str(SCRIPT_DIR / "lib"))
+from task_notification import parse_task_notifications  # noqa: E402
+
+VERSION = "cost-ledger v1 (S1-T9, #72)"
+SCHEMA_ID = "cost-ledger/v1"
+PRICE_BASIS = "api_list_price_equivalent"
+PRICE_SCOPE = "subagents_only"  # the orchestrator's own session transcript is not read
+HOME = Path.home()
+METRICS_DIR = Path(os.environ.get("METRICS_DIR", HOME / ".agent-metrics"))
+PROJECTS_DIR = Path(os.environ.get("CLAUDE_PROJECTS_DIR", HOME / ".claude" / "projects"))
+PRICING_PATH = Path(os.environ.get("V11_MODEL_PRICING", SCRIPT_DIR.parent / "config" / "model-pricing.json"))
+JEV_LOGS = (METRICS_DIR / "typesafe-usage.jsonl", HOME / ".typesafe" / "usage.jsonl")
+
+HOOK_BEFORE, HOOK_AFTER = timedelta(seconds=15), timedelta(seconds=2)
+DISPATCH_BEFORE, DISPATCH_AFTER = timedelta(minutes=30), timedelta(minutes=5)
+TEAMMATE_START_WINDOW = timedelta(minutes=10)
+USAGE_TIE_WINDOW = timedelta(seconds=2)
+TASK_REF = re.compile(r"\btask\s*#\s*(\d+)\b", re.I)
+SPLIT_FIELDS = ("input", "output", "cache_write_5m", "cache_write_1h", "cache_read")
+UNATTRIBUTED = "(unattributed)"
+
+
+# ── small helpers ────────────────────────────────────────────────────────────
+
+def _ts(raw):
+    if not isinstance(raw, str) or not raw:
+        return None
+    try:
+        d = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if d.tzinfo is None:
+        d = d.replace(tzinfo=timezone.utc)
+    return d.astimezone(timezone.utc)
+
+
+def _iso(d):
+    return d.strftime("%Y-%m-%dT%H:%M:%SZ") if d else None
+
+
+def _int(v):
+    return v if isinstance(v, int) and not isinstance(v, bool) and v >= 0 else 0
+
+
+def _opt_int(v):
+    return v if isinstance(v, int) and not isinstance(v, bool) and v >= 0 else None
+
+
+def _jsonl(path):
+    try:
+        fh = open(path, encoding="utf-8", errors="replace")
+    except OSError:
+        return
+    with fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(rec, dict):
+                yield rec
+
+
+def _first_ts(path):
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                try:
+                    t = _ts(json.loads(line).get("timestamp"))
+                except (ValueError, AttributeError):
+                    continue
+                if t:
+                    return t
+    except OSError:
+        pass
+    return None
+
+
+def _strings(obj):
+    if isinstance(obj, str):
+        yield obj
+    elif isinstance(obj, dict):
+        for v in obj.values():
+            yield from _strings(v)
+    elif isinstance(obj, list):
+        for v in obj:
+            yield from _strings(v)
+
+
+# ── pricing ──────────────────────────────────────────────────────────────────
+
+def load_pricing(warnings):
+    try:
+        cfg = json.loads(PRICING_PATH.read_text())
+        if not isinstance(cfg.get("models"), dict):
+            raise ValueError("no 'models' object")
+    except (OSError, ValueError, AttributeError) as e:
+        warnings.append(f"pricing config unreadable ({PRICING_PATH}): {e}; every row priced null")
+        return {"as_of": None, "source": None, "models": {}}
+    return cfg
+
+
+def norm_model(model):
+    m = re.sub(r"\[[^\]]*\]$", "", (model or "").strip())
+    return re.sub(r"-\d{8}$", "", m)
+
+
+def price_split(by_model, pricing, warnings):
+    """USD for a {model: {split fields}} usage map, or None if any model is unpriced."""
+    total = 0.0
+    for model, u in by_model.items():
+        rates = pricing["models"].get(norm_model(model))
+        if not isinstance(rates, dict):
+            warnings.append(f"unknown model {model!r}: rows using it are priced null")
+            return None
+        for field in SPLIT_FIELDS:
+            n = u.get(field, 0)
+            if not n:
+                continue
+            rate = rates.get(field)
+            if not isinstance(rate, (int, float)):
+                warnings.append(f"model {model!r} has no {field} rate: rows using it are priced null")
+                return None
+            total += n * rate / 1_000_000
+    return round(total, 6)
+
+
+# ── sources ──────────────────────────────────────────────────────────────────
+
+def task_index(project, warnings):
+    """The shared resolver's index of the project ledger (S2-T0b-3), or None under
+    V11_TASK_RESOLVER=legacy or when scripts/lib/task_epoch.py cannot load (then bare ids)."""
+    if os.environ.get("V11_TASK_RESOLVER", "shared") == "legacy":
+        return None
+    try:
+        import task_epoch
+    except ImportError as exc:
+        warnings.append(f"task_epoch resolver unavailable ({exc}): tasks keyed by bare task id")
+        return None
+    # the identity view comes from a ledger replay in a subprocess: no bytecode there either
+    os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
+    try:
+        tix = task_epoch.TaskIndex.from_ledger(project, metrics_dir=str(METRICS_DIR))
+    except (OSError, ValueError) as exc:
+        warnings.append(f"task_epoch index failed ({exc}): tasks keyed by bare task id")
+        return None
+    warnings.extend(f"task_epoch: {w}" for w in tix.warnings)
+    return tix
+
+
+UUID_RE = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+_STATUS_ONLY_ATTR = "_cost_ledger_status_only_cache"  # {task_id: [Claim]} of the pairs with no `created`
+
+
+def status_only_claims(tix, tid):
+    # review #11 LOW-3: was keyed by id(tix) in a module-level dict, so a
+    # GC'd-and-reused address could return another (unrelated) TaskIndex's
+    # claims. The cache lives on tix itself instead: correct regardless of
+    # object lifetime, and still memoized across repeated calls for the
+    # same index.
+    by_tid = getattr(tix, _STATUS_ONLY_ATTR, None)
+    if by_tid is None:
+        by_tid = {}
+        for (_sess, t), cl in tix.claim_items():
+            if cl and all(c.ev != "created" for c in cl):
+                by_tid.setdefault(t, []).extend(cl)
+        setattr(tix, _STATUS_ONLY_ATTR, by_tid)
+    return by_tid.get(tid, [])
+
+
+def resolve_task(tix, sess, tid, ts, tl_epoch=None, seqno=None):
+    """task_epoch.resolve of (session, task id) at a row: ts with its ledger seqno, or
+    (for a trace row) ts alone; a session that is not a UUID counts as none (R3). Unresolved
+    at that position, status-only claims naming one task bind anyway (header: a task older
+    than the ledger)."""
+    res = tix.resolve(sess or None, tid, epoch=tl_epoch if sess else None,
+                      at=(ts, seqno) if ts is not None else None)
+    if res.status != "unresolved":
+        return res
+    own = tix.claims(sess, tid) if sess and UUID_RE.fullmatch(sess) else []
+    pool = own if own else status_only_claims(tix, tid)
+    if not pool or any(c.ev == "created" for c in pool) or len({c.identity for c in pool}) != 1:
+        return res
+    return res._replace(identity=pool[0].identity, status="bound", basis="status_only",
+                        candidates=[pool[0].identity], claim=pool[0],
+                        note=f"task {tid} has only status rows in the ledger; bound to their task")
+
+
+def task_key(res, sess, tid):
+    if res.status == "bound":
+        return f"{res.identity[0]}#{res.identity[1]}"
+    if res.status == "ambiguous":
+        return f"?{tid}"
+    return f"unresolved:{(sess or '-')[:8]}:{tid}"
+
+
+def load_ledger(project, tix=None):
+    """Ledger facts keyed by (session_uuid, task_id), and with tix by identity too."""
+    led = {"sessions": set(), "owners": defaultdict(set), "info": {}, "tokens": {},
+           "task_sessions": defaultdict(set), "info_id": {}, "tokens_id": {}}
+    if tix is not None:
+        import task_epoch
+    for ev in _jsonl(METRICS_DIR / "ledger" / f"{project}.jsonl"):
+        sess, tid = ev.get("session_uuid"), str(ev.get("task_id") or "")
+        if isinstance(sess, str) and sess:
+            led["sessions"].add(sess)
+        if not sess or not tid:
+            continue
+        key = (sess, tid)
+        led["task_sessions"][tid].add(sess)
+        owner = ev.get("owner")
+        if isinstance(owner, str) and owner and owner != "orchestrator":
+            led["owners"][key].add(owner)
+        keys = [(led["info"], led["tokens"], key)]
+        if tix is not None and ev.get("ev") not in ("review", "prescope"):
+            ident = task_epoch.event_identity(ev)
+            if ident is not None:
+                ident = tix.alias(ident)
+            else:  # a subject_norm-less status row: the claim at its own position
+                res = resolve_task(tix, sess, tid, ev.get("ts") if _ts(ev.get("ts")) else None,
+                                   task_epoch.tl_epoch_of(ev), ev.get("seqno"))
+                ident = res.identity if res.status == "bound" else None
+            if ident is not None:
+                keys.append((led["info_id"], led["tokens_id"], ident))
+        md = ev.get("metadata") if isinstance(ev.get("metadata"), dict) else {}
+        arts = ev.get("artifacts")
+        for infos, tokens, k in keys:
+            info = infos.setdefault(k, {})
+            for field, val in (("sprint", md.get("sprint") or ev.get("sprint")),
+                               ("subject", ev.get("subject"))):
+                if isinstance(val, str) and val and val != "unknown" and not info.get(field):
+                    info[field] = val
+            if ev.get("ev") == "completed" and isinstance(arts, dict) and _opt_int(arts.get("tokens")):
+                tokens[k] = arts["tokens"]
+    return led
+
+
+def load_dispatch(project, warnings):
+    """Dispatch-trace rows for PROJECT as observations (orchestrator batch rows collapsed)."""
+    obs, batches, bad, self_exec = [], {}, 0, []
+    for r in _jsonl(METRICS_DIR / "dispatch-trace.jsonl"):
+        if r.get("project") != project:
+            continue
+        ts = _ts(r.get("ts"))
+        agent = r.get("spawned_agent")
+        if ts is None or not isinstance(agent, str) or not agent:
+            bad += 1
+            continue
+        if agent == "orchestrator":
+            self_exec.append((ts, r.get("sprint")))
+            continue
+        hook = "event" in r
+        tid = str(r.get("task_id") or "")
+        o = {"kind": "hook" if hook else "dispatch", "ts": ts, "agent": agent,
+             "model": r.get("model") or None, "sprint": r.get("sprint") or None,
+             "task_ids": [] if hook else ([tid] if tid else []),
+             "tokens": _opt_int(r.get("tokens")), "tool_uses": _opt_int(r.get("tool_uses")),
+             "duration_ms": _opt_int(r.get("duration_ms")), "rows": 1, "call": None, "join": None,
+             # S2-T0b-3: the parent session and TaskList epoch a stamped dispatch row carries
+             "session": None if hook or not isinstance(r.get("session_uuid"), str) else r["session_uuid"] or None,
+             "tl_epoch": None if hook else r.get("tl_epoch")}
+        bri = r.get("batch_review_ids")
+        if not hook and isinstance(bri, list) and bri:
+            key = (r.get("ts"), agent, tuple(str(x) for x in bri))
+            if key in batches:
+                batches[key]["rows"] += 1
+                continue
+            o["task_ids"] = [str(x) for x in bri]
+            batches[key] = o
+        obs.append(o)
+    if bad:
+        warnings.append(f"{bad} dispatch-trace row(s) for the project had no parseable ts/spawned_agent; skipped")
+    return obs, self_exec
+
+
+def load_usage_descriptions(project):
+    """(ts, agent, description) from hooks/track-agents usage.jsonl, the hook row's twin."""
+    out = []
+    for r in _jsonl(METRICS_DIR / "usage.jsonl"):
+        if r.get("project") != project:
+            continue
+        ts = _ts(r.get("timestamp"))
+        if ts and isinstance(r.get("agent"), str):
+            out.append((ts, r["agent"], r.get("description") or ""))
+    return out
+
+
+def find_sessions(project, ledger_sessions):
+    """{session_uuid: (projects_subdir, parent_transcript_or_None)}."""
+    found = {}
+    if not PROJECTS_DIR.is_dir():
+        return found
+    slug = "-sessions-" + re.sub(r"[^A-Za-z0-9]", "-", project)
+    try:
+        dirs = [d for d in PROJECTS_DIR.iterdir() if d.is_dir()]
+    except OSError:
+        return found
+    for d in dirs:
+        if d.name.endswith(slug):
+            for f in d.glob("*.jsonl"):
+                found.setdefault(f.stem, (d, f))
+        for sess in ledger_sessions:
+            if sess in found:
+                continue
+            f = d / f"{sess}.jsonl"
+            if f.is_file() or (d / sess / "subagents").is_dir():
+                found[sess] = (d, f if f.is_file() else None)
+    return found
+
+
+def scan_transcript(path, session, parent_stem, calls, results, notifs):
+    """Collect Agent/Task calls, their tool_results and task-notifications from one transcript.
+
+    First sighting wins: a fork replays its parent's history (same tool_use ids), so the copy must
+    not overwrite the original call's owner or its agentId-bearing result."""
+    try:
+        fh = open(path, encoding="utf-8", errors="replace")
+    except OSError:
+        return
+    with fh:
+        for line in fh:
+            is_call = '"tool_use"' in line and ('"Agent"' in line or '"Task"' in line)
+            is_result = '"tool_result"' in line and ("agentId" in line or "teammate_spawned" in line
+                                                    or '"is_error"' in line)
+            is_notif = "<task-notification>" in line and "<usage>" in line
+            if not (is_call or is_result or is_notif):
+                continue
+            try:
+                d = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(d, dict):
+                continue
+            ts = _ts(d.get("timestamp"))
+            msg = d.get("message") if isinstance(d.get("message"), dict) else {}
+            content = msg.get("content") if isinstance(msg.get("content"), list) else []
+            for b in content:
+                if not isinstance(b, dict):
+                    continue
+                if b.get("type") == "tool_use" and b.get("name") in ("Agent", "Task") and b.get("id"):
+                    inp = b.get("input") if isinstance(b.get("input"), dict) else {}
+                    prompt = inp.get("prompt") if isinstance(inp.get("prompt"), str) else ""
+                    calls.setdefault((session, b["id"]), {
+                        "session": session, "tool_use_id": b["id"], "ts": ts,
+                        "agent": inp.get("subagent_type") or "general-purpose",
+                        "description": inp.get("description") or "", "name": inp.get("name") or None,
+                        "model": inp.get("model") or "inherit",
+                        "task_refs": {m for m in TASK_REF.findall(prompt)},
+                        "parent_stem": parent_stem, "result_ts": None, "agent_id": None,
+                        "total_tokens": None, "is_error": False, "stem": None})
+                elif b.get("type") == "tool_result" and b.get("tool_use_id"):
+                    tur = d.get("toolUseResult") if isinstance(d.get("toolUseResult"), dict) else {}
+                    aid = tur.get("agentId") if isinstance(tur.get("agentId"), str) else None
+                    results.setdefault((session, b["tool_use_id"]),
+                                       (ts, aid, _opt_int(tur.get("totalTokens")), b.get("is_error") is True))
+            if is_notif:
+                for text in _strings(d):
+                    for n in parse_task_notifications(text):
+                        if n["subagent_tokens"] is not None:
+                            notifs.add((n["task_id"], n["subagent_tokens"], n["tool_uses"], n["duration_ms"]))
+
+
+def index_sessions(sessions):
+    """Calls, subagent metas and notifications across the project's sessions."""
+    calls, results, notifs, metas = {}, {}, set(), {}
+    for sess, (pdir, parent) in sessions.items():
+        if parent is not None:
+            scan_transcript(parent, sess, None, calls, results, notifs)
+        sub = pdir / sess / "subagents"
+        if not sub.is_dir():
+            continue
+        order = []
+        for f in sorted(sub.glob("agent-*.jsonl")):
+            stem = f.stem[len("agent-"):]
+            meta = {}
+            try:
+                meta = json.loads(f.with_suffix(".meta.json").read_text())
+                meta = meta if isinstance(meta, dict) else {}
+            except (OSError, ValueError):
+                pass
+            parent_id = meta.get("parentAgentId") if isinstance(meta.get("parentAgentId"), str) else None
+            fork = meta.get("isFork") is True
+            metas[(sess, stem)] = {
+                "path": f, "name": meta.get("name"), "tool_use_id": meta.get("toolUseId"),
+                "parent": parent_id, "first_ts": _first_ts(f),
+                # a fork's transcript starts with a copy of its source's turns (same message ids)
+                "copy_of": (sub / f"agent-{parent_id}.jsonl" if parent_id else parent) if fork else None}
+            order.append((fork, _int(meta.get("spawnDepth")), f.name, f, stem))
+        for fork, _, _, f, stem in sorted(order, key=lambda e: e[:3]):  # originals before fork copies
+            scan_transcript(f, sess, stem, calls, results, notifs)
+    for key, call in calls.items():
+        res = results.get(key)
+        if res:
+            call["result_ts"], call["agent_id"], call["total_tokens"], call["is_error"] = res
+        # an Agent call whose tool_result is an error spawned nothing, so it owns no transcript
+        call["stem"] = None if call["is_error"] else _resolve_stem(call, metas)
+    # One transcript, one call: e.g. a same-name teammate respawned after a spawn that never wrote
+    # a transcript reaches the same file twice. Leave all of them unresolved rather than pick one.
+    reach = Counter((c["session"], c["stem"]) for c in calls.values() if c["stem"])
+    collisions = 0
+    for call in calls.values():
+        if call["stem"] and reach[(call["session"], call["stem"])] > 1:
+            call["stem"] = None
+            collisions += 1
+        if call["agent_id"] is None and call["stem"]:
+            call["agent_id"] = call["stem"]
+    by_task = defaultdict(set)
+    for tid, tokens, tool_uses, dur in notifs:
+        by_task[tid].add((tokens, tool_uses, dur))
+    return calls, metas, by_task, collisions
+
+
+def _resolve_stem(call, metas):
+    sess = call["session"]
+    if call["agent_id"] and (sess, call["agent_id"]) in metas:
+        return call["agent_id"]
+    hits = [s for (ms, s), m in metas.items() if ms == sess and m["tool_use_id"] == call["tool_use_id"]]
+    if len(hits) == 1:
+        return hits[0]
+    if call["name"] and call["ts"]:
+        hits = [s for (ms, s), m in metas.items()
+                if ms == sess and m["name"] == call["name"] and m["first_ts"]
+                and call["ts"] - timedelta(seconds=5) <= m["first_ts"] <= call["ts"] + TEAMMATE_START_WINDOW]
+        if len(hits) == 1:
+            return hits[0]
+    return None
+
+
+def transcript_messages(path):
+    """[(message_id, model, split fields, has_cache_split)] in turn order, one per message.id.
+
+    A streamed message is written once per content block with the same id; the line with the
+    largest output_tokens is the final one. has_cache_split is False when cache writes were
+    reported without the ephemeral 5m/1h breakdown (they are then all counted as 5m)."""
+    msgs = {}
+    for d in _iter_assistant(path):
+        m = d["message"]
+        u = m["usage"]
+        cw = _int(u.get("cache_creation_input_tokens"))
+        br = u.get("cache_creation") if isinstance(u.get("cache_creation"), dict) else None
+        w1h = min(_int(br.get("ephemeral_1h_input_tokens")), cw) if br else 0
+        vals = {"input": _int(u.get("input_tokens")), "output": _int(u.get("output_tokens")),
+                "cache_write_5m": cw - w1h, "cache_write_1h": w1h,
+                "cache_read": _int(u.get("cache_read_input_tokens"))}
+        if not any(vals.values()):
+            continue
+        mid = m.get("id") or d.get("requestId") or d.get("uuid")
+        prev = msgs.get(mid)
+        if prev is None or vals["output"] >= prev[1]["output"]:
+            msgs[mid] = (m.get("model") or "unknown", vals, br is not None or cw == 0)
+    return [(mid, *v) for mid, v in msgs.items()]
+
+
+_ID_CACHE = {}
+
+
+def _message_ids(path):
+    if path not in _ID_CACHE:
+        _ID_CACHE[path] = frozenset(mid for mid, *_ in transcript_messages(path)) if path else frozenset()
+    return _ID_CACHE[path]
+
+
+def own_messages(meta):
+    """transcript_messages minus the turns a fork copied from its source transcript."""
+    copied = _message_ids(meta["copy_of"]) if meta["copy_of"] else frozenset()
+    return [t for t in transcript_messages(meta["path"]) if t[0] not in copied]
+
+
+def transcript_usage(meta):
+    """({model: split fields}, all_cache_writes_split) summed over the transcript's own turns."""
+    out, split_ok = {}, True
+    for _, model, vals, has_split in own_messages(meta):
+        split_ok = split_ok and has_split
+        acc = out.setdefault(model, dict.fromkeys(SPLIT_FIELDS, 0))
+        for k, v in vals.items():
+            acc[k] += v
+    return out, split_ok
+
+
+def _iter_assistant(path):
+    try:
+        fh = open(path, encoding="utf-8", errors="replace")
+    except OSError:
+        return
+    with fh:
+        for line in fh:
+            if '"assistant"' not in line or '"usage"' not in line:
+                continue
+            try:
+                d = json.loads(line)
+            except ValueError:
+                continue
+            if (isinstance(d, dict) and d.get("type") == "assistant"
+                    and isinstance(d.get("message"), dict)
+                    and isinstance(d["message"].get("usage"), dict)):
+                yield d
+
+
+def load_jev(project, since, pricing, warnings):
+    """Jev (TypeSafe) calls whose tag names the project, deduped across both usage logs."""
+    seen, calls, tokens, usd, priced = set(), 0, 0, 0.0, True
+    for log in JEV_LOGS:
+        for r in _jsonl(log):
+            tag = r.get("tag")
+            if not isinstance(tag, str) or not (tag == project or tag.startswith((project + "-", project + ":", project + "/"))):
+                continue
+            ts = _ts(r.get("ts"))
+            if since and (ts is None or ts < since):
+                continue
+            key = (r.get("ts"), tag, r.get("input_tokens"), r.get("latency_ms"), json.dumps(r.get("question_ids")))
+            if key in seen:
+                continue
+            seen.add(key)
+            n = _int(r.get("input_tokens"))
+            calls += 1
+            tokens += n
+            rates = pricing["models"].get(norm_model(r.get("model") or ""))
+            if isinstance(rates, dict) and isinstance(rates.get("input"), (int, float)):
+                usd += n * rates["input"] / 1_000_000
+            else:
+                priced = False
+    if calls and not priced:
+        warnings.append("some Jev calls use a model missing from the pricing config; jev.usd is null")
+    return {"tag_match": f"{project} | {project}-* | {project}:* | {project}/*", "calls": calls,
+            "input_tokens": tokens, "usd": round(usd, 6) if priced else None}
+
+
+# ── joins ────────────────────────────────────────────────────────────────────
+
+def resolve(obs, calls, led, usage_desc):
+    """Tie each observation to at most one Agent call (exact keys; ambiguity -> unresolved)."""
+    by_agent = defaultdict(list)
+    for call in calls.values():
+        by_agent[call["agent"]].append(call)
+
+    hooks = sorted((o for o in obs if o["kind"] == "hook"), key=lambda o: o["ts"])
+    # A burst: token-less hook rows for one agent+model, each within USAGE_TIE_WINDOW of the previous
+    # (parallel spawns whose appends straddle a second boundary). Its rows are identical but for ts.
+    burst_of, burst_size, last = {}, Counter(), {}
+    for o in hooks:
+        if o["tokens"] is not None:
+            continue
+        key = (o["agent"], o["model"])
+        prev = last.get(key)
+        burst = prev[1] if prev and o["ts"] - prev[0] <= USAGE_TIE_WINDOW else (key, o["ts"])
+        last[key] = (o["ts"], burst)
+        burst_of[id(o)] = burst
+        burst_size[burst] += 1
+    burst_used = Counter()
+    claimed = set()
+    for o in hooks:
+        cands = [c for c in by_agent.get(o["agent"], ())
+                 if c["result_ts"] and o["ts"] - HOOK_BEFORE <= c["result_ts"] <= o["ts"] + HOOK_AFTER
+                 and (c["session"], c["tool_use_id"]) not in claimed]
+        if len(cands) > 1 and o["model"]:
+            cands = [c for c in cands if c["model"] == o["model"]]
+        if len(cands) > 1 and o["tokens"] is not None:
+            cands = [c for c in cands if c["total_tokens"] == o["tokens"]]
+        if len(cands) > 1:
+            descs = {d for t, a, d in usage_desc if a == o["agent"] and abs(t - o["ts"]) <= USAGE_TIE_WINDOW}
+            if descs:  # usage.jsonl missing -> no tie-break evidence, not a veto
+                cands = [c for c in cands if c["description"] in descs]
+        burst = burst_of.get(id(o))
+        if len(cands) > 1 and burst and len(cands) == burst_size[burst] - burst_used[burst]:
+            # k identical rows left in the burst and exactly k calls: every 1:1 pairing is the same
+            # spawn set, so pair in result order (see header).
+            cands = sorted(cands, key=lambda c: c["result_ts"])[:1]
+        if burst:
+            burst_used[burst] += 1
+        if len(cands) == 1:
+            o["call"], o["join"] = cands[0], "hook_call"
+            claimed.add((cands[0]["session"], cands[0]["tool_use_id"]))
+
+    claimed = set()
+    for o in sorted((o for o in obs if o["kind"] == "dispatch"), key=lambda o: o["ts"]):
+        tids = set(o["task_ids"])
+        if not tids:
+            continue
+        cands = []
+        for c in by_agent.get(o["agent"], ()):
+            if not c["ts"] or not (o["ts"] - DISPATCH_BEFORE <= c["ts"] <= o["ts"] + DISPATCH_AFTER):
+                continue
+            if (c["session"], c["tool_use_id"]) in claimed:
+                continue
+            if c["name"] and any(c["name"] in led["owners"].get((c["session"], t), ()) for t in tids):
+                cands.append((c, "ledger_owner"))
+            elif c["task_refs"] and (c["task_refs"] <= tids or tids <= c["task_refs"]):
+                cands.append((c, "prompt_task_ref"))
+        if not cands:
+            # A resumed teammate (SendMessage, no new Agent call) keeps its old call: the ledger owner
+            # of this task is a teammate spawned earlier. Its tokens stay in that spawn's transcript.
+            cands = [(c, "ledger_owner_resume") for c in by_agent.get(o["agent"], ())
+                     if c["ts"] and c["ts"] <= o["ts"] + DISPATCH_AFTER and c["name"]
+                     and any(c["name"] in led["owners"].get((c["session"], t), ()) for t in tids)]
+        if len(cands) == 1:
+            o["call"], o["join"] = cands[0]
+            claimed.add((cands[0][0]["session"], cands[0][0]["tool_use_id"]))
+
+
+def build_spawns(obs):
+    groups, spawns = {}, []
+    for o in obs:
+        if o["call"] is None:
+            spawns.append([o])
+            continue
+        key = (o["call"]["session"], o["call"]["tool_use_id"])
+        if key not in groups:
+            groups[key] = []
+            spawns.append(groups[key])
+        groups[key].append(o)
+    return spawns
+
+
+# ── rows ─────────────────────────────────────────────────────────────────────
+
+def make_rows(project, spawn_obs, calls, metas, notifs, led, pricing, warnings, tix=None):
+    stem_owner = {}
+    for i, group in enumerate(spawn_obs):
+        call = next((o["call"] for o in group if o["call"]), None)
+        if call and call["stem"]:
+            stem_owner[(call["session"], call["stem"])] = i
+    children = defaultdict(list)
+    for (sess, stem), m in metas.items():
+        if m["parent"]:
+            children[(sess, m["parent"])].append(stem)
+
+    rows, task_spawns = [], Counter()
+    for i, group in enumerate(spawn_obs):
+        disp = [o for o in group if o["kind"] == "dispatch"]
+        hook = [o for o in group if o["kind"] == "hook"]
+        call = next((o["call"] for o in group if o["call"]), None)
+        sess = call["session"] if call else None
+        joins = sorted({o["join"] for o in group if o["join"]})
+
+        task_ids = sorted({t for o in disp for t in o["task_ids"]})
+        task_src = "dispatch" if task_ids else None
+        if not task_ids and call:
+            owned = sorted(t for (s, t), owners in led["owners"].items()
+                           if s == sess and call["name"] and call["name"] in owners)
+            if owned:
+                task_ids, task_src = owned, "ledger_owner"
+            elif len(call["task_refs"]) == 1:
+                task_ids, task_src = sorted(call["task_refs"]), "prompt_task_ref"
+            elif call["parent_stem"] is not None and (sess, call["parent_stem"]) in stem_owner:
+                task_src = "parent_spawn"  # task_ids copied from the parent row below
+
+        # S2-T0b-3: the session and epoch a task id binds in: a stamped dispatch row's, else the call's;
+        # at the first dispatch row naming it (a resumed teammate's later task is created after the spawn)
+        res_sess = next((o["session"] for o in disp if o["session"]), None) or sess
+        res_epoch = next((o["tl_epoch"] for o in disp if o["session"] and o["session"] == res_sess
+                          and o["tl_epoch"] is not None), None)
+        first_ts = min(o["ts"] for o in group)
+        tid_ts = {t: min((o["ts"] for o in disp if t in o["task_ids"]), default=first_ts) for t in task_ids}
+        sprint = next((o["sprint"] for o in disp if o["sprint"] and o["sprint"] != "unknown"), None)
+        if not sprint and tix is not None:
+            for t in task_ids:
+                res = resolve_task(tix, res_sess, t, tid_ts.get(t, first_ts), res_epoch)
+                sprint = led["info_id"].get(res.identity, {}).get("sprint") if res.status == "bound" else None
+                if sprint:
+                    break
+        elif not sprint and sess:
+            sprint = next((led["info"].get((sess, t), {}).get("sprint") for t in task_ids
+                           if led["info"].get((sess, t), {}).get("sprint")), None)
+        if not sprint:
+            sprint = next((o["sprint"] for o in hook if o["sprint"] and o["sprint"] != "unknown"), None)
+
+        row = {
+            "spawn_id": f"{sess}:{call['tool_use_id']}" if call else
+                        f"dt:{_iso(group[0]['ts'])}:{group[0]['agent']}:{','.join(group[0]['task_ids']) or '-'}",
+            "project": project, "ts": _iso(min(o["ts"] for o in group)),
+            "agent": (disp or hook)[0]["agent"],
+            "model_requested": next((o["model"] for o in disp + hook if o["model"]), None),
+            "models": [], "sprint": sprint or "unknown",
+            "task_ids": task_ids, "task_id_source": task_src,
+            "session_uuid": sess, "agent_id": call["agent_id"] if call else None,
+            "join": joins[0] if len(joins) == 1 else ("+".join(joins) if joins else "none"),
+            "dispatch_rows": sum(o["rows"] for o in group),
+            "row_kinds": sorted({o["kind"] for o in group}),
+            "token_source": None, "tokens_basis": None,
+            "tokens": {"total": None, "input": None, "output": None, "cache_write_5m": None,
+                       "cache_write_1h": None, "cache_read": None},
+            "tool_uses": None, "duration_ms": None, "nested_transcripts": 0,
+            "usd": None, "usd_basis": "no_tokens",
+            "_call": call, "_res_sess": res_sess, "_res_epoch": res_epoch, "_first_ts": first_ts,
+            "_tid_ts": tid_ts,
+        }
+
+        # 1. subagent transcript (+ nested ones nobody else registered)
+        if call and call["stem"] and (sess, call["stem"]) in metas:
+            by_model, nested, stack, split_ok = {}, 0, [call["stem"]], True
+            seen = set()
+            while stack:
+                stem = stack.pop()
+                if stem in seen:
+                    continue
+                seen.add(stem)
+                if stem != call["stem"]:
+                    nested += 1
+                usage, stem_split_ok = transcript_usage(metas[(sess, stem)])
+                split_ok = split_ok and stem_split_ok
+                for model, u in usage.items():
+                    acc = by_model.setdefault(model, dict.fromkeys(SPLIT_FIELDS, 0))
+                    for k, v in u.items():
+                        acc[k] += v
+                stack.extend(c for c in children.get((sess, stem), ())
+                             if stem_owner.get((sess, c), i) == i)
+            if by_model:
+                split = {k: sum(u[k] for u in by_model.values()) for k in SPLIT_FIELDS}
+                row["tokens"] = {"total": sum(split.values()), **split}
+                row["models"] = sorted(by_model)
+                row["token_source"], row["tokens_basis"] = "subagent_transcript", "cumulative"
+                row["nested_transcripts"] = nested
+                row["usd"] = price_split(by_model, pricing, warnings)
+                row["usd_basis"] = "priced" if row["usd"] is not None else "unknown_model"
+                row["_no_cache_split"] = not split_ok
+
+        # 2-4. collapsed totals
+        if row["token_source"] is None:
+            total = None
+            aid = call["agent_id"] if call else None
+            notes = notifs.get(aid, set()) if aid else set()
+            if notes:
+                best = max(notes)  # resumed agents notify again; keep the largest, never sum
+                total, row["tool_uses"], row["duration_ms"] = best
+                row["token_source"] = "task_notification"
+                if len(notes) > 1:
+                    warnings.append(f"agent {aid}: {len(notes)} distinct task-notifications; kept the largest")
+            if total is None:
+                t = next((o for o in group if o["tokens"] is not None), None)
+                if t:
+                    total, row["tool_uses"], row["duration_ms"] = t["tokens"], t["tool_uses"], t["duration_ms"]
+                    row["token_source"] = "dispatch_trace"
+            if total is not None:
+                row["tokens"]["total"] = total
+                row["tokens_basis"], row["usd_basis"] = "final_turn_context", "unpriced_final_turn_context"
+        rows.append(row)
+
+    # nested spawns inherit their parent spawn's task and sprint (rows are in ts order: parent first)
+    for row in rows:
+        call = row["_call"]
+        if row["task_id_source"] == "parent_spawn":
+            parent = rows[stem_owner[(call["session"], call["parent_stem"])]]
+            row["task_ids"] = list(parent["task_ids"])
+            if not row["task_ids"]:
+                row["task_id_source"] = None
+            if row["sprint"] == "unknown":
+                row["sprint"] = parent["sprint"]
+    for row in rows:
+        if tix is not None:
+            # S2-T0b-3: one key per task id, bound at the first dispatch row naming it
+            row["_res"] = [resolve_task(tix, row["_res_sess"], t, row["_tid_ts"].get(t, row["_first_ts"]),
+                                        row["_res_epoch"]) for t in row["task_ids"]]
+            row["task_keys"] = [task_key(r, row["_res_sess"], t) for r, t in zip(row["_res"], row["task_ids"])]
+        for key in row.get("task_keys", row["task_ids"]):
+            task_spawns[key] += 1
+    # ledger artifacts.tokens is per task: use it only when the task has exactly one spawn
+    for row in rows:
+        keys = row.get("task_keys", row["task_ids"])
+        ident = row["_res"][0].identity if tix is not None and len(keys) == 1 else None
+        if row["token_source"] is None and len(keys) == 1 and task_spawns[keys[0]] == 1:
+            tid = row["task_ids"][0]
+            if tix is not None:
+                total = led["tokens_id"].get(ident) if ident is not None else None
+            else:
+                sessions = [row["session_uuid"]] if row["session_uuid"] else sorted(led["task_sessions"].get(tid, ()))
+                total = led["tokens"].get((sessions[0], tid)) if len(sessions) == 1 else None
+            if total is not None:
+                row["tokens"]["total"] = total
+                row["token_source"], row["tokens_basis"] = "ledger_artifacts", "final_turn_context"
+                row["usd_basis"] = "unpriced_final_turn_context"
+        if tix is not None:
+            row["_subject"] = led["info_id"].get(ident, {}).get("subject") if ident is not None else None
+            row["_candidates"] = sorted({f"{c[0]}#{c[1]}" for r in row["_res"] if r.status == "ambiguous"
+                                         for c in r.candidates})
+        else:
+            row["_subject"] = (led["info"].get((row["session_uuid"], row["task_ids"][0]), {}).get("subject")
+                               if row["session_uuid"] and len(row["task_ids"]) == 1 else None)
+    return rows, stem_owner
+
+
+def unregistered_transcripts(metas, stem_owner, since):
+    """Top-level subagent transcripts in project sessions that no dispatch row reached."""
+    return sum(1 for key, m in metas.items()
+               if not m["parent"] and key not in stem_owner
+               and (since is None or (m["first_ts"] is not None and m["first_ts"] >= since)))
+
+
+def aggregate(rows, by):
+    groups = {}
+    for r in rows:
+        if by == "task":
+            key = ",".join(r.get("task_keys", r["task_ids"])) or UNATTRIBUTED
+        else:
+            key = r[by if by == "agent" else "sprint"]
+        g = groups.setdefault(key, {"key": key, "label": None, "spawns": 0, "with_tokens": 0,
+                                    "tokens_total": 0, "usd": 0.0, "priced_spawns": 0, "unpriced_tokens": 0,
+                                    "final_context_tokens": 0})
+        if by == "task" and r["_subject"] and not g["label"]:
+            g["label"] = r["_subject"]
+        if by == "task" and r.get("_candidates"):
+            g["ambiguous"] = True
+            g["candidates"] = sorted(set(g.get("candidates", [])) | set(r["_candidates"]))
+        g["spawns"] += 1
+        tot = r["tokens"]["total"]
+        if tot is not None:
+            g["with_tokens"] += 1
+            if r["tokens_basis"] == "cumulative":
+                g["tokens_total"] += tot
+                if r["usd"] is None:
+                    g["unpriced_tokens"] += tot
+            else:
+                g["final_context_tokens"] += tot
+        if r["usd"] is not None:
+            g["usd"] += r["usd"]
+            g["priced_spawns"] += 1
+    out = []
+    for g in groups.values():
+        g["usd"] = round(g["usd"], 6)
+        out.append(g)
+    return sorted(out, key=lambda g: (-g["usd"], -g["tokens_total"], g["key"]))
+
+
+# ── output ───────────────────────────────────────────────────────────────────
+
+def _money(v):
+    return "-" if v is None else f"${v:,.2f}"
+
+
+def render_text(doc):
+    f, cap = doc["filters"], doc["capture"]
+    lines = [f"cost-ledger {doc['project']}  by={f['by']}  sprint={f['sprint'] or 'all'}  since={f['since'] or 'all'}",
+             f"pricing: {doc['pricing']['path']} (as_of {doc['pricing']['as_of']}; "
+             f"{doc['pricing']['basis'].replace('_', ' ')}: not billed per token on a subscription; "
+             f"{doc['pricing']['scope'].replace('_', ' ')}: orchestrator session not included)",
+             f"capture: {cap['with_tokens']}/{cap['spawns']} spawns with token data"
+             + (f" ({cap['rate'] * 100:.1f}%)" if cap["rate"] is not None else "")
+             + f"; cumulative (transcript) {cap['cumulative']}/{cap['spawns']}; priced {cap['priced']}/{cap['spawns']}",
+             "  token_source: " + (", ".join(f"{k}={v}" for k, v in sorted(cap["by_token_source"].items())) or "-"),
+             "  join: " + (", ".join(f"{k}={v}" for k, v in sorted(cap["by_join"].items())) or "-"),
+             f"  unregistered subagent transcripts in project sessions: "
+             f"{'n/a with --sprint' if cap['unregistered_transcripts'] is None else cap['unregistered_transcripts']}; "
+             f"self-executed (orchestrator) dispatch rows, not spawns: {cap['self_executed']}", ""]
+    header = ("KEY", "SPAWNS", "W/TOKENS", "TOKENS", "USD", "UNPRICED_TOK", "FINAL_CTX_TOK")
+    body = [(g["key"] + (f"  {g['label'][:48]}" if g["label"] else ""), str(g["spawns"]), str(g["with_tokens"]),
+             f"{g['tokens_total']:,}", _money(g["usd"]) if g["priced_spawns"] else "-",
+             f"{g['unpriced_tokens']:,}", f"{g['final_context_tokens']:,}")
+            for g in doc["groups"]]
+    t = doc["totals"]
+    body.append(("TOTAL", str(cap["spawns"]), str(cap["with_tokens"]), f"{t['tokens_total']:,}",
+                 _money(t["usd"]) if cap["priced"] else "-",
+                 f"{t['unpriced_tokens']:,}", f"{t['final_context_tokens']:,}"))
+    widths = [max(len(r[i]) for r in [header] + body) for i in range(len(header))]
+    for r in [header] + body:
+        lines.append("  ".join(r[0].ljust(widths[0]) if i == 0 else r[i].rjust(widths[i])
+                               for i in range(len(header))).rstrip())
+    jev = doc["jev"]
+    lines.append("TOKENS = billed input+output+cache tokens summed over every turn (transcripts); "
+                 "FINAL_CTX_TOK = last-turn context size from collapsed sources, not additive with TOKENS")
+    lines.append("")
+    if jev is None:
+        lines.append("jev: not shown with --sprint (Jev usage rows carry no sprint)")
+    else:
+        lines.append(f"jev: {jev['calls']} call(s), {jev['input_tokens']:,} input tokens, {_money(jev['usd'])}"
+                     f" (tag {jev['tag_match']})")
+    if doc["warnings"]:
+        lines.append("warnings:")
+        lines.extend(f"  - {w}" for w in doc["warnings"])
+    return "\n".join(lines)
+
+
+def run(project, by, sprint, since_raw, as_json):
+    warnings = []
+    since = None
+    if since_raw:
+        since = _ts(since_raw)
+        if since is None:
+            print(f"cost-ledger: --since {since_raw!r} is not an ISO date/datetime", file=sys.stderr)
+            return 2
+    pricing = load_pricing(warnings)
+    tix = task_index(project, warnings)
+    led = load_ledger(project, tix)
+    obs, self_exec = load_dispatch(project, warnings)
+    obs = [o for o in obs if since is None or o["ts"] >= since]
+    self_exec = [t for t, sp in self_exec if (since is None or t >= since) and (not sprint or sp == sprint)]
+    sessions = find_sessions(project, led["sessions"])
+    calls, metas, notifs, collisions = index_sessions(sessions)
+    if collisions:
+        warnings.append(f"{collisions} Agent call(s) reached a subagent transcript that another call also "
+                        "reached (e.g. a same-name teammate respawn); left without transcript tokens")
+    resolve(obs, calls, led, load_usage_descriptions(project))
+    spawn_obs = build_spawns(obs)
+    rows, stem_owner = make_rows(project, spawn_obs, calls, metas, notifs, led, pricing, warnings, tix)
+    # session-level fact with no sprint of its own: not reported under --sprint
+    unregistered = None if sprint else unregistered_transcripts(metas, stem_owner, since)
+    if sprint:
+        rows = [r for r in rows if r["sprint"] == sprint]
+    if not sessions:
+        warnings.append(f"no Claude Code transcripts found for the project under {PROJECTS_DIR}")
+
+    spawns = len(rows)
+    with_tokens = sum(1 for r in rows if r["tokens"]["total"] is not None)
+    priced = sum(1 for r in rows if r["usd"] is not None)
+    groups = aggregate(rows, by)
+    no_split = sum(1 for r in rows if r.get("_no_cache_split"))
+    if no_split:
+        warnings.append(f"{no_split} spawn(s) priced every cache write at the 5m rate: their transcript "
+                        "gave no ephemeral 5m/1h cache_creation split")
+    unresolved = Counter(k for r in rows if r["join"] == "none" for k in r["row_kinds"])
+    if unresolved:
+        warnings.append("unresolved rows are counted as their own spawn (a hook row and an orchestrator row for "
+                        f"the same spawn may both be here): hook={unresolved['hook']}, "
+                        f"dispatch={unresolved['dispatch']}")
+    doc = {
+        "schema": SCHEMA_ID,
+        "project": project,
+        "generated_at": _iso(datetime.now(timezone.utc)),
+        "filters": {"by": by, "sprint": sprint, "since": _iso(since)},
+        "pricing": {"path": str(PRICING_PATH), "basis": PRICE_BASIS, "scope": PRICE_SCOPE,
+                    "as_of": pricing.get("as_of"), "source": pricing.get("source")},
+        "capture": {
+            "spawns": spawns, "with_tokens": with_tokens, "priced": priced,
+            "cumulative": sum(1 for r in rows if r["tokens_basis"] == "cumulative"),
+            "rate": round(with_tokens / spawns, 4) if spawns else None,
+            "rate_str": f"{with_tokens}/{spawns}",
+            "by_token_source": dict(Counter(r["token_source"] or "none" for r in rows)),
+            "by_join": dict(Counter(r["join"] for r in rows)),
+            "unregistered_transcripts": unregistered,
+            "self_executed": len(self_exec),
+        },
+        "totals": {"tokens_total": sum(g["tokens_total"] for g in groups),
+                   "usd": round(sum(g["usd"] for g in groups), 6),
+                   "unpriced_tokens": sum(g["unpriced_tokens"] for g in groups),
+                   "final_context_tokens": sum(g["final_context_tokens"] for g in groups)},
+        "groups": groups,
+        "rows": [{k: v for k, v in r.items() if not k.startswith("_")} for r in rows],
+        "jev": None if sprint else load_jev(project, since, pricing, warnings),
+        "warnings": sorted(set(warnings)),
+    }
+    if as_json:
+        print(json.dumps(doc, indent=2))
+    else:
+        print(render_text(doc))
+    return 0
+
+
+def check_notifications(project, as_json):
+    """Compare each task-notification subagent_tokens with its transcript's last and summed turns.
+
+    Evidence for the tokens_basis=final_turn_context rule; re-run it after a Claude Code upgrade."""
+    led = load_ledger(project)
+    calls, metas, notifs, _ = index_sessions(find_sessions(project, led["sessions"]))
+    checks = []
+    for (sess, stem), meta in sorted(metas.items()):
+        notes = notifs.get(stem)
+        turns = own_messages(meta)
+        if not notes or not turns:
+            continue
+        reported = max(notes)[0]  # a resumed agent notifies again; the latest run is the largest
+        checks.append({"agent_id": stem, "session_uuid": sess, "subagent_tokens": reported,
+                       "last_turn_total": sum(turns[-1][2].values()),
+                       "cumulative_total": sum(sum(v.values()) for _, _, v, _ in turns), "turns": len(turns)})
+        checks[-1]["matches_last_turn"] = checks[-1]["subagent_tokens"] == checks[-1]["last_turn_total"]
+    matched = sum(c["matches_last_turn"] for c in checks)
+    if as_json:
+        print(json.dumps({"project": project, "checked": len(checks), "matches_last_turn": matched,
+                          "checks": checks}, indent=2))
+    else:
+        print(f"task-notification subagent_tokens vs transcript ({project}): "
+              f"{matched}/{len(checks)} equal the last turn's input+output+cache tokens")
+        for c in checks:
+            print(f"  {c['agent_id']:<40} notified {c['subagent_tokens']:>11,}  last turn {c['last_turn_total']:>11,}"
+                  f"  summed {c['cumulative_total']:>13,} over {c['turns']} turn(s)"
+                  f"  {'match' if c['matches_last_turn'] else 'MISMATCH'}")
+    return 0
+
+
+def main(argv=None):
+    argv = sys.argv[1:] if argv is None else argv
+    if argv[:1] == ["--test"]:
+        print(VERSION)
+        return 0
+    p = argparse.ArgumentParser(prog="cost-ledger",
+                                description="Per task/agent/sprint tokens and $ estimate with a capture rate (read-only).")
+    p.add_argument("project")
+    p.add_argument("--by", choices=("task", "agent", "sprint"), default="task")
+    p.add_argument("--sprint", default=None, help="only spawns resolved to this sprint")
+    p.add_argument("--since", default=None, help="ISO date or datetime (UTC when no offset)")
+    p.add_argument("--json", action="store_true", help="emit the cost-ledger/v1 JSON document")
+    p.add_argument("--check-notifications", action="store_true",
+                   help="compare task-notification subagent_tokens with transcript turns, then exit")
+    a = p.parse_args(argv)
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", a.project):
+        print(f"cost-ledger: invalid project name {a.project!r}", file=sys.stderr)
+        return 2
+    if a.check_notifications:
+        return check_notifications(a.project, a.json)
+    return run(a.project, a.by, a.sprint, a.since, a.json)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

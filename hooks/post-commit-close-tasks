@@ -9,7 +9,13 @@
 #   1. Confirm git repo; else exit 0.
 #   2. Read HEAD subject only (git log -1 --format='%s').
 #   3. Extract sprint-task patterns: ^S{N}[-prep]-T{M}[,T{M}...]: or + shapes.
-#   4. Resolve active project via $V11_PROJECT > active-project file > repo basename.
+#   4. Resolve active project from the COMMITTING repo, never the host-global
+#      signal file: $V11_PROJECT > repo pin file (<repo-root>/.v11-project,
+#      exactly one line) > repo basename (only if its ledger already exists).
+#      <repo-root> is the MAIN worktree root (git-common-dir), so commits made
+#      from a linked worktree resolve the same as the main checkout. Ambiguous
+#      or unresolvable → refuse (warn + exit 0), never fall back to any
+#      cross-session active-project file (improvements/85).
 #   5. Replay ledger (read-only) to find in_progress tasks for each pattern.
 #   6. Idempotency: skip tasks already closed by THIS commit_sha in ledger.
 #   7. For each in_progress match: v11_ledger_append (ev=completed, audit fields).
@@ -87,7 +93,7 @@ fi
 # HYPOTHESIZED causal claim that needs human validation.
 # Log to stderr when exclusions occur so the author sees why tasks weren't closed.
 HYPOTHESIZED_EXCLUDED_IDS=""
-if printf '%s' "$COMMIT_BODY" | grep -q "Validation: HYPOTHESIZED" 2>/dev/null; then
+if grep -q "Validation: HYPOTHESIZED" <<<"$COMMIT_BODY" 2>/dev/null; then
     # Extract Pairs: within 5 lines after Validation: HYPOTHESIZED
     # Use env var to pass body into Python (avoids heredoc-inside-$() complexity)
     HYPOTHESIZED_EXCLUDED_IDS="$(V11_PC_BODY="$COMMIT_BODY" python3 -c '
@@ -126,9 +132,12 @@ if [ -z "$PATTERNS_RAW" ]; then
     exit 0
 fi
 
-# ── Step 4: resolve active project ──────────────────────────────────────────
-# Priority: $V11_PROJECT env > active-project file > repo basename.
-# On unresolved: exit 0 with warning (never cross-project writes).
+# ── Step 4: resolve active project from the COMMITTING repo ────────────────
+# Priority: $V11_PROJECT env > repo pin file (<repo-root>/.v11-project,
+#           exactly one line) > repo basename (only if its ledger exists).
+# The host-global active-project file is NEVER read here — it tracks whichever
+# session last wrote it, not the repo being committed (improvements/85).
+# On unresolved/ambiguous: exit 0 with warning (never cross-project writes).
 NOW="$(date -Iseconds)"
 PROJECT=""
 PROJECT_SOURCE=""
@@ -138,31 +147,70 @@ if [ -n "${V11_PROJECT:-}" ] && printf '%s' "$V11_PROJECT" | grep -qE '^[a-zA-Z0
     PROJECT_SOURCE="env-V11_PROJECT"
 fi
 
-if [ -z "$PROJECT" ]; then
-    _active="$(v11_read_active_project 2>/dev/null || true)"
-    if [ -n "$_active" ]; then
-        PROJECT="$_active"
-        PROJECT_SOURCE="active-project-file"
+# Resolve the MAIN worktree root once. --git-common-dir points at the main
+# repo's .git even when invoked from a linked worktree's .git/worktrees/<name>,
+# so a commit made in a linked worktree resolves to the same project as the
+# main checkout (unlike --absolute-git-dir, which would resolve per-worktree).
+# For a submodule, --git-common-dir resolves to <superproject>/.git/modules/<name>,
+# so dirname() would land on that modules dir, not the submodule's own checkout.
+# Detect that case via --show-superproject-working-tree (non-empty only inside
+# a submodule) and use --show-toplevel instead, which is the submodule's own
+# working tree.
+_SUPERPROJECT_WORKTREE="$(git rev-parse --show-superproject-working-tree 2>/dev/null || true)"
+_REPO_ROOT=""
+if [ -n "$_SUPERPROJECT_WORKTREE" ]; then
+    _REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+else
+    _GIT_COMMON_DIR="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)"
+    if [ -n "$_GIT_COMMON_DIR" ]; then
+        _REPO_ROOT="$(dirname "$_GIT_COMMON_DIR")"
     fi
 fi
 
-if [ -z "$PROJECT" ]; then
-    # Fallback: repo basename (the directory containing .git)
-    _GIT_DIR="$(git rev-parse --absolute-git-dir 2>/dev/null || true)"
-    if [ -n "$_GIT_DIR" ]; then
-        _REPO_ROOT="$(dirname "$_GIT_DIR")"
-        _BASENAME="$(basename "$_REPO_ROOT")"
-        if printf '%s' "$_BASENAME" | grep -qE '^[a-zA-Z0-9._-]{1,64}$'; then
+if [ -z "$PROJECT" ] && [ -n "$_REPO_ROOT" ]; then
+    _PIN_FILE="$_REPO_ROOT/.v11-project"
+    if [ -f "$_PIN_FILE" ]; then
+        mapfile -t _PIN_LINES < "$_PIN_FILE"
+        _PIN_RAW="${_PIN_LINES[0]:-}"
+        _PIN_RAW="${_PIN_RAW%$'\r'}"
+        if [ "${#_PIN_LINES[@]}" -eq 1 ] && printf '%s' "$_PIN_RAW" | grep -qE '^[a-zA-Z0-9._-]{1,64}$'; then
+            PROJECT="$_PIN_RAW"
+            PROJECT_SOURCE="repo-pin-file"
+        else
+            echo "[post-commit] WARNING: ambiguous or invalid $_PIN_FILE (must be exactly one line, valid project name) — refusing auto-close" >&2
+            exit 0
+        fi
+    fi
+fi
+
+if [ -z "$PROJECT" ] && [ -n "$_REPO_ROOT" ]; then
+    _BASENAME="$(basename "$_REPO_ROOT")"
+    if printf '%s' "$_BASENAME" | grep -qE '^[a-zA-Z0-9._-]{1,64}$' \
+       && [ -f "${METRICS_DIR}/ledger/${_BASENAME}.jsonl" ]; then
+        # The basename tier is trust-by-convention: it may only fire when the
+        # repo sits at ITS project's canonical location, never for a stray
+        # clone elsewhere that happens to share a name (a cross-project write
+        # — the very thing improvements/85 forbids). Compare realpath'd
+        # canonical candidates, not string paths.
+        _REPO_ROOT_REAL="$(realpath "$_REPO_ROOT" 2>/dev/null || true)"
+        _CANON_HOME_REAL="$(realpath "${HOME}/${_BASENAME}" 2>/dev/null || true)"
+        _CANON_SESSIONS_REAL="$(realpath "${SESSIONS_ROOT:-$HOME/sessions}/${_BASENAME}" 2>/dev/null || true)"
+        if [ -n "$_REPO_ROOT_REAL" ] \
+           && { [ "$_REPO_ROOT_REAL" = "$_CANON_HOME_REAL" ] || [ "$_REPO_ROOT_REAL" = "$_CANON_SESSIONS_REAL" ]; }; then
             PROJECT="$_BASENAME"
             PROJECT_SOURCE="repo-basename"
+        else
+            echo "[post-commit] WARNING: repo basename '${_BASENAME}' matches project '${_BASENAME}'s ledger but this repo is not at its canonical location — refusing auto-close (no cross-project writes). Pin it: create ${_REPO_ROOT}/.v11-project containing '${_BASENAME}'" >&2
         fi
     fi
 fi
 
 if [ -z "$PROJECT" ]; then
-    echo "[post-commit] WARNING: could not resolve active project — skipping auto-close (no cross-project writes)" >&2
+    echo "[post-commit] WARNING: could not resolve active project for this repo — skipping auto-close (no cross-project writes)" >&2
     exit 0
 fi
+
+echo "[post-commit] resolved project via ${PROJECT_SOURCE}: ${PROJECT}" >&2
 
 # ── Steps 5 & 6: replay ledger + idempotency via analysis helper ─────────────
 LEDGER_FILE="${METRICS_DIR}/ledger/${PROJECT}.jsonl"

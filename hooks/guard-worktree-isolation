@@ -43,8 +43,37 @@
 # "Exact mechanism... gets worked out during implementation, not this
 # spec" (spec.md Decision #3) — this is that implementation.
 #
+# S2-R6: the TaskList reconcile is one python3 pass over the host-global
+# registry (hooks/lib/worktree_registry.py; was 4-6 jq + date per row: ~550
+# forks / ~8 s per TaskList at 150 rows).
+# Only `pending` rows are judged, with the same rules and the same alert and
+# advisory text; terminal rows are copied through byte-for-byte. The same
+# pass prunes terminal rows older than V11_WORKTREE_REGISTRY_TTL_DAYS, and a
+# pending row is judged only by a TaskList in the repo that recorded it
+# (V11_WORKTREE_GUARD_SCOPE) — the counts it is compared with are that repo's.
+#
 # Exit codes: 0 always (PostToolUse hooks never block; advisory only).
 # Rollback: V11_WORKTREE_ISOLATION_GUARD=off (default on) disables entirely.
+#   V11_WORKTREE_GRACE_SECONDS (120): age before a pending row is judged.
+#   V11_WORKTREE_REGISTRY_TTL_DAYS (14; 0 = never): prune age for
+#     alerted/resolved rows. Pending rows are never pruned on this cap.
+#   V11_WORKTREE_GUARD_SCOPE (repo): =all judges every pending row against
+#     the current repo, whichever repo recorded it (pre-S2-R6).
+#   V11_WORKTREE_PENDING_TTL_DAYS (30; 0 = never): review #11 MED-1 — a
+#     pending row is otherwise judged only by a TaskList that both sees
+#     NEED_GIT and (under SCOPE=repo) matches its repo_root, so a repo that
+#     never runs TaskList again would leave its row in the host-global
+#     registry forever. This cap prunes a pending row past this age
+#     regardless of scope, silently (no alert).
+#
+# Review #11 LOW-2: the TaskList reconcile's read-modify-replace of the
+# registry races this same file's append below (a spawn recording its
+# expectation). Both sides take a non-blocking flock on a sibling
+# $REGISTRY.lock; see hooks/lib/worktree_registry.py for the reconcile
+# side. The append (below) is best-effort: it appends either way, lock or
+# no lock, since losing the append would silently drop the expectation
+# it exists to record — the lock only avoids the common case of
+# colliding with an in-flight reconcile.
 
 source "$(dirname "${BASH_SOURCE[0]}")/lib/common.sh"
 
@@ -58,6 +87,11 @@ fi
 v11_parse_input
 
 GRACE_SECONDS="${V11_WORKTREE_GRACE_SECONDS:-120}"
+[[ "$GRACE_SECONDS" =~ ^-?[0-9]+$ ]] || GRACE_SECONDS=120
+TTL_DAYS="${V11_WORKTREE_REGISTRY_TTL_DAYS:-14}"
+[[ "$TTL_DAYS" =~ ^[0-9]+$ ]] || TTL_DAYS=14
+PENDING_TTL_DAYS="${V11_WORKTREE_PENDING_TTL_DAYS:-30}"
+[[ "$PENDING_TTL_DAYS" =~ ^[0-9]+$ ]] || PENDING_TTL_DAYS=30
 REGISTRY="$METRICS_DIR/worktree-expectations.jsonl"
 
 # Count non-main worktrees for the repo at $1. Empty/non-numeric on any
@@ -73,6 +107,26 @@ _repo_root() {
     local cwd="${V11_CWD:-$(pwd)}"
     git -C "$cwd" rev-parse --show-toplevel 2>/dev/null || printf '%s' "$cwd"
 }
+
+# PostToolUse exit-0 stdout/stderr reaches only the transcript; only a JSON
+# object on stdout reaches the model. Emit at most ONE such object, and only
+# when there is a message. V11_WORKTREE_GUARD_CONTEXT=off keeps legacy
+# plain-text-only behaviour.
+_emit_context() {
+    [ -n "$1" ] || return 0
+    [ "${V11_WORKTREE_GUARD_CONTEXT:-on}" = "off" ] && return 0
+    # Pure-bash JSON string escape: no fork (S2-R6 fork budget on TaskList).
+    local m="$1"
+    m="${m//\\/\\\\}"
+    m="${m//\"/\\\"}"
+    m="${m//$'\n'/\\n}"
+    m="${m//$'\t'/\\t}"
+    m="${m//$'\r'/\\r}"
+    m="${m//[$'\001'-$'\037']/}"
+    printf '{"hookSpecificOutput":{"hookEventName":"PostToolUse","additionalContext":"%s"}}\n' "$m"
+}
+
+ADVISORY=""
 
 case "$V11_TOOL_NAME" in
 
@@ -90,86 +144,108 @@ case "$V11_TOOL_NAME" in
     COUNT_AT_SPAWN="$(_worktree_count "$REPO_ROOT")"
     HEAD_AT_SPAWN="$(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null || echo "unknown")"
 
+    # Base advisory: the harness may base the worktree on origin's default
+    # branch, so a local HEAD ahead of origin means the agent starts stale.
+    # Advisory only; any git failure skips silently (<=3 git calls).
+    if [ "${V11_WORKTREE_BASE_CHECK:-on}" != "off" ] && [ "$HEAD_AT_SPAWN" != "unknown" ]; then
+        _oref="$(git -C "$REPO_ROOT" symbolic-ref -q --short refs/remotes/origin/HEAD 2>/dev/null || true)"
+        if [ -z "$_oref" ]; then
+            _br="$(git -C "$REPO_ROOT" symbolic-ref -q --short HEAD 2>/dev/null || true)"
+            if [ -n "$_br" ] && git -C "$REPO_ROOT" rev-parse -q --verify "refs/remotes/origin/$_br" >/dev/null 2>&1; then
+                _oref="origin/$_br"
+            fi
+        fi
+        if [ -n "$_oref" ]; then
+            _ahead="$(git -C "$REPO_ROOT" rev-list --count "$_oref"..HEAD 2>/dev/null || true)"
+            _min="${V11_WORKTREE_BASE_WARN_MIN:-1}"
+            [[ "$_min" =~ ^[0-9]+$ ]] || _min=1
+            if [[ "$_ahead" =~ ^[0-9]+$ ]] && [ "$_ahead" -ge "$_min" ] && [ "$_ahead" -gt 0 ]; then
+                ADVISORY="$(printf 'WORKTREE BASE ADVISORY: local HEAD %s is %s commits ahead of %s.\n' "${HEAD_AT_SPAWN:0:8}" "$_ahead" "$_oref"
+                printf '  If the harness bases this worktree on %s, the agent starts %s commits stale. Make the agent'"'"'s first step: git reset --keep %s\n' "$_oref" "$_ahead" "$HEAD_AT_SPAWN")"
+            fi
+        fi
+    fi
+
     mkdir -p "$METRICS_DIR"
-    jq -nc \
-        --arg ts "$(date -Iseconds)" \
-        --arg agent_id "$AGENT_ID" \
-        --arg subagent_type "$SUBAGENT_TYPE" \
-        --arg description "$DESCRIPTION" \
-        --arg project "$V11_PROJECT" \
-        --arg repo_root "$REPO_ROOT" \
-        --arg head_at_spawn "$HEAD_AT_SPAWN" \
-        --argjson is_async "$IS_ASYNC_JSON" \
-        --argjson count_at_spawn "$COUNT_AT_SPAWN" \
-        '{ts:$ts, agent_id:$agent_id, subagent_type:$subagent_type,
-          description:$description, project:$project, repo_root:$repo_root,
-          head_at_spawn:$head_at_spawn,
-          is_async:$is_async, count_at_spawn:$count_at_spawn, status:"pending"}' \
-        >> "$REGISTRY" 2>/dev/null
+    # Review #11 LOW-2: best-effort flock against a concurrent TaskList
+    # reconcile (hooks/lib/worktree_registry.py) rewriting the registry out
+    # from under this append. Bounded wait, and the append runs either way
+    # (lock held or not) — dropping the row on a missed lock would be worse
+    # than the rare clobber it guards against.
+    {
+        flock -x -w 2 200 2>/dev/null
+        jq -nc \
+            --arg ts "$(date -Iseconds)" \
+            --arg agent_id "$AGENT_ID" \
+            --arg subagent_type "$SUBAGENT_TYPE" \
+            --arg description "$DESCRIPTION" \
+            --arg project "$V11_PROJECT" \
+            --arg repo_root "$REPO_ROOT" \
+            --arg head_at_spawn "$HEAD_AT_SPAWN" \
+            --argjson is_async "$IS_ASYNC_JSON" \
+            --argjson count_at_spawn "$COUNT_AT_SPAWN" \
+            '{ts:$ts, agent_id:$agent_id, subagent_type:$subagent_type,
+              description:$description, project:$project, repo_root:$repo_root,
+              head_at_spawn:$head_at_spawn,
+              is_async:$is_async, count_at_spawn:$count_at_spawn, status:"pending"}' \
+            >> "$REGISTRY" 2>/dev/null
+    } 200>"$REGISTRY.lock" 2>/dev/null
     # Deliberately no immediate check here — see header note. Reconciliation
     # happens uniformly at the next TaskList fire, once real time has passed.
+    if [ -n "$ADVISORY" ]; then
+        if [ "${V11_WORKTREE_GUARD_CONTEXT:-on}" = "off" ]; then
+            printf '%s\n' "$ADVISORY"
+        else
+            printf '%s\n' "$ADVISORY" >&2
+            _emit_context "$ADVISORY"
+        fi
+    fi
     ;;
 
   TaskList)
     [ -f "$REGISTRY" ] || exit 0
-    NOW_EPOCH="$(date +%s)"
-    REPO_ROOT="$(_repo_root)"
-    NOW_COUNT="$(_worktree_count "$REPO_ROOT")"
-    TMP="$REGISTRY.tmp.$$"
-    : > "$TMP"
 
-    while IFS= read -r line; do
-        [ -z "$line" ] && continue
-        STATUS="$(printf '%s' "$line" | jq -r '.status // "pending"' 2>/dev/null)"
-        if [ "$STATUS" != "pending" ]; then
-            printf '%s\n' "$line" >> "$TMP"
-            continue
-        fi
-        ROW_TS="$(printf '%s' "$line" | jq -r '.ts // ""' 2>/dev/null)"
-        ROW_COUNT="$(printf '%s' "$line" | jq -r '.count_at_spawn // 0' 2>/dev/null)"
-        [[ "$ROW_COUNT" =~ ^[0-9]+$ ]] || ROW_COUNT=0
-        ROW_EPOCH="$(date -d "$ROW_TS" +%s 2>/dev/null || echo "$NOW_EPOCH")"
-        AGE=$(( NOW_EPOCH - ROW_EPOCH ))
-
-        # Rows younger than the grace period haven't had a fair chance to
-        # actually start (or finish creating a worktree) yet — leave pending.
-        if [ "$AGE" -lt "$GRACE_SECONDS" ]; then
-            printf '%s\n' "$line" >> "$TMP"
-            continue
-        fi
-
-        if [ "$NOW_COUNT" -gt "$ROW_COUNT" ]; then
-            # At least one new worktree has appeared since this row's
-            # baseline — best-effort "not obviously broken" signal (not a
-            # per-agent guarantee, no correlation key exists for that).
-            printf '%s\n' "$line" | jq -c '.status = "resolved"' >> "$TMP"
-            # V11.35.6 (#27): stale-ref advisory — if HEAD moved since spawn,
-            # the worktree forked from a stale ref. Advisory only, exit 0.
-            ROW_HEAD="$(printf '%s' "$line" | jq -r '.head_at_spawn // "unknown"' 2>/dev/null)"
-            CURRENT_HEAD="$(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null || echo "unknown")"
-            if [ "$ROW_HEAD" != "unknown" ] && [ "$CURRENT_HEAD" != "unknown" ] \
-               && [ "$ROW_HEAD" != "$CURRENT_HEAD" ]; then
-                SUBJ="$(printf '%s' "$line" | jq -r '.description // ""' 2>/dev/null)"
-                echo "STALE-REF ADVISORY (#27): agent ($SUBJ) worktree forked from ${ROW_HEAD:0:8}, HEAD is now ${CURRENT_HEAD:0:8}. Agent may be working against stale code." >&2
-            fi
-        else
-            SUBJ="$(printf '%s' "$line" | jq -r '.description // ""' 2>/dev/null)"
-            AGENT_T="$(printf '%s' "$line" | jq -r '.subagent_type // "unknown"' 2>/dev/null)"
-            {
-                echo ""
-                echo "WORKTREE ISOLATION ALERT: background agent '$AGENT_T' ($SUBJ), spawned"
-                echo "  $(( AGE / 60 ))m ago requesting isolation:\"worktree\", still shows no new worktree"
-                echo "  (count then=$ROW_COUNT, now=$NOW_COUNT). Possible silent no-op (improvements/12 H1)."
-                echo "  Check: git -C \"$REPO_ROOT\" worktree list"
-                echo ""
-            } >&2
-            # Alert once, not repeated every TaskList call — matches
-            # guard-agent-stall's existing anti-spam convention.
-            printf '%s\n' "$line" | jq -c '.status = "alerted"' >> "$TMP"
-        fi
+    # git runs only when a row may still be pending: the hook writes a
+    # terminal row with "status":"alerted" or "status":"resolved" in it. A
+    # pending row this scan misses is left pending (NEED_GIT=0), never
+    # judged without the git facts.
+    NEED_GIT=0
+    while IFS= read -r line || [ -n "$line" ]; do
+        case "$line" in
+            ''|*'"status":"alerted"'*|*'"status":"resolved"'*) ;;
+            *) NEED_GIT=1; break ;;
+        esac
     done < "$REGISTRY"
 
-    mv "$TMP" "$REGISTRY"
+    REPO_ROOT="${V11_CWD:-$PWD}"
+    NOW_COUNT=0
+    CURRENT_HEAD="unknown"
+    if [ "$NEED_GIT" = "1" ]; then
+        # One rev-parse for both: line 1 is the toplevel, line 2 HEAD (the
+        # literal "HEAD" on an unborn branch; no output outside a repo). The
+        # 2>/dev/null sits on a group: inside $(...) it costs bash a fork.
+        { _rp="$(git -C "$REPO_ROOT" rev-parse --show-toplevel HEAD)"; } 2>/dev/null
+        [[ "${_rp%%$'\n'*}" == /* ]] && REPO_ROOT="${_rp%%$'\n'*}"
+        [[ "${_rp#*$'\n'}" =~ ^[0-9a-f]{40}([0-9a-f]{24})?$ ]] && CURRENT_HEAD="${_rp#*$'\n'}"
+        # Non-main worktrees = the newlines left once $(...) strips the last.
+        { _wt="$(git -C "$REPO_ROOT" worktree list)"; } 2>/dev/null
+        _wt="${_wt//[!$'\n']/}"
+        NOW_COUNT="${#_wt}"
+    fi
+    # One python3 pass: judges the pending rows, prints the alerts, prunes,
+    # and rewrites the registry (tmp + rename) only when something changed.
+    # Measured on 150 rows: ~30 ms, where one jq 1.6 pass spends ~35 ms
+    # compiling the same logic before it reads a row.
+    _lib="${BASH_SOURCE[0]%/*}"
+    [ "$_lib" = "${BASH_SOURCE[0]}" ] && _lib=.
+    command -v python3 >/dev/null 2>&1 || exit 0
+    # The registry writes its alerts to stderr and, unless
+    # V11_WORKTREE_GUARD_CONTEXT=off, also as one additionalContext JSON object
+    # on stdout (worktree_registry.py). Doing it there keeps this path at one
+    # python3 fork, with no temp file shared across sessions.
+    python3 -I -S "$_lib/lib/worktree_registry.py" "$REGISTRY" "$NEED_GIT" \
+        "$REPO_ROOT" "$NOW_COUNT" "$CURRENT_HEAD" "$GRACE_SECONDS" "$TTL_DAYS" \
+        "${V11_WORKTREE_GUARD_SCOPE:-repo}" "$PENDING_TTL_DAYS"
     ;;
 
 esac

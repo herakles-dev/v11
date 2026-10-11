@@ -1,0 +1,1377 @@
+#!/usr/bin/env python3
+"""
+dispatch-advise: advisory agent + skill router (D0-2 of v11-leverage-program, ticket #88).
+
+Ranks the live roster (scripts/lib/roster.py) against a task and prints the
+top-3 agents, the top-3 skills and a derived complexity / model tier / effort.
+It never writes the orchestrator's metadata.agent / scope, is never called from
+a hook, and puts nothing anywhere but stdout and the side log.
+
+Usage:
+    scripts/dispatch-advise --text "add an nginx site for foo" [--json] [--no-log]
+    scripts/dispatch-advise --task-id 20 --project v11-leverage-program [--json]
+                            [--session UUID] [--epoch TL_EPOCH]
+    scripts/dispatch-advise --pending v11-leverage-program [--json] [--no-log]
+    scripts/dispatch-advise --engine baseline ...      # default (and only) engine
+    scripts/dispatch-advise ... --no-prior --no-tiebreak  # engine relevance alone
+
+Pipeline per task (fixed routes first, then the engine, then shared post-steps):
+  1. Fixed routes short-circuit agent scoring, in this order. route.provenance
+     records where the route came from (review_of | subject | description |
+     engine), and every advice carries brief_has_pasted_text (a ``` fence, a >
+     quote line, or a double-quoted span of PASTED_QUOTE_MIN_CHARS+), so a
+     consumer can refuse to auto-apply a route read out of pasted material.
+       fixer           metadata.review_of + a fix marker (metadata.fix truthy,
+                       metadata.kind/type in FIX_KINDS, or a subject that opens
+                       with "Fix") -> adversarial-lite-fixer         [review_of]
+       review_sibling  metadata.review_of -> adversarial-lite-reviewer [review_of]
+       explicit_agent  the subject (or --text) instructs a roster agent:
+                       "use X", "delegate to X", "agent=X", "@X"; the weak
+                       verbs using/via/let/have need "X agent".        [subject]
+       review_text     a subject opening "Review: ..." / "review task #7"
+                       -> adversarial-lite-reviewer                    [subject]
+       explicit_agent  the description's FIRST SENTENCE instructs an agent (as
+                       above)                                      [description]
+     A mention that is negated ("don't use X", "instead of using X": a
+     negation opening its clause within 24 characters), or inside a
+     "double-quoted" span, a ``` fence or a > quote, never routes; the first
+     remaining mention wins. Description mentions after the first sentence
+     never route (pasted briefs and logs live there); they become route
+     warnings. A named route-only agent, or a read-only one on an edit task,
+     still routes, with a warning.
+     fixer / review routes return no skills (the V11 review contract fixes the
+     whole brief); an explicit agent still gets scored skills.
+  2. The engine returns relevance in [0, 1] per candidate (ENGINES; below).
+     Engine "baseline" (BaselineEngine): BM25 (k1=1.2, b=0.75) per field,
+     summed with FIELD_WEIGHTS over name + triggers + description + a text
+     digest of the file body (the first DIGEST_MAX_LINES non-blank body lines,
+     capped at DIGEST_MAX_CHARS). Agents and skills are separate indexes
+     (separate IDF). Relevance = BM25 / the query's best BM25.
+  3. Shared post-steps (Advisor, identical for every engine; advice.components
+     records which of the two optional ones ran):
+       filter    drop names in query["exclude"] (ROUTE_ONLY_AGENTS always; on
+                 an "edit" task also every agent with neither Edit nor Write),
+                 names not in the roster, and duplicates;
+       prior     (--no-prior skips it) agents only: build_candidates(meta,
+                 complexity) from scripts/agent-recommend (its META_MAP and
+                 complexity routing, imported, not copied) adds PRIOR_WEIGHTS
+                 by position; recorded as advice.prior;
+       tie-break (--no-tiebreak skips it) agents only: exact score ties (4 dp)
+                 that touch the top-3 are ordered by the agent-scorecard
+                 success rate (agent-recommend.scorecard_lookup), then by name.
+  4. Rule tables in this file derive meta, activity, complexity, model, effort
+     (META_RULES, ACTIVITY_VERBS, COMPLEXITY_RULES, MODEL_TABLE, EFFORT_TABLE).
+
+Query text: --text is used as-is. For a task, subject terms weigh 1.0 and
+description terms DESCRIPTION_QUERY_WEIGHT; the rule tables read the subject
+only (a spec-length description would trip every keyword).
+
+advice_id = sha256(engine_tag \\0 roster_hash \\0 task text \\0 canonical JSON
+of the metadata the fixed routes read [\\0 the scorecard rates a tie-break
+used])[:16], where engine_tag = "<engine>@<version>;rules@<RULES_VERSION>:
+<rules fingerprint>;cfg@<config fingerprint>;post@<components on>". The rules
+fingerprint hashes the rule tables and route patterns in this file (tests pin
+it to RULES_VERSION);
+the config fingerprint hashes the engine's ranking constants plus the shared
+post-step inputs, including agent-recommend's META_MAP and complexity routing.
+So the same text on the same roster through the same configuration always
+gets the same id, and any change that can reorder the advice changes it.
+
+Output: one human line per task, or --json for the v2 envelope
+(schemas/dispatch-advice.schema.json). Each advice is appended to the side log
+~/.agent-metrics/dispatch-advice.jsonl ($METRICS_DIR, or the full path in
+$V11_DISPATCH_ADVICE_LOG; "off" disables) under flock as one write, unless
+--no-log.
+
+Task selection (S2-T0b-3, #113): a task id is local to one TaskList, and a
+resumed session reuses ids, so --task-id matches (session, TaskList epoch, id) on
+the aggregate open_tasks. --session defaults to $V11_SESSION_ID, then
+$CLAUDE_CODE_SESSION_ID; --epoch to the session's epoch record
+($METRICS_DIR/tasklist-epochs/<session>), or for a task carried into the
+record's epoch the epoch it was created in (review #26). The session's own entries win (a
+session holding no open task under the id matches every session's, with a
+stderr note naming the session advised); among them an entry stamped with
+another TaskList epoch is not the task. More than one match is a real tie: the
+matches are listed on stderr and the exit is 2.
+--pending never routes a pair_* hook shadow (it counts as a review sibling).
+Rollback: V11_TASK_RESOLVER=legacy (a bare id, the best status wins).
+
+Fail-open: a missing roster, task state, task, scorecard or agent-recommend, or
+any internal error while advising or rendering, prints "dispatch-advise: no
+advice (<reason>)" (status no_advice in --json) and exits 0. A failed log write
+is a stderr warning; undecodable text (lone surrogates) is written with
+replacement characters. Bad flags exit 2 (argparse).
+
+Environment:
+  SESSIONS_ROOT            task-state root (default ~/sessions)
+  V11_DISPATCH_ADVICE_LOG  advice log path, or "off"
+  METRICS_DIR              directory of the default advice log
+  V11_AGENT_SCORECARD      agent-scorecard path, or "off" (no tie-break lookups)
+  V11_ROSTER_CACHE         roster cache path (read by roster.py)
+
+Engine interface (how --engine jev plugs in): an engine is built by a factory
+in ENGINES, `factory(roster, context) -> engine`, and exposes
+    name: str, version: str, config: dict   (JSON-able ranking constants)
+    rank_agents(query) -> list[{name, relevance, raw, why}]
+    rank_skills(query) -> list[{name, relevance, raw, why}]
+where query = {"terms": {stem: weight}, "surface": {stem: word}, "text": str,
+"subject": str, "meta": str|None, "complexity": str, "activity": str,
+"exclude": set[str]}. relevance is in [0, 1]; raw is the engine's native score
+(BM25 for baseline, a probability for Jev) or null. An engine should skip
+query["exclude"], and the Advisor drops any it returns anyway. Fixed routes,
+the post-steps (filter, prior, tie-break), the rule tables, advice_id, logging
+and rendering stay in this file, so two engines differ only in relevance.
+"""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import fnmatch
+import hashlib
+import importlib.machinery
+import importlib.util
+import json
+import math
+import os
+import re
+import sys
+from collections import Counter
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Callable
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+LIB_DIR = SCRIPT_DIR / "lib"
+AGENT_RECOMMEND = SCRIPT_DIR / "agent-recommend"
+
+ENVELOPE_VERSION = "2"
+# Bump when a rule table or route pattern below changes; tests pin
+# rules_fingerprint() per RULES_VERSION, so an unbumped edit fails them.
+RULES_VERSION = "3"
+TOP_K = 3
+
+REVIEWER = "adversarial-lite-reviewer"
+FIXER = "adversarial-lite-fixer"
+# Reached only through fixed routes (per-task-review.md: the fixer is never a
+# general implementer; review siblings are routed by contract).
+ROUTE_ONLY_AGENTS = frozenset({REVIEWER, FIXER})
+FIX_KINDS = frozenset({"fix", "fixer", "fix-followup", "fix_followup"})
+OPEN_STATUSES = ("pending", "in_progress", "blocked")
+
+# --- BM25 ---------------------------------------------------------------------
+BM25_K1 = 1.2
+BM25_B = 0.75
+FIELD_WEIGHTS = {"name": 3.0, "triggers": 2.0, "description": 2.0, "digest": 1.0}
+DIGEST_MAX_LINES = 40
+DIGEST_MAX_CHARS = 2000
+DESCRIPTION_QUERY_WEIGHT = 0.5
+DESCRIPTION_QUERY_CHARS = 1500
+# Added to the normalised BM25 score of agent-recommend's candidates by position.
+PRIOR_WEIGHTS = (0.25, 0.15, 0.10)
+MAX_SCORECARD_LOOKUPS = 12  # per process; a larger tie group falls back to name order
+
+STOPWORDS = frozenset(
+    "a an the and or but for to of in on at by with from as is are be been was were "
+    "this that these those it its into onto via per not no do does did can could "
+    "should would will shall may might must i me my we our you your they them their "
+    "he she his her so if then than there here what which who whom when where why "
+    "how all any each some such only own same too very just also about over under "
+    "again further once up down out off new s t don doesn didn isn aren wasn won "
+    "shouldn couldn wouldn".split()
+)
+
+# A task whose text references the V11 framework itself (an existing repo path
+# or a V11 term) is framework work: domain agents are filtered out of its advice
+# unless the task names one explicitly. Patterns are fnmatch globs on agent names.
+# Paths count only when they resolve inside the repo (parent of scripts/, or
+# V11_HOME); generic words like docs/ or a missing docs/x never do.
+FRAMEWORK_MARKERS = re.compile(
+    r"\bV11\b|\bcontract mode\b|\bwave-check\b|\bsync-tasks\b|\breview-queue\b"
+    r"|\bdispatch-advise\b|\bcost-ledger\b|\bTaskUpdate\b",
+    re.IGNORECASE)
+_PATH_TOKEN_RE = re.compile(r"(?<![\w.\-/])/?\.{0,2}[\w.\-]+(?:/[\w.\-]+)+")
+DOMAIN_AGENT_GLOBS = (
+    "account-reconciler", "finance-manager", "debt-strategist", "financial-modeler",  # finance/debt
+    "herakles-*",  # business development
+    "election-*", "dataset-acquirer",  # election
+    "example-project-*",
+    "stoic-analyst", "morita-analyst", "naikan-analyst", "ubuntu-analyst", "hooponopono-analyst",  # self-reflection
+)
+
+# --- Rule tables (documented, tested) ----------------------------------------
+# META_RULES: agent-recommend meta-type <- keyword alternation (whole words,
+# case-insensitive). The meta with the most distinct matched keywords wins;
+# ties go to the earlier row. A task's metadata.meta, when it is a META_MAP key,
+# overrides the text.
+META_RULES: list[tuple[str, str]] = [
+    ("web-app", r"frontend|front-end|react|next\.?js|vue|svelte|ui|ux|css|tailwind|"
+                r"web ?page|landing page|components?|dashboards?|website"),
+    ("backend-svc", r"api|apis|endpoints?|backend|back-end|fastapi|flask|django|express|"
+                    r"server|rest|graphql|database|databases|db|schemas?|sql|postgres(?:ql)?|"
+                    r"mongo(?:db)?|redis|quer(?:y|ies)"),
+    ("cli-tool", r"cli|command[- ]line|argparse|flags?|subcommands?"),
+    ("library", r"library|libraries|sdk|packages?"),
+    ("integration", r"integrat\w*|webhooks?|third[- ]party|oauth|connectors?"),
+    ("pipeline", r"pipelines?|etl|ingest\w*|batch jobs?|queues?|cron|scheduler"),
+    ("realtime", r"websockets?|real[- ]?time|sse|socket\.?io|pub/?sub|live updates?|streaming"),
+    ("agent-system", r"agents?|subagents?|skills?|prompts?|orchestrat\w*|mcp|hooks?|routing|router"),
+    ("infra", r"docker|compose|nginx|deploy\w*|ci|ci/cd|kubernetes|k8s|containers?|ssl|tls|"
+              r"dns|domains?|infra\w*|systemd|cloudflare"),
+    ("data-ml", r"ml|machine learning|embeddings?|rag|vectors?|llms?|training|datasets?|inference"),
+]
+
+# COMPLEXITY_RULES: first row with a whole-word match wins; nothing -> "medium".
+# Values are the task-metadata complexity enum (routine|medium|complex|novel).
+COMPLEXITY_RULES: list[tuple[str, str]] = [
+    ("novel", r"novel|greenfield|from scratch|spike|prototype|proof of concept|poc|"
+              r"research|adr|threat models?|threat modell?ing"),
+    ("complex", r"design\w*|architect\w*|schemas?|migrat\w*|security|auth\w*|concurren\w*|"
+                r"race conditions?|distributed|redesign\w*|refactor\w*|protocols?|"
+                r"multi[- ]service|cross[- ]service|performance|scalab\w*|invariants?"),
+    ("routine", r"typos?|renam\w*|bump\w*|format\w*|lint\w*|docs?|readme|comments?|"
+                r"changelog|trivial|one[- ]liners?|wording"),
+]
+DEFAULT_COMPLEXITY = "medium"
+
+# ACTIVITY_VERBS: the task's first word (task codes like "S1-T6:" and "#82"
+# skipped) picks the activity when it is a listed verb; otherwise the first
+# listed verb anywhere, checked decide > edit > explore; nothing -> "edit".
+# Compared after _stem(), so "designing" / "reviews" / "fixed" match.
+ACTIVITY_VERBS: dict[str, frozenset[str]] = {
+    "decide": frozenset("design architect decide choose plan review audit evaluate assess "
+                        "compare triage critique prioritize prioritise scope".split()),
+    "edit": frozenset("implement fix add write build create modify refactor update migrate "
+                      "delete remove rename deploy configure wire port debug patch bump draft "
+                      "generate setup install convert extend make encode re-encode harden".split()),
+    "explore": frozenset("find search locate list scan survey inventory grep explore read "
+                         "investigate inspect trace check count show probe map diagnose".split()),
+}
+ACTIVITY_ORDER = ("decide", "edit", "explore")
+DEFAULT_ACTIVITY = "edit"
+
+# MODEL_TABLE / EFFORT_TABLE: (activity, complexity) -> tier. Explore reads,
+# edit writes, decide judges; effort uses guard-effort's low|medium|high.
+COMPLEXITIES = ("routine", "medium", "complex", "novel")
+MODEL_TABLE: dict[tuple[str, str], str] = {
+    ("explore", "routine"): "haiku",  ("explore", "medium"): "haiku",
+    ("explore", "complex"): "sonnet", ("explore", "novel"): "sonnet",
+    ("edit", "routine"): "sonnet",    ("edit", "medium"): "sonnet",
+    ("edit", "complex"): "opus",      ("edit", "novel"): "opus",
+    ("decide", "routine"): "sonnet",  ("decide", "medium"): "opus",
+    ("decide", "complex"): "opus",    ("decide", "novel"): "opus",
+}
+EFFORT_TABLE: dict[tuple[str, str], str] = {
+    ("explore", "routine"): "low",    ("explore", "medium"): "low",
+    ("explore", "complex"): "medium", ("explore", "novel"): "medium",
+    ("edit", "routine"): "low",       ("edit", "medium"): "medium",
+    ("edit", "complex"): "high",      ("edit", "novel"): "high",
+    ("decide", "routine"): "medium",  ("decide", "medium"): "high",
+    ("decide", "complex"): "high",    ("decide", "novel"): "high",
+}
+
+_META_RES = [(m, re.compile(rf"\b(?:{rx})\b", re.IGNORECASE)) for m, rx in META_RULES]
+_COMPLEXITY_RES = [(c, re.compile(rf"\b(?:{rx})\b", re.IGNORECASE)) for c, rx in COMPLEXITY_RULES]
+_REVIEW_TEXT_RE = re.compile(
+    r"^\s*review\b\s*(?::|\s+(?:of\s+)?(?:task\s*)?#?\s*[a-z]*\d[\w.-]*)", re.IGNORECASE
+)
+_FIX_SUBJECT_RE = re.compile(r"^\s*(?:auto-?)?fix(?:er|es|-?up)?\b", re.IGNORECASE)
+# Explicit-agent instructions. Weak verbs route only with a trailing "agent" /
+# "subagent" ("have the testing-engineer agent fix it"), so "we have
+# testing-engineer coverage" does not.
+_STRONG_VERBS = (
+    r"(?:use|spawn|dispatch(?:\s+to)?|ask|"
+    r"(?:delegate|assign|route|hand|send|give)(?:\s+(?:it|this|that))?(?:\s+off)?\s+to)"
+)
+_WEAK_VERBS = r"(?:using|via|let|have)"
+# After the agent name: end of text, punctuation or a closing quote, but not a
+# possessive ("use backend-architect's schema" names a thing, not an agent).
+_NAME_END = r"(?=$|[\s,.;:!?)\]\"`]|'(?!s\b))"
+# A mention is negated when a negation opens its clause no more than 24
+# characters before the verb ("don't use X", "instead of using X").
+_NEGATION_RE = re.compile(
+    r"\b(?:not|never|avoid|without|except|nor|instead\s+of|rather\s+than|no\s+longer|"
+    r"don[’']?t|doesn[’']?t|shouldn[’']?t|won[’']?t|can[’']?t)\b[^.;,!?\n]{0,24}$",
+    re.IGNORECASE,
+)
+_FENCE_LINE_RE = re.compile(r"^[ \t]*(?:```|~~~)")
+_QUOTE_LINE_RE = re.compile(r"^[ \t]*>")
+_DQ_SPAN_RE = re.compile(r"\"[^\"\n]*\"|“[^”\n]*”")
+_SENTENCE_END_RE = re.compile(r"[.!?](?=\s|$)|\n")
+# A quoted span at least this long counts as pasted text (brief_has_pasted_text).
+PASTED_QUOTE_MIN_CHARS = 60
+MAX_ROUTE_WARNINGS = 5
+_WORD_RE = re.compile(r"[a-z0-9]+")
+_ALPHA_RE = re.compile(r"[a-z]+")
+
+
+class NoAdvice(Exception):
+    """Fail-open exit: the message is the reason printed with 'no advice'."""
+
+
+class TaskTie(Exception):
+    """--task-id names more than one open task: listed on stderr, exit 2."""
+
+
+# ---------------------------------------------------------------------------
+# Imports that must fail open
+# ---------------------------------------------------------------------------
+
+def _import_path(name: str, path: Path) -> Any:
+    loader = importlib.machinery.SourceFileLoader(name, str(path))
+    spec = importlib.util.spec_from_loader(name, loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+def _load_roster_lib() -> Any:
+    sys.path.insert(0, str(LIB_DIR))
+    try:
+        import roster  # noqa: PLC0415
+    finally:
+        sys.path.remove(str(LIB_DIR))
+    return roster
+
+
+def _load_agent_recommend() -> tuple[Any | None, str | None]:
+    """agent-recommend as a module (META_MAP, build_candidates, scorecard_lookup)."""
+    try:
+        return _import_path("agent_recommend", AGENT_RECOMMEND), None
+    except Exception as e:  # fail-open: no prior, no tie-break
+        return None, f"agent-recommend unavailable ({type(e).__name__})"
+
+
+# ---------------------------------------------------------------------------
+# Text
+# ---------------------------------------------------------------------------
+
+def _stem(w: str) -> str:
+    """Tiny deterministic suffix stripper; applied to both query and documents."""
+    if len(w) <= 3:
+        return w
+    if w.endswith("ies") and len(w) > 4:
+        w = w[:-3] + "y"
+    elif w.endswith(("sses", "xes", "ches", "shes", "zes")):
+        w = w[:-2]
+    elif w.endswith("s") and not w.endswith(("ss", "us", "is")):
+        w = w[:-1]
+    elif w.endswith("ing") and len(w) > 5:
+        w = w[:-3]
+    elif w.endswith("ed") and len(w) > 4:
+        w = w[:-2]
+    if w.endswith("e") and len(w) > 4:
+        w = w[:-1]
+    return w
+
+
+def tokenize(text: str) -> list[str]:
+    out = []
+    for w in _WORD_RE.findall((text or "").lower()):
+        if len(w) < 2 or w.isdigit() or w in STOPWORDS:
+            continue
+        out.append(_stem(w))
+    return out
+
+
+def _can_edit(entry: dict[str, Any]) -> bool:
+    """True when Edit or Write is in the agent's tool surface."""
+    tools = set(entry.get("tools") or ["*"])
+    deny = set(entry.get("disallowed_tools") or [])
+    return any(("*" in tools or t in tools) and t not in deny for t in ("Edit", "Write"))
+
+
+def text_digest(path: str | None, split_frontmatter: Callable[[str], tuple[Any, str]]) -> str:
+    """First DIGEST_MAX_LINES non-blank body lines of an agent/skill file."""
+    if not path:
+        return ""
+    try:
+        text = Path(path).read_text(encoding="utf-8")
+        _, body = split_frontmatter(text)
+    except Exception:  # unreadable or malformed: the digest is optional
+        return ""
+    lines = [ln.strip() for ln in body.splitlines() if ln.strip()][:DIGEST_MAX_LINES]
+    return "\n".join(lines)[:DIGEST_MAX_CHARS]
+
+
+# ---------------------------------------------------------------------------
+# Rule tables
+# ---------------------------------------------------------------------------
+
+def infer_meta(text: str, meta_map: dict[str, Any] | None, explicit: Any = None) -> dict[str, Any]:
+    if meta_map is not None and isinstance(explicit, str) and explicit in meta_map:
+        return {"value": explicit, "source": "metadata", "matched": []}
+    best: tuple[int, int, str, list[str]] | None = None
+    for i, (meta, rx) in enumerate(_META_RES):
+        hits = sorted({m.group(0).lower() for m in rx.finditer(text or "")})
+        if hits and (best is None or len(hits) > best[0]):
+            best = (len(hits), i, meta, hits)
+    if best is None:
+        return {"value": None, "source": "none", "matched": []}
+    return {"value": best[2], "source": "rules", "matched": best[3]}
+
+
+def infer_complexity(text: str) -> dict[str, Any]:
+    for level, rx in _COMPLEXITY_RES:
+        hits = sorted({m.group(0).lower() for m in rx.finditer(text or "")})
+        if hits:
+            return {"value": level, "matched": hits}
+    return {"value": DEFAULT_COMPLEXITY, "matched": []}
+
+
+def _activity_of(word: str) -> str | None:
+    s = _stem(word)
+    for act in ACTIVITY_ORDER:
+        if word in ACTIVITY_VERBS[act] or s in ACTIVITY_VERBS[act]:
+            return act
+    return None
+
+
+def infer_activity(text: str) -> dict[str, Any]:
+    words = [w for w in _ALPHA_RE.findall((text or "").lower()) if len(w) > 1 and w not in STOPWORDS]
+    if words:
+        act = _activity_of(words[0])
+        if act:
+            return {"value": act, "matched": [words[0]], "rule": "leading verb"}
+    for act in ACTIVITY_ORDER:
+        for w in words:
+            if w in ACTIVITY_VERBS[act] or _stem(w) in ACTIVITY_VERBS[act]:
+                return {"value": act, "matched": [w], "rule": "keyword"}
+    return {"value": DEFAULT_ACTIVITY, "matched": [], "rule": "default"}
+
+
+def derive(subject: str, meta_map: dict[str, Any] | None, explicit_meta: Any = None) -> dict[str, Any]:
+    meta = infer_meta(subject, meta_map, explicit_meta)
+    complexity = infer_complexity(subject)
+    activity = infer_activity(subject)
+    key = (activity["value"], complexity["value"])
+    return {
+        "meta": meta,
+        "complexity": complexity,
+        "activity": activity,
+        "model": MODEL_TABLE[key],
+        "effort": EFFORT_TABLE[key],
+    }
+
+
+# ---------------------------------------------------------------------------
+# Fixed routes
+# ---------------------------------------------------------------------------
+
+def _truthy(v: Any) -> bool:
+    if isinstance(v, str):
+        return v.strip().lower() not in ("", "0", "false", "no", "off", "none", "null")
+    return bool(v)
+
+
+def _quoted_spans(text: str) -> list[tuple[int, int]]:
+    """Character spans of ``` / ~~~ fences, > quote lines and "double-quoted" text."""
+    spans: list[tuple[int, int]] = []
+    pos, fence_start = 0, None
+    for line in text.splitlines(keepends=True):
+        if _FENCE_LINE_RE.match(line):
+            if fence_start is None:
+                fence_start = pos
+            else:
+                spans.append((fence_start, pos + len(line)))
+                fence_start = None
+        elif fence_start is None and _QUOTE_LINE_RE.match(line):
+            spans.append((pos, pos + len(line)))
+        pos += len(line)
+    if fence_start is not None:
+        spans.append((fence_start, pos))
+    spans.extend((m.start(), m.end()) for m in _DQ_SPAN_RE.finditer(text))
+    return spans
+
+
+def explicit_mentions(text: str, agent_names: list[str]) -> list[dict[str, Any]]:
+    """Every instruction in text that names a roster agent ("use X", "delegate
+    to X", "agent=X", "@X", "have the X agent"), in text order, each with
+    negated / quoted flags. Hyphen-less names (Plan, Explore, claude) also need
+    a trailing "agent"/"subagent", quotes, "=", ":" or "@" to count."""
+    if not text or not agent_names:
+        return []
+    by_lower = {n.lower(): n for n in agent_names}
+    alts = "|".join(re.escape(n) for n in sorted(by_lower, key=lambda n: (-len(n), n)))
+    name = rf"(?P<q>[`'\"]?)(?P<name>{alts})(?P=q){_NAME_END}"
+    patterns = [
+        rf"\b{_STRONG_VERBS}\s+(?:the\s+)?{name}(?P<tail>\s+(?:sub)?agent\b)?",
+        rf"\b{_WEAK_VERBS}\s+(?:the\s+)?{name}(?P<tail>\s+(?:sub)?agent\b)",
+        rf"(?:\b(?:sub)?agent(?:_type)?\s*[=:]\s*|(?<![\w.])@){name}(?P<tail>)",
+    ]
+    spans = _quoted_spans(text)
+    found: dict[tuple[int, str], dict[str, Any]] = {}
+    for p in patterns:
+        for m in re.finditer(p, text, re.IGNORECASE):
+            agent = by_lower[m.group("name").lower()]
+            if "-" not in agent and not (m.group("q") or m.group("tail") or "=" in m.group(0)
+                                         or ":" in m.group(0) or "@" in m.group(0)):
+                continue
+            start = m.start()
+            found.setdefault((start, agent), {
+                "name": agent,
+                "start": start,
+                "end": m.end(),
+                "text": m.group(0).strip(),
+                "negated": bool(_NEGATION_RE.search(text[max(0, start - 80):start])),
+                "quoted": any(a < start < b for a, b in spans),
+            })
+    return [found[k] for k in sorted(found)]
+
+
+def explicit_agent(text: str, agent_names: list[str]) -> str | None:
+    """The first roster agent text instructs, skipping negated and quoted mentions."""
+    usable = [m for m in explicit_mentions(text, agent_names) if not m["negated"] and not m["quoted"]]
+    return usable[0]["name"] if usable else None
+
+
+def first_sentence_end(text: str) -> int:
+    """End of the first sentence: the first [.!?] before whitespace, or the first newline."""
+    m = _SENTENCE_END_RE.search(text or "")
+    return m.start() if m else len(text or "")
+
+
+def has_pasted_text(text: str) -> bool:
+    """True when the brief carries pasted material: a ``` / ~~~ fence, a > quote
+    line, or a double-quoted span of PASTED_QUOTE_MIN_CHARS or more."""
+    for line in (text or "").splitlines():
+        if _FENCE_LINE_RE.match(line) or _QUOTE_LINE_RE.match(line):
+            return True
+    return any(m.end() - m.start() - 2 >= PASTED_QUOTE_MIN_CHARS for m in _DQ_SPAN_RE.finditer(text or ""))
+
+
+def fixed_route(subject: str, description: str, metadata: dict[str, Any],
+                agent_names: list[str]) -> tuple[dict[str, Any] | None, list[str]]:
+    """(route or None, warnings). Routes carry kind, agent, rule and provenance:
+    review_of (metadata.review_of routes), subject, or description (an
+    instruction in the description's first sentence, outside fences/quotes)."""
+    warnings: list[str] = []
+    review_of = metadata.get("review_of")
+    if review_of not in (None, "", []):
+        kind = str(metadata.get("kind") or metadata.get("type") or "").strip().lower()
+        if _truthy(metadata.get("fix")) or kind in FIX_KINDS or _FIX_SUBJECT_RE.match(subject or ""):
+            return {"kind": "fixer", "agent": FIXER, "provenance": "review_of",
+                    "rule": f"metadata.review_of={review_of} + fix marker"}, warnings
+        return {"kind": "review_sibling", "agent": REVIEWER, "provenance": "review_of",
+                "rule": f"metadata.review_of={review_of}"}, warnings
+
+    def pick(mentions: list[dict[str, Any]], where: str) -> dict[str, Any] | None:
+        chosen = None
+        for m in mentions:
+            if m["negated"] or m["quoted"]:
+                why = "negated" if m["negated"] else "quoted"
+                warnings.append(f"ignored {why} {where} mention {m['text']!r}")
+            elif chosen is None:
+                chosen = m
+            elif m["name"] != chosen["name"]:
+                warnings.append(f"{where} also names {m['name']!r}; routed to the first ({chosen['name']!r})")
+        return chosen
+
+    chosen = pick(explicit_mentions(subject, agent_names), "subject")
+    if chosen is not None:
+        route = {"kind": "explicit_agent", "agent": chosen["name"], "provenance": "subject",
+                 "rule": f"subject instructs {chosen['text']!r}"}
+    elif (m := _REVIEW_TEXT_RE.match(subject or "")):
+        route = {"kind": "review_text", "agent": REVIEWER, "provenance": "subject",
+                 "rule": f"subject opens {m.group(0).strip()!r}"}
+    else:
+        route = None
+    cut = first_sentence_end(description)
+    described = explicit_mentions(description, agent_names)
+    if route is None:
+        chosen = pick([m for m in described if m["start"] < cut], "description first-sentence")
+        if chosen is not None:
+            route = {"kind": "explicit_agent", "agent": chosen["name"], "provenance": "description",
+                     "rule": f"description's first sentence instructs {chosen['text']!r}"}
+    noted = {route["agent"]} if route else set()
+    for m in described:
+        if (route is None or m["start"] >= cut) and not (m["negated"] or m["quoted"]) \
+                and m["name"] not in noted:
+            noted.add(m["name"])
+            warnings.append(f"description names {m['name']!r} ({m['text']!r}) after its first sentence; "
+                            "not routed: explicit routes come from the subject or the first sentence")
+    return route, warnings
+
+
+def _repo_root() -> Path:
+    home = os.environ.get("V11_HOME")
+    return (Path(home) if home else SCRIPT_DIR.parent).resolve()
+
+
+def _names_repo_path(text: str) -> bool:
+    root = _repo_root()
+    for tok in _PATH_TOKEN_RE.findall(text):
+        tok = tok.rstrip(".-")
+        p = Path(tok) if tok.startswith("/") else root / tok
+        try:
+            rel = p.resolve().relative_to(root)
+        except (ValueError, OSError):
+            continue
+        if rel.parts and p.exists():
+            return True
+    return False
+
+
+def is_framework_task(text: str) -> bool:
+    return bool(FRAMEWORK_MARKERS.search(text)) or _names_repo_path(text)
+
+
+def domain_agent(name: str) -> bool:
+    return any(fnmatch.fnmatchcase(name, g) for g in DOMAIN_AGENT_GLOBS)
+
+
+def rules_fingerprint() -> str:
+    """sha256 of every rule table and route pattern in this file."""
+    payload = {
+        "meta": META_RULES,
+        "complexity": [COMPLEXITY_RULES, DEFAULT_COMPLEXITY],
+        "activity": [{k: sorted(v) for k, v in ACTIVITY_VERBS.items()}, ACTIVITY_ORDER, DEFAULT_ACTIVITY],
+        "model": sorted([*k, v] for k, v in MODEL_TABLE.items()),
+        "effort": sorted([*k, v] for k, v in EFFORT_TABLE.items()),
+        "routes": [sorted(ROUTE_ONLY_AGENTS), sorted(FIX_KINDS), _REVIEW_TEXT_RE.pattern,
+                   _FIX_SUBJECT_RE.pattern, _STRONG_VERBS, _WEAK_VERBS, _NAME_END,
+                   _NEGATION_RE.pattern, _FENCE_LINE_RE.pattern, _QUOTE_LINE_RE.pattern,
+                   _DQ_SPAN_RE.pattern, _SENTENCE_END_RE.pattern, PASTED_QUOTE_MIN_CHARS,
+                   sorted(OPEN_STATUSES)],
+        "stopwords": sorted(STOPWORDS),
+        "framework": [FRAMEWORK_MARKERS.pattern, FRAMEWORK_MARKERS.flags, list(DOMAIN_AGENT_GLOBS)],
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+# ---------------------------------------------------------------------------
+# Baseline engine
+# ---------------------------------------------------------------------------
+
+class BM25Index:
+    """Per-field BM25 over roster entries, summed with FIELD_WEIGHTS."""
+
+    def __init__(self, entries: list[dict[str, Any]], split_frontmatter: Callable):
+        self.names: list[str] = []
+        self.fields: list[dict[str, Counter]] = []
+        for e in entries:
+            f = {
+                "name": Counter(tokenize(re.sub(r"[-_:]", " ", e["name"]))),
+                "triggers": Counter(tokenize(" ".join(e.get("triggers") or []))),
+                "description": Counter(tokenize(e.get("description") or "")),
+                "digest": Counter(tokenize(text_digest(e.get("path"), split_frontmatter))),
+            }
+            self.names.append(e["name"])
+            self.fields.append(f)
+        n = len(self.fields)
+        self.df: Counter = Counter()
+        for f in self.fields:
+            self.df.update(set().union(*(c.keys() for c in f.values())))
+        self.idf = {t: math.log(1.0 + (n - d + 0.5) / (d + 0.5)) for t, d in self.df.items()}
+        self.avglen = {
+            k: (sum(sum(f[k].values()) for f in self.fields) / n if n else 0.0) or 1.0
+            for k in FIELD_WEIGHTS
+        }
+
+    def score(self, terms: dict[str, float]) -> list[tuple[float, dict[str, float]]]:
+        out = []
+        for f in self.fields:
+            total = 0.0
+            contrib: dict[str, float] = {}
+            for t, qw in terms.items():
+                idf = self.idf.get(t)
+                if not idf:
+                    continue
+                s = 0.0
+                for k, w in FIELD_WEIGHTS.items():
+                    tf = f[k].get(t, 0)
+                    if tf:
+                        dl = sum(f[k].values())
+                        norm = 1 - BM25_B + BM25_B * dl / self.avglen[k]
+                        s += w * tf * (BM25_K1 + 1) / (tf + BM25_K1 * norm)
+                if s:
+                    contrib[t] = idf * s * qw
+                    total += contrib[t]
+            out.append((total, contrib))
+        return out
+
+
+def _why_terms(contrib: dict[str, float], surface: dict[str, str], limit: int = 3) -> str:
+    top = sorted(contrib.items(), key=lambda kv: (-kv[1], kv[0]))[:limit]
+    return "terms: " + ", ".join(surface.get(t, t) for t, _ in top)
+
+
+class ScorecardTieBreak:
+    """Per-process cache of agent-recommend.scorecard_lookup success rates."""
+
+    def __init__(self, ar_module: Any | None):
+        self.lookup = None
+        self.state = "unavailable"
+        setting = os.environ.get("V11_AGENT_SCORECARD", "")
+        if setting.lower() == "off":
+            self.state = "disabled"
+        elif ar_module is not None:
+            if setting:
+                ar_module.SCORECARD = Path(setting)
+            if Path(ar_module.SCORECARD).exists():
+                self.lookup = ar_module.scorecard_lookup
+                self.state = "available"
+        self.cache: dict[str, float | None] = {}
+
+    def rates(self, names: list[str]) -> dict[str, float | None] | None:
+        """Rates for names, or None when unavailable or over the lookup budget."""
+        if self.lookup is None:
+            return None
+        todo = [n for n in names if n not in self.cache]
+        if len(self.cache) + len(todo) > MAX_SCORECARD_LOOKUPS:
+            return None
+        for n in todo:
+            try:
+                self.cache[n] = self.lookup(n)[0]
+            except Exception:
+                self.cache[n] = None
+        return {n: self.cache[n] for n in names}
+
+
+class BaselineEngine:
+    """Lexical baseline: per-field BM25, relevance = BM25 / the query's best."""
+
+    name = "baseline"
+    version = "1.1.0"
+    config = {
+        "bm25": [BM25_K1, BM25_B], "fields": FIELD_WEIGHTS,
+        "digest": [DIGEST_MAX_LINES, DIGEST_MAX_CHARS],
+        "description_query": [DESCRIPTION_QUERY_WEIGHT, DESCRIPTION_QUERY_CHARS],
+    }
+
+    def __init__(self, roster: dict[str, Any], context: dict[str, Any]):
+        split = context["split_frontmatter"]
+        self.agents = BM25Index(roster["agents"], split)
+        self.skills = BM25Index(roster["skills"], split)
+
+    @staticmethod
+    def _rank(index: BM25Index, query: dict[str, Any], exclude: set[str]) -> list[dict[str, Any]]:
+        scored = [(n, s) for n, s in zip(index.names, index.score(query["terms"]))
+                  if n not in exclude and s[0] > 0]
+        best = max((s[0] for _, s in scored), default=0.0)
+        surface = query.get("surface") or {}
+        return [{"name": n, "relevance": raw / best, "raw": round(raw, 4),
+                 "why": [_why_terms(contrib, surface)]}
+                for n, (raw, contrib) in scored]
+
+    def rank_agents(self, query: dict[str, Any]) -> list[dict[str, Any]]:
+        return self._rank(self.agents, query, query.get("exclude") or set())
+
+    def rank_skills(self, query: dict[str, Any]) -> list[dict[str, Any]]:
+        return self._rank(self.skills, query, set())
+
+
+ENGINES: dict[str, Callable[[dict[str, Any], dict[str, Any]], Any]] = {
+    "baseline": BaselineEngine,
+}
+
+
+# ---------------------------------------------------------------------------
+# Task input
+# ---------------------------------------------------------------------------
+
+def _sessions_root() -> Path:
+    env = os.environ.get("SESSIONS_ROOT")
+    return Path(env) if env else Path.home() / "sessions"
+
+
+def load_open_tasks(project: str) -> list[dict[str, Any]]:
+    """open_tasks of ~/sessions/<project>/.task-state.json as a list of
+    {task_id, subject, description, status, metadata}; array or object form."""
+    if not project or "/" in project or project in (".", ".."):
+        raise NoAdvice(f"bad project name {project!r}")
+    path = _sessions_root() / project / ".task-state.json"
+    try:
+        state = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as e:
+        raise NoAdvice(f"task state unreadable: {path} ({type(e).__name__})") from None
+    raw = state.get("open_tasks") if isinstance(state, dict) else None
+    if isinstance(raw, dict):
+        items = [({**v, "task_id": str(v.get("task_id") or v.get("id") or k)})
+                 for k, v in raw.items() if isinstance(v, dict)]
+    elif isinstance(raw, list):
+        items = [({**v, "task_id": str(v.get("task_id") or v.get("id") or "")})
+                 for v in raw if isinstance(v, dict)]
+    else:
+        raise NoAdvice(f"no open_tasks in {path}")
+    out = []
+    for t in items:
+        md = t.get("metadata")
+        out.append({
+            "task_id": t["task_id"],
+            "subject": str(t.get("subject") or ""),
+            "description": str(t.get("description") or ""),
+            "status": str(t.get("status") or ""),
+            "metadata": md if isinstance(md, dict) else {},
+            "_session": str(t.get("session_uuid") or ""),
+            "_tl_epoch": t.get("tl_epoch"),
+        })
+    return out
+
+
+def resolver_shared() -> bool:
+    return os.environ.get("V11_TASK_RESOLVER", "shared") != "legacy"
+
+
+def default_session() -> str:
+    return os.environ.get("V11_SESSION_ID") or os.environ.get("CLAUDE_CODE_SESSION_ID") or ""
+
+
+def record_epoch(session: str, task_id: str | None = None) -> int | None:
+    """The session's current TaskList epoch from its record, or None. With a
+    task_id, the epoch that task is stamped with: a task carried into the
+    current epoch keeps the one it was created in (review #26,
+    task_epoch.epoch_for_task)."""
+    if not session:
+        return None
+    sys.path.insert(0, str(LIB_DIR))
+    try:
+        import task_epoch  # noqa: PLC0415
+        rec = task_epoch.read_epoch_record(session)
+        if task_id is not None:
+            return task_epoch.epoch_for_task(rec, task_id)
+    except Exception:
+        return None
+    finally:
+        sys.path.remove(str(LIB_DIR))
+    return rec.tl_epoch if rec is not None else None
+
+
+def _epoch_of(t: dict[str, Any]) -> int | None:
+    v = t.get("_tl_epoch")
+    if isinstance(v, float) and v.is_integer():
+        v = int(v)
+    elif isinstance(v, str) and v.isdigit():
+        v = int(v)
+    return v if isinstance(v, int) and not isinstance(v, bool) and v > 0 else None
+
+
+def find_task(tasks: list[dict[str, Any]], task_id: str, session: str = "",
+              epoch: int | None = None) -> dict[str, Any]:
+    tid = task_id.lstrip("#").strip()
+    matches = [t for t in tasks if t["task_id"] == tid]
+    if not matches:
+        raise NoAdvice(f"task {tid} not in open_tasks")
+    if not resolver_shared():
+        rank = {"in_progress": 0, "pending": 1, "blocked": 2}
+        return sorted(matches, key=lambda t: rank.get(t["status"], 3))[0]
+    mine = [t for t in matches if session and t.get("_session") == session]
+    if mine:
+        if epoch is not None:
+            other = sorted({str(_epoch_of(t)) for t in mine})
+            mine = [t for t in mine if _epoch_of(t) in (None, epoch)]
+            if not mine:
+                raise NoAdvice(f"task {tid} of session {session[:8]} is open only in TaskList "
+                               f"epoch {', '.join(other)}, not in epoch {epoch}")
+        matches = mine
+    if len(matches) > 1:
+        raise TaskTie(f"task {tid} names {len(matches)} open tasks; pass --session (and --epoch) "
+                      "to pick one:\n" + "\n".join(
+                          f"  session {t.get('_session') or '?'} epoch {_epoch_of(t) or '-'} "
+                          f"[{t['status']}] {t['subject'][:70]}" for t in matches))
+    if session and not mine:
+        # The named session holds no open task under the id: say whose task
+        # this is rather than advise it silently (review #23).
+        try:
+            print(f"dispatch-advise: note — session {session[:8]} holds no open task {tid}; "
+                  f"advising session {(matches[0].get('_session') or '?')[:8]}'s "
+                  f"[{matches[0]['status']}] {matches[0]['subject'][:70]}", file=sys.stderr)
+        except Exception:
+            pass
+    return matches[0]
+
+
+# ---------------------------------------------------------------------------
+# Advice
+# ---------------------------------------------------------------------------
+
+def _route_metadata(md: dict[str, Any]) -> dict[str, Any]:
+    keys = ("review_of", "fix", "kind", "type", "meta")
+    return {k: md[k] for k in keys if k in md and md[k] not in (None, "")}
+
+
+def advice_id(engine_tag: str, roster_hash: str, text: str, md: dict[str, Any],
+              tiebreak_rates: dict[str, float | None] | None = None) -> str:
+    parts = [engine_tag, roster_hash, text,
+             json.dumps(_route_metadata(md), sort_keys=True, default=str)]
+    if tiebreak_rates:
+        parts.append(json.dumps(tiebreak_rates, sort_keys=True))
+    return hashlib.sha256("\0".join(parts).encode("utf-8", "surrogatepass")).hexdigest()[:16]
+
+
+def _fingerprint(obj: Any) -> str:
+    return hashlib.sha256(json.dumps(obj, sort_keys=True, default=str).encode("utf-8")).hexdigest()[:12]
+
+
+def query_terms(subject: str, description: str) -> tuple[dict[str, float], dict[str, str]]:
+    """({stem: weight}, {stem: first surface word}); subject terms win."""
+    terms: dict[str, float] = {}
+    surface: dict[str, str] = {}
+    for text, weight in ((description[:DESCRIPTION_QUERY_CHARS], DESCRIPTION_QUERY_WEIGHT), (subject, 1.0)):
+        for w in _WORD_RE.findall(text.lower()):
+            t = tokenize(w)
+            if t:
+                terms[t[0]] = weight
+                surface.setdefault(t[0], w)
+    return dict(sorted(terms.items())), surface
+
+
+class Advisor:
+    def __init__(self, engine_name: str, prior: bool = True, tiebreak: bool = True):
+        try:
+            roster_lib = _load_roster_lib()
+        except Exception as e:
+            raise NoAdvice(f"roster library unavailable ({type(e).__name__})") from None
+        self.roster = roster_lib.load_roster()
+        if not any(a["kind"] == "agent" for a in self.roster["agents"]) and not self.roster["skills"]:
+            raise NoAdvice("roster empty (no registry agents or skills under $HOME)")
+        self.notes: list[str] = []
+        ar, err = _load_agent_recommend()
+        if err:
+            self.notes.append(err)
+        self.ar = ar
+        self.components = {"prior": bool(prior), "tiebreak": bool(tiebreak)}
+        self.meta_map = getattr(ar, "META_MAP", None) if ar is not None else None
+        self.tiebreak = ScorecardTieBreak(ar)
+        self.engine = ENGINES[engine_name](self.roster, {
+            "split_frontmatter": roster_lib.split_frontmatter,
+            "agent_recommend": ar,
+        })
+        shared = {
+            "prior_weights": PRIOR_WEIGHTS, "top_k": TOP_K,
+            "agent_recommend": None if ar is None else {
+                k: getattr(ar, k, None) for k in ("META_MAP", "COMPLEXITY_ROUTING", "FALLBACK", "ARCHITECT")},
+        }
+        cfg = _fingerprint({"engine": getattr(self.engine, "config", None), "shared": shared})
+        post = "+".join(k for k, on in self.components.items() if on) or "none"
+        self.engine_tag = (f"{self.engine.name}@{self.engine.version};"
+                           f"rules@{RULES_VERSION}:{rules_fingerprint()[:12]};cfg@{cfg};post@{post}")
+        self.agent_names = [a["name"] for a in self.roster["agents"]]
+        self.agent_models = {a["name"]: a.get("model") for a in self.roster["agents"]}
+        self.skill_models = {s["name"]: s.get("model") for s in self.roster["skills"]}
+        self.read_only = {a["name"] for a in self.roster["agents"] if not _can_edit(a)}
+
+    # --- shared post-steps (every engine) -----------------------------------
+
+    def _prior(self, meta: str | None, complexity: str) -> tuple[dict[str, tuple[float, str]], dict | None]:
+        """agent-recommend build_candidates(meta, complexity) -> PRIOR_WEIGHTS by position."""
+        if self.ar is None or not self.components["prior"]:
+            return {}, None
+        try:
+            cands, fallback = self.ar.build_candidates(meta, complexity)
+        except Exception:
+            return {}, None
+        if fallback:
+            return {}, None
+        label = f"agent-recommend meta={meta or '-'} complexity={complexity}"
+        picked = list(cands[: len(PRIOR_WEIGHTS)])
+        return ({a: (PRIOR_WEIGHTS[i], f"{label} #{i + 1} (+{PRIOR_WEIGHTS[i]:.2f})")
+                 for i, a in enumerate(picked)}, {"label": label, "agents": picked})
+
+    def _finish(self, rows: Any, models: dict[str, Any], exclude: set[str],
+                prior: dict[str, tuple[float, str]]) -> list[dict[str, Any]]:
+        """Filter (excluded, unknown, duplicate), add the prior, sort by (-score, name)."""
+        kept: dict[str, dict[str, Any]] = {}
+        for r in rows or []:
+            n = r.get("name") if isinstance(r, dict) else None
+            if not isinstance(n, str) or n in exclude or n not in models or n in kept:
+                continue
+            try:
+                rel = min(max(float(r.get("relevance") or 0.0), 0.0), 1.0)
+            except (TypeError, ValueError):
+                rel = 0.0
+            raw = r.get("raw")
+            kept[n] = {"relevance": rel, "raw": round(raw, 4) if isinstance(raw, (int, float)) else None,
+                       "why": [str(w) for w in (r.get("why") or [])]}
+        for n in prior:
+            if n in models and n not in exclude:
+                kept.setdefault(n, {"relevance": 0.0, "raw": None, "why": []})
+        out = []
+        for n, r in kept.items():
+            p, p_why = prior.get(n, (0.0, ""))
+            score = round(r["relevance"] + p, 4)
+            if score <= 0:
+                continue
+            out.append({"name": n, "score": score, "relevance": round(r["relevance"], 4), "raw": r["raw"],
+                        "prior": p, "model": models.get(n), "success_rate": None,
+                        "why": r["why"] + ([p_why] if p_why else [])})
+        out.sort(key=lambda r: (-r["score"], r["name"]))
+        return out
+
+    def _tie_break(self, rows: list[dict[str, Any]]) -> tuple[str, dict[str, float | None]]:
+        """Order exact ties touching the top-3 by scorecard success rate, then name
+        (name only when the tiebreak component is off: status "disabled")."""
+        status, used = "not_needed", {}
+        i = 0
+        while i < min(TOP_K, len(rows)):
+            j = i
+            while j + 1 < len(rows) and rows[j + 1]["score"] == rows[i]["score"]:
+                j += 1
+            if j > i:
+                group = rows[i: j + 1]
+                rates = self.tiebreak.rates([r["name"] for r in group]) if self.components["tiebreak"] else None
+                if rates is None:
+                    if status == "not_needed":
+                        status = ("disabled" if not self.components["tiebreak"]
+                                  else self.tiebreak.state if self.tiebreak.state != "available" else "skipped")
+                else:
+                    status = "used"
+                    for r in group:
+                        rate = rates[r["name"]]
+                        r["success_rate"] = rate
+                        used[r["name"]] = rate
+                        r["why"].append(f"tie-break: scorecard {rate:.2f}" if rate is not None
+                                        else "tie-break: no scorecard data")
+                    group.sort(key=lambda r: (-(r["success_rate"] if r["success_rate"] is not None else -1.0),
+                                              r["name"]))
+                    rows[i: j + 1] = group
+            i = j + 1
+        return status, used
+
+    # --- advice ---------------------------------------------------------------
+
+    def advise(self, subject: str, description: str = "", metadata: dict[str, Any] | None = None,
+               task: dict[str, Any] | None = None) -> dict[str, Any]:
+        md = metadata or {}
+        text = subject if not description else f"{subject}\n{description}"
+        derived = derive(subject, self.meta_map, md.get("meta"))
+        activity = derived["activity"]["value"]
+        route, warnings = fixed_route(subject, description, md, self.agent_names)
+        # Agent-naming instructions ("use X", "don't use Y") describe routing, not
+        # the work: blank them out of the scoring query.
+        scoring_subject = subject
+        for m in explicit_mentions(subject, self.agent_names):
+            scoring_subject = (scoring_subject[:m["start"]] + " " * (m["end"] - m["start"])
+                               + scoring_subject[m["end"]:])
+        terms, surface = query_terms(scoring_subject, description)
+        exclude = set(ROUTE_ONLY_AGENTS) | (self.read_only if activity == "edit" else set())
+        base_exclude = frozenset(exclude)
+        framework = is_framework_task(text)
+        if framework:
+            exclude |= {n for n in self.agent_names if domain_agent(n)}
+        query = {
+            "terms": terms,
+            "surface": surface,
+            "text": text,
+            "subject": subject,
+            "meta": derived["meta"]["value"],
+            "complexity": derived["complexity"]["value"],
+            "activity": activity,
+            "exclude": base_exclude,  # domain filter for framework tasks is applied in _finish
+        }
+        scorecard, rates_used, prior_block = "not_needed", {}, None
+        if route is None:
+            prior, prior_block = self._prior(query["meta"], query["complexity"])
+            rows = self.engine.rank_agents(query)
+            agents = self._finish(rows, self.agent_models, exclude, prior)
+            scorecard, rates_used = self._tie_break(agents)
+            agents = agents[:TOP_K]
+            if framework:
+                unfiltered = self._finish(rows, self.agent_models, set(base_exclude), prior)[:TOP_K]
+                dropped = [r["name"] for r in unfiltered if domain_agent(r["name"])]
+                if dropped:
+                    warnings.append("framework task: filtered domain agent(s) " + ", ".join(dropped))
+            if agents:
+                route = {"kind": "scored", "agent": agents[0]["name"], "provenance": "engine",
+                         "rule": "engine rank + shared post-steps"}
+            else:
+                fb = next((n for n in ("spec-implementer-v11", "general-purpose", "claude")
+                           if n in self.agent_models and n not in exclude), None)
+                route = {"kind": "fallback", "agent": fb, "provenance": "engine",
+                         "rule": "no relevance or prior"}
+                agents = [] if fb is None else [{
+                    "name": fb, "score": 0.0, "relevance": 0.0, "raw": None, "prior": 0.0,
+                    "model": self.agent_models.get(fb), "success_rate": None,
+                    "why": ["fallback: nothing scored"]}]
+        else:
+            named = route["agent"]
+            if route["kind"] == "explicit_agent":
+                if named in ROUTE_ONLY_AGENTS:
+                    warnings.append(f"{named!r} is route-only (reserved for review/fix siblings)")
+                if activity == "edit" and named in self.read_only:
+                    warnings.append(f"{named!r} has neither Edit nor Write but the task reads as an edit")
+            agents = [{"name": named, "score": None, "relevance": None, "raw": None, "prior": None,
+                       "model": self.agent_models.get(named), "success_rate": None,
+                       "why": [f"fixed route {route['kind']}: {route['rule']}"]}]
+        route["warnings"] = warnings[:MAX_ROUTE_WARNINGS]
+        skills = [] if route["kind"] in ("fixer", "review_sibling", "review_text") \
+            else self._finish(self.engine.rank_skills(query), self.skill_models, set(), {})[:TOP_K]
+        task_block = {
+            "source": "task" if task else "text",
+            "project": task.get("project") if task else None,
+            "task_id": task.get("task_id") if task else None,
+            "status": task.get("status") if task else None,
+            "subject": subject,
+            "tagged": ({k: (str(md[k]) if md.get(k) not in (None, "") else None)
+                        for k in ("agent", "complexity", "scope")} if task else None),
+        }
+        return {
+            "advice_id": advice_id(self.engine_tag, self.roster["roster_hash"], text, md, rates_used),
+            "task": task_block,
+            "route": route,
+            "agents": agents,
+            "skills": skills,
+            "derived": derived,
+            "brief_has_pasted_text": has_pasted_text(text),
+            "components": dict(self.components),
+            "prior": prior_block,
+            "scorecard": scorecard,
+        }
+
+
+# ---------------------------------------------------------------------------
+# Output
+# ---------------------------------------------------------------------------
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _cands(rows: list[dict[str, Any]]) -> str:
+    if not rows:
+        return "-"
+    parts = []
+    for r in rows:
+        s = f"{r['name']}" + (f" {r['score']:.2f}" if r.get("score") is not None else "")
+        terms = next((w[len("terms: "):] for w in r["why"] if w.startswith("terms: ")), "")
+        extra = [terms] if terms else []
+        if r.get("prior"):
+            extra.append(f"prior+{r['prior']:.2f}")
+        if r.get("success_rate") is not None:
+            extra.append(f"sc {r['success_rate']:.2f}")
+        parts.append(s + (f" ({'; '.join(extra)})" if extra else ""))
+    return " · ".join(parts)
+
+
+def render_line(a: dict[str, Any], with_task: bool = False) -> str:
+    d = a["derived"]
+    route = a["route"]
+    if route["kind"] in ("scored", "fallback"):
+        agents = _cands(a["agents"])
+    else:
+        agents = f"{route['agent']} [fixed {route['kind']}: {route['rule']}]"
+    head = f"adv {a['advice_id']}"
+    if with_task:
+        t = a["task"]
+        tagged = (t.get("tagged") or {}).get("agent") or "-"
+        head = f"#{t['task_id']} {t['status']} tagged={tagged} | {head}"
+    warn = f" | warnings: {'; '.join(route['warnings'])}" if route.get("warnings") else ""
+    return (f"{head} | agents: {agents} | skills: {_cands(a['skills'])} | "
+            f"{d['complexity']['value']}/{d['model']}/{d['effort']} "
+            f"(activity={d['activity']['value']}, meta={d['meta']['value'] or '-'}){warn}")
+
+
+def envelope(advisor: Advisor | None, mode: str, advice: list[dict[str, Any]],
+             status: str = "ok", reason: str | None = None,
+             extra: dict[str, Any] | None = None) -> dict[str, Any]:
+    eng = advisor.engine if advisor else None
+    return {
+        "version": ENVELOPE_VERSION,
+        "status": status,
+        "reason": reason,
+        "generated_at": _now(),
+        "mode": mode,
+        "engine": {"name": eng.name if eng else None, "version": eng.version if eng else None,
+                   "rules_version": RULES_VERSION, "tag": advisor.engine_tag if advisor else None},
+        "roster_hash": advisor.roster["roster_hash"] if advisor else None,
+        "notes": list(advisor.notes) if advisor else [],
+        "advice": advice,
+        **({"pending": extra} if extra is not None else {}),
+    }
+
+
+def _log_path() -> Path | None:
+    env = os.environ.get("V11_DISPATCH_ADVICE_LOG", "")
+    if env.lower() == "off":
+        return None
+    if env:
+        return Path(env)
+    metrics = os.environ.get("METRICS_DIR")
+    return (Path(metrics) if metrics else Path.home() / ".agent-metrics") / "dispatch-advice.jsonl"
+
+
+def log_record(advisor: Advisor, a: dict[str, Any], ts: str) -> dict[str, Any]:
+    t = a["task"]
+    return {
+        "v": ENVELOPE_VERSION,
+        "ts": ts,
+        "advice_id": a["advice_id"],
+        "engine": advisor.engine.name,
+        "engine_version": advisor.engine.version,
+        "rules_version": RULES_VERSION,
+        "engine_tag": advisor.engine_tag,
+        "roster_hash": advisor.roster["roster_hash"],
+        "source": t["source"],
+        "project": t["project"],
+        "task_id": t["task_id"],
+        "subject": t["subject"][:200],
+        "tagged_agent": (t.get("tagged") or {}).get("agent"),
+        "route": a["route"]["kind"],
+        "route_provenance": a["route"]["provenance"],
+        "brief_has_pasted_text": a["brief_has_pasted_text"],
+        "components": a["components"],
+        "agents": [{"name": r["name"], "score": r["score"]} for r in a["agents"]],
+        "skills": [{"name": r["name"], "score": r["score"]} for r in a["skills"]],
+        "complexity": a["derived"]["complexity"]["value"],
+        "model": a["derived"]["model"],
+        "effort": a["derived"]["effort"],
+    }
+
+
+def append_log(path: Path, records: list[dict[str, Any]]) -> None:
+    """All records in one write under an exclusive flock (O_APPEND)."""
+    if not records:
+        return
+    data = "".join(json.dumps(r, ensure_ascii=False, separators=(",", ":")) + "\n" for r in records)
+    payload = data.encode("utf-8", "replace")  # a lone surrogate becomes "?", never a crash
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(path), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        try:
+            os.write(fd, payload)
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def _run(args: argparse.Namespace) -> tuple[Advisor, str, list[dict[str, Any]], dict[str, Any] | None]:
+    if args.text is not None:
+        if not args.text.strip():
+            raise NoAdvice("empty --text")
+        advisor = Advisor(args.engine, prior=not args.no_prior, tiebreak=not args.no_tiebreak)
+        return advisor, "text", [advisor.advise(args.text.strip())], None
+    if args.task_id is not None:
+        if not args.project:
+            raise NoAdvice("--task-id needs --project")
+        session = default_session() if args.session is None else args.session
+        epoch = (args.epoch if args.epoch is not None
+                 else record_epoch(session, args.task_id.lstrip("#").strip()))
+        t = find_task(load_open_tasks(args.project), args.task_id, session, epoch)
+        advisor = Advisor(args.engine, prior=not args.no_prior, tiebreak=not args.no_tiebreak)
+        t["project"] = args.project
+        return advisor, "task", [advisor.advise(t["subject"], t["description"], t["metadata"], t)], None
+    tasks = load_open_tasks(args.pending)
+    work, reviews, fixers = [], [], []
+    for t in tasks:
+        if t["status"] not in OPEN_STATUSES:
+            continue
+        if resolver_shared() and t["task_id"].startswith("pair_"):
+            reviews.append(t)  # a hook review shadow, never TaskList work (S2-T0b-3)
+            continue
+        if t["metadata"].get("review_of") in (None, "", []):
+            work.append(t)
+            continue
+        route, _ = fixed_route(t["subject"], "", t["metadata"], [])
+        (fixers if route["kind"] == "fixer" else reviews).append(t)
+    advisor = Advisor(args.engine, prior=not args.no_prior, tiebreak=not args.no_tiebreak)
+    out = []
+    for t in work:
+        t["project"] = args.pending
+        out.append(advisor.advise(t["subject"], t["description"], t["metadata"], t))
+    extra = {"project": args.pending, "open_work_tasks": len(work),
+             "review_siblings_skipped": len(reviews), "fixer_tasks_skipped": len(fixers)}
+    return advisor, "pending", out, extra
+
+
+def _render(args: argparse.Namespace, mode_name: str, env: dict[str, Any], advisor: Advisor,
+            advice: list[dict[str, Any]], extra: dict[str, Any] | None) -> str:
+    if args.json:
+        return json.dumps(env, indent=2, ensure_ascii=False) + "\n"
+    lines = []
+    if mode_name == "pending":
+        lines.append(
+            f"dispatch-advise --pending {extra['project']} [{advisor.engine.name} "
+            f"{advisor.engine.version} · roster {advisor.roster['roster_hash'][:8]} · "
+            f"{extra['open_work_tasks']} open work tasks · "
+            f"{extra['review_siblings_skipped']} review siblings skipped (fixed route {REVIEWER}) · "
+            f"{extra['fixer_tasks_skipped']} fixer tasks skipped (fixed route {FIXER})]")
+    lines.extend(render_line(a, with_task=mode_name == "pending") for a in advice)
+    return "".join(ln + "\n" for ln in lines)
+
+
+def _emit(text: str) -> None:
+    try:
+        sys.stdout.write(text)
+        sys.stdout.flush()
+    except Exception:  # a closed or unencodable stdout must not turn into exit 1
+        pass
+
+
+def main(argv: list[str] | None = None) -> int:
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="replace")
+        except (AttributeError, ValueError):
+            pass
+    ap = argparse.ArgumentParser(
+        description="Advisory agent + skill router over the live roster (ticket #88). "
+                    "Read-only except for the side log; fail-open.")
+    mode = ap.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--text", help="free-text task to route")
+    mode.add_argument("--task-id", help="route this open task (needs --project)")
+    mode.add_argument("--pending", metavar="PROJECT", help="route every open work task of PROJECT")
+    ap.add_argument("--project", help="project for --task-id (~/sessions/PROJECT/.task-state.json)")
+    ap.add_argument("--session", default=None,
+                    help="session of --task-id (default $V11_SESSION_ID, then $CLAUDE_CODE_SESSION_ID)")
+    ap.add_argument("--epoch", type=int, default=None,
+                    help="TaskList epoch of --task-id (default: the session's epoch record)")
+    ap.add_argument("--engine", choices=sorted(ENGINES), default="baseline")
+    ap.add_argument("--json", action="store_true", help="print the v2 JSON envelope")
+    ap.add_argument("--no-log", action="store_true", help="do not append to dispatch-advice.jsonl")
+    ap.add_argument("--no-prior", action="store_true",
+                    help="skip the shared agent-recommend META_MAP/complexity prior (rank by engine relevance)")
+    ap.add_argument("--no-tiebreak", action="store_true",
+                    help="skip the shared agent-scorecard tie-break (exact ties go by name)")
+    args = ap.parse_args(argv)
+    mode_name = "text" if args.text is not None else "task" if args.task_id is not None else "pending"
+
+    advisor: Advisor | None = None
+    try:
+        advisor, mode_name, advice, extra = _run(args)
+        env = envelope(advisor, mode_name, advice, extra=extra)
+        out = _render(args, mode_name, env, advisor, advice, extra)
+    except NoAdvice as e:
+        return _no_advice(args, mode_name, str(e), advisor)
+    except TaskTie as e:
+        try:
+            print(f"dispatch-advise: {e}", file=sys.stderr)
+        except Exception:
+            pass
+        return 2
+    except Exception as e:  # fail-open: advice must never break the caller
+        return _no_advice(args, mode_name, f"internal error: {type(e).__name__}: {e}", advisor)
+
+    if not args.no_log and advice:
+        try:
+            path = _log_path()
+            if path is not None:
+                append_log(path, [log_record(advisor, a, env["generated_at"]) for a in advice])
+        except Exception as e:  # the log is a side channel: warn, keep the advice
+            try:
+                print(f"dispatch-advise: advice log not written ({type(e).__name__}: {e})", file=sys.stderr)
+            except Exception:
+                pass
+    _emit(out)
+    return 0
+
+
+def _no_advice(args: argparse.Namespace, mode_name: str, reason: str, advisor: Advisor | None) -> int:
+    try:
+        if args.json:
+            text = json.dumps(envelope(advisor, mode_name, [], status="no_advice", reason=reason), indent=2)
+        else:
+            text = f"dispatch-advise: no advice ({reason})"
+    except Exception as e:
+        text = f"dispatch-advise: no advice (internal error: {type(e).__name__})"
+    _emit(text + "\n")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

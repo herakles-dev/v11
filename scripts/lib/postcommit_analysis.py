@@ -88,15 +88,26 @@ def main():
         idk = f"{sn}\x00{cs}"
         ev_type = ev.get("ev", "")
 
+        # "cancelled" (incl. the deleted-task shape: ev="cancelled",
+        # reason="deleted" — see hooks/sync-tasks / improvements/63) must be
+        # tracked like any other status event. Before this, "cancelled" was
+        # absent from the recognized set below, so it was silently dropped
+        # and the record kept whatever status preceded it (usually
+        # "in_progress") — the same class of bug fixed for the main ledger
+        # replay by improvements/17 F1 (hooks/lib/common.sh ~:3654). A
+        # matching commit could then "complete" an already-cancelled task.
+        # Last-event-wins, same as every other status: if a genuine later
+        # event reopens the task (e.g. a fresh "in_progress"), it still
+        # supersedes "cancelled" here too, consistent with common.sh.
         if idk not in by_idk:
             by_idk[idk] = {
-                "status": ev_type if ev_type in ("pending", "in_progress", "completed", "blocked") else "unknown",
+                "status": ev_type if ev_type in ("pending", "in_progress", "completed", "blocked", "cancelled") else "unknown",
                 "subject_norm": sn,
                 "create_seq": cs,
                 "task_id": ev.get("task_id", ""),
             }
         else:
-            if ev_type in ("pending", "in_progress", "completed", "blocked"):
+            if ev_type in ("pending", "in_progress", "completed", "blocked", "cancelled"):
                 by_idk[idk]["status"] = ev_type
             if ev.get("task_id"):
                 by_idk[idk]["task_id"] = ev.get("task_id")

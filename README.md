@@ -18,7 +18,7 @@ treat it as a serious starting point rather than a finished product for every
 environment — see **Known limitations** below before you install it somewhere
 that matters.
 
-_Distribution sync status: tracks source protocol v11.44 "Orchestrator Quality"._
+_Distribution sync status: tracks source protocol v11.46 "Stop the Bleeding" (v11-leverage-program S1)._
 
 ## What's actually in the box
 
@@ -71,6 +71,16 @@ production-deploy/DNS/nginx toolchain wired to the origin deployment's own
 infrastructure, and generated run artifacts (test reports, benchmark
 history). None of that is required to run V11 somewhere else.
 
+## Requirements
+
+- **bash** (4+), **jq**, and **python3** (3.10+) on `PATH`. The hooks and scripts call `python3` by name.
+- **Claude Code**, for the hooks to fire. Settings are read once at session start, so restart Claude Code after installing.
+
+Platform notes:
+
+- **Linux / macOS**: use the system bash. Install `jq` and `python3` from your package manager.
+- **Windows**: run the installer from **Git Bash** (or another bash). Install `jq` (for example `winget install jqlang.jq`) and a real Python 3 install. The Microsoft Store `python3` alias is a stub that fails, so put a `python3` command on `PATH` that runs your real Python 3 install before you install. On Windows, the installer's `ln -s` produced copies of `hooks/` and `schemas/` at the project root rather than links. Those root copies are convenience only: the registered hooks run from `.v11/hooks/`, and re-running the installer does not refresh the root copies, so delete them and re-run if they go stale.
+
 ## Quickstart
 
 ```bash
@@ -94,9 +104,9 @@ requires `bash` and `jq`. What it does:
    `.autonomy-state` at A0 (Manual).
 4. Prints a summary and next steps.
 
-Session/task state defaults to `$HOME/.v11` (override by exporting
-`V11_WORKSPACE_ROOT` before running Claude Code or the installer) — this is a
-deliberate central location shared across every V11 project on one machine,
+Session/task state defaults to `$HOME/sessions` (override by exporting
+`HERCULES_ROOT` or `SESSIONS_ROOT` before running Claude Code or the installer)
+— a deliberate central location shared across every V11 project on one machine,
 mirroring the upstream architecture, not a directory inside your project.
 
 **Important**: Claude Code reads `.claude/settings.json` once at session
@@ -108,10 +118,13 @@ project, restart the session to pick up the hooks.
 - **Single-deployment provenance.** This protocol was extracted from one
   server that had been running it for months; the CORE welds that assumed
   a single hardcoded operator home directory have been parameterized to
-  portable defaults (`$HOME/.v11`), and the install/verify steps below
-  confirm the loop runs end-to-end on a throwaway project — but it has not
-  yet been run against a second, independent environment. Expect rough
-  edges.
+  portable defaults (`$HOME`-relative), and the install/verify steps below
+  confirm the loop runs end-to-end on a throwaway project. Outside the origin
+  server it has been checked on one Windows 10 machine (Git Bash, jq, Python
+  3.12): install into a sandbox project, hook registration, project detection,
+  and the write gate's fresh-session advisory ran as coded. The write gate's
+  blocking path was not exercised, and the full test suite is not part of this
+  distribution, so verify what matters to you yourself. Expect rough edges.
 - **Residual references, post-scrub.** An earlier pass found ~172 hits of a
   hardcoded operator path or the origin's own domain across just `hooks/` +
   `scripts/`; a full scrub across every shipped file (including dropping
@@ -223,8 +236,8 @@ individually-justified list. The 10 CORE ones:
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `V11_WORKSPACE_ROOT` | `$HOME/.v11` | Root for session/task/autonomy/audit state. Shared across every V11 project on one machine. |
-| `SESSIONS_ROOT` | `$V11_WORKSPACE_ROOT/sessions` | Where per-project session directories (spec.md, autonomy state, handoff) live. |
+| `HERCULES_ROOT` | `$HOME` | Root for session/task/autonomy/audit state. Shared across every V11 project on one machine. |
+| `SESSIONS_ROOT` | `$HERCULES_ROOT/sessions` | Where per-project session directories (spec.md, autonomy state, handoff) live. |
 | `V11_HOME` | auto-detected (the directory containing this `hooks/`) | Where the framework code itself lives — usually `<project>/.v11`, computed automatically; you shouldn't need to set it. |
 | `V11_BUSINESS_TZ` | `America/Chicago` | Timezone used for the cached business-hours timestamp `detect-project` maintains. |
 | `V11_SESSION_ID` | (set by Claude Code) | Scopes active-project/task-state to the current session for isolation. |

@@ -93,9 +93,13 @@ fi
 
 # Write to project-local state if project detected AND it's a real project
 # (NON_PROJECTS dirs get attributed correctly but don't have autonomy state)
-if [ -n "$V11_PROJECT" ] && [ "$V11_DETECTION_METHOD" != "non-project" ]; then
+# improvements/59: never create a session dir here. This is a trust score, not
+# a project registry: the old `mkdir -p` turned every string the detector
+# captured into a directory (48 junk dirs: `example-project;`, `$P;`, `*`, `CLAUDE.md/`).
+# No session dir yet => no autonomy state to update (fails closed).
+if [ -n "$V11_PROJECT" ] && [ "$V11_DETECTION_METHOD" != "non-project" ] \
+   && [ -d "$SESSIONS_ROOT/$V11_PROJECT" ]; then
     STATE_FILE="$SESSIONS_ROOT/$V11_PROJECT/.autonomy-state"
-    mkdir -p "$(dirname "$STATE_FILE")"
 else
     STATE_FILE=""
 fi

@@ -214,7 +214,15 @@ if [ -f "$HANDOFF_TASKS" ]; then
     if [ "${open_count:-0}" != "0" ] && [ -n "${open_count:-}" ]; then
         echo ""
         echo "REHYDRATE: ${open_count} open task(s) from prior session — run:"
-        echo "  ./scripts/v11-resume-tasks $PROJECT"
+        # S1-T4 (#81): absolute (a relative V11_HOME is anchored at $PWD) and
+        # shell-quoted, so it runs from the project directory too — the same
+        # form scripts/handoff emits.
+        _resume_home="${V11_HOME:-$HERCULES_ROOT/v11}"
+        case "$_resume_home" in
+            /*) _resume_cmd="$_resume_home/scripts/v11-resume-tasks" ;;
+            *)  _resume_cmd="$PWD/$_resume_home/scripts/v11-resume-tasks" ;;
+        esac
+        echo "  $(printf '%q' "$_resume_cmd") $PROJECT"
         echo "…then Claude issues TaskCreate per the emitted <v11-resume> block."
     fi
 fi

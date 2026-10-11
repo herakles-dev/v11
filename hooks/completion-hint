@@ -59,7 +59,7 @@ esac
 # Resolve session + project
 _SID="$(printf '%s' "$_STDIN_JSON" | jq -r '.session_id // empty' 2>/dev/null || true)"
 [ -z "$_SID" ] && _SID="${V11_SESSION_ID:-}"
-[ -z "$_SID" ] && exit 0
+v11_valid_session_id "$_SID" || exit 0  # also no id; S2-R5: "..", ".x", "a/b" never reach a path
 
 PROJECT="$(v11_read_active_project 2>/dev/null || true)"
 [ -z "$PROJECT" ] && exit 0

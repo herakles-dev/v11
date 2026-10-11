@@ -1,11 +1,11 @@
 #!/bin/bash
 # V11 Compliance Check — validate full V11 setup for a project
-# Usage: ./scripts/v11-compliance-check PROJECT [--fix]
+# Usage: ./scripts/v11-compliance-check PROJECT|PATH [--fix]
 #
 # Checks 10 compliance gates:
 #   1. Session directory exists
 #   2. spec.md exists and is <100 lines
-#   3. .claude/settings.json has V11 hooks (all 13)
+#   3. .claude/settings.json has every template-managed hook wiring (wiring_diff managed-coverage)
 #   4. All hook scripts exist and are executable
 #  4b. Hooks actually firing (advisory — detects mid-session installs)
 #   5. Autonomy state file exists
@@ -43,14 +43,14 @@ done
 if [ -z "$PROJECT" ]; then
     echo "V11 Compliance Check"
     echo ""
-    echo "Usage: $0 PROJECT [--fix] [--dark-code]"
+    echo "Usage: $0 PROJECT|PATH [--fix] [--dark-code]   (PATH: any arg with a '/' is scanned as-is)"
     echo "       $0 --scan              Scan all projects"
     echo "       $0 --test              Self-test"
     echo ""
     echo "Core gates (1-10):"
     echo "  1. Session directory         6. Formation registry (if team)"
     echo "  2. spec.md (<100 lines)      7. No legacy artifacts"
-    echo "  3. V11 hooks (all 13)        8. CLAUDE.md V11 reference"
+    echo "  3. V11 hooks (live count)     8. CLAUDE.md V11 reference"
     echo "  4. Hook scripts executable   9. Task state accessible"
     echo "  5. Autonomy state file      10. Schemas accessible"
     echo ""
@@ -163,16 +163,31 @@ fi
 
 # --- Single project check ---
 
-# Find project directory — prefer sessions/ (code lives there) over root (may be stale state)
+# Find project directory. An explicit path (contains '/') wins: PROJECT_DIR is
+# exactly that dir and its basename is the project name (#95 — test fixtures
+# and standalone repos). A bare name prefers sessions/ (code lives there) over
+# root (may be stale state).
 PROJECT_DIR=""
+MANIFEST_TARGET="$PROJECT"
+if [[ "$PROJECT" == */* ]]; then
+    PROJECT_DIR="$(cd -- "$PROJECT" 2>/dev/null && pwd)" || PROJECT_DIR=""
+    if [ -z "$PROJECT_DIR" ] || [ "$PROJECT_DIR" = "/" ]; then
+        echo "ERROR: Project dir '$PROJECT' not found"
+        exit 2
+    fi
+    PROJECT="$(basename "$PROJECT_DIR")"
+    MANIFEST_TARGET="$PROJECT_DIR"
+fi
 SESSION_DIR="$SESSIONS_ROOT/$PROJECT"
-if [ -d "$SESSION_DIR" ]; then
-    PROJECT_DIR="$SESSION_DIR"
-elif [ -d "$HERCULES_ROOT/$PROJECT" ]; then
-    PROJECT_DIR="$HERCULES_ROOT/$PROJECT"
-else
-    echo "ERROR: Project '$PROJECT' not found"
-    exit 2
+if [ -z "$PROJECT_DIR" ]; then
+    if [ -d "$SESSION_DIR" ]; then
+        PROJECT_DIR="$SESSION_DIR"
+    elif [ -d "$HERCULES_ROOT/$PROJECT" ]; then
+        PROJECT_DIR="$HERCULES_ROOT/$PROJECT"
+    else
+        echo "ERROR: Project '$PROJECT' not found"
+        exit 2
+    fi
 fi
 
 echo "=== V11 Compliance Check: $PROJECT ==="
@@ -240,27 +255,43 @@ SETTINGS=""
 [ -f "$PROJECT_DIR/.claude/settings.json" ] && SETTINGS="$PROJECT_DIR/.claude/settings.json"
 [ -f "$SESSION_DIR/.claude/settings.json" ] && SETTINGS="$SESSION_DIR/.claude/settings.json"
 
-EXPECTED_HOOKS=(detect-project guard-write-gates guard-enforcement guard-effort enforce-test-coverage verify-syntax track-autonomy sync-tasks guard-agent-stall track-agents fix-team-model post-compact session-end)
-
-# Dynamic threshold: count v11/hooks references in canonical settings.json (v11.37 W3-T2).
-# Falls back to 13 if the canonical file is missing.
+# EXPECTED_HOOKS is derived live from the canonical template (S0-T5, ticket
+# #86) — never hardcoded: the set of distinct v11/hooks/* command basenames
+# wired anywhere in the template (Gate 4: do these scripts exist and are they
+# executable). Gate 3 compares the project against the template's full
+# (event, matcher, command) wiring via wiring_diff managed-coverage.
 CANONICAL_SETTINGS="$V11_HOME/.claude/settings.json"
+EXPECTED_HOOKS=()
 if [ -f "$CANONICAL_SETTINGS" ]; then
-    HOOK_THRESHOLD=$(grep -c "v11/hooks" "$CANONICAL_SETTINGS" 2>/dev/null || echo 13)
-    HOOK_THRESHOLD=$(echo "$HOOK_THRESHOLD" | tr -d '[:space:]' | head -c 5)
-    [ -z "$HOOK_THRESHOLD" ] || [ "$HOOK_THRESHOLD" -lt 1 ] && HOOK_THRESHOLD=13
-else
-    HOOK_THRESHOLD=13
+    while IFS= read -r cmd; do
+        [ -n "$cmd" ] && EXPECTED_HOOKS+=("$(basename "$cmd")")
+    done < <(jq -r '[.hooks[][].hooks[]?.command // empty] | unique | .[]' "$CANONICAL_SETTINGS" 2>/dev/null | grep '/v11/hooks/')
+fi
+if [ ${#EXPECTED_HOOKS[@]} -eq 0 ]; then
+    # Degraded fallback only — the canonical template couldn't be read/parsed.
+    # This is NOT asserted as the current hook set, just a last resort so
+    # Gate 4 has something to check rather than silently no-op'ing.
+    EXPECTED_HOOKS=(detect-project guard-write-gates guard-enforcement guard-effort enforce-test-coverage verify-syntax track-autonomy sync-tasks guard-agent-stall track-agents fix-team-model post-compact session-end)
 fi
 
 if [ -n "$SETTINGS" ]; then
     v11_count=$(grep -c "v11/hooks" "$SETTINGS" 2>/dev/null || echo "0")
     v11_count=$(echo "$v11_count" | tr -d '[:space:]' | head -c 5)
     [ -z "$v11_count" ] && v11_count=0
-    if [ "$v11_count" -ge "$HOOK_THRESHOLD" ]; then
-        gate 3 "V11 hooks wired" "PASS" "$v11_count references (>= $HOOK_THRESHOLD)"
+    # PASS needs every template-managed (event, matcher, command) wiring
+    # present (wiring_diff.managed_coverage, S0-T5 review): unmanaged opt-in
+    # or custom v11 hooks don't count toward it. v11_count only decides
+    # "is this a V11 project at all" (the legacy/--fix branch below).
+    managed_cov=$(python3 "$V11_HOME/scripts/lib/wiring_diff.py" managed-coverage \
+        --template "$CANONICAL_SETTINGS" --settings "$SETTINGS" 2>/dev/null) || managed_cov=""
+    managed_present="${managed_cov%% *}"
+    managed_expected="${managed_cov##* }"
+    if [ "$v11_count" -gt 0 ] && { [ -z "$managed_cov" ] || [ "$managed_expected" -lt 1 ]; }; then
+        gate 3 "V11 hooks wired" "WARN" "Could not reconcile against the template (invalid JSON/shape, or template unreadable)"
+    elif [ "$v11_count" -gt 0 ] && [ "$managed_present" -ge "$managed_expected" ]; then
+        gate 3 "V11 hooks wired" "PASS" "$managed_present/$managed_expected template-managed wirings present"
     elif [ "$v11_count" -gt 0 ]; then
-        gate 3 "V11 hooks wired" "WARN" "Only $v11_count/${HOOK_THRESHOLD}+ references"
+        gate 3 "V11 hooks wired" "WARN" "Only $managed_present/$managed_expected template-managed wirings present (see: scripts/v11-update PATH --dry-run)"
     else
         # Check for legacy hooks
         legacy=""
@@ -308,7 +339,7 @@ if [ -n "$SETTINGS" ] && [ -f "$SETTINGS" ]; then
         fi
     done
     if [ ${#missing_hooks[@]} -eq 0 ]; then
-        gate 4 "Hook scripts executable" "PASS" "All 13 hooks OK"
+        gate 4 "Hook scripts executable" "PASS" "All ${#EXPECTED_HOOKS[@]} hooks OK"
     else
         gate 4 "Hook scripts executable" "FAIL" "Missing: ${missing_hooks[*]}"
     fi
@@ -539,16 +570,16 @@ unvalidated_count=0
 invalid_count=0
 manifest_issues=""
 if [ -x "$MANIFEST_VALIDATOR" ] && [ -d "$PROJECT_DIR" ]; then
-    manifest_json=$("$MANIFEST_VALIDATOR" "$PROJECT" --json 2>/dev/null || echo "")
+    manifest_json=$("$MANIFEST_VALIDATOR" "$MANIFEST_TARGET" --json 2>/dev/null || echo "")
     if [ -n "$manifest_json" ] && echo "$manifest_json" | jq empty 2>/dev/null; then
         unvalidated_count=$(echo "$manifest_json" | jq '[.manifests[] | select(.status == "unvalidated")] | length' 2>/dev/null || echo 0)
         invalid_count=$(echo "$manifest_json" | jq '[.manifests[] | select(.status == "invalid")] | length' 2>/dev/null || echo 0)
         if [ "${unvalidated_count:-0}" -gt 0 ]; then
-            unvalidated_paths=$(echo "$manifest_json" | jq -r '.manifests[] | select(.status == "unvalidated") | .path' 2>/dev/null | head -3 | tr '\n' ',' | sed 's/,$//')
+            unvalidated_paths=$(echo "$manifest_json" | jq -r '.manifests[] | select(.status == "unvalidated") | .path' 2>/dev/null | head -3 | tr '\n' ',' | sed 's/,$//' || true)
             manifest_issues="${unvalidated_count} MODULE.md unvalidated (no \`\`\`json block): ${unvalidated_paths}. Add a fenced JSON manifest using templates/MODULE.md.template."
         fi
         if [ "${invalid_count:-0}" -gt 0 ]; then
-            invalid_paths=$(echo "$manifest_json" | jq -r '.manifests[] | select(.status == "invalid") | .path' 2>/dev/null | head -3 | tr '\n' ',' | sed 's/,$//')
+            invalid_paths=$(echo "$manifest_json" | jq -r '.manifests[] | select(.status == "invalid") | .path' 2>/dev/null | head -3 | tr '\n' ',' | sed 's/,$//' || true)
             [ -n "$manifest_issues" ] && manifest_issues="$manifest_issues; "
             manifest_issues="${manifest_issues}${invalid_count} MODULE.md invalid (schema violations): ${invalid_paths}"
         fi

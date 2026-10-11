@@ -8,6 +8,38 @@
 # Exit codes:
 #   0 - Always (PostToolUse hooks never block)
 
+# --- S2-T1: opt-in profiler (V11_SYNC_TASKS_PROFILE) ---
+# On only for "1", "on" or an absolute path. Anything else (unset, '', 0, off, false,
+# no, a relative path) is off: this one case and nothing else — no fork, no file IO.
+# On: one JSONL row per invocation, appended at EXIT, to the path given (absolute)
+# or to $METRICS_DIR/sync-tasks-profile.jsonl (=1|on):
+#   {ts, t0_us, pid, tool, task_id, ms, marks_us: {phase: µs since start}}
+# The phases are the _v11_prof_mark calls below (init, resolve, load, branch, write,
+# ledger, aggregate); the time after "aggregate" is the tail. Builtins only
+# ($EPOCHREALTIME, $(( )), printf), so the profiler adds 0 forks. It does not count
+# forks: bash has no per-process fork counter; tests/forktrace.py counts them from
+# outside and buckets them into these phases by pid and timestamp (recon/S2-baseline.md).
+_V11_PROF_T0=""
+case "${V11_SYNC_TASKS_PROFILE:-}" in 1|on|/*) _V11_PROF_T0="${EPOCHREALTIME/./}" ;; esac
+if [ -n "$_V11_PROF_T0" ]; then
+    _V11_PROF_MARKS=""
+    _V11_PROF_ID_ERE='^[A-Za-z0-9._-]{1,64}$'
+    _v11_prof_mark() {
+        _V11_PROF_MARKS+="${_V11_PROF_MARKS:+,}\"$1\":$(( ${EPOCHREALTIME/./} - _V11_PROF_T0 ))"
+    }
+    _v11_prof_flush() {
+        local us=$(( ${EPOCHREALTIME/./} - _V11_PROF_T0 ))
+        local out="$V11_SYNC_TASKS_PROFILE" tool="${V11_TOOL_NAME:-}" tid="${TASK_ID:-}"
+        case "$out" in /*) ;; *) out="$METRICS_DIR/sync-tasks-profile.jsonl" ;; esac
+        [[ "$tool" =~ $_V11_PROF_ID_ERE ]] || tool="?"
+        [[ "$tid" =~ $_V11_PROF_ID_ERE ]] || tid=""
+        printf '{"ts":%s,"t0_us":%s,"pid":%d,"tool":"%s","task_id":"%s","ms":%d.%03d,"marks_us":{%s}}\n' \
+            "${_V11_PROF_T0:0:10}" "$_V11_PROF_T0" "$$" "$tool" "$tid" $(( us / 1000 )) $(( us % 1000 )) \
+            "$_V11_PROF_MARKS" 2>/dev/null >> "$out"
+    }
+    trap _v11_prof_flush EXIT
+fi
+
 source "$(dirname "${BASH_SOURCE[0]}")/lib/common.sh"
 
 # Self-test for hook validation
@@ -24,6 +56,7 @@ case "$V11_TOOL_NAME" in
     TaskCreate|TaskUpdate|TaskList|TaskGet) ;;
     *) exit 0 ;;
 esac
+[ -z "$_V11_PROF_T0" ] || _v11_prof_mark init
 
 # --- Session heartbeat (subdir-staleness fix) ---
 # v11_session_is_live() judges liveness by the newest TOP-LEVEL file mtime in
@@ -33,11 +66,33 @@ esac
 # file once per sync-tasks invocation so there's always a guaranteed-fresh
 # top-level signal. Cheap (empty touch), idempotent, skipped for legacy-cli
 # (never considered live regardless, per v11_session_is_live).
-_v11_hb_uuid="$(v11_session_uuid)"
+# S2-T2: v11_session_uuid's rule inlined (builtins; was a $(...) fork) and
+# mkdir only when the dir is missing, so the heartbeat is the one `touch`.
+_v11_hb_uuid="${V11_SESSION_ID:-${CLAUDE_CODE_SESSION_ID:-}}"
+v11_valid_session_id "$_v11_hb_uuid" || _v11_hb_uuid="legacy-cli"
 if [ "$_v11_hb_uuid" != "legacy-cli" ]; then
     _v11_hb_dir="$METRICS_DIR/sessions/$_v11_hb_uuid"
-    mkdir -p "$_v11_hb_dir" 2>/dev/null
+    [ -d "$_v11_hb_dir" ] || mkdir -p "$_v11_hb_dir" 2>/dev/null
     touch "$_v11_hb_dir/.heartbeat" 2>/dev/null
+fi
+
+# --- S2-T2: TaskGet early exit (V11_TASKGET_EARLY_EXIT) ---
+# TaskGet only reads a task. Before S2 it ran the whole pipeline to bump the
+# scratch's last_updated: project resolution, the active-project dual-write,
+# the FD-201 load and STATE rewrite, the aggregate rebuild and the python3
+# context tracker (126 forks / 33 jq at minimal scale, 195 / 79 at live
+# scale; sessions/v11-leverage-program/recon/S2-baseline.md). It never wrote
+# a ledger event or a live snapshot. It now keeps the heartbeat above and
+# exits. No longer done on a TaskGet: the scratch last_updated/mtime bump (a
+# read is not progress; the legacy aggregate fold's last_updated and
+# latest-session pick moved with it, #87), the active-project write
+# (TaskCreate/TaskUpdate/TaskList still do it), the v11.33 reconcile-marker
+# drain (the next locked TaskCreate/TaskUpdate/TaskList does it), the
+# aggregate rebuild, and the context tracker's 'task' event (~300 estimated
+# tokens per TaskGet, and its threshold line on stdout).
+# Rollback: V11_TASKGET_EARLY_EXIT=off (the full pre-S2 path).
+if [ "$V11_TOOL_NAME" = "TaskGet" ] && [ "${V11_TASKGET_EARLY_EXIT:-on}" != "off" ]; then
+    exit 0
 fi
 
 # --- Parse task details from output ---
@@ -58,29 +113,60 @@ case "$V11_TOOL_NAME" in
         # use "Task #N created successfully: SUBJECT". Chain: structured .task.id →
         # bare .id → regex on raw text. The regex preserves back-compat for any
         # legacy fixture that bypasses the structured response.
-        TASK_ID=$(printf '%s' "$V11_TOOL_OUTPUT" | jq -r '.task.id // .id // ""' 2>/dev/null)
-        [ -z "$TASK_ID" ] && TASK_ID=$(printf '%s' "$V11_TOOL_OUTPUT" | _extract_task_id)
         TASK_STATUS="pending"
-        TASK_SUBJECT=$(printf '%s' "$V11_RAW_INPUT" | jq -r '.tool_input.subject // ""' 2>/dev/null)
-        TASK_DESCRIPTION=$(printf '%s' "$V11_RAW_INPUT" | jq -r '.tool_input.description // ""' 2>/dev/null)
+        # S2-T0b-2: also need the payload's tool_use_id (the TaskList epoch
+        # record dedupes a re-fired PostToolUse on it).
+        # S2-T4: single jq pass (was 3 jq forks: TASK_ID from $V11_TOOL_OUTPUT,
+        # tool_use_id+subject combined from $V11_RAW_INPUT, description from
+        # $V11_RAW_INPUT). $V11_TOOL_OUTPUT is passed in as --arg and parsed
+        # with try/catch so a legacy raw-text tool_output (not JSON) degrades
+        # the same way the old two-call chain did: TASK_ID empty, falls
+        # through to the _extract_task_id sed regex below.
+        TASK_ID="" _V11_TOOL_USE_ID="" TASK_SUBJECT="" TASK_DESCRIPTION=""
+        {
+            IFS= read -r -d '' TASK_ID
+            IFS= read -r -d '' _V11_TOOL_USE_ID
+            IFS= read -r -d '' TASK_SUBJECT
+            IFS= read -r -d '' TASK_DESCRIPTION
+        } < <(printf '%s' "$V11_RAW_INPUT" | jq -j --arg raw_out "$V11_TOOL_OUTPUT" '
+            ((try ($raw_out | fromjson) catch {})) as $to
+            | ($to.task.id // $to.id // "" | tostring), "\u0000",
+            ((.tool_use_id // "") | tostring | gsub("[^A-Za-z0-9_-]"; "")), "\u0000",
+            (.tool_input.subject // "" | tostring), "\u0000",
+            (.tool_input.description // ""), "\u0000"
+        ')
+        [ -z "$TASK_ID" ] && TASK_ID=$(printf '%s' "$V11_TOOL_OUTPUT" | _extract_task_id)
         ;;
     TaskUpdate)
         # Primary: structured tool_input.taskId. Fallbacks: tool_response.taskId
         # (Claude Code emits {success, taskId, statusChange}) then legacy text regex.
-        TASK_ID=$(printf '%s' "$V11_RAW_INPUT" | jq -r '.tool_input.taskId // ""' 2>/dev/null)
+        # S2-T4: single jq pass for the always-read fields (was 4 jq forks:
+        # taskId, status, description-as-subject, subject). TASK_DESCRIPTION
+        # reuses TASK_SUBJECT's value directly below — they were always the
+        # identical jq expression (.tool_input.description // ""), read twice.
+        TASK_ID="" TASK_STATUS="" TASK_SUBJECT="" TASK_SUBJECT_NEW=""
+        {
+            IFS= read -r -d '' TASK_ID
+            IFS= read -r -d '' TASK_STATUS
+            IFS= read -r -d '' TASK_SUBJECT
+            IFS= read -r -d '' TASK_SUBJECT_NEW
+        } < <(printf '%s' "$V11_RAW_INPUT" | jq -j '
+            (.tool_input.taskId // ""), "\u0000",
+            (.tool_input.status // ""), "\u0000",
+            (.tool_input.description // ""), "\u0000",
+            (.tool_input.subject // ""), "\u0000"
+        ')
         [ -z "$TASK_ID" ] && TASK_ID=$(printf '%s' "$V11_TOOL_OUTPUT" | jq -r '.taskId // ""' 2>/dev/null)
         [ -z "$TASK_ID" ] && TASK_ID=$(printf '%s' "$V11_TOOL_OUTPUT" | _extract_task_id)
-        TASK_STATUS=$(printf '%s' "$V11_RAW_INPUT" | jq -r '.tool_input.status // ""' 2>/dev/null)
         # Legacy aliasing: TASK_SUBJECT pulls from .tool_input.description for the
         # recent_completed/blocked_tasks audit trail and active_task display. Kept
         # for back-compat; the audit subject "best-effort" reads the description
         # because pre-V11.14 TaskUpdate had no real subject field plumbed here.
-        TASK_SUBJECT=$(printf '%s' "$V11_RAW_INPUT" | jq -r '.tool_input.description // ""' 2>/dev/null)
-        # V11.14.1: real subject refresh, used to update open_tasks[$id].subject
-        # without clobbering it with the description payload. Empty when the
-        # caller didn't pass a subject (the common case for status flips).
-        TASK_SUBJECT_NEW=$(printf '%s' "$V11_RAW_INPUT" | jq -r '.tool_input.subject // ""' 2>/dev/null)
-        TASK_DESCRIPTION=$(printf '%s' "$V11_RAW_INPUT" | jq -r '.tool_input.description // ""' 2>/dev/null)
+        # V11.14.1: TASK_SUBJECT_NEW is the real subject refresh, used to update
+        # open_tasks[$id].subject without clobbering it with the description
+        # payload. Empty when the caller didn't pass a subject (the common
+        # case for status flips).
+        TASK_DESCRIPTION="$TASK_SUBJECT"
         ;;
 esac
 # Normalize jq "null" → empty for downstream conditionals
@@ -101,6 +187,19 @@ if [ -z "$TASK_ID" ] && { [ "$V11_TOOL_NAME" = "TaskCreate" ] || [ "$V11_TOOL_NA
     echo "sync-tasks: could not extract task id from $V11_TOOL_NAME" >&2
     exit 0
 fi
+
+# --- S2-T0b-2 (#113): the session's TaskList epoch, read once ---
+# Read before Strategy 1.6, which prefers the create stamped with this epoch
+# (review #19 C9); a missing or unreadable record just means no epoch. Every
+# event this call appends is stamped with _V11_TL_EPOCH (v11_ledger_append).
+# A TaskCreate re-reads it under FD-201 below, where it may open a new epoch.
+# A task carried into the current epoch keeps the epoch it was created in
+# (review #26), so the read names this call's task. Builtins only
+# (lib/common.sh). Rollback: V11_TASKLIST_EPOCH=off.
+_V11_TL_EPOCH=""; _V11_TL_OPEN=""; _V11_TLR_STATE="off"
+case "$V11_TOOL_NAME" in
+    TaskCreate|TaskUpdate|TaskList) v11_tl_epoch_read "$_v11_hb_uuid" "$TASK_ID" ;;
+esac
 
 # --- Detect project ---
 PROJECT=""
@@ -176,21 +275,32 @@ fi
 # artifacts + counters_delta would all go to project A's ledger and never
 # fold into project B's aggregate — exactly the V11.15.4 misroute class.
 #
-# Fix: since (session_uuid, task_id) is a unique pair within a Claude Code
-# session (IDs start at 1 per session), we can ask the durable ledger
-# directly: "which project saw a 'created' event for THIS session_uuid +
-# TASK_ID?". That project IS the task's home, by V11.23 per-task routing
-# contract. Strategies 1 and 1.5a still take precedence (cheaper + no
-# filesystem scan); 1.6 runs only when those fail to resolve.
+# Fix: ask the durable ledger "which project saw a 'created' event for THIS
+# session_uuid + TASK_ID?". That project IS the task's home, by V11.23
+# per-task routing contract. Strategies 1 and 1.5a still take precedence
+# (cheaper + no filesystem scan); 1.6 runs only when those fail to resolve.
 #
-# Cost: one grep + jq per ledger file. ~100-200 jsonl files on typical hosts;
-# bounded by file count, not file size (we early-out on grep miss). Acceptable
-# for the rare path (never fires when Strategy 1 succeeds).
+# (session_uuid, task_id) is NOT unique within a session (S2-T0b-2, #113): a
+# resumed conversation keeps its hook session id but can get a new TaskList
+# that numbers from 1 again, so several creates can match. Pick, across ALL
+# ledger files (review #19 C9): the create stamped with the current TaskList
+# epoch (_V11_TL_EPOCH, read above) if any file holds one, else the latest
+# create by ts. The old pick, `head -n 1` of the first matching file, was the
+# oldest create: after a resume, the previous TaskList's task. Its identity
+# pre-populates the ladder below only when it is the current epoch's create,
+# or there is no current epoch, or the epoch opened `fresh` (it continues the
+# TaskList before it); a `reuse` epoch whose create never reached a ledger
+# must not bind an older TaskList's task, so the ladder then finds nothing.
+#
+# Cost: two greps + one jq per ledger file that holds both strings; files
+# without them cost the greps only. Acceptable for the rare path (never fires
+# when Strategy 1 succeeds).
 #
 # Rollback: V11_LEDGER_TASK_HOME=off restores old behavior (Strategy 1.5
-# fallthrough to .project).
+# fallthrough to .project); V11_TASKLIST_EPOCH=off restores the oldest-create
+# pick.
 if [ -z "$PROJECT" ] && [ -n "$TASK_ID" ] && [ "${V11_LEDGER_TASK_HOME:-on}" != "off" ]; then
-    _v11_sess_uuid="$(v11_session_uuid)"
+    _v11_sess_uuid="$_v11_hb_uuid"
     _v11_ledger_dir="${METRICS_DIR}/ledger"
     # Will hold the matched created event's subject_norm + create_seq so the
     # downstream identity-resolution ladder (Step 1-4) finds them pre-populated
@@ -201,36 +311,68 @@ if [ -z "$PROJECT" ] && [ -n "$TASK_ID" ] && [ "${V11_LEDGER_TASK_HOME:-on}" != 
     V11_LEDGER_TASK_HOME_CREATE_SEQ=""
     if [ -n "$_v11_sess_uuid" ] && [ "$_v11_sess_uuid" != "legacy-cli" ] \
        && [ -d "$_v11_ledger_dir" ]; then
-        _v11_found_project=""
+        _v11_found_project=""; _v11_found_cur=0; _v11_found_s=-1
+        _v11_found_sn=""; _v11_found_cs=""; _V11_SECS_ERE='^-?[0-9]{1,12}$'
+        # V11_TASKLIST_EPOCH=off: v11.46's pick, the first create of the first file.
+        _v11_16_legacy=false
+        [ "${V11_TASKLIST_EPOCH:-on}" = "off" ] && _v11_16_legacy=true
         for _f in "$_v11_ledger_dir"/*.jsonl; do
             [ -f "$_f" ] || continue
             # Cheap pre-filter: most ledgers won't contain this session_uuid.
             # Two greps because session_uuid and task_id may not be adjacent.
             if grep -q "\"session_uuid\":\"$_v11_sess_uuid\"" "$_f" 2>/dev/null \
                && grep -q "\"task_id\":\"$TASK_ID\"" "$_f" 2>/dev/null; then
-                # Single jq pass extracts project + subject_norm + create_seq
-                # as TAB-separated. subject_norm is whitespace-normalized at
-                # TaskCreate so it never contains a TAB (v11_normalize_subject).
-                _v11_match=$(jq -r --arg sid "$_v11_sess_uuid" --arg tid "$TASK_ID" '
-                    select(.ev == "created" and .session_uuid == $sid and .task_id == $tid)
-                    | [(.project // ""), (.subject_norm // ""), ((.create_seq // 0) | tostring)]
-                    | @tsv
-                ' "$_f" 2>/dev/null | head -n 1)
-                if [ -n "$_v11_match" ]; then
-                    _v11_found_project=$(printf '%s' "$_v11_match" | cut -f1)
-                    V11_LEDGER_TASK_HOME_SUBJ_NORM=$(printf '%s' "$_v11_match" | cut -f2)
-                    V11_LEDGER_TASK_HOME_CREATE_SEQ=$(printf '%s' "$_v11_match" | cut -f3)
-                    if [ -n "$_v11_found_project" ] && [ "$_v11_found_project" != "null" ]; then
-                        break
-                    fi
-                    _v11_found_project=""
+                # One jq pass per file: this file's best create for the pair,
+                # "<current epoch 1|0> <ts as epoch seconds> <project>
+                # <subject_norm> <create_seq>" joined on \x1f (not IFS
+                # whitespace, so an empty field keeps its place; a normalized
+                # subject never holds it). Lines are parsed one at a time
+                # (fromjson?), so a torn tail line costs only itself.
+                _v11_match=$(jq -rnR --arg sid "$_v11_sess_uuid" --arg tid "$TASK_ID" \
+                    --arg tle "${_V11_TL_EPOCH:-}" --argjson legacy "$_v11_16_legacy" '
+                    def secs: (.ts // "" | tostring) as $t
+                        | ([$t | capture("^(?<d>[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2})(\\.[0-9]+)?(?<z>Z|[+-][0-9]{2}:?[0-9]{2})?$")] | .[0]) as $m
+                        | if $m == null then 0
+                          else (($m.d + "Z") | fromdateiso8601)
+                               - (if ($m.z // "Z") == "Z" then 0
+                                  else ([$m.z | capture("(?<s>[+-])(?<h>[0-9]{2}):?(?<n>[0-9]{2})")] | .[0])
+                                       | (if .s == "+" then 1 else -1 end)
+                                         * ((.h | tonumber) * 3600 + (.n | tonumber) * 60) end)
+                          end;
+                    ("\"session_uuid\":\"" + $sid + "\"") as $needle
+                    | [inputs | select(contains($needle)) | fromjson?
+                       | select(type == "object" and .ev == "created" and .session_uuid == $sid and .task_id == $tid)
+                       | {cur: ($tle != "" and ((.tl_epoch // "") | tostring) == $tle), s: secs,
+                          p: (.project // "" | tostring), sn: (.subject_norm // "" | tostring),
+                          cs: ((.create_seq // 0) | tostring)}]
+                    | if length == 0 then empty
+                      else (if $legacy then .[0]
+                            else ((map(select(.cur)) | last) // (sort_by(.s) | last)) end)
+                           | [(if .cur then "1" else "0" end), (.s | floor | tostring), .p, .sn, .cs]
+                           | join("\u001f") end
+                ' "$_f" 2>/dev/null)
+                [ -n "$_v11_match" ] || continue
+                IFS=$'\x1f' read -r _v11_m_cur _v11_m_s _v11_m_p _v11_m_sn _v11_m_cs <<< "$_v11_match"
+                { [ -n "$_v11_m_p" ] && [ "$_v11_m_p" != "null" ]; } || continue
+                [[ $_v11_m_s =~ $_V11_SECS_ERE ]] || _v11_m_s=0
+                if [ "$_v11_m_cur" = "1" ] || [ -z "$_v11_found_project" ] \
+                   || (( _v11_m_s > _v11_found_s )); then
+                    _v11_found_project="$_v11_m_p"; _v11_found_cur="$_v11_m_cur"; _v11_found_s="$_v11_m_s"
+                    _v11_found_sn="$_v11_m_sn"; _v11_found_cs="$_v11_m_cs"
                 fi
+                # The current epoch's create is the one; one epoch holds one create per id.
+                [ "$_v11_found_cur" = "1" ] && break
+                [ "$_v11_16_legacy" = true ] && break
             fi
         done
         if [ -n "$_v11_found_project" ] \
-           && printf '%s' "$_v11_found_project" | grep -qE '^[a-zA-Z0-9._-]{1,64}$'; then
+           && [[ $_v11_found_project =~ $V11_PROJECT_SLUG_ERE_LEGACY ]]; then
             PROJECT="$_v11_found_project"
             PROJECT_SOURCE="ledger-task-home"
+            if [ "$_v11_found_cur" = "1" ] || [ -z "${_V11_TL_EPOCH:-}" ] || [ "${_V11_TLR_REASON:-}" = "fresh" ]; then
+                V11_LEDGER_TASK_HOME_SUBJ_NORM="$_v11_found_sn"
+                V11_LEDGER_TASK_HOME_CREATE_SEQ="$_v11_found_cs"
+            fi
             echo "[v11.24-strategy-1.6] resolved project='${_v11_found_project}' via ledger-task-home for task #${TASK_ID} (session=${_v11_sess_uuid})" >&2
         else
             # Clear identity fields if project didn't validate so we don't
@@ -273,6 +415,24 @@ if [ -z "$PROJECT" ] && [ -n "$V11_CWD" ] && [ "${V11_TASK_PROJECT_AUTODEFAULT:-
         if printf '%s' "$_v11_cwd_project" | grep -qE '^[a-zA-Z0-9._-]{1,64}$'; then
             PROJECT="$_v11_cwd_project"
             PROJECT_SOURCE="cwd-sessions-match"
+        fi
+    elif declare -F _v11_detect_project_from_path >/dev/null 2>&1; then
+        # CWD in a repo outside sessions/ ($HERCULES_ROOT/{name} or a
+        # portfolio app): reuse the shared detector, which sets globals.
+        # Save + restore V11_PROJECT / V11_DETECTION_METHOD exactly
+        # (unset vs empty preserved). No forks: builtins only.
+        _v11_sv_p_set="${V11_PROJECT+x}"; _v11_sv_p="${V11_PROJECT:-}"
+        _v11_sv_m_set="${V11_DETECTION_METHOD+x}"; _v11_sv_m="${V11_DETECTION_METHOD:-}"
+        V11_PROJECT=""; V11_DETECTION_METHOD=""
+        _v11_detect_project_from_path "$V11_CWD"
+        _v11_cand="$V11_PROJECT"; _v11_cand_m="$V11_DETECTION_METHOD"
+        if [ -n "$_v11_sv_p_set" ]; then V11_PROJECT="$_v11_sv_p"; else unset V11_PROJECT; fi
+        if [ -n "$_v11_sv_m_set" ]; then V11_DETECTION_METHOD="$_v11_sv_m"; else unset V11_DETECTION_METHOD; fi
+        if [ -n "$_v11_cand" ] \
+           && { [ "$_v11_cand_m" = "hercules-root" ] || [ "$_v11_cand_m" = "portfolio-app" ]; } \
+           && [ -d "$SESSIONS_ROOT/$_v11_cand" ]; then
+            PROJECT="$_v11_cand"
+            PROJECT_SOURCE="cwd-hercules-root-match"
         fi
     fi
 fi
@@ -327,7 +487,7 @@ fi
 # attribution visible. TaskUpdate/TaskList don't typically carry metadata in
 # the input, so we only warn on TaskCreate to keep noise low.
 if [ "$V11_TOOL_NAME" = "TaskCreate" ] \
-   && { [ "$PROJECT_SOURCE" = "active-project-fallback" ] || [ "$PROJECT_SOURCE" = "cwd-sessions-match" ]; }; then
+   && { [ "$PROJECT_SOURCE" = "active-project-fallback" ] || [ "$PROJECT_SOURCE" = "cwd-sessions-match" ] || [ "$PROJECT_SOURCE" = "cwd-hercules-root-match" ]; }; then
     if [ "${V11_TASK_PROJECT_AUTODEFAULT:-on}" != "off" ]; then
         # V11.36 (#36-F1): downgraded from WARN — a fallback strategy DID
         # successfully resolve the project, so this is informational, not a
@@ -427,6 +587,7 @@ _v11_str_advisory() {
 # Measured before fix: 1972/7367 (26.8%) file-mutating edits resolved via the global fallback,
 # 1504 credited to the wrong project, 602 of those auto-approved at A4/A5. (improvements/15)
 v11_write_active_project "$PROJECT"
+[ -z "$_V11_PROF_T0" ] || _v11_prof_mark resolve
 
 # --- Load or initialize task state ---
 # V11.13: per-session ownership. Source of truth is now
@@ -476,6 +637,9 @@ _V11_SYNC_RACED=0
 exec 201>"$STATE_FILE.lock"
 flock -w "$_V11_SYNC_LOCK_TIMEOUT" 201 || { _V11_SYNC_RACED=1; echo "sync-tasks: lock contention >${_V11_SYNC_LOCK_TIMEOUT}s on $STATE_FILE.lock; proceeding unserialized (ledger stays lossless; per-session scratch reconciled on next locked call — v11.33)" >&2; }
 
+# S2-T2: _V11_STATE_FRESH=1 when the scratch was missing or invalid (the no-op
+# TaskList check below then never skips: the call repopulates the scratch).
+_V11_STATE_FRESH=0
 if [ -f "$STATE_FILE" ] && [ -s "$STATE_FILE" ] && jq empty "$STATE_FILE" 2>/dev/null; then
     STATE=$(cat "$STATE_FILE")
     # Self-heal: ensure session_uuid + project are stamped (e.g. file pre-dates V11.13)
@@ -487,6 +651,7 @@ if [ -f "$STATE_FILE" ] && [ -s "$STATE_FILE" ] && jq empty "$STATE_FILE" 2>/dev
     ')
 else
     # File missing, empty, or invalid JSON — initialize fresh state
+    _V11_STATE_FRESH=1
     [ -f "$STATE_FILE" ] && ! [ -s "$STATE_FILE" ] && echo "sync-tasks: state file empty/invalid, reinitializing ($STATE_FILE)" >&2
     STATE=$(jq -n --arg sid "$SESSION_UUID" --arg project "$PROJECT" --arg now "$NOW" '{
         session_uuid: $sid,
@@ -523,6 +688,18 @@ if [ "${V11_SYNC_SCRATCH_RECONCILE:-on}" != "off" ] && [ "${_V11_SYNC_RACED:-0}"
         echo "sync-tasks: drained scratch-reconcile marker for session $SESSION_UUID (v11.33)" >&2
     fi
 fi
+[ -z "$_V11_PROF_T0" ] || _v11_prof_mark load
+
+# --- S2-T0b-2 (#113): does this create open a TaskList epoch? ---
+# Under FD-201, before this call appends anything (its prescope rows and a
+# review sibling's create are stamped too). v11_tl_epoch_on_create re-reads the
+# record, appends this create to it, and sets _V11_TL_EPOCH / _V11_TL_OPEN. On
+# the unserialized fallback it only reads (design §2 fallbacks). An epoch opens
+# even when this create's ledger line is skipped: the record tracks the
+# TaskList, not a project.
+if [ "$V11_TOOL_NAME" = "TaskCreate" ] && [ "$_V11_TLR_STATE" != "off" ]; then
+    v11_tl_epoch_on_create "$SESSION_UUID" "$TASK_ID" "${_V11_TOOL_USE_ID:-}" "${_V11_SYNC_RACED:-0}"
+fi
 
 # --- V11.16: Ledger event accumulator ---
 # LEDGER_EVENT_JSON is set by each branch and emitted once after the STATE write.
@@ -553,6 +730,8 @@ case "$V11_TOOL_NAME" in
 
         # V11: Advisory schema validation on task metadata
         METADATA=$(printf '%s' "$V11_RAW_INPUT" | jq -c '.tool_input.metadata // empty' 2>/dev/null)
+        COMPLEXITY="" STR_COUNT="0" RECOMMENDED_AGENT="" TASK_SCOPE="" DELIVERABLE_OF=""
+        META_REVIEW_OF="" META_BLOCKER="" META_SOURCE=""
         if [ -n "$METADATA" ] && [ "$METADATA" != "null" ] && [ "$METADATA" != "" ]; then
             SCHEMA_WARN=$(mktemp /tmp/v11-schema-XXXXXX.txt)
             if ! v11_validate_json "$METADATA" "task-metadata.schema.json" 2>"$SCHEMA_WARN"; then
@@ -561,12 +740,45 @@ case "$V11_TOOL_NAME" in
             fi
             rm -f "$SCHEMA_WARN"
 
+            # S2-T4: single jq pass for the 8 metadata.* fields this block
+            # reads (was 7 separate jq forks against $METADATA; S2-T5 added
+            # .source — #83 — to the same pass, 0 extra forks). NUL-delimited
+            # for the same reason as v11_parse_input (common.sh header
+            # comment) — @tsv would mangle embedded tabs/newlines in
+            # deliverable_of/blocker free-text values.
+            #
+            # review-#14 LOW (E4): META_BLOCKER's formatting for a non-string
+            # .blocker changed here from jq -r's pretty-printed multi-line
+            # JSON to this block's compact tojson (single line). Confirmed
+            # safe: META_BLOCKER is only ever read in truthy checks below
+            # (-n / != "null" / != "false" / != "0"), never re-emitted or
+            # line-anchored on its exact formatting. See docs/ROLLBACK_REFERENCE.md
+            # "S2-T4 ... (+ review-#14 fixes, task #15)".
+            {
+                IFS= read -r -d '' COMPLEXITY
+                IFS= read -r -d '' STR_COUNT
+                IFS= read -r -d '' RECOMMENDED_AGENT
+                IFS= read -r -d '' TASK_SCOPE
+                IFS= read -r -d '' DELIVERABLE_OF
+                IFS= read -r -d '' META_REVIEW_OF
+                IFS= read -r -d '' META_BLOCKER
+                IFS= read -r -d '' META_SOURCE
+            } < <(printf '%s' "$METADATA" | jq -j '
+                (.complexity // ""), "\u0000",
+                ((.spec_test_requirements // []) | length | tostring), "\u0000",
+                (.agent // ""), "\u0000",
+                (.scope // ""), "\u0000",
+                (.deliverable_of // ""), "\u0000",
+                (.review_of // ""), "\u0000",
+                (.blocker // "" | if type == "string" then . else tojson end), "\u0000",
+                (.source // "" | if type == "string" then . else "" end), "\u0000"
+            ')
+            STR_COUNT="${STR_COUNT:-0}"
+
             # V11.7.2: Dark Code Layer 1 — complex/novel tasks should carry
             # spec_test_requirements so implementers see checkable assertions.
             # Advisory is also persisted in task-state as a counter so
             # compliance gate 12 can surface it.
-            COMPLEXITY=$(printf '%s' "$METADATA" | jq -r '.complexity // ""' 2>/dev/null)
-            STR_COUNT=$(printf '%s' "$METADATA" | jq -r '.spec_test_requirements // [] | length' 2>/dev/null)
             STR_MISSING_THIS_CALL=0
             if { [ "$COMPLEXITY" = "complex" ] || [ "$COMPLEXITY" = "novel" ]; } && [ "${STR_COUNT:-0}" = "0" ]; then
                 echo "ADVISORY (Dark Code Layer 1): Task #$TASK_ID is complexity=$COMPLEXITY but has no spec_test_requirements." >&2
@@ -575,25 +787,20 @@ case "$V11_TOOL_NAME" in
                 STR_MISSING_THIS_CALL=1
             fi
 
-            # V11.11: extract metadata.agent (push-recommend). Stored in
+            # V11.11: metadata.agent (push-recommend), read above. Stored in
             # recommended_agents map keyed by task_id; downstream hooks
             # (track-autonomy, post-compact) read it for audit attribution
             # when owner/active_agent_id is empty.
-            RECOMMENDED_AGENT=$(printf '%s' "$METADATA" | jq -r '.agent // ""' 2>/dev/null)
 
-            # W2-T10: extract metadata.scope + metadata.deliverable_of for the
-            # pre-scope advisory below. metadata.scope has been settable at
-            # TaskCreate since early V11 but was read by nothing — this is
-            # the wiring that closes that gap.
-            TASK_SCOPE=$(printf '%s' "$METADATA" | jq -r '.scope // ""' 2>/dev/null)
-            DELIVERABLE_OF=$(printf '%s' "$METADATA" | jq -r '.deliverable_of // ""' 2>/dev/null)
+            # W2-T10: metadata.scope + metadata.deliverable_of, read above,
+            # feed the pre-scope advisory below. metadata.scope has been
+            # settable at TaskCreate since early V11 but was read by nothing
+            # — this is the wiring that closes that gap.
 
-            # S1-A1: extract metadata.review_of + metadata.blocker for the
-            # scope advisory below — reviewer/blocker tasks are exempt from
-            # the missing/invalid-scope check (they aren't "work" tasks in
-            # the deliverable-sizing sense).
-            META_REVIEW_OF=$(printf '%s' "$METADATA" | jq -r '.review_of // ""' 2>/dev/null)
-            META_BLOCKER=$(printf '%s' "$METADATA" | jq -r '.blocker // ""' 2>/dev/null)
+            # S1-A1: metadata.review_of + metadata.blocker, read above, feed
+            # the scope advisory below — reviewer/blocker tasks are exempt
+            # from the missing/invalid-scope check (they aren't "work" tasks
+            # in the deliverable-sizing sense).
         fi
 
         # V11.11: advisory when TaskCreate lacks metadata.agent. Push-recommend
@@ -623,7 +830,13 @@ case "$V11_TOOL_NAME" in
         # is a heuristic CONTEXT-WINDOW token estimator (conversation token
         # budget: 50/70/85% warnings), not task-size/deliverable-size
         # machinery. It is unrelated latent infrastructure — not reused here.
-        if [ "${V11_PRESCOPE_ADVISORY:-on}" != "off" ]; then
+        #
+        # S2-T5 (#83): metadata.source=="rehydrate" skips this and the two
+        # advisory blocks below (SCOPE, SMELL) entirely. A rehydrated
+        # TaskCreate is re-stating a task that already fired these advisories
+        # (or was created before they existed) at its original TaskCreate —
+        # re-firing on every handoff is orchestration noise, not new signal.
+        if [ "${V11_PRESCOPE_ADVISORY:-on}" != "off" ] && [ "${META_SOURCE:-}" != "rehydrate" ]; then
             _PRESCOPE_FIRE=0
             _PRESCOPE_REASON=""
             if [ "${TASK_SCOPE:-}" = "large" ]; then
@@ -658,7 +871,9 @@ case "$V11_TOOL_NAME" in
         #     or metadata.blocker is truthy)
         #
         # stderr-only, NEVER blocks or alters the tool result.
-        if [ "${V11_SCOPE_WARN:-on}" != "off" ]; then
+        # S2-T5 (#83): skipped for metadata.source=="rehydrate" — see the
+        # PRE-SCOPE block above.
+        if [ "${V11_SCOPE_WARN:-on}" != "off" ] && [ "${META_SOURCE:-}" != "rehydrate" ]; then
             _SCOPE_WARN_EXEMPT=0
             if [ -n "${META_REVIEW_OF:-}" ] && [ "${META_REVIEW_OF}" != "null" ]; then
                 _SCOPE_WARN_EXEMPT=1
@@ -711,7 +926,9 @@ case "$V11_TOOL_NAME" in
         # Independent env-var gate (V11_PRESCOPE_SMELL) — separate knob from
         # both V11_PRESCOPE_ADVISORY and V11_SCOPE_WARN, separate concern.
         # stderr-only, NEVER blocks or alters the tool result.
-        if [ "${V11_PRESCOPE_SMELL:-on}" != "off" ]; then
+        # S2-T5 (#83): skipped for metadata.source=="rehydrate" — see the
+        # PRE-SCOPE block above.
+        if [ "${V11_PRESCOPE_SMELL:-on}" != "off" ] && [ "${META_SOURCE:-}" != "rehydrate" ]; then
             _SMELL_EXEMPT=0
             if [ -n "${META_REVIEW_OF:-}" ] && [ "${META_REVIEW_OF}" != "null" ]; then
                 _SMELL_EXEMPT=1
@@ -745,24 +962,27 @@ case "$V11_TOOL_NAME" in
             fi
         fi
 
-        # ── S1-B2: durable-ledger rows for fired prescope/scope/smell advisories ────
-        # Persists each fired advisory above (V11_PRESCOPE_ADVISORY / V11_SCOPE_WARN /
-        # V11_PRESCOPE_SMELL) as a status-neutral ev:"prescope" ledger row, mirroring
-        # the ev:"review" verdict fold-back pattern (v11.30, _v11_review_ledger_event
-        # in lib/common.sh) — identity_unresolved:true sentinel, since the FD-207-
-        # confirmed create_seq for THIS task_id's "created" event isn't assigned until
-        # v11_ledger_append runs for it later in this same TaskCreate call. Gated on
-        # V11_PRESCOPE_LEDGER (default on) and the same PROJECT_SOURCE !=
-        # "active-project-fallback" guard the main "created" ledger event uses below
-        # (ambient/mutable global state must never be in the ledger write path).
+        # ── S1-B2: durable-ledger row for fired prescope/scope/smell advisories ────
+        # Persists the advisories fired above (V11_PRESCOPE_ADVISORY / V11_SCOPE_WARN /
+        # V11_PRESCOPE_SMELL) as ONE status-neutral ev:"prescope" ledger row carrying
+        # every fired reason (S2-T5, #83: was one ~42-fork v11_ledger_append call per
+        # reason — a scope=large task with a smelly description fired two full
+        # appends for one TaskCreate). Mirrors the ev:"review" verdict fold-back
+        # pattern (v11.30, _v11_review_ledger_event in lib/common.sh) —
+        # identity_unresolved:true sentinel, since the FD-207-confirmed create_seq for
+        # THIS task_id's "created" event isn't assigned until v11_ledger_append runs
+        # for it later in this same TaskCreate call. Gated on V11_PRESCOPE_LEDGER
+        # (default on) and the same PROJECT_SOURCE != "active-project-fallback" guard
+        # the main "created" ledger event uses below (ambient/mutable global state
+        # must never be in the ledger write path). Never fires for
+        # metadata.source=="rehydrate": the three advisory blocks above are skipped
+        # for it, so _V11_PRESCOPE_LEDGER_REASONS is always empty there.
         # Advisory-grade: never fails the hook (v11_ledger_append is side-effect-
-        # never-fails; loop errors are swallowed).
+        # never-fails).
         if [ "${V11_PRESCOPE_LEDGER:-on}" != "off" ] && [ -n "$TASK_ID" ] \
            && [ "$PROJECT_SOURCE" != "active-project-fallback" ] \
            && [ "${#_V11_PRESCOPE_LEDGER_REASONS[@]}" -gt 0 ]; then
-            for _v11_pr_reason in "${_V11_PRESCOPE_LEDGER_REASONS[@]}"; do
-                _v11_prescope_ledger_event "$PROJECT" "$TASK_ID" "$_v11_pr_reason" "$SESSION_UUID" >/dev/null 2>/dev/null || true
-            done
+            _v11_prescope_ledger_event "$PROJECT" "$TASK_ID" "$SESSION_UUID" "${_V11_PRESCOPE_LEDGER_REASONS[@]}" >/dev/null 2>/dev/null || true
         fi
 
         # ── V11 R2.1: TaskCreate dedupe advisory ─────────────────────────────
@@ -872,8 +1092,33 @@ case "$V11_TOOL_NAME" in
             [ -z "$_LEDGER_SUBJ_NORM" ] && _LEDGER_SUBJ_NORM="__empty__"
         fi
 
+        # S2-T0b-2 (#111): a rehydrated create names the identity it continues
+        # in metadata.rehydrated_from.identity (scripts/v11-resume-tasks).
+        # The ledger event carries it as rehydrate_target; v11_ledger_append
+        # keys the create on it while that identity is open, so a task renamed
+        # before the handoff keeps its original (subject_norm, create_seq).
+        # _idk starts from the target and the second STATE write below patches
+        # in the identity the ledger actually used. RH_TARGET_DEF is shared by
+        # both jq calls; the target also names rehydrated_from's session and id,
+        # which v11_ledger_append checks the identity against (review #26).
+        # Rollback: V11_REHYDRATE_IDENTITY_WRITE=off.
+        _V11_RH_ON=true
+        [ "${V11_REHYDRATE_IDENTITY_WRITE:-on}" = "off" ] && _V11_RH_ON=false
+        _V11_RH_TARGET_DEF='def rh_target($meta; $rh):
+            if $rh then ($meta.rehydrated_from? // null) as $rf
+                | ($rf | if type == "object" then .identity else null end)
+                | if type == "object" and (.subject_norm | type) == "string" and .subject_norm != ""
+                     and (.create_seq | type) == "number" and .create_seq >= 0
+                     and .create_seq == (.create_seq | floor)
+                  then {subject_norm, create_seq, session: ($rf.session // null), id: ($rf.id // null)}
+                  else null end
+            else null end;'
+        # review #26: _created_at (the create's ts, lever on) lets the
+        # completion-time dispatch-trace dedupe (C8) date a row with no session.
+        _V11_TL_CAT=""; [ "${V11_TASKLIST_EPOCH:-on}" != "off" ] && _V11_TL_CAT="$NOW"
         STATE=$(printf '%s' "$STATE" | jq \
             --arg now "$NOW" \
+            --arg cat "$_V11_TL_CAT" \
             --arg subj "$TASK_SUBJECT" \
             --arg desc "$TASK_DESCRIPTION" \
             --arg complexity "${COMPLEXITY:-}" \
@@ -884,8 +1129,15 @@ case "$V11_TOOL_NAME" in
             --arg subj_norm "${_LEDGER_SUBJ_NORM:-}" \
             --arg project "$PROJECT" \
             --arg proj_source "$PROJECT_SOURCE" \
-            --argjson live_reconcile "$([ "${V11_HANDOFF_LIVE_RECONCILE:-on}" != "off" ] && echo 'true' || echo 'false')" '
+            --argjson tle "${_V11_TL_EPOCH:-null}" \
+            --argjson rh "$_V11_RH_ON" \
+            --argjson live_reconcile "$([ "${V11_HANDOFF_LIVE_RECONCILE:-on}" != "off" ] && echo 'true' || echo 'false')" "$_V11_RH_TARGET_DEF"'
             .total += 1 | .pending += 1 | .last_updated = $now
+            # #87: last_progress_at is written only here and on TaskUpdate status
+            # changes, never on TaskList/TaskGet, which also touch last_updated.
+            # guard-agent-stall prefers it (V11_STALL_PROGRESS_CLOCK) so a passive
+            # poll does not re-arm the stall clock.
+            | .last_progress_at = $now
             # V11.14.3: do NOT set .active_task on TaskCreate. A newly-created task
             # is pending, not active. Pre-V11.14.3, every TaskCreate overwrote
             # .active_task with the new task subject, making the handoff display
@@ -914,15 +1166,21 @@ case "$V11_TOOL_NAME" in
             # the snapshot JOIN forever. Unstamped tasks land in the ambient bucket
             # with stamped=false (visible, not silently-wrong). E1 fix.
             # Gated on V11_HANDOFF_LIVE_RECONCILE (E3 fix).
+            # S2-T0b-2: _tl_epoch = the TaskList epoch the task was created in
+            # (the identity ladder trusts only current-epoch entries, review #19
+            # C7); absent when there is none. _idk starts from a rehydrate target.
             | if $task_id != "" then
-                .open_tasks = ((.open_tasks // {}) + {($task_id): {
+                .open_tasks = ((.open_tasks // {}) + {($task_id): ({
                     subject: (if $subj != "" and $subj != "null" then $subj else null end),
                     description: (if $desc != "" and $desc != "null" then $desc else null end),
                     status: "pending",
                     metadata: $meta,
                     _proj: (if $live_reconcile and $proj_source != "active-project-fallback" then $project else null end),
-                    _idk: (if $subj_norm != "" then {subject_norm: $subj_norm, create_seq: 0} else null end)
-                }})
+                    _idk: (if $subj_norm != "" then
+                               {subject_norm: (rh_target($meta; $rh).subject_norm // $subj_norm), create_seq: 0}
+                           else null end)
+                } + (if $tle != null then {_tl_epoch: $tle} else {} end)
+                  + (if $cat != "" then {_created_at: $cat} else {} end))})
               else . end
         ')
 
@@ -940,7 +1198,9 @@ case "$V11_TOOL_NAME" in
                 --arg ts "$NOW" \
                 --arg rec_agent "${RECOMMENDED_AGENT:-}" \
                 --arg dup_of "${_DEDUPE_DUP_OF:-}" \
-                --argjson meta "${METADATA:-null}" '
+                --arg tl_open "${_V11_TL_OPEN:-}" \
+                --argjson rh "$_V11_RH_ON" \
+                --argjson meta "${METADATA:-null}" "$_V11_RH_TARGET_DEF"'
                 {
                     v: 1,
                     ev: "created",
@@ -950,6 +1210,8 @@ case "$V11_TOOL_NAME" in
                     subject: $subj,
                     task_id: $task_id,
                     session_uuid: $sid,
+                    tl_open: (if $tl_open != "" then $tl_open else null end),
+                    rehydrate_target: rh_target($meta; $rh),
                     recommended_agent: (if $rec_agent != "" and $rec_agent != "null" then $rec_agent else null end),
                     dup_of: (if $dup_of != "" and $dup_of != "null" then $dup_of else null end),
                     metadata: $meta,
@@ -961,8 +1223,12 @@ case "$V11_TOOL_NAME" in
 
         # ── V11.21: auto-pair review sibling (producer side) ─────────────────
         # Guard 1: V11_AUTO_PAIR_REVIEW must not be "off" (default ON).
-        # Guard 2: parent complexity in {medium, complex, novel} OR risk in {medium, high}.
-        # Guard 3: parent must NOT already have metadata.review_task_id set.
+        # Guard 2: parent complexity in {medium, complex, novel} OR risk in {medium, high},
+        #          and the parent is not INV-7 exempt (#101): metadata.skip_review=true,
+        #          metadata.review_of set (it is a review), or metadata.agent adversarial-*.
+        # Guard 3: parent must NOT already have metadata.review_task_id set. A
+        #          rehydrated task carries its old shadow here (scripts/handoff,
+        #          V11_HANDOFF_REVIEW_TASK_ID), so a restart mints no second one.
         # Action: synthesize a sibling task entry with ID pair_<sid8>_<seq> in open_tasks
         #         and stamp parent.metadata.review_task_id = pair_<sid8>_<seq>. The sid8
         #         (8-char SESSION_UUID fragment) scopes the ID to this session so two
@@ -981,7 +1247,10 @@ case "$V11_TOOL_NAME" in
                 def reviewable: (. == "medium" or . == "complex" or . == "novel");
                 def risk_reviewable: (. == "medium" or . == "high");
                 . as $root |
-                (($complexity | reviewable) or ($root.open_tasks[$id].metadata.risk // "" | risk_reviewable))
+                ($root.open_tasks[$id].metadata // {}) as $m
+                | ($m.skip_review == true or ($m.review_of // "") != ""
+                   or (($m.agent // "") | tostring | startswith("adversarial-"))) as $exempt
+                | (($complexity | reviewable) or ($m.risk // "" | risk_reviewable)) and ($exempt | not)
                 | if . then "yes" else "no" end
                 | . as $should
                 | [$should, ($root.open_tasks[$id].metadata.review_task_id // "")] | @tsv
@@ -1038,7 +1307,8 @@ case "$V11_TOOL_NAME" in
                     --arg now "$_AP_NOW" \
                     --arg sid "$SESSION_UUID" \
                     --arg durable_seq "$_AP_DURABLE_SEQ" \
-                    --arg rand_suffix "$_AP_RAND_SUFFIX" '
+                    --arg rand_suffix "$_AP_RAND_SUFFIX" \
+                    --argjson tle "${_V11_TL_EPOCH:-null}" '
                     # Allocate counter (0 when field absent → first pair is pair_1).
                     # Collision fix: the counter is per-session STATE, so two concurrent
                     # sessions on the same project could each mint bare "pair_1", and
@@ -1070,7 +1340,7 @@ case "$V11_TOOL_NAME" in
                         ),
                         _proj: (if $live_reconcile and $proj_src != "active-project-fallback" then $proj else null end),
                         _idk: null
-                    }
+                    } + (if $tle != null then {_tl_epoch: $tle} else {} end)
                     # Increment .total so TaskList shows the full picture;
                     # pending_parent siblings are NOT counted in .pending.
                     | .total += 1
@@ -1118,10 +1388,34 @@ case "$V11_TOOL_NAME" in
         fi
         ;;
     TaskUpdate)
-        # V11.8 (S1-7): STR advisory on in_progress and completed transitions
-        TU_COMPLEXITY=$(printf '%s' "$V11_RAW_INPUT" | jq -r '.tool_input.metadata.complexity // ""' 2>/dev/null)
-        TU_STR_COUNT=$(printf '%s' "$V11_RAW_INPUT" | jq -r '.tool_input.metadata.spec_test_requirements // [] | length' 2>/dev/null)
-        TU_NO_STR=$(printf '%s' "$V11_RAW_INPUT" | jq -r '.tool_input.metadata.no_str // false' 2>/dev/null)
+        # V11.8 (S1-7): STR advisory on in_progress and completed transitions.
+        # S2-T4: single jq pass — folds in TASK_PHASE/TASK_OWNER/TASK_SPRINT/
+        # TASK_GATE too (previously 4 more jq forks, read only inside the
+        # in_progress case arm below). Computing all 7 here unconditionally
+        # costs nothing extra (one jq call either way) and is safe: grep
+        # confirms TASK_PHASE/OWNER/SPRINT/GATE are referenced ONLY inside
+        # that in_progress arm, so other status transitions just carry
+        # unused empty-string values, same as before.
+        TU_COMPLEXITY="" TU_STR_COUNT="0" TU_NO_STR="false"
+        TASK_PHASE="" TASK_OWNER="" TASK_SPRINT="" TASK_GATE=""
+        {
+            IFS= read -r -d '' TU_COMPLEXITY
+            IFS= read -r -d '' TU_STR_COUNT
+            IFS= read -r -d '' TU_NO_STR
+            IFS= read -r -d '' TASK_PHASE
+            IFS= read -r -d '' TASK_OWNER
+            IFS= read -r -d '' TASK_SPRINT
+            IFS= read -r -d '' TASK_GATE
+        } < <(printf '%s' "$V11_RAW_INPUT" | jq -j '
+            (.tool_input.metadata.complexity // ""), "\u0000",
+            ((.tool_input.metadata.spec_test_requirements // []) | length | tostring), "\u0000",
+            ((.tool_input.metadata.no_str // false) | tostring), "\u0000",
+            (.tool_input.metadata.phase // ""), "\u0000",
+            (.tool_input.owner // ""), "\u0000",
+            (.tool_input.metadata.sprint // ""), "\u0000",
+            (.tool_input.metadata.gate // ""), "\u0000"
+        ')
+        TU_STR_COUNT="${TU_STR_COUNT:-0}"
 
         # V11.16 (ledger wiring): capture prior bucket from open_tasks BEFORE the fold
         # (ADR §1.3.0 writer prior-bucket rule). Also resolve _idk for identity.
@@ -1130,19 +1424,33 @@ case "$V11_TOOL_NAME" in
         _TU_IDK_SUBJ_NORM=""
         _TU_IDK_CREATE_SEQ=""
         if [ -n "$TASK_ID" ] && [ "$PROJECT_SOURCE" != "active-project-fallback" ]; then
-            # Read prior status + _idk from current STATE (before this fold mutates it)
+            # Read prior status + _idk from current STATE (before this fold mutates it).
+            # S2-T0b-2 (review #19 C7): the entry's _tl_epoch comes first. An
+            # entry from an older TaskList epoch names another task that had
+            # this id (v11_tl_entry_current), so Step 1 does not bind it and the
+            # prior bucket is absent; recent_completed / blocked_tasks /
+            # _terminal_idk below apply the same test (TU_EPOCH_OK_DEF).
             _TU_STATE_INFO=$(printf '%s' "$STATE" | jq -r \
                 --arg id "$TASK_ID" '
+                ((.open_tasks[$id]._tl_epoch // "") | tostring) + "|" +
                 (.open_tasks[$id].status // "absent") + "|" +
                 (.open_tasks[$id]._idk.subject_norm // "") + "|" +
                 ((.open_tasks[$id]._idk.create_seq // "") | tostring)
-            ' 2>/dev/null || echo "absent||")
+            ' 2>/dev/null || echo "|absent||")
+            _TU_ENTRY_TLE="${_TU_STATE_INFO%%|*}"
+            _TU_STATE_INFO="${_TU_STATE_INFO#*|}"
             _TU_PRIOR_STATUS="${_TU_STATE_INFO%%|*}"
             _TU_REST="${_TU_STATE_INFO#*|}"
             _TU_IDK_SUBJ_NORM="${_TU_REST%%|*}"
             _TU_IDK_CREATE_SEQ="${_TU_REST##*|}"
             [ "$_TU_IDK_CREATE_SEQ" = "null" ] && _TU_IDK_CREATE_SEQ=""
             [ "$_TU_PRIOR_STATUS" = "null" ] && _TU_PRIOR_STATUS="absent"
+            if [ "$_TU_PRIOR_STATUS" != "absent" ] && ! v11_tl_entry_current "$_TU_ENTRY_TLE"; then
+                _TU_PRIOR_STATUS="absent"; _TU_IDK_SUBJ_NORM=""; _TU_IDK_CREATE_SEQ=""
+            fi
+            _TU_TLE_JSON="${_V11_TL_EPOCH:-null}"
+            _TU_TLE_FRESH=false; [ "${_V11_TLR_REASON:-}" = "fresh" ] && _TU_TLE_FRESH=true
+            _TU_EPOCH_OK_DEF='def epoch_ok($e): $tle == null or $e == $tle or $fresh;'
             # V11.24 Strategy 1.6 hand-off: when PROJECT was resolved via the
             # durable ledger lookup (session_uuid + task_id), we captured the
             # task's subject_norm + create_seq from the same matched 'created'
@@ -1166,16 +1474,18 @@ case "$V11_TOOL_NAME" in
             # Also check recent_completed and blocked_tasks for prior bucket if not in open_tasks
             if [ "$_TU_PRIOR_STATUS" = "absent" ]; then
                 _TU_IN_COMPLETED=$(printf '%s' "$STATE" | jq -r \
-                    --arg id "$TASK_ID" '
-                    if ([(.recent_completed // [])[] | select(.id == $id)] | length) > 0
+                    --arg id "$TASK_ID" --argjson tle "$_TU_TLE_JSON" --argjson fresh "$_TU_TLE_FRESH" \
+                    "$_TU_EPOCH_OK_DEF"'
+                    if ([(.recent_completed // [])[] | select(.id == $id and epoch_ok(.tl_epoch))] | length) > 0
                     then "completed" else "" end
                 ' 2>/dev/null || echo "")
                 [ -n "$_TU_IN_COMPLETED" ] && _TU_PRIOR_STATUS="$_TU_IN_COMPLETED"
             fi
             if [ "$_TU_PRIOR_STATUS" = "absent" ]; then
                 _TU_IN_BLOCKED=$(printf '%s' "$STATE" | jq -r \
-                    --arg id "$TASK_ID" '
-                    if ([(.blocked_tasks // [])[] | select(.id == $id)] | length) > 0
+                    --arg id "$TASK_ID" --argjson tle "$_TU_TLE_JSON" --argjson fresh "$_TU_TLE_FRESH" \
+                    "$_TU_EPOCH_OK_DEF"'
+                    if ([(.blocked_tasks // [])[] | select(.id == $id and epoch_ok(.tl_epoch))] | length) > 0
                     then "blocked" else "" end
                 ' 2>/dev/null || echo "")
                 [ -n "$_TU_IN_BLOCKED" ] && _TU_PRIOR_STATUS="$_TU_IN_BLOCKED"
@@ -1197,9 +1507,10 @@ case "$V11_TOOL_NAME" in
             if [ "$_IDRESLV_NEEDED" = "1" ] && [ "$_TU_PRIOR_STATUS" != "absent" ]; then
                 # Step 2: check _terminal_idk (same-session, not durable)
                 _TERM_IDK=$(printf '%s' "$STATE" | jq -r \
-                    --arg id "$TASK_ID" '
+                    --arg id "$TASK_ID" --argjson tle "$_TU_TLE_JSON" --argjson fresh "$_TU_TLE_FRESH" \
+                    "$_TU_EPOCH_OK_DEF"'
                     (._terminal_idk[$id] // null)
-                    | if . != null then (.subject_norm + "|" + (.create_seq | tostring)) else "" end
+                    | if . != null and epoch_ok(._tl_epoch) then (.subject_norm + "|" + (.create_seq | tostring)) else "" end
                 ' 2>/dev/null || echo "")
                 if [ -n "$_TERM_IDK" ] && [ "$_TERM_IDK" != "|" ] && [ "$_TERM_IDK" != "|0" ]; then
                     _TU_IDK_SUBJ_NORM="${_TERM_IDK%%|*}"
@@ -1252,12 +1563,18 @@ case "$V11_TOOL_NAME" in
             fi
         fi
 
-        case "$TASK_STATUS" in
+        # improvements/63: a delete is a cancellation. Route it to the
+        # `deleted)` arm unless V11_DELETE_CANCELS=off, which restores the old
+        # field-only handling (task stays open in every view).
+        _TU_CASE_STATUS="$TASK_STATUS"
+        if [ "$TASK_STATUS" = "deleted" ] && [ "${V11_DELETE_CANCELS:-on}" = "off" ]; then
+            _TU_CASE_STATUS="__field_only__"
+        fi
+
+        case "$_TU_CASE_STATUS" in
             in_progress)
-                TASK_PHASE=$(printf '%s' "$V11_RAW_INPUT" | jq -r '.tool_input.metadata.phase // ""' 2>/dev/null)
-                TASK_OWNER=$(printf '%s' "$V11_RAW_INPUT" | jq -r '.tool_input.owner // ""' 2>/dev/null)
-                TASK_SPRINT=$(printf '%s' "$V11_RAW_INPUT" | jq -r '.tool_input.metadata.sprint // ""' 2>/dev/null)
-                TASK_GATE=$(printf '%s' "$V11_RAW_INPUT" | jq -r '.tool_input.metadata.gate // ""' 2>/dev/null)
+                # TASK_PHASE/TASK_OWNER/TASK_SPRINT/TASK_GATE: read in the
+                # single jq pass at the top of the TaskUpdate case (S2-T4).
                 TU_STR_VIOLATED=0
                 if ! _v11_str_advisory "$TASK_ID" "$TU_COMPLEXITY" "$TU_STR_COUNT" "$TU_NO_STR" "in_progress"; then
                     TU_STR_VIOLATED=1
@@ -1286,15 +1603,39 @@ case "$V11_TOOL_NAME" in
                     --arg now "$NOW" \
                     --arg project "$PROJECT" \
                     --arg proj_source "$PROJECT_SOURCE" \
+                    --arg prior "$_TU_PRIOR_STATUS" \
                     --argjson live_reconcile "$([ "${V11_HANDOFF_LIVE_RECONCILE:-on}" != "off" ] && echo 'true' || echo 'false')" '
-                    .pending = ([.pending - 1, 0] | max)
-                    | .in_progress += 1
+                    # F36: counter fold is prior-status-aware, mirroring the
+                    # counters_delta table just below (pending/blocked/completed
+                    # -> in_progress each drop exactly the bucket the task was
+                    # actually in; in_progress -> in_progress is a no-op so a
+                    # re-fired TaskUpdate never double-counts).
+                    # review fix (S2 T2/T3/R2 batch, LOW #4): $prior=="absent" (this
+                    # session scratch never saw the task -- cross-session first
+                    # touch, not an old marker line) falls to the unconditional
+                    # += with no decrement, intentionally NOT mirroring the
+                    # empty-prior->"in_progress" backward-compat fallback in
+                    # v11_reapply_terminal_fold: that fallback is safe only
+                    # because a lost-transition marker line task WAS this
+                    # session own in_progress task moments earlier (the scratch
+                    # just failed to persist it); "absent" here carries no such
+                    # guarantee, so decrementing in_progress for it could
+                    # wrongly steal count from unrelated real in_progress
+                    # tasks. Self-heals on the next unfiltered TaskList recount
+                    # either way.
+                    (if $prior == "pending" then .pending = ([.pending - 1, 0] | max) | .in_progress += 1
+                     elif $prior == "blocked" then .blocked = ([.blocked - 1, 0] | max) | .in_progress += 1
+                     elif $prior == "completed" then .completed = ([.completed - 1, 0] | max) | .in_progress += 1
+                     elif $prior == "in_progress" then .
+                     else .in_progress += 1
+                     end)
                     | .active_task_ids = ((.active_task_ids // []) + (if ($id | tostring) != "" and $id != null then [$id] else [] end) | unique)
                     | .active_agent_id = (if $owner == "" or $owner == "null" then .active_agent_id else $owner end)
                     | .phase = (if $phase == "" or $phase == "null" then .phase else $phase end)
                     | .active_task_sprint = (if $sprint != "" and $sprint != "null" then $sprint else .active_task_sprint end)
                     | .active_task_gate = (if $gate != "" and $gate != "null" then $gate else .active_task_gate end)
                     | .last_updated = $now
+                    | .last_progress_at = $now  # #87: status change is real progress
                     # V11.13:   open_tasks status flip + subject refresh
                     # V11.14:   description refresh — TaskUpdate often carries an enriched
                     #           body (progress notes, decisions); preserve that on the
@@ -1386,10 +1727,13 @@ case "$V11_TOOL_NAME" in
                     TU_COMPLETED_VIOLATED=1
                 fi
                 # V11.14.3: prefer the canonical subject stored in open_tasks (set on
-                # TaskCreate, survives status transitions). Falls back to .active_task
-                # for legacy state files where open_tasks may be empty (pre-V11.13).
-                ACTIVE_SUBJECT=$(printf '%s' "$STATE" | jq -r --arg id "$TASK_ID" '
-                    (.open_tasks[$id].subject) // .active_task // "unknown"
+                # TaskCreate, survives status transitions). #107a: never fall back to
+                # .active_task — that's the session's currently-displayed task, which
+                # can be a DIFFERENT task than the one completing here (ledger seqno
+                # 316 wrote another task's subject this way). Fall back to this call's
+                # own tool_input.subject instead, then "unknown".
+                ACTIVE_SUBJECT=$(printf '%s' "$STATE" | jq -r --arg id "$TASK_ID" --arg subj_new "${TASK_SUBJECT_NEW:-}" '
+                    (.open_tasks[$id].subject) // (if $subj_new != "" and $subj_new != "null" then $subj_new else null end) // "unknown"
                 ')
                 # V11.19: snapshot per-task metadata BEFORE the completed STATE fold
                 # removes the open_tasks entry. The review-queue enqueue block
@@ -1404,51 +1748,106 @@ case "$V11_TOOL_NAME" in
                 _RQ_PREFOLD_TASK_IDX=$(printf '%s' "$STATE" | jq -r '.completed // 0' 2>/dev/null || echo 0)
                 # V11 loop-keystone Fix 3: sprint snapshot for the dispatch-trace
                 # auto-emit block below (also needs pre-fold open_tasks metadata).
+                # Review #26: the same jq takes the task's _created_at for that
+                # block's dedupe of rows with no session.
                 _RQ_PREFOLD_SPRINT=$(printf '%s' "$STATE" | jq -r --arg id "$TASK_ID" \
-                    '.open_tasks[$id].metadata.sprint // ""' 2>/dev/null || true)
+                    '.open_tasks[$id] | "\(.metadata.sprint // "")\u001f\(._created_at // "")"' 2>/dev/null || true)
+                _RQ_PREFOLD_CREATED_AT="${_RQ_PREFOLD_SPRINT##*$'\x1f'}"
+                _RQ_PREFOLD_SPRINT="${_RQ_PREFOLD_SPRINT%%$'\x1f'*}"
                 # V11.21: snapshot the parent's review pairing markers from STATE BEFORE the
                 # completed fold removes them from open_tasks. These drive:
                 #   * V11.19 enqueue suppression (mutual exclusion when parent already has a paired sibling)
                 #   * sibling status transition (pending_parent → pending on parent completion)
                 # Also honor markers passed directly on this TaskUpdate (rare, but supported).
-                _V21_REVIEW_TASK_ID=$(printf '%s' "$STATE" | jq -r --arg id "$TASK_ID" \
-                    '.open_tasks[$id].metadata.review_task_id // ""' 2>/dev/null || true)
-                if [ -z "$_V21_REVIEW_TASK_ID" ]; then
-                    _V21_REVIEW_TASK_ID=$(printf '%s' "$V11_RAW_INPUT" | jq -r '.tool_input.metadata.review_task_id // ""' 2>/dev/null || true)
-                fi
+                # S2-R1 (#101): one pass over STATE + this input also says whether the
+                # review_task_id is a pair_ shadow this session does not hold (a
+                # rehydrated task carries its old session's, scripts/handoff). Such a
+                # shadow cannot activate here, so the V11.19 queue below keeps the row.
+                # Review #12 HIGH: a re-fired TaskUpdate(completed) on an ALREADY-
+                # completed task (e.g. to attach late metadata) has no open_tasks[$id]
+                # any more (deleted on the first completion, tombstoned into
+                # _terminal_idk below) and typically carries no metadata.review_task_id
+                # of its own -- without a third fallback to the tombstone's stashed
+                # value, _V21_REVIEW_TASK_ID resolves empty, _V21_SUPPRESS_QUEUE stays
+                # "no", and a duplicate V11.19 review gets enqueued for an already-
+                # reviewed task. The tombstone fallback only ever fires when both live
+                # sources are empty, so it never shadows a real live/explicit value.
+                _V21_RT_INFO=$(printf '%s\n%s' "$STATE" "$V11_RAW_INPUT" | jq -rn --arg id "$TASK_ID" '
+                    input as $s | input as $r
+                    | (($s.open_tasks[$id].metadata.review_task_id // "") as $a
+                       | if $a != "" then $a
+                         else (($r.tool_input.metadata.review_task_id // "") as $b
+                               | if $b != "" then $b
+                                 else ($s._terminal_idk[$id].review_task_id // "") end)
+                         end) as $rid
+                    | ($rid | tostring) + "\u001f"
+                      + (if ($rid | type) == "string" and ($rid | startswith("pair_"))
+                            and $s.open_tasks[$rid] == null then "foreign" else "" end)
+                ' 2>/dev/null || true)
+                _V21_REVIEW_TASK_ID="${_V21_RT_INFO%%$'\x1f'*}"
+                _V21_RT_FOREIGN="${_V21_RT_INFO#*$'\x1f'}"
                 _V21_REVIEW_OF=$(printf '%s' "$STATE" | jq -r --arg id "$TASK_ID" \
                     '.open_tasks[$id].metadata.review_of // ""' 2>/dev/null || true)
                 if [ -z "$_V21_REVIEW_OF" ]; then
                     _V21_REVIEW_OF=$(printf '%s' "$V11_RAW_INPUT" | jq -r '.tool_input.metadata.review_of // ""' 2>/dev/null || true)
                 fi
                 _V21_SYNTHETIC=$(printf '%s' "$V11_RAW_INPUT" | jq -r '.tool_input.metadata.synthetic_completion // false' 2>/dev/null || echo false)
+                # S2-T0b-2 (C7): the recent_completed entry carries the TaskList
+                # epoch it happened in; the tombstone keeps the entry's own.
                 STATE=$(printf '%s' "$STATE" | jq \
                     --arg id "$TASK_ID" \
                     --arg subject "$ACTIVE_SUBJECT" \
                     --arg sid "$SESSION_UUID" \
                     --arg now "$NOW" \
+                    --arg prior "$_TU_PRIOR_STATUS" \
+                    --arg rtid "${_V21_REVIEW_TASK_ID:-}" \
+                    --argjson tle "${_V11_TL_EPOCH:-null}" \
                     --argjson str_violated "${TU_COMPLETED_VIOLATED:-0}" '
-                    .in_progress = ([.in_progress - 1, 0] | max)
-                    | .completed += 1
+                    # F36: only drop the bucket the task was actually in (mirrors
+                    # the counters_delta table below). A pending->completed task
+                    # (agents do this directly) never touched in_progress, so it
+                    # must not decrement a counter it never incremented.
+                    # review fix (S2 T2/T3/R2 batch, LOW #4): $prior=="absent"
+                    # deliberately does NOT fold into the in_progress branch the
+                    # way v11_reapply_terminal_fold treats its own empty-prior
+                    # sentinel — see the in_progress arm above (~:1500) for why
+                    # the two fallbacks intentionally differ.
+                    (if $prior == "in_progress" then .in_progress = ([.in_progress - 1, 0] | max) | .completed += 1
+                     elif $prior == "pending" then .pending = ([.pending - 1, 0] | max) | .completed += 1
+                     elif $prior == "blocked" then .blocked = ([.blocked - 1, 0] | max) | .completed += 1
+                     elif $prior == "completed" then .
+                     else .completed += 1
+                     end)
                     | (if $str_violated == 1 then
                         .dark_code_advisories //= {"str_missing_count": 0, "str_missing_complex": 0, "str_missing_novel": 0, "last_advisory_at": null, "completions_without_str": 0}
                         | .dark_code_advisories.completions_without_str = ((.dark_code_advisories.completions_without_str // 0) + 1)
                         | .dark_code_advisories.last_advisory_at = $now
                       else . end)
-                    | .recent_completed = ([{id: $id, subject: $subject, at: $now, session_uuid: $sid}] + (.recent_completed // []))[:10]
+                    | .recent_completed = ([{id: $id, subject: $subject, at: $now, session_uuid: $sid}
+                                            + (if $tle != null then {tl_epoch: $tle} else {} end)]
+                                           + (.recent_completed // []))[:10]
                     | .active_task = null
                     | .active_task_ids = ((.active_task_ids // []) | map(select(. != $id)))
                     | .active_agent_id = null
                     | .last_updated = $now
+                    | .last_progress_at = $now  # #87: status change is real progress
                     # ADR §A.1.1: tombstone _idk into _terminal_idk BEFORE del(.open_tasks[$id]).
                     # Same-session O(1) cache so step-2 identity resolution can find it
                     # if this task is re-opened within the same session.
+                    # Review #12 HIGH: also stash review_task_id (already resolved into
+                    # $rtid above, from live open_tasks metadata or this calls own
+                    # metadata) so a LATER re-fired TaskUpdate(completed) on this same
+                    # id -- once open_tasks[$id] is gone -- can still recover its paired
+                    # shadow via the _V21_RT_INFO fallback chain and correctly suppress
+                    # the V11.19 queue instead of enqueueing a duplicate review.
                     | if $id != "" and (.open_tasks[$id]._idk) != null then
                         ._terminal_idk = (._terminal_idk // {})
                         | ._terminal_idk[$id] = (
                             .open_tasks[$id]._idk
                             + {terminal_status: "completed", tombstoned_at: $now}
                             + (if .open_tasks[$id].subject != null then {subject: .open_tasks[$id].subject} else {} end)
+                            + (if .open_tasks[$id]._tl_epoch != null then {_tl_epoch: .open_tasks[$id]._tl_epoch} else {} end)
+                            + (if $rtid != "" and $rtid != "null" then {review_task_id: $rtid} else {} end)
                           )
                       else . end
                     # V11.13: clear from open_tasks (no longer pending rehydration)
@@ -1461,17 +1860,78 @@ case "$V11_TOOL_NAME" in
                 # metadata.parent_status flips so the orchestrator's dispatch filter (T13)
                 # picks it up on the next iteration. Idempotent: re-running on an already-
                 # pending sibling is a no-op (jq pattern check).
+                # A shadow this session does not hold has nothing to flip (S2-R1).
                 # Rollback: V11_AUTO_PAIR_REVIEW=off skips the transition entirely.
-                if [ "${V11_AUTO_PAIR_REVIEW:-on}" != "off" ] \
+                # #107b: this transition previously had no ledger row at all, so a
+                # replay couldn't tell an activated shadow from a still-dormant one.
+                # ._pair_just_activated is a transient marker (stripped at the final
+                # STATE write below, ~:3410) this jq call sets ONLY on the real
+                # pending_parent->pending flip. review fix (S2 T2/T3/R2 batch, LOW
+                # #3): detection used to be a raw substring match of
+                # '"_pair_just_activated":"<rid>"' against the compact STATE blob --
+                # a task subject/description containing that literal text could in
+                # theory false-trigger. The SAME jq call now also emits a second,
+                # structural output value (a bare true/false), so the activation
+                # flag never depends on STATE's text shape. 0 new forks: still one
+                # jq call; -c gives one compact line per output value, and the
+                # updated STATE (first value) is itself single-line JSON, so the
+                # flag is always exactly the trailing line.
+                _V21_PAIR_JUST_ACTIVATED=""
+                if [ "${V11_AUTO_PAIR_REVIEW:-on}" != "off" ] && [ "$_V21_RT_FOREIGN" != "foreign" ] \
                    && [ -n "$_V21_REVIEW_TASK_ID" ] && [ "$_V21_REVIEW_TASK_ID" != "null" ]; then
-                    STATE=$(printf '%s' "$STATE" | jq \
+                    _V21_PJA_OUT=$(printf '%s' "$STATE" | jq -c \
                         --arg rid "$_V21_REVIEW_TASK_ID" '
-                        if ($rid != "" and (.open_tasks[$rid].metadata.parent_status // "") == "pending_parent")
-                        then
+                        (($rid != "" and (.open_tasks[$rid].metadata.parent_status // "") == "pending_parent")) as $activate
+                        | (if $activate then
                             .open_tasks[$rid].metadata.parent_status = "pending"
                             | .open_tasks[$rid].metadata.parent_unblocked_at = (.last_updated // (now | strftime("%Y-%m-%dT%H:%M:%S+00:00")))
-                        else . end
-                    ' 2>/dev/null || printf '%s' "$STATE")
+                            | ._pair_just_activated = $rid
+                          else . end) as $out
+                        | $out, $activate
+                    ' 2>/dev/null)
+                    if [ -n "$_V21_PJA_OUT" ]; then
+                        _V21_PJA_FLAG="${_V21_PJA_OUT##*$'\n'}"
+                        STATE="${_V21_PJA_OUT%$'\n'*}"
+                        [ "$_V21_PJA_FLAG" = "true" ] && _V21_PAIR_JUST_ACTIVATED="$_V21_REVIEW_TASK_ID"
+                    fi
+                fi
+                if [ -n "$_V21_PAIR_JUST_ACTIVATED" ] && [ -n "$PROJECT" ] && [ "$PROJECT_SOURCE" != "active-project-fallback" ]; then
+                    _PA_SHADOW_SUBJ=$(printf '%s' "$STATE" | jq -r --arg rid "$_V21_PAIR_JUST_ACTIVATED" \
+                        '.open_tasks[$rid].subject // ""' 2>/dev/null)
+                    _PA_SUBJ_NORM=$(v11_normalize_subject "${_PA_SHADOW_SUBJ:-}" 2>/dev/null || printf '__empty__')
+                    [ -z "$_PA_SUBJ_NORM" ] && _PA_SUBJ_NORM="__empty__"
+                    # The shadow's own `created` event (auto-pair, TaskCreate time) got a
+                    # real create_seq minted in the ledger, but open_tasks[$rid]._idk was
+                    # never patched with it (separate gap, not this ticket). Rather than a
+                    # second ledger scan to resolve it, use the established
+                    # identity_unresolved:true sentinel (same doctrine as prescope/review
+                    # rows) so the row is written, durable, and excluded from identity
+                    # folding instead of silently dropped by v11_ledger_append's no-_idk guard.
+                    _PA_EVENT=$(jq -cn \
+                        --arg project "$PROJECT" \
+                        --arg subj "${_PA_SHADOW_SUBJ:-}" \
+                        --arg subj_norm "$_PA_SUBJ_NORM" \
+                        --arg task_id "$_V21_PAIR_JUST_ACTIVATED" \
+                        --arg review_of "$TASK_ID" \
+                        --arg sid "$SESSION_UUID" \
+                        --arg ts "$NOW" '
+                        {
+                            v: 1,
+                            ev: "pair_activate",
+                            ts: $ts,
+                            project: $project,
+                            subject_norm: $subj_norm,
+                            task_id: $task_id,
+                            session_uuid: $sid,
+                            subject: (if $subj != "" and $subj != "null" then $subj else null end),
+                            review_of: $review_of,
+                            identity_unresolved: true,
+                            counters_delta: {}
+                        } | with_entries(select(.value != null))
+                    ' 2>/dev/null || true)
+                    # Append deferred to after the terminal STATE_FILE write below
+                    # (ADR §4.1/§4.2 ordering: STATE write happens-before ledger
+                    # write), same as LEDGER_EVENT_JSON's append site.
                 fi
 
                 # V11: Persist artifacts from completed task metadata
@@ -1546,14 +2006,87 @@ case "$V11_TOOL_NAME" in
                             4|5) _DTC_MODE="bypassPermissions" ;;
                             *)   _DTC_MODE="default" ;;
                         esac
+                        # S2-T0b-2 (review #19 C8): a task id is only unique within
+                        # one session's TaskList epoch, so the dedupe key is
+                        # (project, session_uuid, tl_epoch, task_id) and the row
+                        # records both. A row written before the rollout has no
+                        # session (review #26): it matches (project, task_id) when
+                        # its ts is at or after this task's create, taken from
+                        # open_tasks[id]._created_at, else (a task created before
+                        # the rollout) from the task's latest create in this epoch
+                        # in the project ledger, read only when such a row exists.
+                        # So a task in flight at the rollout is not re-emitted as
+                        # self-executed. The trace pass prints M (a match) or, with
+                        # no create ts yet, L<secs> per session-less row.
+                        # V11_TASKLIST_EPOCH=off keeps (project, task_id).
+                        _DTC_TSEC_DEF='def v11_tsec: try ((.[0:19] + "Z" | fromdateiso8601) as $b
+                            | (.[19:] | sub("^\\.[0-9]+"; "")) as $z
+                            | if $z == "" or $z == "Z" then $b
+                              elif ($z | test("^[+-][0-9][0-9]:?[0-9][0-9]$")) then ($z | gsub(":"; "")) as $o
+                                  | $b - (($o[1:3] | tonumber) * 3600 + ($o[3:5] | tonumber) * 60)
+                                         * (if $o[0:1] == "+" then 1 else -1 end)
+                              else null end) catch null;'
+                        _DTC_SEL='select(.project == $proj and .task_id == $tid) | "M"'
+                        _DTC_EPOCH_ARGS=()
+                        _DTC_CAT="${_RQ_PREFOLD_CREATED_AT:-}"
+                        v11_tl_entry_current "${_TU_ENTRY_TLE:-}" || _DTC_CAT=""
+                        if [ "${V11_TASKLIST_EPOCH:-on}" != "off" ]; then
+                            _DTC_SEL='select(.project == $proj and .task_id == $tid)
+                                | if .session_uuid == $sid and (.tl_epoch // null) == $tle then "M"
+                                  elif (.session_uuid // "") != "" then empty
+                                  elif $cat == "" then "L\((.ts // "") | v11_tsec // "")"
+                                  elif (((.ts // "") | v11_tsec) as $t | ($cat | v11_tsec) as $c
+                                        | $t != null and $c != null and $t >= $c) then "M"
+                                  else empty end'
+                            _DTC_EPOCH_ARGS=(--session-uuid "$SESSION_UUID")
+                            [ -n "${_V11_TL_EPOCH:-}" ] && _DTC_EPOCH_ARGS+=(--tl-epoch "$_V11_TL_EPOCH")
+                        fi
                         (
                             flock -x 202
                             _DTC_EXISTS=""
+                            _DTC_HITS=""
                             if [ -f "$_DTC_TRACE_FILE" ]; then
-                                _DTC_EXISTS=$(jq -c --arg proj "$PROJECT" --arg tid "$TASK_ID" \
-                                    'select(.project == $proj and .task_id == $tid)' \
-                                    "$_DTC_TRACE_FILE" 2>/dev/null | head -1)
+                                # S2-T5: dispatch-trace.jsonl is host-wide,
+                                # shared across every project (6,277 rows /
+                                # 3.4 MB measured 2026-09-27) — most rows
+                                # belong to some OTHER project. Prefilter with
+                                # a literal grep before the precise jq select
+                                # below parses it: a row's `project` value is
+                                # written into plain JSON with none of the
+                                # characters PROJECT's SEC-C-02 charset
+                                # (alphanumeric . _ -) would need escaped, so
+                                # it always appears verbatim on a matching
+                                # line — no false negatives, jq's own
+                                # `.project == $proj` still does the exact
+                                # match. ~150ms -> ~10-25ms at that size
+                                # (measured, load 11-15); this completed-only
+                                # path isn't M2-gated.
+                                _DTC_HITS=$(grep -F -- "$PROJECT" "$_DTC_TRACE_FILE" 2>/dev/null \
+                                    | jq -r --arg proj "$PROJECT" --arg tid "$TASK_ID" \
+                                    --arg sid "$SESSION_UUID" --argjson tle "${_V11_TL_EPOCH:-null}" \
+                                    --arg cat "$_DTC_CAT" "$_DTC_TSEC_DEF$_DTC_SEL" 2>/dev/null)
                             fi
+                            case "$_DTC_HITS" in
+                                *M*) _DTC_EXISTS=1 ;;
+                                *L[0-9]*)
+                                    _DTC_FRESH=false; [ "${_V11_TLR_REASON:-}" = "fresh" ] && _DTC_FRESH=true
+                                    _DTC_CTS=$(jq -r --arg sid "$SESSION_UUID" --arg tid "$TASK_ID" \
+                                        --argjson tle "${_V11_TL_EPOCH:-null}" --argjson fresh "$_DTC_FRESH" \
+                                        "$_DTC_TSEC_DEF"'select(.ev == "created" and .session_uuid == $sid
+                                            and .task_id == $tid and ((.tl_epoch // null) == $tle
+                                                                      or (.tl_epoch == null and $fresh)))
+                                        | (.ts // "") | v11_tsec // empty' \
+                                        "$METRICS_DIR/ledger/$PROJECT.jsonl" 2>/dev/null)
+                                    _DTC_CTS="${_DTC_CTS##*$'\n'}"
+                                    if [[ $_DTC_CTS =~ ^[0-9]{1,12}$ ]]; then
+                                        for _DTC_L in $_DTC_HITS; do
+                                            _DTC_L="${_DTC_L#L}"
+                                            if [[ $_DTC_L =~ ^[0-9]{1,12}$ ]] && (( _DTC_L >= _DTC_CTS )); then
+                                                _DTC_EXISTS=1; break
+                                            fi
+                                        done
+                                    fi ;;
+                            esac
                             if [ -z "$_DTC_EXISTS" ]; then
                                 "$V11_HOME/scripts/dispatch-trace-append" \
                                     --task-id "$TASK_ID" \
@@ -1564,7 +2097,7 @@ case "$V11_TOOL_NAME" in
                                     --override-reason "unattributed-self-exec" \
                                     --model "inherit" \
                                     --mode "$_DTC_MODE" \
-                                    --caller-kind "orchestrator" 2>/dev/null || true
+                                    --caller-kind "orchestrator" "${_DTC_EPOCH_ARGS[@]}" 2>/dev/null || true
                             fi
                         ) 202>"$_DTC_TRACE_FILE.checklock" 2>/dev/null || true
                     fi
@@ -2301,9 +2834,18 @@ PYEOF
                 # metadata.review_task_id set (its paired sibling), the V11.21
                 # Phase-4 path handles review. Skip the V11.19 queue for this task.
                 # Likewise skip when synthetic_completion=true. O(1) checks; no scan.
+                # S2-R1 (#101): except when the sibling is a pair_ shadow this session
+                # does not hold (_V21_RT_FOREIGN, a rehydrated task): nothing here
+                # activates it, so the queue row (with parent_identity) is its review.
                 _V21_SUPPRESS_QUEUE="no"
+                _V21_FOREIGN_ENQUEUE="no"
                 if [ "${V11_AUTO_PAIR_REVIEW:-on}" != "off" ] && [ -n "$_V21_REVIEW_TASK_ID" ] && [ "$_V21_REVIEW_TASK_ID" != "null" ]; then
                     _V21_SUPPRESS_QUEUE="yes"
+                    if [ "$_V21_RT_FOREIGN" = "foreign" ]; then
+                        _V21_SUPPRESS_QUEUE="no"
+                        _V21_FOREIGN_ENQUEUE="yes"
+                        echo "[v11.21-auto-pair] task #${TASK_ID}: review shadow ${_V21_REVIEW_TASK_ID} is not in this session (rehydrated); the V11.19 review queue carries its review" >&2
+                    fi
                 fi
                 if [ "$_V21_SYNTHETIC" = "true" ]; then
                     _V21_SUPPRESS_QUEUE="yes"
@@ -2344,6 +2886,11 @@ PYEOF
                         if [ -n "$_RQ_SESSION_PROJECT" ] && [ "$_RQ_SESSION_PROJECT" != "$PROJECT" ]; then
                             echo "[V11.19] sync-tasks: review queue enqueue SKIPPED for task #$TASK_ID — session project '$_RQ_SESSION_PROJECT' != resolved PROJECT '$PROJECT' (cross-session active-project leakage; pass metadata.project on TaskUpdate to prevent)." >&2
                             _RQ_SHOULD="no"
+                        elif [ "$_V21_FOREIGN_ENQUEUE" = "yes" ]; then
+                            # S2-R1: the row stands in for a pair_ shadow, and
+                            # auto-pair minted that without .review-config.json's
+                            # scope filter, so the filter does not apply here.
+                            _RQ_SHOULD="yes"
                         else
                             # Risk/complexity for the scope filter: prefer this
                             # event's metadata; fall back to the PRE-FOLD
@@ -2391,7 +2938,14 @@ PYEOF
                             fi
                             [ -z "$_RQ_AGENT" ] || [ "$_RQ_AGENT" = "null" ] && _RQ_AGENT="unknown"
 
-                            v11_review_queue_add "$PROJECT" "$TASK_ID" "$_RQ_AGENT" "${ACTIVE_SUBJECT:-}" "$_RQ_FILES" "$SESSION_UUID" >/dev/null 2>&1 || true
+                            # S2-T0b-2: the pending row names its parent by identity
+                            # and TaskList epoch (#97 going forward), so a reader
+                            # never has to guess which task a reused id meant.
+                            _RQ_PARENT_ARGS=()
+                            if [ "${V11_TASKLIST_EPOCH:-on}" != "off" ]; then
+                                _RQ_PARENT_ARGS=("${_TU_IDK_SUBJ_NORM:-}" "${_TU_IDK_CREATE_SEQ:-}" "${_V11_TL_EPOCH:-}")
+                            fi
+                            v11_review_queue_add "$PROJECT" "$TASK_ID" "$_RQ_AGENT" "${ACTIVE_SUBJECT:-}" "$_RQ_FILES" "$SESSION_UUID" "${_RQ_PARENT_ARGS[@]}" >/dev/null 2>&1 || true
                             # Always emit the nudge (already-pending tasks still get the signal)
                             _RQ_PENDING=$(v11_review_queue_pending_count "$PROJECT" 2>/dev/null || echo "?")
                             echo "[V11] REVIEW PENDING: task #${TASK_ID} in ${PROJECT} (pending queue: ${_RQ_PENDING}). Spawn adversarial-lite-reviewer." >&2
@@ -2490,14 +3044,17 @@ PYEOF
                     --arg reason "$BLOCK_REASON" \
                     --arg subject "$ACTIVE_SUBJECT" \
                     --arg sid "$SESSION_UUID" \
-                    --arg now "$NOW" '
+                    --arg now "$NOW" \
+                    --argjson tle "${_V11_TL_EPOCH:-null}" '
                     .in_progress = ([.in_progress - 1, 0] | max)
                     | .blocked += 1
                     | .active_task = null
                     | .active_task_ids = ((.active_task_ids // []) | map(select(. != $id)))
                     | .active_agent_id = null
-                    | .blocked_tasks = ([{id: $id, subject: $subject, reason: (if $reason != "" and $reason != "null" then $reason else "unspecified" end), at: $now, session_uuid: $sid}] + (.blocked_tasks // []))[:5]
+                    | .blocked_tasks = ([{id: $id, subject: $subject, reason: (if $reason != "" and $reason != "null" then $reason else "unspecified" end), at: $now, session_uuid: $sid}
+                                         + (if $tle != null then {tl_epoch: $tle} else {} end)] + (.blocked_tasks // []))[:5]
                     | .last_updated = $now
+                    | .last_progress_at = $now  # #87: status change is real progress
                     # ADR §A.1.1: tombstone _idk into _terminal_idk BEFORE del(.open_tasks[$id]).
                     # Same-session O(1) cache for step-2 identity resolution on re-open.
                     | if $id != "" and (.open_tasks[$id]._idk) != null then
@@ -2506,6 +3063,7 @@ PYEOF
                             .open_tasks[$id]._idk
                             + {terminal_status: "blocked", tombstoned_at: $now}
                             + (if .open_tasks[$id].subject != null then {subject: .open_tasks[$id].subject} else {} end)
+                            + (if .open_tasks[$id]._tl_epoch != null then {_tl_epoch: .open_tasks[$id]._tl_epoch} else {} end)
                           )
                       else . end
                     # V11.13: drop blocked task from open_tasks (no auto-rehydrate)
@@ -2518,6 +3076,11 @@ PYEOF
                 #   completed→blocked: {completed:-1,blocked:+1}
                 #   blocked→blocked (idempotent): {}
                 #   absent→blocked (half-delta): {blocked:+1}
+                # review fix (S2 T2/T3/R2 batch, LOW #4): absent's half-delta is
+                # the same deliberate no-decrement convention as the in_progress
+                # and completed live STATE arms above (~:1500, ~:1700) — see
+                # those comments for why it intentionally does not mirror
+                # v11_reapply_terminal_fold's empty-prior->"in_progress" fallback.
                 if [ -n "$_TU_IDK_SUBJ_NORM" ] && [ -n "$_TU_IDK_CREATE_SEQ" ]; then
                     _BLOCK_DELTA=$(case "$_TU_PRIOR_STATUS" in
                         in_progress) printf '{"in_progress":-1,"blocked":1}' ;;
@@ -2552,6 +3115,92 @@ PYEOF
                         } | with_entries(select(.value != null))
                         | . + {counters_delta: $delta, at: $ts}
                     ' 2>/dev/null || true)
+                fi
+                ;;
+            deleted)
+                # improvements/63: TaskUpdate(status="deleted") cancels the task.
+                # Mirrors the blocked arm: release the lane, tombstone the
+                # identity, drop it from open_tasks, fold the prior bucket, and
+                # write a `cancelled` ledger event (reason "deleted"). The replay
+                # makes it terminal (#17 F1) and a paired review sibling follows
+                # (#58 item 3). No `total` change: a cancelled task still counts.
+                # Deleting a COMPLETED task only removes it from the list: the
+                # work was done, so nothing is rewritten and no event is written.
+                # review fix (S2 T2/T3/R2 batch, MEDIUM #1): last_progress_at is
+                # NOT bumped here — deleting an already-completed task isn't new
+                # progress (the progress happened at the earlier completed
+                # transition), and this branch writes no ledger event, so the
+                # cutover aggregate (last_progress_at derived from ledger events
+                # only) never sees this as progress either. Bumping it only in
+                # the legacy-fold scratch (this STATE) made the two aggregate
+                # derivation paths diverge silently (last_updated stays — it is
+                # not the progress signal and is fine to move).
+                if [ "$_TU_PRIOR_STATUS" = "completed" ]; then
+                    STATE=$(printf '%s' "$STATE" | jq --arg now "$NOW" '.last_updated = $now')
+                else
+                if [ "${V11_LANE_LEASE:-on}" != "off" ] && [ -n "$PROJECT" ] && [ -n "$TASK_ID" ]; then
+                    v11_lane_release "$PROJECT" "$TASK_ID" >/dev/null 2>&1
+                fi
+                ACTIVE_SUBJECT=$(printf '%s' "$STATE" | jq -r --arg id "$TASK_ID" '
+                    (.open_tasks[$id].subject) // "unknown"
+                ')
+                STATE=$(printf '%s' "$STATE" | jq \
+                    --arg id "$TASK_ID" \
+                    --arg prior "$_TU_PRIOR_STATUS" \
+                    --arg now "$NOW" '
+                    (if $prior == "pending" then .pending = ([.pending - 1, 0] | max)
+                     elif $prior == "in_progress" then .in_progress = ([.in_progress - 1, 0] | max)
+                     elif $prior == "blocked" then .blocked = ([.blocked - 1, 0] | max)
+                     else . end)
+                    | (if (.active_task_ids // []) | index($id) then .active_task = null | .active_agent_id = null else . end)
+                    | .active_task_ids = ((.active_task_ids // []) | map(select(. != $id)))
+                    | .last_updated = $now
+                    | .last_progress_at = $now  # #87: status change is real progress
+                    # A paired review sibling still waiting on this parent has
+                    # nothing to review: drop it from the scratch now (the
+                    # replay closes it in the ledger view, #58 item 3).
+                    | ((.open_tasks[$id].metadata.review_task_id // "") as $rid
+                       | if $rid != "" and ((.open_tasks[$rid].metadata.parent_status // "") == "pending_parent")
+                         then .open_tasks = ((.open_tasks // {}) | del(.[$rid])) else . end)
+                    | if $id != "" and (.open_tasks[$id]._idk) != null then
+                        ._terminal_idk = (._terminal_idk // {})
+                        | ._terminal_idk[$id] = (
+                            .open_tasks[$id]._idk
+                            + {terminal_status: "cancelled", tombstoned_at: $now}
+                            + (if .open_tasks[$id].subject != null then {subject: .open_tasks[$id].subject} else {} end)
+                            + (if .open_tasks[$id]._tl_epoch != null then {_tl_epoch: .open_tasks[$id]._tl_epoch} else {} end)
+                          )
+                      else . end
+                    | if $id != "" then .open_tasks = ((.open_tasks // {}) | del(.[$id])) else . end
+                ')
+                if [ -n "$_TU_IDK_SUBJ_NORM" ] && [ -n "$_TU_IDK_CREATE_SEQ" ]; then
+                    _DEL_DELTA=$(case "$_TU_PRIOR_STATUS" in
+                        in_progress) printf '{"in_progress":-1,"cancelled":1}' ;;
+                        pending)     printf '{"pending":-1,"cancelled":1}' ;;
+                        blocked)     printf '{"blocked":-1,"cancelled":1}' ;;
+                        completed)   printf '{"completed":-1,"cancelled":1}' ;;
+                        absent|*)    printf '{"cancelled":1}' ;;
+                    esac)
+                    LEDGER_EVENT_JSON=$(jq -cn \
+                        --arg project "$PROJECT" \
+                        --arg subj_norm "$_TU_IDK_SUBJ_NORM" \
+                        --argjson create_seq "$_TU_IDK_CREATE_SEQ" \
+                        --arg task_id "$TASK_ID" \
+                        --arg sid "$SESSION_UUID" \
+                        --arg ts "$NOW" \
+                        --arg subj "${ACTIVE_SUBJECT:-}" \
+                        --argjson delta "$_DEL_DELTA" '
+                        {
+                            v: 1, ev: "cancelled", ts: $ts, at: $ts,
+                            project: $project, subject_norm: $subj_norm,
+                            create_seq: $create_seq, task_id: $task_id,
+                            session_uuid: $sid,
+                            subject: (if $subj != "" and $subj != "null" and $subj != "unknown" then $subj else null end),
+                            reason: "deleted", requested_status: "deleted",
+                            counters_delta: $delta
+                        } | with_entries(select(.value != null))
+                    ' 2>/dev/null || true)
+                fi
                 fi
                 ;;
             *)
@@ -2616,19 +3265,20 @@ PYEOF
         esac
         ;;
     TaskList)
-        # Always sanitize active_task_ids: drop nulls and empty strings (corruption guard).
-        # Past TaskUpdate(in_progress) calls with missing taskId injected "" entries; this
-        # purges them on every TaskList without waiting for full reconciliation to fire.
-        STATE=$(printf '%s' "$STATE" | jq --arg now "$NOW" '
-            .last_updated = $now
-            | .active_task_ids = ((.active_task_ids // []) | map(select(. != null and . != "")))
-        ')
         # Counter reconciliation: recount from TaskList output to fix drift on long-running projects.
         # Claude Code emits tool_response = {tasks: [{id, status, ...}, ...]}; legacy
         # fixtures stringify "N. subject [status]". jq counts the structured form
         # when present; grep is the back-compat path. grep -c exits 1 on no match;
         # `|| true` keeps that benign and the post-process strips to a clean integer.
+        # S2-T2: whether the output is the structured form is read once (the
+        # first call below, in this shell) and reused, also by _count_status
+        # inside its $(...) subshells; it was one printf|jq per call (6 per list).
+        _V11_TL_STRUCT=""
         _has_structured_tasks() {
+            case "$_V11_TL_STRUCT" in
+                1) return 0 ;;
+                0) return 1 ;;
+            esac
             printf '%s' "$V11_TOOL_OUTPUT" | jq -e 'type == "object" and (.tasks | type) == "array"' >/dev/null 2>&1
         }
         _count_status() {
@@ -2642,119 +3292,228 @@ PYEOF
             n="${n//[^0-9]/}"
             printf '%s' "${n:-0}"
         }
-        PENDING_ACTUAL=$(_count_status pending)
-        IN_PROGRESS_ACTUAL=$(_count_status in_progress)
-        COMPLETED_ACTUAL=$(_count_status completed)
-        BLOCKED_ACTUAL=$(_count_status blocked)
-        TOTAL_ACTUAL=$((PENDING_ACTUAL + IN_PROGRESS_ACTUAL + COMPLETED_ACTUAL + BLOCKED_ACTUAL))
-        # Only reconcile if TaskList returned real data (TOTAL_ACTUAL > 0) and counters differ by >1
-        if [ "$TOTAL_ACTUAL" -gt 0 ]; then
-            TOTAL_STATE=$(printf '%s' "$STATE" | jq -r '.total // 0')
-            COMPLETED_STATE=$(printf '%s' "$STATE" | jq -r '.completed // 0')
-            PENDING_STATE=$(printf '%s' "$STATE" | jq -r '.pending // 0')
-            IN_PROG_STATE=$(printf '%s' "$STATE" | jq -r '.in_progress // 0')
-            BLOCKED_STATE=$(printf '%s' "$STATE" | jq -r '.blocked // 0')
-            _TOTAL_DRIFT=$(( TOTAL_ACTUAL - TOTAL_STATE ))
-            _COMP_DRIFT=$(( COMPLETED_ACTUAL - COMPLETED_STATE ))
-            _PEND_DRIFT=$(( PENDING_ACTUAL - PENDING_STATE ))
-            _PROG_DRIFT=$(( IN_PROGRESS_ACTUAL - IN_PROG_STATE ))
-            _BLOCK_DRIFT=$(( BLOCKED_ACTUAL - BLOCKED_STATE ))
-            [ "$_TOTAL_DRIFT" -lt 0 ] && _TOTAL_DRIFT=$(( -_TOTAL_DRIFT ))
-            [ "$_COMP_DRIFT" -lt 0 ]  && _COMP_DRIFT=$(( -_COMP_DRIFT ))
-            [ "$_PEND_DRIFT" -lt 0 ]  && _PEND_DRIFT=$(( -_PEND_DRIFT ))
-            [ "$_PROG_DRIFT" -lt 0 ]  && _PROG_DRIFT=$(( -_PROG_DRIFT ))
-            [ "$_BLOCK_DRIFT" -lt 0 ] && _BLOCK_DRIFT=$(( -_BLOCK_DRIFT ))
-            # M2 (meta-improvement 2026-05): drop the >1 drift threshold. Any drift
-            # on UNFILTERED TaskList is reconciled — TaskList output IS ground truth
-            # for that moment, so accepting it is always safe and self-healing. The
-            # old >1 threshold left 1-task drift to compound across sessions.
-            if [ "$_TOTAL_DRIFT" -gt 0 ] || [ "$_COMP_DRIFT" -gt 0 ] || \
-               [ "$_PEND_DRIFT" -gt 0 ]  || [ "$_PROG_DRIFT" -gt 0 ] || \
-               [ "$_BLOCK_DRIFT" -gt 0 ]; then
-                echo "sync-tasks: counter reconcile for $PROJECT (total: ${TOTAL_STATE}→${TOTAL_ACTUAL}, completed: ${COMPLETED_STATE}→${COMPLETED_ACTUAL}, pending: ${PENDING_STATE}→${PENDING_ACTUAL}, in_progress: ${IN_PROG_STATE}→${IN_PROGRESS_ACTUAL}, blocked: ${BLOCKED_STATE}→${BLOCKED_ACTUAL})" >&2
-                STATE=$(printf '%s' "$STATE" | jq \
-                    --argjson total "$TOTAL_ACTUAL" \
-                    --argjson completed "$COMPLETED_ACTUAL" \
-                    --argjson pending "$PENDING_ACTUAL" \
-                    --argjson in_progress "$IN_PROGRESS_ACTUAL" \
-                    --argjson blocked "$BLOCKED_ACTUAL" \
-                    '.total = $total | .completed = $completed | .pending = $pending |
-                     .in_progress = $in_progress | .blocked = $blocked')
-                # V11.16 (ledger wiring): emit reconcile event on counter drift (ADR §1.3 reconcile).
-                # scope=project, counters_abs = authoritative recount from TaskList output.
-                # Sentinel: subject_norm="" create_seq=-1 (ADR MED-B). NO counters_delta.
-                # Bug E/H immunity: only emit when project was not resolved via ambient fallback.
-                if [ "$PROJECT_SOURCE" != "active-project-fallback" ]; then
-                    LEDGER_EVENT_JSON=$(jq -cn \
-                        --arg project "$PROJECT" \
-                        --arg sid "$SESSION_UUID" \
-                        --arg ts "$NOW" \
+
+        # --- S2-T2: skip the no-op TaskList (V11_TASKLIST_NOOP_SKIP) ---
+        # An orchestrator polls TaskList, and most polls see the list the last
+        # one saw. A full pass (sanitize, recount, orphan trim; then the STATE
+        # write and the aggregate rebuild) leaves a fingerprint beside the
+        # scratch, sessions/<sid>/.tasklist-fp: a header line ("s2t2-v2",
+        # PROJECT, TOTAL_ACTUAL, structured 1|0, the list filter, the STATE_FILE
+        # write-generation this fingerprint describes, joined on \x1f) and then
+        # the tool_response it reconciled. A TaskList is a no-op when that file
+        # holds this call's PROJECT and tool_response byte for byte (and its
+        # filter, when the list had tasks) and the scratch is still the one
+        # that pass wrote: loaded valid (not reinitialized), not newer than the
+        # fingerprint (every scratch write replaces the file, so its mtime
+        # moves; this check and every locked writer hold FD-201) AND its
+        # write-generation sidecar (sessions/<sid>/.task-state-gen, review fix
+        # S2 T2/T3/R2 batch LOW #5) still matches the fingerprint's recorded
+        # value — the mtime check alone cannot tell two locked writes apart
+        # when they land in the same filesystem tick, but the generation
+        # counter always can (bumped on every real write, immune to clock
+        # resolution) — no reconcile marker drained by this call, not the
+        # unserialized fallback. Each step of the full pass is idempotent on the same scratch
+        # and list, so re-running it would change only last_updated, and the
+        # rebuild would re-read unchanged inputs. The no-op path keeps the live
+        # snapshot write below (handoff reads it; its ts stays fresh) and the
+        # discipline nudge; it skips the recount, the findings recompute, the
+        # STATE write (the scratch keeps its last_updated and mtime) and the
+        # aggregate rebuild. A missing or invalid scratch always takes the full
+        # pass, which repopulates it. Builtins only, plus the filter jq when the
+        # list had tasks. The fingerprint is rewritten after each full pass's
+        # STATE write, and removed when that pass's rebuild fails.
+        # Rollback: V11_TASKLIST_NOOP_SKIP=off (every TaskList takes the full
+        # pass; no fingerprint is written).
+        # review fix (S2 T2/T3/R2 batch, LOW #5): staleness was a plain
+        # `[ STATE_FILE -nt fp_file ]` mtime comparison — two locked writes
+        # landing in the same filesystem tick can leave that pair indistinguish-
+        # able, wrongly letting a no-op skip a just-landed real change (tests
+        # dodge this with explicit sleeps; production has no such guarantee).
+        # The mtime check stays (it is the only signal for a write that lands
+        # OUTSIDE the generation-counter's own write sites, e.g. drift injected
+        # straight onto the scratch file) but is now ANDed with a monotonic
+        # write-generation counter (sidecar plain-int file .task-state-gen,
+        # bumped on every successful STATE_FILE write — see ~:3634) compared
+        # for exact equality, immune to tick granularity: a same-tick real
+        # write through sync-tasks always bumps it, so the AND catches what
+        # mtime alone cannot. v2 fingerprint format (extra trailing gen field);
+        # a v1 file (pre-existing on disk from before this fix) fails the
+        # version check below and takes the full pass once, same as any other
+        # invalid fingerprint.
+        _V11_TL_NOOP=0; _V11_TL_FILTER_SET=0; _V11_TL_FP_NEW=""
+        _V11_TL_FP_FILE="${STATE_FILE%/*}/.tasklist-fp"
+        _V11_STATE_GEN_FILE="${STATE_FILE%/*}/.task-state-gen"
+        if [ "${V11_TASKLIST_NOOP_SKIP:-on}" != "off" ] && [ "${_V11_SYNC_RACED:-0}" != "1" ] \
+           && [ "${_V11_RECON_DRAINED:-0}" != "1" ] && [ "${_V11_STATE_FRESH:-1}" = "0" ] \
+           && [ -f "$_V11_TL_FP_FILE" ] && ! [ "$STATE_FILE" -nt "$_V11_TL_FP_FILE" ] \
+           && [ -f "$_V11_STATE_GEN_FILE" ]; then
+            _v11_tl_hdr=""; _v11_tl_body=""
+            { IFS= read -r _v11_tl_hdr; IFS= read -r -d '' _v11_tl_body; } < "$_V11_TL_FP_FILE" 2>/dev/null
+            IFS=$'\x1f' read -r _v11_tl_v _v11_tl_proj _v11_tl_total _v11_tl_struct _v11_tl_filter _v11_tl_gen <<< "$_v11_tl_hdr"
+            case "$_v11_tl_total" in ''|*[!0-9]*) _v11_tl_v="" ;; esac
+            case "$_v11_tl_struct" in 0|1) ;; *) _v11_tl_v="" ;; esac
+            case "$_v11_tl_gen" in ''|*[!0-9]*) _v11_tl_v="" ;; esac
+            _V11_STATE_GEN_CUR=""
+            IFS= read -r _V11_STATE_GEN_CUR < "$_V11_STATE_GEN_FILE" 2>/dev/null
+            case "$_V11_STATE_GEN_CUR" in ''|*[!0-9]*) _v11_tl_v="" ;; esac
+            if [ "$_v11_tl_v" = "s2t2-v2" ] && [ "$_v11_tl_proj" = "$PROJECT" ] \
+               && [ "$_v11_tl_gen" = "$_V11_STATE_GEN_CUR" ] \
+               && [ "$_v11_tl_body" = "$V11_TOOL_OUTPUT" ]; then
+                # Same list, so the same counts; with tasks, the filter decides
+                # the orphan trim and the snapshot, so it must match too.
+                if [ "$_v11_tl_total" != "0" ]; then
+                    LIST_FILTER_STATUS=$(printf '%s' "$V11_RAW_INPUT" | jq -r '.tool_input.status // ""' 2>/dev/null || true)
+                    _V11_TL_FILTER_SET=1
+                fi
+                if [ "$_v11_tl_total" = "0" ] || [ "$LIST_FILTER_STATUS" = "$_v11_tl_filter" ]; then
+                    _V11_TL_NOOP=1
+                    TOTAL_ACTUAL="$_v11_tl_total"
+                    _V11_TL_STRUCT="$_v11_tl_struct"
+                fi
+            fi
+        fi
+
+        if [ "$_V11_TL_NOOP" != "1" ]; then
+            if _has_structured_tasks; then _V11_TL_STRUCT=1; else _V11_TL_STRUCT=0; fi
+            # Always sanitize active_task_ids: drop nulls and empty strings (corruption guard).
+            # Past TaskUpdate(in_progress) calls with missing taskId injected "" entries; this
+            # purges them on every TaskList without waiting for full reconciliation to fire.
+            STATE=$(printf '%s' "$STATE" | jq --arg now "$NOW" '
+                .last_updated = $now
+                | .active_task_ids = ((.active_task_ids // []) | map(select(. != null and . != "")))
+            ')
+            PENDING_ACTUAL=$(_count_status pending)
+            IN_PROGRESS_ACTUAL=$(_count_status in_progress)
+            COMPLETED_ACTUAL=$(_count_status completed)
+            BLOCKED_ACTUAL=$(_count_status blocked)
+            TOTAL_ACTUAL=$((PENDING_ACTUAL + IN_PROGRESS_ACTUAL + COMPLETED_ACTUAL + BLOCKED_ACTUAL))
+            # Only reconcile if TaskList returned real data (TOTAL_ACTUAL > 0) and counters differ by >1
+            if [ "$TOTAL_ACTUAL" -gt 0 ]; then
+                TOTAL_STATE=$(printf '%s' "$STATE" | jq -r '.total // 0')
+                COMPLETED_STATE=$(printf '%s' "$STATE" | jq -r '.completed // 0')
+                PENDING_STATE=$(printf '%s' "$STATE" | jq -r '.pending // 0')
+                IN_PROG_STATE=$(printf '%s' "$STATE" | jq -r '.in_progress // 0')
+                BLOCKED_STATE=$(printf '%s' "$STATE" | jq -r '.blocked // 0')
+                _TOTAL_DRIFT=$(( TOTAL_ACTUAL - TOTAL_STATE ))
+                _COMP_DRIFT=$(( COMPLETED_ACTUAL - COMPLETED_STATE ))
+                _PEND_DRIFT=$(( PENDING_ACTUAL - PENDING_STATE ))
+                _PROG_DRIFT=$(( IN_PROGRESS_ACTUAL - IN_PROG_STATE ))
+                _BLOCK_DRIFT=$(( BLOCKED_ACTUAL - BLOCKED_STATE ))
+                [ "$_TOTAL_DRIFT" -lt 0 ] && _TOTAL_DRIFT=$(( -_TOTAL_DRIFT ))
+                [ "$_COMP_DRIFT" -lt 0 ]  && _COMP_DRIFT=$(( -_COMP_DRIFT ))
+                [ "$_PEND_DRIFT" -lt 0 ]  && _PEND_DRIFT=$(( -_PEND_DRIFT ))
+                [ "$_PROG_DRIFT" -lt 0 ]  && _PROG_DRIFT=$(( -_PROG_DRIFT ))
+                [ "$_BLOCK_DRIFT" -lt 0 ] && _BLOCK_DRIFT=$(( -_BLOCK_DRIFT ))
+                # M2 (meta-improvement 2026-05): drop the >1 drift threshold. Any drift
+                # on UNFILTERED TaskList is reconciled — TaskList output IS ground truth
+                # for that moment, so accepting it is always safe and self-healing. The
+                # old >1 threshold left 1-task drift to compound across sessions.
+                if [ "$_TOTAL_DRIFT" -gt 0 ] || [ "$_COMP_DRIFT" -gt 0 ] || \
+                   [ "$_PEND_DRIFT" -gt 0 ]  || [ "$_PROG_DRIFT" -gt 0 ] || \
+                   [ "$_BLOCK_DRIFT" -gt 0 ]; then
+                    echo "sync-tasks: counter reconcile for $PROJECT (total: ${TOTAL_STATE}→${TOTAL_ACTUAL}, completed: ${COMPLETED_STATE}→${COMPLETED_ACTUAL}, pending: ${PENDING_STATE}→${PENDING_ACTUAL}, in_progress: ${IN_PROG_STATE}→${IN_PROGRESS_ACTUAL}, blocked: ${BLOCKED_STATE}→${BLOCKED_ACTUAL})" >&2
+                    STATE=$(printf '%s' "$STATE" | jq \
                         --argjson total "$TOTAL_ACTUAL" \
                         --argjson completed "$COMPLETED_ACTUAL" \
                         --argjson pending "$PENDING_ACTUAL" \
                         --argjson in_progress "$IN_PROGRESS_ACTUAL" \
-                        --argjson blocked "$BLOCKED_ACTUAL" '
-                        {
-                            v: 1,
-                            ev: "reconcile",
-                            ts: $ts,
-                            project: $project,
-                            subject_norm: "",
-                            create_seq: -1,
-                            task_id: "",
-                            session_uuid: $sid,
-                            scope: "project",
-                            counters_abs: {
-                                total: $total,
-                                pending: $pending,
-                                in_progress: $in_progress,
-                                completed: $completed,
-                                blocked: $blocked
-                            },
-                            reason: "tasklist-recount",
-                            source: "tasklist"
-                        }
-                    ' 2>/dev/null || true)
+                        --argjson blocked "$BLOCKED_ACTUAL" \
+                        '.total = $total | .completed = $completed | .pending = $pending |
+                         .in_progress = $in_progress | .blocked = $blocked')
+                    # V11.16 (ledger wiring): emit reconcile event on counter drift (ADR §1.3 reconcile).
+                    # scope=project, counters_abs = authoritative recount from TaskList output.
+                    # Sentinel: subject_norm="" create_seq=-1 (ADR MED-B). NO counters_delta.
+                    # Bug E/H immunity: only emit when project was not resolved via ambient fallback.
+                    if [ "$PROJECT_SOURCE" != "active-project-fallback" ]; then
+                        LEDGER_EVENT_JSON=$(jq -cn \
+                            --arg project "$PROJECT" \
+                            --arg sid "$SESSION_UUID" \
+                            --arg ts "$NOW" \
+                            --argjson total "$TOTAL_ACTUAL" \
+                            --argjson completed "$COMPLETED_ACTUAL" \
+                            --argjson pending "$PENDING_ACTUAL" \
+                            --argjson in_progress "$IN_PROGRESS_ACTUAL" \
+                            --argjson blocked "$BLOCKED_ACTUAL" '
+                            {
+                                v: 1,
+                                ev: "reconcile",
+                                ts: $ts,
+                                project: $project,
+                                subject_norm: "",
+                                create_seq: -1,
+                                task_id: "",
+                                session_uuid: $sid,
+                                scope: "project",
+                                counters_abs: {
+                                    total: $total,
+                                    pending: $pending,
+                                    in_progress: $in_progress,
+                                    completed: $completed,
+                                    blocked: $blocked
+                                },
+                                reason: "tasklist-recount",
+                                source: "tasklist"
+                            }
+                        ' 2>/dev/null || true)
+                    fi
+                fi
+
+                # active_task_ids reconciliation: trim orphan IDs against the actual
+                # [in_progress] set in TaskList output. Past sprints accumulated zombies
+                # (e.g. 15, 41, 47) that no TaskUpdate path could clean.
+                #
+                # Safety: only run on UNFILTERED TaskList. A filtered call (e.g.
+                # tool_input.status="completed") would hide legit in-progress tasks
+                # from the output and cause us to wrongly purge them.
+                # S2-T2: already read when the no-op check above fell through on the filter.
+                [ "${_V11_TL_FILTER_SET:-0}" = "1" ] \
+                    || LIST_FILTER_STATUS=$(printf '%s' "$V11_RAW_INPUT" | jq -r '.tool_input.status // ""' 2>/dev/null || true)
+                if [ -z "$LIST_FILTER_STATUS" ] || [ "$LIST_FILTER_STATUS" = "null" ] || [ "$LIST_FILTER_STATUS" = "in_progress" ]; then
+                    # Extract in_progress IDs. Prefer Claude Code's structured tool_response
+                    # ({tasks:[{id,status}]}). Fall back to text formats:
+                    #   "<id>. <subject> [in_progress]"   ← legacy text TaskList
+                    #   "Task #<id> ... [in_progress]"    ← older text fixtures
+                    # IDs are alphanumeric + - + _ to handle T63, voice-mode, plain digits.
+                    REAL_IDS_JSON='[]'
+                    if _has_structured_tasks; then
+                        REAL_IDS_JSON=$(printf '%s' "$V11_TOOL_OUTPUT" | jq -c '[.tasks[] | select(.status == "in_progress") | .id | tostring] | unique' 2>/dev/null || echo '[]')
+                        REAL_IDS_JSON="${REAL_IDS_JSON:-[]}"
+                    else
+                        REAL_IDS_RAW=$(printf '%s' "$V11_TOOL_OUTPUT" | grep -F '[in_progress]' 2>/dev/null || true)
+                        if [ -n "$REAL_IDS_RAW" ]; then
+                            REAL_IDS_JSON=$(printf '%s' "$REAL_IDS_RAW" | sed -n -E '
+                                    s/^[[:space:]]*([A-Za-z0-9_-]+)[.:].*/\1/p
+                                    s/.*[Tt]ask #([0-9]+).*/\1/p
+                                ' | grep -v '^$' | sort -u | jq -R . | jq -sc 'unique' 2>/dev/null || echo '[]')
+                            REAL_IDS_JSON="${REAL_IDS_JSON:-[]}"
+                        fi
+                    fi
+                    IDS_BEFORE=$(printf '%s' "$STATE" | jq -c '.active_task_ids // []')
+                    STATE=$(printf '%s' "$STATE" | jq --argjson real "$REAL_IDS_JSON" '
+                        .active_task_ids = ((.active_task_ids // []) | map(select(. as $x | $real | index($x) != null)))
+                    ')
+                    IDS_AFTER=$(printf '%s' "$STATE" | jq -c '.active_task_ids // []')
+                    if [ "$IDS_BEFORE" != "$IDS_AFTER" ]; then
+                        ZOMBIES=$(jq -nc --argjson b "$IDS_BEFORE" --argjson a "$IDS_AFTER" '$b - $a' 2>/dev/null || echo '[]')
+                        echo "sync-tasks: trimmed orphan active_task_ids for $PROJECT (zombies: $ZOMBIES)" >&2
+                    fi
                 fi
             fi
 
-            # active_task_ids reconciliation: trim orphan IDs against the actual
-            # [in_progress] set in TaskList output. Past sprints accumulated zombies
-            # (e.g. 15, 41, 47) that no TaskUpdate path could clean.
-            #
-            # Safety: only run on UNFILTERED TaskList. A filtered call (e.g.
-            # tool_input.status="completed") would hide legit in-progress tasks
-            # from the output and cause us to wrongly purge them.
-            LIST_FILTER_STATUS=$(printf '%s' "$V11_RAW_INPUT" | jq -r '.tool_input.status // ""' 2>/dev/null || true)
-            if [ -z "$LIST_FILTER_STATUS" ] || [ "$LIST_FILTER_STATUS" = "null" ] || [ "$LIST_FILTER_STATUS" = "in_progress" ]; then
-                # Extract in_progress IDs. Prefer Claude Code's structured tool_response
-                # ({tasks:[{id,status}]}). Fall back to text formats:
-                #   "<id>. <subject> [in_progress]"   ← legacy text TaskList
-                #   "Task #<id> ... [in_progress]"    ← older text fixtures
-                # IDs are alphanumeric + - + _ to handle T63, voice-mode, plain digits.
-                REAL_IDS_JSON='[]'
-                if _has_structured_tasks; then
-                    REAL_IDS_JSON=$(printf '%s' "$V11_TOOL_OUTPUT" | jq -c '[.tasks[] | select(.status == "in_progress") | .id | tostring] | unique' 2>/dev/null || echo '[]')
-                    REAL_IDS_JSON="${REAL_IDS_JSON:-[]}"
-                else
-                    REAL_IDS_RAW=$(printf '%s' "$V11_TOOL_OUTPUT" | grep -F '[in_progress]' 2>/dev/null || true)
-                    if [ -n "$REAL_IDS_RAW" ]; then
-                        REAL_IDS_JSON=$(printf '%s' "$REAL_IDS_RAW" | sed -n -E '
-                                s/^[[:space:]]*([A-Za-z0-9_-]+)[.:].*/\1/p
-                                s/.*[Tt]ask #([0-9]+).*/\1/p
-                            ' | grep -v '^$' | sort -u | jq -R . | jq -sc 'unique' 2>/dev/null || echo '[]')
-                        REAL_IDS_JSON="${REAL_IDS_JSON:-[]}"
-                    fi
-                fi
-                IDS_BEFORE=$(printf '%s' "$STATE" | jq -c '.active_task_ids // []')
-                STATE=$(printf '%s' "$STATE" | jq --argjson real "$REAL_IDS_JSON" '
-                    .active_task_ids = ((.active_task_ids // []) | map(select(. as $x | $real | index($x) != null)))
-                ')
-                IDS_AFTER=$(printf '%s' "$STATE" | jq -c '.active_task_ids // []')
-                if [ "$IDS_BEFORE" != "$IDS_AFTER" ]; then
-                    ZOMBIES=$(jq -nc --argjson b "$IDS_BEFORE" --argjson a "$IDS_AFTER" '$b - $a' 2>/dev/null || echo '[]')
-                    echo "sync-tasks: trimmed orphan active_task_ids for $PROJECT (zombies: $ZOMBIES)" >&2
-                fi
+            # S2-T2: this full pass's fingerprint, written beside the scratch
+            # right after the STATE write below. Not on the unserialized
+            # fallback, nor for a filter that cannot sit in the header line.
+            # review fix (S2 T2/T3/R2 batch, LOW #5): v2 header carries a 6th
+            # field, the write-generation this fingerprint will describe. The
+            # actual value isn't known yet (it's assigned at the STATE_FILE
+            # write below, ~:3634) so a literal placeholder is spliced out for
+            # the real number at write time (~:3662) — bash substring
+            # replacement, no new fork.
+            if [ "${V11_TASKLIST_NOOP_SKIP:-on}" != "off" ] && [ "${_V11_SYNC_RACED:-0}" != "1" ]; then
+                case "${LIST_FILTER_STATUS:-}" in
+                    *$'\n'*|*$'\x1f'*) ;;
+                    *) _V11_TL_FP_NEW="s2t2-v2"$'\x1f'"$PROJECT"$'\x1f'"$TOTAL_ACTUAL"$'\x1f'"$_V11_TL_STRUCT"$'\x1f'"${LIST_FILTER_STATUS:-}"$'\x1f'$'\x1e''GEN'$'\x1e'$'\n'"$V11_TOOL_OUTPUT" ;;
+                esac
             fi
         fi
 
@@ -2815,10 +3574,13 @@ PYEOF
                 # Single jq pass: join + group by resolved project + emit one JSON
                 # object per group. Output is newline-delimited JSON objects (one per
                 # project), each complete snapshot. We then split on \n and write files.
+                # S2-T0b-2: the snapshot lists the current TaskList, so it
+                # carries that epoch (tl_epoch) when there is one.
                 _SNAP_GROUPED=$(printf '%s' "$V11_TOOL_OUTPUT" | jq -c \
                     --arg ts "$NOW" \
                     --arg ambient "$PROJECT" \
                     --arg sid "$SESSION_UUID" \
+                    --argjson tle "${_V11_TL_EPOCH:-null}" \
                     --argjson state "$STATE" '
                     # Build id→project map from stored open_tasks.
                     # Resolution order per task (Bug E/H drift-immunity):
@@ -2865,7 +3627,7 @@ PYEOF
                                 owner:    .owner,
                                 stamped:  .stamped
                             }))
-                        }
+                        } + (if $tle != null then {tl_epoch: $tle} else {} end)
                       )
                     | .[]
                 ' 2>/dev/null || true)
@@ -2949,7 +3711,8 @@ v11_update_findings_summary() {
         current_severity=$(printf '%s' "$V11_RAW_INPUT" | jq -r '.tool_input.metadata.severity // "low"' 2>/dev/null)
         [ "$current_severity" = "null" ] && current_severity="low"
 
-        case "$TASK_STATUS" in
+        # improvements/63: a delete (V11_DELETE_CANCELS on) is terminal here too.
+        case "${_TU_CASE_STATUS:-$TASK_STATUS}" in
             "")
                 # TaskCreate: new finding task
                 STATE=$(printf '%s' "$STATE" | jq \
@@ -2958,7 +3721,7 @@ v11_update_findings_summary() {
                     .finding_tasks = ((.finding_tasks // {}) + {($id): $sev})
                 ')
                 ;;
-            completed|cancelled)
+            completed|cancelled|deleted)
                 # Remove from active findings index on terminal status
                 STATE=$(printf '%s' "$STATE" | jq \
                     --arg id "$TASK_ID" '
@@ -2998,7 +3761,9 @@ v11_update_findings_summary() {
 }
 
 # Invoke findings summary update before writing state to disk
-v11_update_findings_summary "$PROJECT"
+# (S2-T2: not on a no-op TaskList, whose scratch already holds the result.)
+[ "${_V11_TL_NOOP:-0}" = "1" ] || v11_update_findings_summary "$PROJECT"
+[ -z "$_V11_PROF_T0" ] || _v11_prof_mark branch
 
 # --- Atomic write (per-session file) ---
 # Write to PID-suffixed tmp, validate, then mv — never truncates target on
@@ -3011,28 +3776,71 @@ v11_update_findings_summary "$PROJECT"
 # rare unserialized-fallback path the lock was NOT held — the end-of-hook
 # scratch-reconcile marker + next-call drain repair any lost update from the
 # durable ledger; see _V11_SYNC_RACED.)
-_TMP="$STATE_FILE.tmp.$$"
-printf '%s' "$STATE" | jq '.' > "$_TMP"
-if [ -s "$_TMP" ] && jq empty "$_TMP" 2>/dev/null; then
-    mv "$_TMP" "$STATE_FILE"
-    # Deletion breadcrumb (2026-07-21): per-session task-state.json (+.lock/
-    # .heartbeat) has been observed vanishing mid-session for a LIVE session,
-    # deleter unidentified — which empties the aggregate rebuild's scan and
-    # freezes counters (see frozen-aggregate guard in lib/common.sh). Stamp
-    # every successful write so a later disappearance can be dated against
-    # this file's survival or absence.
-    date -Iseconds > "$(dirname "$STATE_FILE")/.task-state-last-write" 2>/dev/null || true
-    # v11.33: the reconciled STATE is now persisted — safe to remove the drained
-    # marker + its per-task artifact sidecars. Still under FD-201, so no racer can
-    # slip a new marker in between the drain and this cleanup. On a write failure
-    # (else branch) the marker is intentionally LEFT so a later call retries.
-    if [ "${_V11_RECON_DRAINED:-0}" = "1" ]; then
-        rm -f "$STATE_FILE.needs-reconcile" "$STATE_FILE".needs-reconcile.artifacts.*.json 2>/dev/null || true
+# S2-T2: a no-op TaskList leaves the scratch as the last full pass wrote it.
+if [ "${_V11_TL_NOOP:-0}" != "1" ]; then
+    _TMP="$STATE_FILE.tmp.$$"
+    # #107b: strip the transient pair-activation marker (piggybacked on this
+    # already-unconditional write, no extra fork) so it never persists on disk.
+    printf '%s' "$STATE" | jq 'del(._pair_just_activated)' > "$_TMP"
+    if [ -s "$_TMP" ] && jq empty "$_TMP" 2>/dev/null; then
+        mv "$_TMP" "$STATE_FILE"
+        # Deletion breadcrumb (2026-07-21): per-session task-state.json (+.lock/
+        # .heartbeat) has been observed vanishing mid-session for a LIVE session,
+        # deleter unidentified — which empties the aggregate rebuild's scan and
+        # freezes counters (see frozen-aggregate guard in lib/common.sh). Stamp
+        # every successful write so a later disappearance can be dated against
+        # this file's survival or absence.
+        date -Iseconds > "$(dirname "$STATE_FILE")/.task-state-last-write" 2>/dev/null || true
+        # review fix (S2 T2/T3/R2 batch, LOW #5): bump the write-generation
+        # sidecar on EVERY successful STATE_FILE write (any tool type, not just
+        # TaskList) so a same-tick TaskCreate/TaskUpdate correctly invalidates a
+        # TaskList fingerprint captured moments before — read/increment/write
+        # are all bash builtins (`read`, `printf` redirection), 0 new forks.
+        # fix review #16 (S2-T5 MEDIUM): that read-increment-write is
+        # unserialized on the raced fallback path (_V11_SYNC_RACED=1, ~:620 —
+        # FD-201 timed out), so two racing unlocked writers can read the same
+        # counter value and both write value+1, losing an increment and
+        # colliding on one generation number — reopening the exact same-tick
+        # indistinguishability this counter exists to close. On that path,
+        # skip the unlocked bump and drop the TaskList fingerprint instead
+        # (only forked on this rare path): the next TaskList can no longer
+        # match a generation this write never safely recorded, so it takes
+        # the full pass rather than trust a possibly-collided value — the
+        # same self-heal-on-next-locked-call doctrine the raced STATE_FILE
+        # write above already relies on (scratch-reconcile).
+        _V11_TL_FP_FILE="${STATE_FILE%/*}/.tasklist-fp"
+        if [ "${_V11_SYNC_RACED:-0}" = "1" ]; then
+            rm -f "$_V11_TL_FP_FILE" 2>/dev/null || true
+            _V11_TL_FP_NEW=""
+        else
+            _V11_STATE_GEN_FILE="${STATE_FILE%/*}/.task-state-gen"
+            _V11_STATE_GEN_NEW=0
+            [ -f "$_V11_STATE_GEN_FILE" ] && IFS= read -r _V11_STATE_GEN_NEW < "$_V11_STATE_GEN_FILE" 2>/dev/null
+            case "$_V11_STATE_GEN_NEW" in ''|*[!0-9]*) _V11_STATE_GEN_NEW=0 ;; esac
+            _V11_STATE_GEN_NEW=$((_V11_STATE_GEN_NEW + 1))
+            printf '%s\n' "$_V11_STATE_GEN_NEW" > "$_V11_STATE_GEN_FILE" 2>/dev/null || true
+        fi
+        # v11.33: the reconciled STATE is now persisted — safe to remove the drained
+        # marker + its per-task artifact sidecars. Still under FD-201, so no racer can
+        # slip a new marker in between the drain and this cleanup. On a write failure
+        # (else branch) the marker is intentionally LEFT so a later call retries.
+        if [ "${_V11_RECON_DRAINED:-0}" = "1" ]; then
+            rm -f "$STATE_FILE.needs-reconcile" "$STATE_FILE".needs-reconcile.artifacts.*.json 2>/dev/null || true
+        fi
+        # S2-T2: the full TaskList pass's fingerprint, after the scratch it
+        # describes (so the scratch is not newer) and still under FD-201. The
+        # placeholder built into the header above is spliced for the real
+        # generation number just bumped (bash substring replace, no new fork).
+        if [ -n "${_V11_TL_FP_NEW:-}" ]; then
+            _V11_TL_FP_NEW="${_V11_TL_FP_NEW/$'\x1e''GEN'$'\x1e'/$_V11_STATE_GEN_NEW}"
+            printf '%s' "$_V11_TL_FP_NEW" > "$_V11_TL_FP_FILE" 2>/dev/null || _V11_TL_FP_NEW=""
+        fi
+    else
+        rm -f "$_TMP"
+        echo "sync-tasks: jq produced empty/invalid output; existing state preserved ($STATE_FILE)" >&2
     fi
-else
-    rm -f "$_TMP"
-    echo "sync-tasks: jq produced empty/invalid output; existing state preserved ($STATE_FILE)" >&2
 fi
+[ -z "$_V11_PROF_T0" ] || _v11_prof_mark write
 
 # --- V11.16: Ledger append (ADR §4.2 call site) ---
 # Emit the ledger event that was prepared inside the per-tool branch above.
@@ -3054,9 +3862,23 @@ fi
 # STATE write to patch open_tasks[$TASK_ID]._idk.create_seq from the sentinel
 # value 0 to the authoritative value.  The second write also flushes to disk
 # (STATE_FILE) so the per-session file is always consistent.
+# #107b: pair_ shadow activation row, built earlier in the TaskUpdate(completed)
+# branch (only set when the pending_parent -> pending flip actually happened).
+# Appended here, after the STATE write above, same ordering as LEDGER_EVENT_JSON.
+if [ -n "${_PA_EVENT:-}" ] && [ "$PROJECT_SOURCE" != "active-project-fallback" ]; then
+    v11_ledger_append "$PROJECT" "$_PA_EVENT" >/dev/null 2>/dev/null || true
+fi
+
 if [ -n "$LEDGER_EVENT_JSON" ] && [ "$LEDGER_EVENT_JSON" != "null" ] \
    && [ "$PROJECT_SOURCE" != "active-project-fallback" ]; then
     _LEDGER_CONFIRMED_SEQ=$(v11_ledger_append "$PROJECT" "$LEDGER_EVENT_JSON" 2>/dev/null || true)
+    # S2-T0b-2 (#111): a rehydrated create prints "create_seq<TAB>subject_norm",
+    # the identity the line was keyed on (its target's when that was open).
+    _LEDGER_CONFIRMED_NORM=""
+    if [[ $_LEDGER_CONFIRMED_SEQ == *$'\t'* ]]; then
+        _LEDGER_CONFIRMED_NORM="${_LEDGER_CONFIRMED_SEQ#*$'\t'}"
+        _LEDGER_CONFIRMED_SEQ="${_LEDGER_CONFIRMED_SEQ%%$'\t'*}"
+    fi
     # If this was a `created` event, patch _idk.create_seq with the confirmed value.
     _LEDGER_EV_TYPE=$(printf '%s' "${LEDGER_EVENT_JSON:-}" | jq -r '.ev // ""' 2>/dev/null || true)
     if [ "$_LEDGER_EV_TYPE" = "created" ] \
@@ -3067,9 +3889,11 @@ if [ -n "$LEDGER_EVENT_JSON" ] && [ "$LEDGER_EVENT_JSON" != "null" ] \
         # The jq expression is a no-op if _idk is null (guards against absent _idk).
         STATE=$(printf '%s' "$STATE" | jq \
             --arg id "$TASK_ID" \
+            --arg confirmed_norm "$_LEDGER_CONFIRMED_NORM" \
             --argjson confirmed_seq "$_LEDGER_CONFIRMED_SEQ" '
             if $id != "" and (.open_tasks[$id]._idk) != null then
                 .open_tasks[$id]._idk.create_seq = $confirmed_seq
+                | if $confirmed_norm != "" then .open_tasks[$id]._idk.subject_norm = $confirmed_norm else . end
             else . end
         ' 2>/dev/null) || true
         # Flush patched STATE to disk (same atomic-write pattern as above).
@@ -3079,6 +3903,27 @@ if [ -n "$LEDGER_EVENT_JSON" ] && [ "$LEDGER_EVENT_JSON" != "null" ] \
             printf '%s' "$STATE" | jq '.' > "$_TMP2"
             if [ -s "$_TMP2" ] && jq empty "$_TMP2" 2>/dev/null; then
                 mv "$_TMP2" "$STATE_FILE"
+                # review fix (S2 T2/T3/R2 batch, LOW #5): this is also a real
+                # STATE_FILE write (create_seq patch) — bump the same
+                # write-generation sidecar as the primary write above so a
+                # later TaskList's no-op guard can't miss it. Builtins only.
+                # fix review #16 (S2-T5 MEDIUM): same unlocked-raced-path race
+                # as the primary bump above (the "FD-201 is still held" claim
+                # two comments up does not hold on the raced fallback — the
+                # flock at ~:620 timed out, so nothing serializes this write
+                # either) — skip the bump and drop the fingerprint instead
+                # when raced; see the matching comment at the primary bump
+                # (~:3781) for why.
+                if [ "${_V11_SYNC_RACED:-0}" = "1" ]; then
+                    rm -f "${STATE_FILE%/*}/.tasklist-fp" 2>/dev/null || true
+                else
+                    _V11_STATE_GEN_FILE="${STATE_FILE%/*}/.task-state-gen"
+                    _V11_STATE_GEN_NEW=0
+                    [ -f "$_V11_STATE_GEN_FILE" ] && IFS= read -r _V11_STATE_GEN_NEW < "$_V11_STATE_GEN_FILE" 2>/dev/null
+                    case "$_V11_STATE_GEN_NEW" in ''|*[!0-9]*) _V11_STATE_GEN_NEW=0 ;; esac
+                    _V11_STATE_GEN_NEW=$((_V11_STATE_GEN_NEW + 1))
+                    printf '%s\n' "$_V11_STATE_GEN_NEW" > "$_V11_STATE_GEN_FILE" 2>/dev/null || true
+                fi
             else
                 rm -f "$_TMP2"
                 echo "sync-tasks: second STATE write failed; _idk.create_seq may be 0 for task ${TASK_ID}" >&2
@@ -3086,6 +3931,7 @@ if [ -n "$LEDGER_EVENT_JSON" ] && [ "$LEDGER_EVENT_JSON" != "null" ] \
         fi
     fi
 fi
+[ -z "$_V11_PROF_T0" ] || _v11_prof_mark ledger
 
 # --- v11.33 (d)-lite: release FD-201 before the aggregate rebuild ---
 # Both STATE writes (first write above at ~:2753 and the create_seq patch at
@@ -3108,7 +3954,14 @@ fi
 # walks every $METRICS_DIR/sessions/*/task-state.json where .project == $PROJECT
 # and folds them into a single view. Run after the per-session write so the
 # aggregate always reflects the latest per-session truth.
-v11_rebuild_project_aggregate "$PROJECT"
+# S2-T2: not after a no-op TaskList (it changed none of the rebuild's inputs).
+# A full TaskList pass whose rebuild fails drops its fingerprint, so the next
+# TaskList rebuilds again instead of skipping.
+if [ "${_V11_TL_NOOP:-0}" != "1" ]; then
+    v11_rebuild_project_aggregate "$PROJECT" \
+        || { [ -z "${_V11_TL_FP_NEW:-}" ] || rm -f "$_V11_TL_FP_FILE" 2>/dev/null; }
+fi
+[ -z "$_V11_PROF_T0" ] || _v11_prof_mark aggregate
 
 # --- v11.33: scratch-reconcile record (raced terminal write) ---
 # We took the unserialized fallback, so this terminal (completed|blocked) write
@@ -3131,9 +3984,14 @@ v11_rebuild_project_aggregate "$PROJECT"
 if [ "${V11_SYNC_SCRATCH_RECONCILE:-on}" != "off" ] && [ "${_V11_SYNC_RACED:-0}" = "1" ] \
    && [ -n "$TASK_ID" ] && { [ "$TASK_STATUS" = "completed" ] || [ "$TASK_STATUS" = "blocked" ]; }; then
     _RC_SUBJ="${ACTIVE_SUBJECT:-unknown}"; _RC_SUBJ="${_RC_SUBJ:0:500}"
+    # F36: carry the prior status already resolved earlier in this TaskUpdate
+    # call so v11_reapply_terminal_fold folds the SAME bucket the live branch
+    # would have (not an unconditional in_progress decrement).
     jq -cn --arg tid "$TASK_ID" --arg st "$TASK_STATUS" --arg subj "$_RC_SUBJ" \
-        --arg rtid "${_V21_REVIEW_TASK_ID:-}" \
-        '{task_id:$tid, status:$st, subject:$subj} + (if $rtid != "" and $rtid != "null" then {review_task_id:$rtid} else {} end)' \
+        --arg rtid "${_V21_REVIEW_TASK_ID:-}" --arg prior "${_TU_PRIOR_STATUS:-}" \
+        '{task_id:$tid, status:$st, subject:$subj}
+         + (if $rtid != "" and $rtid != "null" then {review_task_id:$rtid} else {} end)
+         + (if $prior != "" then {prior_status:$prior} else {} end)' \
         2>/dev/null >> "$STATE_FILE.needs-reconcile" 2>/dev/null || true
     # E2b: persist artifacts to a whole-file sidecar (only for a completed event
     # carrying an artifacts object, and a filesystem-safe task id).
@@ -3159,7 +4017,7 @@ fi
 # directly via TaskList polling, not a hook-side pulse.
 
 # V11.4: Sync plan file on task status transitions (background, no latency impact)
-if [ "$TASK_STATUS" = "completed" ] || [ "$TASK_STATUS" = "in_progress" ]; then
+if [ "$TASK_STATUS" = "completed" ] || [ "$TASK_STATUS" = "in_progress" ] || [ "${_TU_CASE_STATUS:-}" = "deleted" ]; then
     PLAN_SYNC_SCRIPT="$(dirname "$(dirname "${BASH_SOURCE[0]}")")/scripts/plan-sync"
     if [ -x "$PLAN_SYNC_SCRIPT" ] && [ -n "$PROJECT" ]; then
         # HS-013 (Wave 3c): disown fire-and-forget job to prevent zombie accumulation

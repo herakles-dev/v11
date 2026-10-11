@@ -48,7 +48,7 @@ fi
 # Use word-boundary awareness: grep for \bgit\b to avoid matching
 # "digital", "git-lfs-install", etc.
 # -----------------------------------------------------------------------
-if ! printf '%s' "$COMMAND" | grep -qwE 'git'; then
+if ! grep -qwE 'git' <<<"$COMMAND"; then
     exit 0
 fi
 

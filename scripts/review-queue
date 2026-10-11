@@ -2,19 +2,31 @@
 # V11.19 Script: review-queue
 # CLI for the per-project adversarial-lite review queue.
 #
-# The queue is an append-only JSONL of pending/done events keyed by (project,
-# task_id). Replay semantics: latest event per task_id wins.
+# The queue is an append-only JSONL of pending/done/parked events keyed by
+# (project, task_id). Replay semantics: latest event per task_id wins.
+# "parked" = neither drainable nor done; no drain re-reviews it until it is
+# un-parked. review-daemon parks a verdict mark-done refused to fold (exit 2);
+# an operator can park one by hand with another reason (park_reason says which).
 #
 # USAGE:
-#   review-queue pending [PROJECT]           # List pending tasks (subjects only)
-#   review-queue pending [PROJECT] --json    # JSON for orchestrator consumption
-#   review-queue stats [PROJECT]             # Pending/done/total counts
+#   review-queue pending [PROJECT]           # List pending tasks (subjects only; parked listed apart)
+#   review-queue pending [PROJECT] --json    # JSON for orchestrator consumption (drainable only)
+#   review-queue pending [PROJECT] --json --include-parked
+#                                            # ... plus parked entries; every row gets state: pending|parked
+#   review-queue stats [PROJECT]             # Pending/done/parked/total counts
 #   review-queue list [PROJECT]              # All entries (pending+done)
 #   review-queue mark-done PROJECT TASK_ID [SEV] [SESSION_UUID] [--verdict-file FILE]
 #                                            # Manually mark done (advisory; sync-tasks usually does this).
 #                                            # --verdict-file FILE (W5-T16): fold the full verdict JSON into
 #                                            # a durable store + ev:"review" ledger event; SEV may be omitted
 #                                            # (derived as max severity from the file). Rollback: V11_REVIEW_LEDGER=off.
+#                                            # SESSION_UUID is the parent task's session (pending --json lists it);
+#                                            # with --verdict-file, a task_id reused across sessions and no
+#                                            # SESSION_UUID exits 2 and writes nothing (S1-P3, #97).
+#                                            # --identity SN:CS (S2-T0b-3) names the parent task exactly (the
+#                                            # subject_norm:create_seq pending --json lists as parent_identity);
+#                                            # without it the pending row's parent_identity, tl_epoch, then its
+#                                            # ts + subject bind the parent. Rollback: V11_TASK_RESOLVER=legacy.
 #   review-queue all-pending                 # Cross-project pending summary
 #   review-queue claim PROJECT TASK_ID [SESSION_UUID]
 #                                            # Claim a pending entry for draining (default: current session)
@@ -24,6 +36,13 @@
 #   review-queue backstop PROJECT [--json]   # DETECT-phase hard backstop check (improvement 03 §D)
 #   review-queue ack-stale PROJECT --reason "..."
 #                                            # Acknowledge the backstop without draining (escape hatch)
+#   review-queue park PROJECT TASK_ID --reason "..." [--verdict-kept FILE] [--rc N]
+#                                            # Park a pending entry whose verdict cannot bind (review-daemon
+#                                            # does this on mark-done's AMBIGUOUS refusal, exit 2; V11_REVIEW_DAEMON_PARK=off stops it)
+#   review-queue unpark PROJECT TASK_ID      # Make a parked entry drainable again (the next drain re-reviews it).
+#                                            # To keep the verdict already paid for instead, fold it once the
+#                                            # task_id binds: mark-done PROJECT TASK_ID "" SESSION --verdict-file KEPT
+#                                            # (a done event closes a parked entry; a new enqueue re-pends it)
 #   review-queue --test
 #   review-queue --help
 #
@@ -49,7 +68,7 @@ if [ "${1:-}" = "--test" ]; then
 fi
 
 if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ] || [ $# -eq 0 ]; then
-    sed -n '2,37p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,55p' "$0" | sed 's/^# \{0,1\}//'
     exit 0
 fi
 
@@ -69,17 +88,21 @@ _resolve_project() {
 
 # Emit the canonical pending-task summary as JSON array. One element per pending task.
 # Each: {task_id, subject, agent_id, files_changed[], pending_since, session_uuid}
+# INCLUDE_PARKED=parked adds parked entries (with parked_at, park_reason, park_rc,
+# verdict_kept) and a state field (pending|parked) on every element; without it
+# the output is unchanged and never lists a parked entry (drain consumers use it).
 _pending_json() {
-    local project="$1"
+    local project="$1" include_parked="${2:-}"
     local jsonl_file
     jsonl_file=$(v11_review_queue_path "$project" jsonl) || return 1
     if [ ! -f "$jsonl_file" ] || [ ! -s "$jsonl_file" ]; then
         printf '[]'
         return 0
     fi
-    V11_RQ_FILE="$jsonl_file" python3 - <<'PYEOF'
+    V11_RQ_FILE="$jsonl_file" V11_RQ_PARKED="$include_parked" python3 - <<'PYEOF'
 import os, json, sys
 path = os.environ["V11_RQ_FILE"]
+with_parked = os.environ.get("V11_RQ_PARKED") == "parked"
 # Replay: latest event per task_id wins. Track full latest event for output.
 latest = {}
 try:
@@ -103,9 +126,10 @@ except Exception as e:
 
 out = []
 for tid, ev in latest.items():
-    if ev.get("ev") != "pending":
+    state = ev.get("ev")
+    if state != "pending" and not (with_parked and state == "parked"):
         continue
-    out.append({
+    row = {
         "task_id": tid,
         "subject": ev.get("subject", ""),
         "agent_id": ev.get("agent_id", "unknown"),
@@ -114,7 +138,20 @@ for tid, ev in latest.items():
         "session_uuid": ev.get("session_uuid", ""),
         "claimed_by": ev.get("claimed_by") or None,
         "claimed_at": ev.get("claimed_at") or None,
-    })
+    }
+    # S2-T0b-3: the parent's identity and TaskList epoch, when the row carries
+    # them (hooks/sync-tasks, S2-T0b-2). V11_TASK_RESOLVER=legacy lists the
+    # v11.46 fields only (review #23).
+    if os.environ.get("V11_TASK_RESOLVER", "shared") != "legacy":
+        for k in ("parent_identity", "tl_epoch"):
+            if ev.get(k) not in (None, ""):
+                row[k] = ev[k]
+    if with_parked:
+        row["state"] = state
+        if state == "parked":
+            for k in ("parked_at", "park_reason", "park_rc", "verdict_kept"):
+                row[k] = ev.get(k)
+    out.append(row)
 # Sort by pending_since (oldest first — orchestrator drains FIFO)
 out.sort(key=lambda x: x["pending_since"])
 print(json.dumps(out, separators=(",", ":")))
@@ -127,7 +164,7 @@ _stats_json() {
     local jsonl_file
     jsonl_file=$(v11_review_queue_path "$project" jsonl) || return 1
     if [ ! -f "$jsonl_file" ] || [ ! -s "$jsonl_file" ]; then
-        printf '{"pending":0,"done":0,"tasks":0,"events":0}'
+        printf '{"pending":0,"done":0,"parked":0,"tasks":0,"events":0}'
         return 0
     fi
     V11_RQ_FILE="$jsonl_file" python3 - <<'PYEOF'
@@ -151,13 +188,15 @@ try:
             events += 1
             latest[tid] = ev.get("ev", "")
 except Exception:
-    print('{"pending":0,"done":0,"tasks":0,"events":0}')
+    print('{"pending":0,"done":0,"parked":0,"tasks":0,"events":0}')
     raise SystemExit(0)
 pending = sum(1 for s in latest.values() if s == "pending")
 done = sum(1 for s in latest.values() if s == "done")
+parked = sum(1 for s in latest.values() if s == "parked")
 print(json.dumps({
     "pending": pending,
     "done": done,
+    "parked": parked,
     "tasks": len(latest),
     "events": events,
 }, separators=(",", ":")))
@@ -169,20 +208,30 @@ case "$SUB" in
         PROJECT=$(_resolve_project "${1:-}") || exit 1
         # Consume PROJECT arg if it matched something (or was passed)
         [ "${1:-}" = "$PROJECT" ] && shift || true
-        # Look for --json
+        # Look for --json / --include-parked
         JSON=false
+        WITH_PARKED=""
         for arg in "$@"; do
             [ "$arg" = "--json" ] && JSON=true
+            [ "$arg" = "--include-parked" ] && WITH_PARKED="parked"
         done
 
-        PENDING=$(_pending_json "$PROJECT")
         if [ "$JSON" = "true" ]; then
+            PENDING=$(_pending_json "$PROJECT" "$WITH_PARKED")
             printf '%s\n' "$PENDING"
         else
+            ALL=$(_pending_json "$PROJECT" parked)
+            PENDING=$(printf '%s' "$ALL" | jq -c '[.[] | select(.state == "pending")]')
+            PARKED=$(printf '%s' "$ALL" | jq -c '[.[] | select(.state == "parked")]')
             COUNT=$(printf '%s' "$PENDING" | jq 'length')
             echo "Pending reviews for project '$PROJECT': $COUNT"
             if [ "$COUNT" -gt 0 ]; then
                 printf '%s' "$PENDING" | jq -r '.[] | "  - task #\(.task_id): \(.subject) (agent: \(.agent_id), since: \(.pending_since))"'
+            fi
+            PCOUNT=$(printf '%s' "$PARKED" | jq 'length')
+            if [ "$PCOUNT" -gt 0 ]; then
+                echo "Parked (not drained): $PCOUNT — un-park: scripts/review-queue unpark $PROJECT TASK_ID"
+                printf '%s' "$PARKED" | jq -r '.[] | "  - task #\(.task_id): \(.subject) (parked: \(.parked_at), reason: \((.park_reason // "") | if length > 80 then .[:79] + "…" elif length == 0 then "none recorded" else . end), verdict kept: \(.verdict_kept // "none"))"'
             fi
         fi
         ;;
@@ -200,6 +249,7 @@ case "$SUB" in
             printf '%s' "$STATS" | jq -r '. as $s | "Project: '"$PROJECT"'
   Pending: \($s.pending)
   Done:    \($s.done)
+  Parked:  \($s.parked)
   Tasks:   \($s.tasks)
   Events:  \($s.events)"'
         fi
@@ -218,6 +268,7 @@ case "$SUB" in
         # list wherever it appears; remaining positionals keep their original
         # order (PROJECT TASK_ID [SEV] [SESSION_UUID]).
         VERDICT_FILE=""
+        IDENTITY=""
         ARGS=()
         while [ $# -gt 0 ]; do
             case "$1" in
@@ -229,6 +280,14 @@ case "$SUB" in
                     VERDICT_FILE="${2:-}"
                     shift 2
                     ;;
+                --identity)
+                    if [ $# -lt 2 ] || ! [[ "${2:-}" =~ ^.+:[0-9]+$ ]]; then
+                        echo "review-queue mark-done: --identity requires SUBJECT_NORM:CREATE_SEQ" >&2
+                        exit 2
+                    fi
+                    IDENTITY="$2"
+                    shift 2
+                    ;;
                 *)
                     ARGS+=("$1")
                     shift
@@ -238,7 +297,7 @@ case "$SUB" in
         set -- "${ARGS[@]+"${ARGS[@]}"}"
 
         if [ $# -lt 2 ]; then
-            echo "review-queue mark-done: requires PROJECT TASK_ID [SEV] [SESSION_UUID] [--verdict-file FILE]" >&2
+            echo "review-queue mark-done: requires PROJECT TASK_ID [SEV] [SESSION_UUID] [--verdict-file FILE] [--identity SN:CS]" >&2
             exit 2
         fi
         PROJECT="$1"; TASK_ID="$2"; SEV="${3:-}"; SESSION_UUID="${4:-}"
@@ -256,7 +315,7 @@ case "$SUB" in
         fi
         SEV="${SEV:-NONE}"
 
-        RESULT=$(v11_review_queue_mark_done "$PROJECT" "$TASK_ID" "$SEV" "$SESSION_UUID" "$VERDICT_FILE")
+        RESULT=$(v11_review_queue_mark_done "$PROJECT" "$TASK_ID" "$SEV" "$SESSION_UUID" "$VERDICT_FILE" "$IDENTITY") || exit $?
         echo "$RESULT"
         ;;
     all-pending)
@@ -323,12 +382,14 @@ case "$SUB" in
 
         MY_SESSION="$(v11_session_uuid 2>/dev/null || echo "legacy-cli")"
         PENDING=$(_pending_json "$PROJECT")
+        PARKED=$(_pending_json "$PROJECT" parked | jq -c '[.[] | select(.state == "parked")]')
         CLASS=$(v11_review_queue_classify "$PROJECT" "$MY_SESSION")
 
-        DASH=$(V11_RQ_PENDING="$PENDING" V11_RQ_CLASS="$CLASS" V11_RQ_MY="$MY_SESSION" V11_RQ_PROJECT="$PROJECT" python3 - <<'PYEOF'
+        DASH=$(V11_RQ_PENDING="$PENDING" V11_RQ_PARKED="$PARKED" V11_RQ_CLASS="$CLASS" V11_RQ_MY="$MY_SESSION" V11_RQ_PROJECT="$PROJECT" python3 - <<'PYEOF'
 import os, json
 
 pending = json.loads(os.environ.get("V11_RQ_PENDING", "[]"))
+parked = json.loads(os.environ.get("V11_RQ_PARKED", "[]") or "[]")
 classify = json.loads(os.environ.get("V11_RQ_CLASS", "[]"))
 project = os.environ.get("V11_RQ_PROJECT", "")
 
@@ -345,6 +406,11 @@ for e in pending:
     owners[owner] = owners.get(owner, 0) + 1
 
 owned = sum(owners.values())
+reasons = {}  # park_reason -> task_ids, oldest pending_since first
+for e in parked:
+    reasons.setdefault(e.get("park_reason") or "", []).append(e["task_id"])
+parked_by_reason = [{"reason": r, "count": len(t), "task_ids": t}
+                    for r, t in sorted(reasons.items(), key=lambda kv: (-len(kv[1]), kv[0]))]
 top_owner = None
 if owners:
     top_owner = sorted(owners.items(), key=lambda kv: -kv[1])[0][0]
@@ -356,6 +422,12 @@ print(json.dumps({
     "owned": owned,
     "owners": [{"session": k, "count": v} for k, v in sorted(owners.items(), key=lambda kv: -kv[1])],
     "top_owner": top_owner,
+    # Neither drainable nor done. review-daemon parks on mark-done's refusal; a
+    # hand park carries its own reason (F37), so the entries are grouped by it.
+    "parked": len(parked),
+    "parked_entries": [{k: e.get(k) for k in ("task_id", "subject", "session_uuid", "parked_at",
+                                              "park_reason", "verdict_kept")} for e in parked],
+    "parked_by_reason": parked_by_reason,
 }, separators=(",", ":")))
 PYEOF
 )
@@ -363,14 +435,19 @@ PYEOF
             printf '%s\n' "$DASH"
         else
             printf '%s' "$DASH" | jq -r --arg proj "$PROJECT" '
-              .pending as $p | .drainable as $d | .owned as $o | .top_owner as $t |
-              if $p == 0 then
+              .pending as $p | .drainable as $d | .owned as $o | .top_owner as $t | .parked as $k |
+              (if $p == 0 then
                 "Reviews pending: 0"
               elif $o == 0 then
                 "Reviews pending: \($p) ⚠  (\($d) drainable here)\nDrain: scripts/drain-review-queue \($proj) --safe\nDrain all anyway: scripts/drain-review-queue \($proj) --force"
               else
                 "Reviews pending: \($p) ⚠  (\($d) drainable here, \($o) owned by concurrent session '"'"'\($t)'"'"')\nDrain \($d): scripts/drain-review-queue \($proj) --safe\nDrain all anyway: scripts/drain-review-queue \($proj) --force"
-              end'
+              end)
+              + (if $k > 0 then
+                "\nReviews parked: \($k) ⚠  (not drained, not done)"
+                + ([.parked_by_reason[] | "\n  \(.count) × \(.reason | if length > 80 then .[:79] + "…" elif length == 0 then "(no reason recorded)" else . end): task \(.task_ids | join(", "))"] | join(""))
+                + "\nInspect: scripts/review-queue pending \($proj) --json --include-parked\nUn-park: scripts/review-queue unpark \($proj) TASK_ID"
+              else "" end)'
         fi
         ;;
     backstop)
@@ -391,11 +468,14 @@ PYEOF
 
         PENDING=$(_pending_json "$PROJECT")
         COUNT=$(printf '%s' "$PENDING" | jq 'length')
+        # Parked entries are reported, not counted: a drain cannot clear them.
+        PARKED_COUNT=$(_pending_json "$PROJECT" parked | jq '[.[] | select(.state == "parked")] | length')
         ACK_FILE="$METRICS_DIR/review-queue/${PROJECT}.ack.json"
         ACK_JSON="{}"
         [ -f "$ACK_FILE" ] && ACK_JSON=$(cat "$ACK_FILE" 2>/dev/null || echo "{}")
 
-        RESULT=$(V11_RQ_PENDING="$PENDING" V11_RQ_COUNT="$COUNT" V11_RQ_THRESH_COUNT="$THRESH_COUNT" \
+        RESULT=$(V11_RQ_PENDING="$PENDING" V11_RQ_COUNT="$COUNT" V11_RQ_PARKED_COUNT="${PARKED_COUNT:-0}" \
+                 V11_RQ_THRESH_COUNT="$THRESH_COUNT" \
                  V11_RQ_THRESH_AGE_H="$THRESH_AGE_H" V11_RQ_THRESH_HARDCOUNT="$THRESH_HARDCOUNT" \
                  V11_RQ_GATED="$GATED" V11_RQ_ACK="$ACK_JSON" \
                  V11_RQ_PROJECT="$PROJECT" python3 - <<'PYEOF'
@@ -404,6 +484,7 @@ from datetime import datetime, timezone
 
 pending = json.loads(os.environ.get("V11_RQ_PENDING", "[]"))
 count = int(os.environ.get("V11_RQ_COUNT", "0"))
+parked = int(os.environ.get("V11_RQ_PARKED_COUNT", "0") or "0")
 thresh_count = int(os.environ.get("V11_RQ_THRESH_COUNT", "20"))
 thresh_age_h = float(os.environ.get("V11_RQ_THRESH_AGE_H", "24"))
 thresh_hardcount = int(os.environ.get("V11_RQ_THRESH_HARDCOUNT", str(thresh_count * 2)))
@@ -484,13 +565,17 @@ print(json.dumps({
     "gated_off": gated,
     "acked": acked,
     "message": message,
+    "parked": parked,
 }, separators=(",", ":")))
 PYEOF
 )
         if [ "$JSON" = "true" ]; then
             printf '%s\n' "$RESULT"
         else
-            printf '%s' "$RESULT" | jq -r '.message // "OK — review queue within backstop thresholds."'
+            printf '%s' "$RESULT" | jq -r '(.message // "OK — review queue within backstop thresholds.")
+              + (if (.parked // 0) > 0 then
+                  "\n   Parked (not counted above): \(.parked) review(s), not drained. See: scripts/review-queue dashboard \(.project)"
+                 else "" end)'
         fi
         # Exit 1 when blocked so callers (DETECT) can branch on exit code, not just parse text.
         printf '%s' "$RESULT" | jq -e '.blocked == true' >/dev/null 2>&1 && exit 1
@@ -529,6 +614,38 @@ PYEOF
             '{acked_at:$acked_at, reason:$reason, session_uuid:$session, pending_count:$pending_count}' \
             > "$ACK_FILE.tmp" && mv "$ACK_FILE.tmp" "$ACK_FILE"
         echo "Acknowledged $COUNT pending review(s) for '$PROJECT' at $NOW. The backstop will not re-block on this snapshot -- draining is still owed, and a NEW pending entry re-arms it."
+        ;;
+    park|unpark)
+        if [ $# -lt 2 ]; then
+            echo "review-queue $SUB: requires PROJECT TASK_ID$([ "$SUB" = park ] && echo ' --reason "..." [--verdict-kept FILE] [--rc N]')" >&2
+            exit 2
+        fi
+        PROJECT="$1"; TASK_ID="$2"; shift 2
+        if ! printf '%s' "$PROJECT" | grep -qE '^[a-zA-Z0-9._-]{1,64}$' \
+           || ! printf '%s' "$TASK_ID" | grep -qE '^[a-zA-Z0-9._-]{1,64}$'; then
+            echo "review-queue $SUB: invalid project '$PROJECT' or task_id '$TASK_ID'" >&2
+            exit 2
+        fi
+        REASON=""; KEPT=""; PARK_RC=""
+        while [ $# -gt 0 ]; do
+            case "$1" in
+                --reason) REASON="${2:-}"; shift ;;
+                --verdict-kept) KEPT="${2:-}"; shift ;;
+                --rc) PARK_RC="${2:-}"; shift ;;
+            esac
+            shift
+        done
+        if [ "$SUB" = "park" ]; then
+            if [ -z "$REASON" ]; then
+                echo "review-queue park: --reason is required (why the verdict cannot bind)" >&2
+                exit 2
+            fi
+            RESULT=$(v11_review_queue_park "$PROJECT" "$TASK_ID" "$REASON" "$KEPT" "$PARK_RC")
+        else
+            RESULT=$(v11_review_queue_unpark "$PROJECT" "$TASK_ID")
+        fi
+        echo "$RESULT"
+        case "$RESULT" in parked|already_parked|unparked) exit 0 ;; *) exit 1 ;; esac
         ;;
     *)
         echo "review-queue: unknown subcommand '$SUB'" >&2

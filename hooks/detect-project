@@ -22,6 +22,29 @@ v11_detect_project
 # Skip if metadata/infrastructure file
 v11_is_metadata_file "$V11_FILE_PATH" && exit 0
 
+# S2-R3 (F38): scripts/handoff keeps a baked steer in .handoff-steer.consumed.md
+# and re-injects it into every regeneration until a DIFFERENT session reads
+# handoff.md. This Read is that acknowledgement: the header names the consuming
+# session; any other session id retires it (.acked). The consumer's own Reads,
+# and Reads without a session id, keep it. Builtins only on this path; the one
+# mv runs once per steer. Rollback: V11_STEER_PERSIST=off.
+# Review #20: a headless session (review-daemon's `claude -p` runs with
+# CLAUDE_CODE_ENTRYPOINT=sdk-cli; SDK hosts sdk-ts/sdk-py; mcp; the GitHub
+# action) reading handoff.md for context is not the successor, so it keeps it.
+if [ "${V11_STEER_PERSIST:-on}" != "off" ] && [ -n "$V11_PROJECT" ] && [ -n "${V11_SESSION_ID:-}" ] \
+   && [[ "${CLAUDE_CODE_ENTRYPOINT:-}" != @(sdk-*|mcp|claude-code-github-action) ]] \
+   && [ "$V11_FILE_PATH" = "$SESSIONS_ROOT/$V11_PROJECT/handoff.md" ] \
+   && [ -f "$SESSIONS_ROOT/$V11_PROJECT/.handoff-steer.consumed.md" ]; then
+    _STEER_KEPT="$SESSIONS_ROOT/$V11_PROJECT/.handoff-steer.consumed.md"
+    _STEER_HDR="" _STEER_BY=""
+    IFS= read -r _STEER_HDR < "$_STEER_KEPT" 2>/dev/null || true
+    [[ "$_STEER_HDR" =~ session=([A-Za-z0-9._-]*) ]] && _STEER_BY="${BASH_REMATCH[1]}"
+    if [ "$_STEER_BY" != "$V11_SESSION_ID" ] && mv -f "$_STEER_KEPT" "$_STEER_KEPT.acked" 2>/dev/null; then
+        printf '<!-- v11-steer-acked session=%s at=%(%Y-%m-%dT%H:%M:%S%z)T -->\n' "$V11_SESSION_ID" -1 \
+            >> "$_STEER_KEPT.acked" 2>/dev/null || true
+    fi
+fi
+
 # Write active project if detected (P4: dual-write to global + session-scoped)
 # B1 (2026-05-14): sticky-first-touch. Once THIS session has been bound to a
 # project (session-scoped active-project is non-empty), subsequent Reads in
@@ -56,19 +79,60 @@ if [ -n "$V11_PROJECT" ]; then
             printf '%s\n' "$(date -Iseconds)" > "$_START_FILE" 2>/dev/null || true
         fi
 
+        # S1-T3 (#75c): the session that WROTE handoff-tasks.json (its S1-T1
+        # live_session_uuid stamp: whose open tasks the file carries) already
+        # holds those tasks. Nudging it to rehydrate makes duplicates, and
+        # verifying its own handoff logs a false rehydrate_missed (or a
+        # meaningless ack). _HO_SELF=1 suppresses the nudge below and L2.3.
+        # Needs a non-empty session id AND a non-empty stamp that match;
+        # anything else (pre-S1 file, no session id, unreadable file) keeps
+        # today's behaviour — fail toward nudging, never silence.
+        # Review #73: evaluated only while a fire-once marker it gates is
+        # still missing (the nudge's .handoff-surfaced, or L2.3's
+        # .rehydrate-verify-done once a baseline exists), and a match touches
+        # .handoff-surfaced. So a repeated Read runs no jq, and when another
+        # session's Stop later re-stamps the file mid-session, this session
+        # is not nudged to rehydrate that session's tasks.
+        # S2-T0b-4 (design §5): a resumed session keeps its id but can get a
+        # new TaskList, so the session match alone is not enough. The file
+        # must also have been written by this claude process (live_sitting)
+        # with no TaskList epoch opened since (live_tl_epoch); see
+        # v11_handoff_self_sitting. One jq reads all three stamps.
+        # Rollback: V11_HANDOFF_SELF_NUDGE_SUPPRESS=off (never suppress),
+        # =session (the S1 session-only match).
+        _HO_SELF=0
+        if [ "${V11_HANDOFF_SELF_NUDGE_SUPPRESS:-on}" != "off" ] && [ -n "${V11_SESSION_ID:-}" ]; then
+            _HO_TASKS="$SESSIONS_ROOT/$V11_PROJECT/handoff-tasks.json"
+            _NUDGE_MARKER="$METRICS_DIR/sessions/$V11_SESSION_ID/.handoff-surfaced"
+            _HO_RV_DONE="$METRICS_DIR/sessions/$V11_SESSION_ID/.rehydrate-verify-done"
+            if [ -f "$_HO_TASKS" ] && { [ ! -f "$_NUDGE_MARKER" ] || { [ ! -f "$_HO_RV_DONE" ] \
+                    && [ -f "$SESSIONS_ROOT/$V11_PROJECT/.loop-baseline.json" ]; }; }; then
+                _HO_LIVE_SID="" _HO_SITTING="" _HO_TLE=""
+                IFS='|' read -r _HO_LIVE_SID _HO_SITTING _HO_TLE < <(jq -r \
+                    '[.live_session_uuid, .live_sitting, .live_tl_epoch] | map(. // "" | tostring) | join("|")' \
+                    "$_HO_TASKS" 2>/dev/null) || true
+                if [ -n "$_HO_LIVE_SID" ] && [ "$_HO_LIVE_SID" = "$V11_SESSION_ID" ] \
+                   && v11_handoff_self_sitting "$V11_SESSION_ID" "$_HO_SITTING" "$_HO_TLE"; then
+                    _HO_SELF=1
+                    mkdir -p "$(dirname "$_NUDGE_MARKER")" 2>/dev/null || true
+                    : > "$_NUDGE_MARKER" 2>/dev/null || true
+                fi
+            fi
+        fi
+
         # V11.17 Fix 4: Surface pending handoff once per session.
         # Goal: if a prior session left a handoff-tasks.json with open tasks,
         # the receiving session learns about it on first Read instead of
         # waiting for the user to type /v11. Rate-limited per V11_SESSION_ID
         # via marker file. Opt-out: V11_HANDOFF_NUDGE=off.
-        if [ "${V11_HANDOFF_NUDGE:-}" != "off" ] && [ -n "${V11_SESSION_ID:-}" ]; then
+        if [ "${V11_HANDOFF_NUDGE:-}" != "off" ] && [ -n "${V11_SESSION_ID:-}" ] && [ "$_HO_SELF" -eq 0 ]; then
             _HO_TASKS="$SESSIONS_ROOT/$V11_PROJECT/handoff-tasks.json"
             _NUDGE_MARKER="$METRICS_DIR/sessions/$V11_SESSION_ID/.handoff-surfaced"
             if [ -f "$_HO_TASKS" ] && [ -s "$_HO_TASKS" ] && [ ! -f "$_NUDGE_MARKER" ]; then
                 _OPEN_COUNT=$(jq -r '(.open_tasks // []) | length' "$_HO_TASKS" 2>/dev/null || echo 0)
                 [[ "$_OPEN_COUNT" =~ ^[0-9]+$ ]] || _OPEN_COUNT=0
                 if [ "$_OPEN_COUNT" -gt 0 ]; then
-                    echo "[V11] $_OPEN_COUNT open task(s) in handoff for $V11_PROJECT. Run /v11 to auto-rehydrate." >&2
+                    echo "[V11] $_OPEN_COUNT open task(s) in handoff for $V11_PROJECT. Run /v11 to auto-rehydrate — if TaskList already lists them, ignore this." >&2
                     mkdir -p "$(dirname "$_NUDGE_MARKER")" 2>/dev/null || true
                     : > "$_NUDGE_MARKER" 2>/dev/null || true
                 fi
@@ -117,8 +181,9 @@ if [ -n "$V11_PROJECT" ]; then
         #   gate_off         — V11_AUTO_REHYDRATE=off (user disabled rehydrate)
         #   skill_not_invoked— .handoff-surfaced marker exists AND live count=0
         #                      (the dogfood signature: /v11 didn't route)
-        #   identity_mismatch— counts match but (session, task_id) sets differ
-        #                      (v11.24 Bug-H-class ghost-task resurrection)
+        #   identity_mismatch— counts match but the task identities differ
+        #                      (v11.24 Bug-H-class ghost-task resurrection;
+        #                      S1-T2: subject_norm multiset, not session-local ids)
         #   script_error     — every other divergence (fallback)
         # Outer guard: enter when ANY of L2.1/L2.2/L2.3 is enabled. Sub-features
         # gate independently inside the block. Refined from initial
@@ -202,7 +267,10 @@ if [ -n "$V11_PROJECT" ]; then
                 # Gated separately from L2.1/L2.2 so operators can disable
                 # verification while keeping the boot-delta and freshness
                 # banners live.
-                if [ "${V11_REHYDRATE_VERIFY:-}" != "off" ]; then
+                # S1-T3 (#75c): skipped when this session wrote the handoff
+                # (_HO_SELF above) — there was no cross-session rehydrate to
+                # verify, so neither rehydrate_missed nor handoff_ack applies.
+                if [ "${V11_REHYDRATE_VERIFY:-}" != "off" ] && [ "${_HO_SELF:-0}" -eq 0 ]; then
                 _RV_LIVE_STATE="$METRICS_DIR/sessions/$V11_SESSION_ID/task-state.json"
                 _RV_ACTUAL=0
                 _RV_COMPLETED=0
@@ -226,6 +294,7 @@ if [ -n "$V11_PROJECT" ]; then
 
                     _RV_MODE=""
                     _RV_IDENTITY_DELTA=""
+                    _RV_ID_MATCHED=1   # handoff_ack --identity-matched (0 = identity could not be checked)
                     if [ "$_RV_EXPECTED" != "$_RV_ACTUAL" ]; then
                         # gate_off wins first — user explicitly disabled the
                         # mechanism, divergence is expected not a bug.
@@ -246,11 +315,40 @@ if [ -n "$V11_PROJECT" ]; then
                             _RV_MODE="script_error"
                         fi
                     else
-                        # Counts match — check identity (v11.24). Compare id sets
-                        # from handoff-tasks.json.open_tasks[].id vs live state
-                        # open_tasks keys. Only fires when counts equal AND expected>0.
-                        if [ "$_RV_EXPECTED" -gt 0 ]; then
-                            _RV_HO_TASKS="$SESSIONS_ROOT/$V11_PROJECT/handoff-tasks.json"
+                        # Counts match — check identity (v11.24). Only fires when
+                        # counts equal AND expected>0.
+                        # S1-T2 (#75b): compare task identities, not ids. Ids are
+                        # session-local — a clean rehydrate gets fresh ids (false
+                        # identity_mismatch) and a different task can reuse an id
+                        # (missed mismatch). scripts/lib/handoff_identity.py compares
+                        # the subject_norm multiset of handoff-tasks.json (.identity)
+                        # with the live open tasks (a rehydrated task's
+                        # metadata.rehydrated_from.identity, else ._idk). Delta lists
+                        # subject_norms. Review #70: a helper that fails or cannot run
+                        # is not a match — the ack records identity_matched=false
+                        # (a real mismatch is a rehydrate_missed event, never an ack)
+                        # and stderr says why; the hook still never blocks.
+                        # Rollback: V11_HANDOFF_IDENTITY_KEYS=off (id sets).
+                        _RV_HO_TASKS="$SESSIONS_ROOT/$V11_PROJECT/handoff-tasks.json"
+                        _RV_ID_PY="${V11_HOME:-$(dirname "$(dirname "$(readlink -f "${BASH_SOURCE[0]:-$0}")")")}/scripts/lib/handoff_identity.py"
+                        if [ "$_RV_EXPECTED" -gt 0 ] && [ "${V11_HANDOFF_IDENTITY_KEYS:-on}" != "off" ]; then
+                            _RV_ID_N=""
+                            if [ -f "$_RV_HO_TASKS" ] && [ -f "$_RV_LIVE_STATE" ] && [ -f "$_RV_ID_PY" ]; then
+                                _RV_ID_DELTA=$(timeout 5 python3 "$_RV_ID_PY" delta "$_RV_HO_TASKS" "$_RV_LIVE_STATE" 2>/dev/null || echo "")
+                                _RV_ID_N=$(printf '%s' "$_RV_ID_DELTA" | jq -r '((.missing // []) + (.extra // [])) | length' 2>/dev/null || echo "")
+                            fi
+                            case "$_RV_ID_N" in
+                                0) : ;;
+                                ''|*[!0-9]*)
+                                    _RV_ID_MATCHED=0
+                                    echo "[V11] rehydrate identity check could not run for $V11_PROJECT (scripts/lib/handoff_identity.py, handoff-tasks.json) — handoff_ack records identity_matched=false." >&2
+                                    ;;
+                                *)
+                                    _RV_MODE="identity_mismatch"
+                                    _RV_IDENTITY_DELTA="$_RV_ID_DELTA"
+                                    ;;
+                            esac
+                        elif [ "$_RV_EXPECTED" -gt 0 ]; then
                             if [ -f "$_RV_HO_TASKS" ] && [ -f "$_RV_LIVE_STATE" ]; then
                                 _RV_EXPECTED_IDS=$(jq -r '[(.open_tasks // [])[] | (.id // "") | tostring] | sort | @csv' "$_RV_HO_TASKS" 2>/dev/null || echo "")
                                 _RV_ACTUAL_IDS=$(jq -r '[((.open_tasks // {}) | keys[])] | sort | @csv' "$_RV_LIVE_STATE" 2>/dev/null || echo "")
@@ -310,7 +408,7 @@ if [ -n "$V11_PROJECT" ]; then
                                 --expected "$_RV_EXPECTED" \
                                 --actual "$_RV_ACTUAL" \
                                 --prev-handoff-at "$_RV_B_HANDOFF_AT" \
-                                --identity-matched 1 \
+                                --identity-matched "${_RV_ID_MATCHED:-1}" \
                                 --baseline-delta-fields "$_RV_ACK_DELTAS" \
                                 >/dev/null 2>&1 || true
                         fi

@@ -6,6 +6,8 @@
 > V11.11+: Apply a formation by setting `metadata.agent` on tasks and spawning background agents.
 > TeamCreate is deprecated — see [AGENT_TEAMS.md](AGENT_TEAMS.md) for the execution approach reference.
 
+> Execution default is Contract mode: each formation member gets one contract with an explicit `model` and an in-tree disjoint write set; worktree-by-default is legacy under `V11_CONTRACT_MODE=off`.
+
 **Formation Selection**: Use the flowchart at the bottom for quick decision-making.
 
 **Execution Patterns**: See [AGENT_TEAMS.md](AGENT_TEAMS.md) for how to spawn agents (background, subagent, or legacy TeamCreate).

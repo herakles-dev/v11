@@ -1,7 +1,30 @@
 #!/bin/bash
 # V11 Hook: session-end
-# Stop hook that fires when a Claude session ends.
-# Updates session metrics and logs session summary.
+# Wired to BOTH Stop and SessionEnd; dispatches on the stdin hook_event_name
+# (S0-T6, ticket #90). Stop fires at the end of EVERY assistant turn;
+# SessionEnd fires once when the session ends (reason: clear | logout |
+# prompt_input_exit | other).
+#   SessionEnd → FULL path, critical work first: aggregate fold, discipline
+#                check, last-session.json, auto-emit, then session-log row +
+#                retro counter (exactly once per session_id + sitting),
+#                manifest, scratch retirement (quarantined by default —
+#                S1-R1 review #58). Optional work last, each step
+#                bounded: plan-sync, align-aggregate, orphan detector, GC of
+#                dead-session dirs (UUID-named only; quarantined, not
+#                deleted, by default — S1-R1).
+#   Stop       → CHEAP path (fold + last-session.json + digest-throttled
+#                auto-emit) when the project also wires SessionEnd to this hook
+#                with a timeout >= 30 s; otherwise the FULL path, as before
+#                S0-T6, so projects not yet synced keep their teardown —
+#                except the scratch, which a Stop (a live session) never
+#                removes or moves (S1-R1 review #58).
+# Correctness never depends on SessionEnd firing (undocumented on tmux kill /
+# SIGHUP): the Stop emit and the GC are the safety net.
+# Both paths do per-project work only for a project the session is bound to,
+# never from the global active-project file alone (S2-R5, _v11_project_gate).
+# Rollback: V11_STOP_SPLIT=off → Stop always takes the FULL path (scratch kept)
+# and SessionEnd only logs, i.e. the pre-S0-T6 behaviour but for the scratch.
+# GC preview (read-only): hooks/session-end --gc-preview; one GC run: --gc-run
 #
 # Exit codes:
 #   0 - Always exit 0 (never block session end)
@@ -15,339 +38,140 @@ if [ "$1" == "--test" ]; then
 fi
 
 # P4: parse stdin to capture session_id for session-scoped cleanup.
-# Stop event JSON includes session_id; read it before active-project lookup
+# Stop/SessionEnd JSON includes session_id; read it before active-project lookup
 # so v11_read_active_project tier-1 read can resolve session-scoped state.
-_STDIN_JSON="$(cat 2>/dev/null || true)"
+# S0-T6: the same jq call also reads hook_event_name, reason and cwd (0x1f-joined
+# so an empty field keeps its position). --gc-preview and --gc-run read no stdin.
+_STDIN_JSON=""
+case "${1:-}" in
+    --gc-preview|--gc-run) : ;;
+    *) _STDIN_JSON="$(cat 2>/dev/null || true)" ;;
+esac
+_SE_EVENT=""; _SE_REASON=""; _SE_CWD=""; _SE_SID_SOURCE=""; _SE_SID_INVALID=""
 if [ -n "$_STDIN_JSON" ]; then
-    V11_SESSION_ID="$(printf '%s' "$_STDIN_JSON" | jq -r '.session_id // empty' 2>/dev/null || true)"
+    IFS=$'\x1f' read -r V11_SESSION_ID _SE_EVENT _SE_REASON _SE_CWD < <(
+        printf '%s' "$_STDIN_JSON" | jq -r \
+            '[.session_id, .hook_event_name, .reason, .cwd] | map(. // "" | tostring | gsub("[\u001f\n]"; " ")) | join("\u001f")' \
+            2>/dev/null || true)
+    # S2-R5: an id that is not a safe path component ("..", ".x", "a/b") is
+    # dropped, so no sessions/<id> path below can leave sessions/; the binding
+    # gate still treats the payload as an (unbound) session's.
+    if ! v11_valid_session_id "$V11_SESSION_ID"; then
+        [ -n "$V11_SESSION_ID" ] && _SE_SID_INVALID=1
+        V11_SESSION_ID=""
+    fi
     export V11_SESSION_ID
+    # Review #69 E2: scripts/handoff takes a hook-stdin session id as the live
+    # session outright (no recency window, no newest-session fallback).
+    [ -n "$V11_SESSION_ID" ] && _SE_SID_SOURCE="hook-stdin"
 fi
 
-# V11.15.6 (Solution A): fold the session's FINAL state into the durable
-# aggregate BEFORE anything else — in particular before the no-aggregate-yet
-# early-exit below and before the per-session dir is destroyed at the end of
-# this hook. The aggregate is otherwise updated only by sync-tasks; a turn
-# that ended without a trailing sync-tasks call (or whose last sync raced, or
-# whose project had no aggregate yet) lost its final state entirely once the
-# per-session dir was removed — the exact mechanism by which a live session's
-# "5/5" evaporated. Keyed off the session's OWN .project stamp (never ambient
-# active-project — Bug E/H lesson); the Part 1 quarantine filter still applies
-# inside the rebuild so a mis-stamped session cannot poison another project.
-# Best-effort, never fails session-end.
-#
-# V11.16 (sprint-2 #4 cutover): this fold is now a BACKSTOP, not the primary
-# durability mechanism. v11_rebuild_project_aggregate is cutover-aware — when
-# the project ledger exists and is equal-or-superset of legacy, the rebuild it
-# performs here REPLAYS THE LEDGER (the durable, cross-session-identity source
-# of truth) rather than the lossy ephemeral session-fold. Solution A survives
-# only to bound worst-case loss for not-yet-seeded projects and to keep the
-# legacy guard-reference fresh; the append-only ledger (B) is what actually
-# carries a task completed in a *different* since-deleted session across the
-# handoff boundary. The auto-rollback guard in the rebuild guarantees this
-# call can never regress a project that has not been backfilled yet.
-if [ -n "${V11_SESSION_ID:-}" ] \
-   && printf '%s' "$V11_SESSION_ID" | grep -qE '^[a-zA-Z0-9._-]{1,64}$'; then
-    _SESS_STATE="$METRICS_DIR/sessions/$V11_SESSION_ID/task-state.json"
-    if [ -f "$_SESS_STATE" ] && [ -s "$_SESS_STATE" ] && jq empty "$_SESS_STATE" 2>/dev/null; then
-        # v11.33 (E1): drain any pending scratch-reconcile marker for THIS session
-        # BEFORE the rebuild folds the scratch. A race on the session's LAST
-        # TaskUpdate (the common real shape) leaves no subsequent locked sync-tasks
-        # call to drain it, so session-end is the backstop — otherwise the marker
-        # orphans permanently and handoff keeps seeing a stale under-count. Mirrors
-        # the sync-tasks top-of-hook drain (v11_apply_reconcile_markers), but on
-        # disk under its own bounded lock (FD 205 on the same scratch lock file;
-        # session-end holds no other lock here, so no deadlock). Best-effort; never
-        # fails session-end. Rollback: V11_SYNC_SCRATCH_RECONCILE=off.
-        _SE_MARKER="$_SESS_STATE.needs-reconcile"
-        if [ "${V11_SYNC_SCRATCH_RECONCILE:-on}" != "off" ] && [ -s "$_SE_MARKER" ]; then
-            (
-                exec 205>"$_SESS_STATE.lock"
-                if flock -w 5 205; then
-                    _SE_CUR="$(cat "$_SESS_STATE" 2>/dev/null)"
-                    _SE_NEW="$(printf '%s' "$_SE_CUR" | v11_apply_reconcile_markers "$_SE_MARKER" "$V11_SESSION_ID" "$(date -Iseconds)")"
-                    if [ -n "$_SE_NEW" ] && printf '%s' "$_SE_NEW" | jq empty 2>/dev/null; then
-                        _SE_TMP="$_SESS_STATE.tmp.$$"
-                        if printf '%s' "$_SE_NEW" | jq '.' > "$_SE_TMP" 2>/dev/null && [ -s "$_SE_TMP" ]; then
-                            mv "$_SE_TMP" "$_SESS_STATE" \
-                                && rm -f "$_SE_MARKER" "$_SESS_STATE".needs-reconcile.artifacts.*.json 2>/dev/null
-                        else
-                            rm -f "$_SE_TMP" 2>/dev/null
-                        fi
-                    fi
-                fi
-            ) 2>/dev/null || true
-        fi
-        _SESS_PROJECT="$(jq -r '.project // empty' "$_SESS_STATE" 2>/dev/null)"
-        if [ -n "$_SESS_PROJECT" ] \
-           && printf '%s' "$_SESS_PROJECT" | grep -qE '^[a-zA-Z0-9._-]{1,64}$'; then
-            v11_rebuild_project_aggregate "$_SESS_PROJECT" 2>/dev/null || true
-        fi
+# S0-T6: one line per decision to $METRICS_DIR/session-end.log (rotated at 1 MB).
+_v11_se_log() {
+    local _log="$METRICS_DIR/session-end.log"
+    mkdir -p "$METRICS_DIR" 2>/dev/null || return 0
+    if [ "$(stat -c %s "$_log" 2>/dev/null || echo 0)" -gt 1048576 ]; then
+        mv -f "$_log" "$_log.1" 2>/dev/null || true
     fi
-fi
+    printf '%s event=%s mode=%s session=%s %s\n' "$(date -Iseconds)" "${_SE_EVENT:-none}" \
+        "${_SE_MODE:-full}" "${V11_SESSION_ID:-none}" "$*" >> "$_log" 2>/dev/null || true
+    [ -z "${_SE_GC_ECHO:-}" ] || printf '%s\n' "$*"
+}
 
-# L2.5 (v11-handoff-cross-session-loop, sprint-02): orphan handoff detector.
-# Scans $SESSIONS_ROOT/*/.last-spawn-at for spawn latches older than
-# V11_LOOP_ORPHAN_MINUTES (default 60) with no matching handoff_ack OR
-# rehydrate_missed event in ~/.agent-metrics/loop-events.jsonl (ts >= latch
-# mtime, same project). Missing → emit HANDOFF_ORPHAN event. Fire-once per
-# orphan via {latch}.orphan-notified marker sibling to the latch file itself
-# (survives across sessions, not per-session-scoped, since the observer that
-# notices may not be the observer that later re-notices). Global scan (not
-# restricted to $PROJECT — orphans are cross-project by nature).
-# Rollback: V11_ORPHAN_DETECTOR=off. Never blocks session-end; hook always
-# exits 0 regardless.
-if [ "${V11_ORPHAN_DETECTOR:-on}" != "off" ] && [ -d "$SESSIONS_ROOT" ]; then
-    _L25_MIN_MIN="${V11_LOOP_ORPHAN_MINUTES:-60}"
-    [[ "$_L25_MIN_MIN" =~ ^[0-9]+$ ]] || _L25_MIN_MIN=60
-    if [ "$_L25_MIN_MIN" -gt 0 ]; then
-        _L25_V11_HOME="${V11_HOME:-$(dirname "$(dirname "$(readlink -f "${BASH_SOURCE[0]:-$0}")")")}"
-        _L25_LOOP_EVENTS="$_L25_V11_HOME/scripts/lib/loop_events.py"
-        _L25_LEDGER="${HOME}/.agent-metrics/loop-events.jsonl"
-        if [ -f "$_L25_LOOP_EVENTS" ]; then
-            _L25_NOW=$(date +%s)
-            _L25_MIN_S=$(( _L25_MIN_MIN * 60 ))
-            for _L25_LATCH in "$SESSIONS_ROOT"/*/.last-spawn-at; do
-                [ -f "$_L25_LATCH" ] || continue
-                _L25_MARKER="${_L25_LATCH}.orphan-notified"
-                [ -f "$_L25_MARKER" ] && continue
-                _L25_MTIME=$(stat -c %Y "$_L25_LATCH" 2>/dev/null || echo 0)
-                [ "$_L25_MTIME" -gt 0 ] || continue
-                _L25_AGE_S=$(( _L25_NOW - _L25_MTIME ))
-                [ "$_L25_AGE_S" -ge "$_L25_MIN_S" ] || continue
-                _L25_PROJ=$(basename "$(dirname "$_L25_LATCH")")
-                printf '%s' "$_L25_PROJ" | grep -qE '^[a-zA-Z0-9._-]{1,64}$' || continue
-                _L25_SPAWN_ISO=$(date -Iseconds -d "@$_L25_MTIME" 2>/dev/null || echo "")
-                [ -n "$_L25_SPAWN_ISO" ] || continue
-
-                # Ledger scan — someone-woke-up if any handoff_ack OR
-                # rehydrate_missed row for this project has ts >= spawn ISO.
-                _L25_ACKED=0
-                if [ -f "$_L25_LEDGER" ]; then
-                    _L25_ACKED=$(python3 -c "
-import json, sys
-project, spawn_ts = sys.argv[1], sys.argv[2]
-try:
-    with open(sys.argv[3]) as f:
-        for line in f:
-            line = line.strip()
-            if not line: continue
-            try:
-                d = json.loads(line)
-            except Exception:
-                continue
-            if d.get('project') != project: continue
-            if d.get('kind') not in ('handoff_ack', 'rehydrate_missed'): continue
-            if d.get('ts', '') >= spawn_ts:
-                print(1)
-                sys.exit(0)
-    print(0)
-except Exception:
-    print(0)
-" "$_L25_PROJ" "$_L25_SPAWN_ISO" "$_L25_LEDGER" 2>/dev/null || echo 0)
-                    [[ "$_L25_ACKED" =~ ^[01]$ ]] || _L25_ACKED=0
-                fi
-                [ "$_L25_ACKED" = "1" ] && continue
-
-                _L25_AGE_MIN=$(( _L25_AGE_S / 60 ))
-                _L25_DET_BY="${V11_SESSION_ID:-unknown}"
-                if timeout 5 python3 "$_L25_LOOP_EVENTS" \
-                    --project "$_L25_PROJ" \
-                    --session-id "$_L25_DET_BY" \
-                    --kind handoff_orphan \
-                    --spawn-ts "$_L25_SPAWN_ISO" \
-                    --detected-by "$_L25_DET_BY" \
-                    --age-minutes "$_L25_AGE_MIN" \
-                    >/dev/null 2>&1; then
-                    : > "$_L25_MARKER" 2>/dev/null || true
-                fi
-            done
-        fi
-    fi
-fi
-
-# v11.42 W2-T3 (RC2): review-sibling age-out via /align-aggregate skill.
-# When V11_ALIGN_ON_SESSION_END=apply, the skill's Shape 3 detection (parent
-# completed > V11_REVIEW_SIBLING_AGEOUT_DAYS ago + parent_status="pending") auto-
-# cancels stale V11.21 review siblings. Cancellation events carry EXACT
-# reason="review_sibling_ageout" — v11.42 W2-T2's guard-rollback carve-out in
-# hooks/lib/common.sh credits them so the resulting count drop doesn't trip
-# REGRESSION-GUARD and silently revert.
-# Default =dryrun: skill only lists what it WOULD cancel (stderr, quiet in normal use).
-# Rollback: V11_ALIGN_ON_SESSION_END=off skips the invocation entirely.
-# Best-effort — never blocks session-end (hook always exits 0).
-_ALIGN_MODE="${V11_ALIGN_ON_SESSION_END:-dryrun}"
-if [ "$_ALIGN_MODE" != "off" ] && [ -x "$HOME/.claude/skills/align-aggregate/align_aggregate.py" ]; then
-    _ALIGN_ARG=""
-    case "$_ALIGN_MODE" in
-        apply)   _ALIGN_ARG="--apply" ;;
-        dryrun|"") _ALIGN_ARG="--list-phantoms" ;;
+# S0-T6: does the project's .claude/settings.json wire SessionEnd to this hook
+# with a timeout the teardown can finish in? Claude Code kills SessionEnd hooks
+# after 1.5 s unless an entry sets a timeout, so an untimed (or < 30 s) entry
+# would leave Stop cheap and the teardown never run. Returns 0 wired with
+# timeout >= 30 s, 1 not wired, 2 wired with a missing/low timeout.
+# Project root = $CLAUDE_PROJECT_DIR, else the stdin cwd. One jq read.
+_v11_project_wires_session_end() {
+    local _dir="${CLAUDE_PROJECT_DIR:-$_SE_CWD}" _verdict
+    [ -n "$_dir" ] && [ -f "$_dir/.claude/settings.json" ] || return 1
+    _verdict="$(jq -r '[.hooks.SessionEnd[]?.hooks[]? | select(.command? | strings | test("/hooks/session-end$"))
+        | (.timeout // 0 | tonumber? // 0)]
+        | if length == 0 then "none" elif max >= 30 then "ok" else "low" end' \
+        "$_dir/.claude/settings.json" 2>/dev/null)"
+    case "$_verdict" in
+        ok)  return 0 ;;
+        low) return 2 ;;
+        *)   return 1 ;;
     esac
-    _ALIGN_PROJ=""
-    if [ -n "${PROJECT:-}" ]; then
-        _ALIGN_PROJ="$PROJECT"
-    elif [ -f "$SESSIONS_ROOT/../.agent-metrics/active-project" ]; then
-        _ALIGN_PROJ=$(head -1 "$SESSIONS_ROOT/../.agent-metrics/active-project" 2>/dev/null | tr -d '\n' | head -c 64)
+}
+
+# S0-T6: stable hash of the project's open set (sorted session/task_id=status
+# lines from the aggregate). Empty open set → hash of "", a valid digest. No
+# output when the aggregate is missing or unreadable.
+_v11_open_set_digest() {
+    local _agg="$TASK_STATE_DIR/$1.json" _lines
+    [ -s "$_agg" ] || return 1
+    _lines="$(jq -r '
+        if (.open_tasks_by_session | type) == "object" then
+            [.open_tasks_by_session | to_entries[] | .key as $s | .value
+             | if type == "object" then to_entries[] | "\($s)/\(.key)=\(.value.status // "")"
+               elif type == "array" then .[] | "\($s)/\(.task_id // .id // "")=\(.status // "")"
+               else empty end]
+        elif (.open_tasks | type) == "array" then
+            [.open_tasks[] | "\(.session_uuid // "")/\(.task_id // .id // "")=\(.status // "")"]
+        elif (.open_tasks | type) == "object" then
+            [.open_tasks | to_entries[] | "/\(.key)=\(.value.status // "")"]
+        else [] end
+        | sort | .[]' "$_agg" 2>/dev/null)" || return 1
+    printf '%s' "$_lines" | sha256sum | cut -c1-64
+}
+
+# S2-R5 (SF1, #85 class): v11_read_active_project falls back to the host-global
+# active-project file, so a session that never touched that project emitted its
+# handoff: claude-ahk's launch session, replaced by an in-process /resume, ended
+# with reason=resume and overwrote v11-leverage-program's handoff-tasks.json and
+# handoff.md (steer lost). The per-project work (last_session_end stamp,
+# discipline check, last-session.json, auto-emit, session-log row, retro
+# counter, manifest, plan-sync, align-aggregate) now runs only for a project
+# the session is bound to. Evidence, cheapest first:
+#   scoped      sessions/<sid>/active-project names it (detect-project, sync-tasks)
+#   owner       the global file names it and this session wrote it (line 2):
+#               a resumed sitting whose scratch the last SessionEnd quarantined
+#   task-state  the session's own task-state.json is stamped with it
+#   ledger      ledger/<project>.jsonl has a row with this session_uuid
+# A SessionEnd with reason=resume needs work of its own (task-state or ledger):
+# a launch session replaced by /resume may hold a scoped bind from a Read, and
+# its emit would stamp its id as the live session and consume the steer.
+# Applies to Stop/SessionEnd payloads with a session id (an invalid one, dropped
+# at parse, counts and is never bound); hand-run payloads (no hook_event_name
+# or no session_id) keep the global fallback.
+# Rollback: V11_SESSION_END_REQUIRE_BINDING=off.
+_v11_binding_gate_applies() {
+    [ "${V11_SESSION_END_REQUIRE_BINDING:-on}" != "off" ] && [ -n "${V11_SESSION_ID:-}${_SE_SID_INVALID:-}" ] \
+        && { [ "$_SE_EVENT" = "SessionEnd" ] || [ "$_SE_EVENT" = "Stop" ]; }
+}
+
+# 0 when the session is bound to project $1 (evidence in the order above), else 1.
+_v11_session_binding() {
+    local _p="$1" _sid="${V11_SESSION_ID:-}" _l1="" _l2=""
+    local _ledger="$METRICS_DIR/ledger/$1.jsonl"
+    [ -n "$_p" ] && v11_valid_session_id "$_sid" || return 1
+    if [ "$_SE_EVENT" != "SessionEnd" ] || [ "$_SE_REASON" != "resume" ]; then
+        { read -r _l1; } 2>/dev/null < "$METRICS_DIR/sessions/$_sid/active-project"
+        [ "${_l1//[[:space:]]/}" = "$_p" ] && return 0
+        _l1=""
+        { read -r _l1; read -r _l2; } 2>/dev/null < "$ACTIVE_PROJECT_FILE"
+        [ "${_l1//[[:space:]]/}" = "$_p" ] && [ "${_l2//[[:space:]]/}" = "$_sid" ] && return 0
     fi
-    if [ -n "$_ALIGN_PROJ" ] && printf '%s' "$_ALIGN_PROJ" | grep -qE '^[a-zA-Z0-9._-]{1,64}$'; then
-        timeout 15 python3 "$HOME/.claude/skills/align-aggregate/align_aggregate.py" \
-            "$_ALIGN_PROJ" $_ALIGN_ARG >/dev/null 2>&1 || true
-    fi
-fi
+    [ "${_SESS_PROJECT:-}" = "$_p" ] && return 0
+    [ -f "$_ledger" ] && grep -qF -e "\"session_uuid\":\"$_sid\"" -e "\"session_uuid\": \"$_sid\"" \
+        "$_ledger" 2>/dev/null
+}
 
-# Read active project from ACTIVE_PROJECT_FILE
-# SEC-C-02: sanitized read — rejects path-traversal / metacharacter payloads
-PROJECT="$(v11_read_active_project)"
-
-# If no active project, exit silently
-if [ -z "$PROJECT" ]; then
-    exit 0
-fi
-
-# Read task state from TASK_STATE_DIR
-STATE_FILE="$TASK_STATE_DIR/${PROJECT}.json"
-
-# If state file doesn't exist, exit silently
-if [ ! -f "$STATE_FILE" ]; then
-    exit 0
-fi
-
-# Extract stats from task state JSON
-TOTAL=$(jq -r '.total // 0' "$STATE_FILE" 2>/dev/null || echo "0")
-COMPLETED=$(jq -r '.completed // 0' "$STATE_FILE" 2>/dev/null || echo "0")
-PENDING=$(jq -r '.pending // 0' "$STATE_FILE" 2>/dev/null || echo "0")
-IN_PROGRESS=$(jq -r '.in_progress // 0' "$STATE_FILE" 2>/dev/null || echo "0")
-
-# Ensure all variables are valid integers (strip non-digits, default to 0 if empty)
-TOTAL="${TOTAL//[!0-9]/}"; TOTAL="${TOTAL:-0}"
-COMPLETED="${COMPLETED//[!0-9]/}"; COMPLETED="${COMPLETED:-0}"
-PENDING="${PENDING//[!0-9]/}"; PENDING="${PENDING:-0}"
-IN_PROGRESS="${IN_PROGRESS//[!0-9]/}"; IN_PROGRESS="${IN_PROGRESS:-0}"
-
-# Update last_session_end timestamp in task state
-# Fix 1: Lock + atomicize — use same flock that sync-tasks holds, PID-suffixed tmp,
-# validate before mv so a concurrent TaskUpdate landing during jq read is not silently lost.
-TIMESTAMP=$(date -Iseconds)
-(
-    _TMP="$STATE_FILE.tmp.$$"
-    {
-        flock -w 5 200 || { echo "session-end: could not acquire lock for task-state update" >&2; exit 0; }
-        jq --arg ts "$TIMESTAMP" '.last_session_end = $ts' "$STATE_FILE" > "$_TMP" 2>/dev/null
-        if [ -s "$_TMP" ] && jq empty "$_TMP" 2>/dev/null; then
-            mv "$_TMP" "$STATE_FILE"
-        else
-            rm -f "$_TMP"
-            echo "session-end: skipped task-state update (jq produced invalid/empty output)" >&2
-        fi
-    } 200>"$STATE_FILE.lock"
-) 2>/dev/null || true
-
-# Write session summary to session-log.jsonl
-mkdir -p "$METRICS_DIR"
-SESSION_LOG="$METRICS_DIR/session-log.jsonl"
-
-# Read session-start for duration (used in both session-log and last-session.json)
-_SLOG_START_TS=""
-_SLOG_DURATION=0
-_SLOG_START_FILE="$SESSIONS_ROOT/$PROJECT/.session-start"
-if [ -f "$_SLOG_START_FILE" ]; then
-    _SLOG_START_TS=$(tr -d '[:space:]' < "$_SLOG_START_FILE" 2>/dev/null || true)
-    if [ -n "$_SLOG_START_TS" ]; then
-        _SE=$(date -d "$_SLOG_START_TS" +%s 2>/dev/null || echo 0)
-        _SLOG_DURATION=$(( $(date +%s) - _SE ))
-        [ "$_SLOG_DURATION" -lt 0 ] && _SLOG_DURATION=0
-    fi
-fi
-
-# Create session summary JSON
-SESSION_SUMMARY=$(jq -c -n \
-  --arg timestamp "$TIMESTAMP" \
-  --arg project "$PROJECT" \
-  --argjson total "$TOTAL" \
-  --argjson completed "$COMPLETED" \
-  --argjson pending "$PENDING" \
-  --argjson in_progress "$IN_PROGRESS" \
-  --arg session_start "$_SLOG_START_TS" \
-  --argjson duration_secs "$_SLOG_DURATION" \
-  '{
-    timestamp: $timestamp,
-    project: $project,
-    total: $total,
-    completed: $completed,
-    pending: $pending,
-    in_progress: $in_progress,
-    session_start: (if $session_start == "" then null else $session_start end),
-    duration_secs: $duration_secs
-  }')
-
-# V11.6: Enrich session summary with plan-context metadata
-PLAN_CONTEXT_FILE="$SESSIONS_ROOT/$PROJECT/.plan-context.json"
-if [ -f "$PLAN_CONTEXT_FILE" ]; then
-    PC_HYPO_COUNT=$(jq -r '(.hypotheses // []) | length' "$PLAN_CONTEXT_FILE" 2>/dev/null || echo "0")
-    PC_DEC_COUNT=$(jq -r '(.decisions // []) | length' "$PLAN_CONTEXT_FILE" 2>/dev/null || echo "0")
-    PC_CYNEFIN=$(jq -r '.domain.cynefin // ""' "$PLAN_CONTEXT_FILE" 2>/dev/null || echo "")
-    [ "$PC_CYNEFIN" = "null" ] && PC_CYNEFIN=""
-    SESSION_SUMMARY=$(printf '%s' "$SESSION_SUMMARY" | jq -c \
-        --argjson hypo "${PC_HYPO_COUNT:-0}" \
-        --argjson dec "${PC_DEC_COUNT:-0}" \
-        --arg cynefin "$PC_CYNEFIN" '
-        . + {hypothesis_count: $hypo, decision_count: $dec}
-        | if $cynefin != "" then . + {cynefin: $cynefin} else . end
-    ')
-fi
-
-# Append to session-log.jsonl
-printf '%s\n' "$SESSION_SUMMARY" >> "$SESSION_LOG" 2>/dev/null
-
-# V11.10: Retrospective counter — flywheel input for /v11 retrospective.
-# Project-aware: increments sessions/{project}/.retro-counter on every CLOSE.
-# Threshold env var: V11_RETRO_THRESHOLD (default 5; consumers read the counter directly).
-# Surfaced by: scripts/v11-retro PROJECT, /v11 retrospective, DETECT dashboard.
-# Reset by:    scripts/v11-retro PROJECT --reset (after running /v11 retrospective).
-(
-    RETRO_FILE="$SESSIONS_ROOT/$PROJECT/.retro-counter"
-    [ ! -d "$SESSIONS_ROOT/$PROJECT" ] && exit 0
-
-    # V11.27 T2: flock the read-increment-write so two concurrent session-end
-    # CLOSEs can't lose a write (read-read / inc-inc / write-write → +1 not +2).
-    # fd 201: 200 is held by the task-state flock, 202 by the aggregate flock
-    # (common.sh:535) — 201 is collision-free. Best-effort: a >5s timeout (never
-    # realistic for a microsecond critical section) falls through unlocked rather
-    # than blocking CLOSE. Honors V11_RETRO_SANITY_GUARD=off → original path.
-    if [ "${V11_RETRO_SANITY_GUARD:-on}" != "off" ]; then
-        exec 201>"$RETRO_FILE.lock" 2>/dev/null || true
-        flock -w 5 201 2>/dev/null || true
-    fi
-
-    _COUNT=0
-    [ -f "$RETRO_FILE" ] && _COUNT=$(tr -dc '0-9' < "$RETRO_FILE" 2>/dev/null || echo "0")
-    _COUNT="${_COUNT:-0}"
-    _COUNT=$((_COUNT + 1))
-
-    _TMP="$RETRO_FILE.tmp.$$"
-    printf '%s\n' "$_COUNT" > "$_TMP" 2>/dev/null && mv "$_TMP" "$RETRO_FILE" 2>/dev/null
-    rm -f "$_TMP" 2>/dev/null || true
-    exit 0
-) 2>/dev/null || true
-
-# V11.4: Sync plan file on session end (captures final state for context resume)
-PLAN_SYNC_SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/scripts/plan-sync"
-if [ -x "$PLAN_SYNC_SCRIPT" ] && [ -n "$PROJECT" ]; then
-    "$PLAN_SYNC_SCRIPT" "$PROJECT" &>/dev/null || true
-fi
-
-# V11.18 T2 (v11-handoff-hygiene): run the discipline detector BEFORE auto-emit
-# so the resulting handoff.md includes "may need completion" warnings for any
-# in_progress task with recent file activity. Best-effort; honors
-# V11_DISCIPLINE_DETECTOR=off and never fails session-end.
-(
-    _DC="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/scripts/handoff-discipline-check"
-    [ -x "$_DC" ] && [ -n "$PROJECT" ] || exit 0
-    HERCULES_ROOT="$HERCULES_ROOT" \
-    SESSIONS_ROOT="$SESSIONS_ROOT" \
-    METRICS_DIR="$METRICS_DIR" \
-    timeout 10 "$_DC" "$PROJECT" >/dev/null 2>&1 || true
-    exit 0
-) 2>/dev/null || true
+# 0 when the per-project work may run for $PROJECT; 1 (logged) when the ending
+# session is not bound to it.
+_v11_project_gate() {
+    [ -n "${PROJECT:-}" ] && _v11_binding_gate_applies || return 0
+    _v11_session_binding "$PROJECT" && return 0
+    local _why="no-binding"
+    [ "$_SE_EVENT" = "SessionEnd" ] && [ "$_SE_REASON" = "resume" ] && _why="resume-no-work"
+    [ -n "${_SE_SID_INVALID:-}" ] && _why="invalid-session-id"
+    _v11_se_log "handoff_skipped_unbound session=${V11_SESSION_ID:-invalid} reason=${_SE_REASON:-none} project=$PROJECT why=$_why"
+    return 1
+}
 
 # V11.17 Fix 2 + V11.25.1 reorder: Auto-emit handoff.md as safety net.
 # When the user closes a session without running /handoff, the next session
@@ -355,21 +179,49 @@ fi
 #   (a) V11_AUTO_HANDOFF=off  (b) PROJECT empty
 #   (c) handoff.md younger than 60s (user just ran /handoff — don't stomp).
 #
-# V11.25.1 REORDER: this block is now defined as a function and invoked AFTER
-# last-session.json is written (search "v11.25.1 invoke" below). The legacy
-# order ran auto-emit BEFORE last-session.json, so the handoff read the PRIOR
-# session's enrichment fields (.active_task, .git_status, .reasoning.*) —
-# a stale-data bug surfaced 2026-06-19 when v11-sharpening's handoff embedded
-# a 48-day-old summary into the Zeus spawn.
-# Rollback: V11_SESSION_END_REORDER=off restores legacy order.
+# V11.25.1 REORDER: the full path invokes this AFTER last-session.json is
+# written (search "v11.25.1 invoke" below). The legacy order ran auto-emit
+# BEFORE last-session.json, so the handoff read the PRIOR session's enrichment
+# fields (.active_task, .git_status, .reasoning.*) — a stale-data bug surfaced
+# 2026-06-19 when v11-sharpening's handoff embedded a 48-day-old summary into
+# the Zeus spawn. Rollback: V11_SESSION_END_REORDER=off restores legacy order.
+#
+# S0-T6 (#90), $1 = stop | full:
+#   - stop: never consumes .handoff-steer.md — a Stop landing between /handoff
+#     Step 3.5 and Step 6 used to eat the steer. Pending steer → skip.
+#   - Runs scripts/handoff WITHOUT --force on both paths, so the #41 mtime-guard
+#     (V11_HANDOFF_MTIME_GUARD) keeps a hand-edited handoff.md; the refusal is
+#     reported as "skipped: hand-edited" (stderr + log) instead of silence.
+#   - Stamps only when the run exits 0: .handoff-autoemit-at when handoff.md was
+#     regenerated, .handoff-autoemit-digest (the open set it covered) also on a
+#     guard refusal, so the Stop throttle does not re-run a refused emit per turn.
+#   - The digest is taken BEFORE scripts/handoff runs ($2, or computed here): a
+#     TaskUpdate landing during the run is then not stamped as covered, and the
+#     next Stop re-emits.
+#   - A refused emission ("handoff: refused —" on stderr: exit 2 for an empty
+#     emission, 0 for the shrink breaker; review #69 E5) stamps the digest, so
+#     a Stop does not re-run it until the open set changes, never stamps
+#     .handoff-autoemit-at (handoff.md was not regenerated) and is reported on
+#     stderr and in the log as emit=refused.
+#   - On the first SessionEnd of a sitting the 60 s window does not apply when
+#     handoff.md is not newer than .handoff-autoemit-at (the last write was this
+#     hook's own emit, not /handoff): a Stop emit shortly before /exit must not
+#     become the final handoff.
 _v11_auto_emit_handoff() {
+    local _mode="${1:-full}" _DIGEST="${2:-}"
     [ "${V11_AUTO_HANDOFF:-}" = "off" ] && return 0
     [ -z "$PROJECT" ] && return 0
 
     local _HANDOFF_SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/scripts/handoff"
     [ -x "$_HANDOFF_SCRIPT" ] || return 0
 
-    local _HO_FILE="$SESSIONS_ROOT/$PROJECT/handoff.md"
+    local _HO_DIR="$SESSIONS_ROOT/$PROJECT"
+    local _HO_FILE="$_HO_DIR/handoff.md"
+    if [ "$_mode" = "stop" ] && [ -s "$_HO_DIR/.handoff-steer.md" ]; then
+        _v11_se_log "project=$PROJECT emit=skipped: steer pending"
+        return 0
+    fi
+
     local _NOW_EPOCH=$(date +%s 2>/dev/null || echo 0)
     local _HO_MTIME=0
     if [ -f "$_HO_FILE" ]; then
@@ -379,37 +231,441 @@ _v11_auto_emit_handoff() {
 
     # Skip if user-written handoff.md is fresh (< 60s old) — don't stomp manual /handoff
     if [ -f "$_HO_FILE" ] && [ "$_HO_AGE" -lt 60 ]; then
-        return 0
+        if [ "$_SE_EVENT" = "SessionEnd" ] && [ -f "$_HO_DIR/.handoff-autoemit-at" ] \
+           && ! [ "$_HO_FILE" -nt "$_HO_DIR/.handoff-autoemit-at" ] \
+           && ! _v11_session_end_claimed; then
+            _v11_se_log "project=$PROJECT emit=window bypassed: handoff.md (${_HO_AGE}s) is this hook's own emit"
+        else
+            _v11_se_log "project=$PROJECT emit=skipped: handoff.md fresh (${_HO_AGE}s)"
+            return 0
+        fi
     fi
+
+    [ -n "$_DIGEST" ] || _DIGEST="$(_v11_open_set_digest "$PROJECT" || true)"
 
     # V11.28.1 (F1): do NOT pass --file "$_HO_FILE". scripts/handoff writes the
     # structured handoff.md (with V11.28 steer markers) to $SESSION_DIR/handoff.md
     # unconditionally; --file pointed at that same path would overwrite it AFTER the
     # steer sidecar was already consumed, with the markerless $PROMPT — silently
     # dropping the steer on this safety-net path. Let handoff own the file write.
-    HERCULES_ROOT="$HERCULES_ROOT" \
-    SESSIONS_ROOT="$SESSIONS_ROOT" \
-    METRICS_DIR="$METRICS_DIR" \
-    V11_HOME="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)" \
-    timeout 20 "$_HANDOFF_SCRIPT" "$PROJECT" >/dev/null 2>&1 || true
+    local _HO_ERR _HO_RC=0
+    _HO_ERR="$(HERCULES_ROOT="$HERCULES_ROOT" \
+        SESSIONS_ROOT="$SESSIONS_ROOT" \
+        METRICS_DIR="$METRICS_DIR" \
+        V11_HOME="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)" \
+        V11_SESSION_ID_SOURCE="$_SE_SID_SOURCE" \
+        timeout 20 "$_HANDOFF_SCRIPT" "$PROJECT" 2>&1 >/dev/null)" || _HO_RC=$?
+
+    local _HO_REFUSED
+    _HO_REFUSED="$(printf '%s\n' "$_HO_ERR" | grep -m1 -F 'handoff: refused — ' || true)"
+    if [ -n "$_HO_REFUSED" ] && { [ "$_HO_RC" -eq 0 ] || [ "$_HO_RC" -eq 2 ]; }; then
+        if [ -n "$_DIGEST" ] && [ -d "$_HO_DIR" ]; then
+            printf '%s\n' "$_DIGEST" > "$_HO_DIR/.handoff-autoemit-digest.tmp.$$" 2>/dev/null \
+                && mv -f "$_HO_DIR/.handoff-autoemit-digest.tmp.$$" "$_HO_DIR/.handoff-autoemit-digest" 2>/dev/null
+            rm -f "$_HO_DIR/.handoff-autoemit-digest.tmp.$$" 2>/dev/null || true
+        fi
+        _v11_se_log "project=$PROJECT emit=refused rc=$_HO_RC digest=${_DIGEST:0:12}"
+        echo "session-end: auto-emit ${_HO_REFUSED#handoff: }" >&2
+        return 0
+    fi
+
+    if [ "$_HO_RC" -ne 0 ]; then
+        _v11_se_log "project=$PROJECT emit=failed rc=$_HO_RC"
+        echo "session-end: auto-emit failed (scripts/handoff rc=$_HO_RC) — no freshness stamp written" >&2
+        return 0
+    fi
+
+    if [ -n "$_DIGEST" ] && [ -d "$_HO_DIR" ]; then
+        printf '%s\n' "$_DIGEST" > "$_HO_DIR/.handoff-autoemit-digest.tmp.$$" 2>/dev/null \
+            && mv -f "$_HO_DIR/.handoff-autoemit-digest.tmp.$$" "$_HO_DIR/.handoff-autoemit-digest" 2>/dev/null
+        rm -f "$_HO_DIR/.handoff-autoemit-digest.tmp.$$" 2>/dev/null || true
+    fi
+
+    # Ticket #41 guard refusal: scripts/handoff exits 0 and leaves handoff.md as is.
+    if printf '%s' "$_HO_ERR" | grep -qF 'newer than trigger basis'; then
+        _v11_se_log "project=$PROJECT emit=skipped: hand-edited"
+        echo "session-end: auto-emit skipped: hand-edited — $_HO_FILE is newer than its trigger basis and was left intact (run /handoff, or scripts/handoff --force, to regenerate)" >&2
+        return 0
+    fi
 
     if [ -f "$_HO_FILE" ]; then
-        date -Iseconds > "$SESSIONS_ROOT/$PROJECT/.handoff-autoemit-at" 2>/dev/null || true
+        date -Iseconds > "$_HO_DIR/.handoff-autoemit-at" 2>/dev/null || true
+    fi
+    _v11_se_log "project=$PROJECT emit=emitted digest=${_DIGEST:0:12}"
+    return 0
+}
+
+# S0-T6: a sitting is one run of the claude process. `claude --resume` and
+# `--continue` reuse the session_id, so exactly-once accounting keys on the id
+# plus a sitting marker: $METRICS_DIR/sessions/<id>/.sitting, written once by
+# the first Stop of a sitting ($1 = create makes the scratch dir) or by a
+# SessionEnd that finds the scratch without one. The SessionEnd teardown
+# removes it with the scratch, so a resumed sitting's first Stop writes a new
+# one. _v11_sitting prints the marker, or "-" when there is none.
+_v11_mark_sitting() {
+    v11_valid_session_id "${V11_SESSION_ID:-}" || return 0
+    local _dir="$METRICS_DIR/sessions/$V11_SESSION_ID"
+    [ -s "$_dir/.sitting" ] && return 0
+    if [ "${1:-}" = "create" ]; then
+        mkdir -p "$_dir" 2>/dev/null || return 0
+    fi
+    [ -d "$_dir" ] || return 0
+    printf '%s.%s\n' "$(date +%s%N)" "$$" > "$_dir/.sitting" 2>/dev/null || true
+}
+
+_v11_sitting() {
+    local _s=""
+    v11_valid_session_id "${V11_SESSION_ID:-}" || { printf '%s' "-"; return 0; }
+    _s="$(head -n 1 "$METRICS_DIR/sessions/${V11_SESSION_ID:-}/.sitting" 2>/dev/null | tr -cd '0-9.')"
+    printf '%s' "${_s:--}"
+}
+
+# S0-T6: exactly-once accounting for SessionEnd (session-log row + retro only;
+# the auto-emit is never gated on it). Ledger $METRICS_DIR/.session-end-ended,
+# one "<session_id> <sitting> <epoch>" line per ended sitting.
+# _v11_session_end_claimed (read-only): 0 when this sitting already ended. With
+# no marker the scratch is gone, i.e. an earlier SessionEnd already tore this
+# sitting down, so any ledger line for the id counts.
+# _v11_claim_session_end: 0 when this call is the first SessionEnd for the
+# sitting (and records it), 1 when it already ended. No (well-formed) session
+# id → 0 (cannot dedupe; count as before).
+_v11_session_end_claimed() {
+    v11_valid_session_id "${V11_SESSION_ID:-}" || return 1
+    local _ledger="$METRICS_DIR/.session-end-ended"
+    [ -f "$_ledger" ] || return 1
+    awk -v s="$V11_SESSION_ID" -v t="$(_v11_sitting)" \
+        '$1 == s && (t == "-" || $2 == t) {f = 1} END {exit !f}' "$_ledger" 2>/dev/null
+}
+
+_v11_claim_session_end() {
+    v11_valid_session_id "${V11_SESSION_ID:-}" || return 0
+    local _ledger="$METRICS_DIR/.session-end-ended"
+    (
+        exec 206>"$_ledger.lock" 2>/dev/null || exit 0
+        flock -w 2 206 2>/dev/null || true
+        _v11_session_end_claimed && exit 1
+        { tail -n 999 "$_ledger" 2>/dev/null; printf '%s %s %s\n' "$V11_SESSION_ID" "$(_v11_sitting)" "$(date +%s)"; } \
+            > "$_ledger.tmp.$$" 2>/dev/null && mv -f "$_ledger.tmp.$$" "$_ledger" 2>/dev/null
+        rm -f "$_ledger.tmp.$$" 2>/dev/null
+        exit 0
+    )
+}
+
+# S1-R1 review #58: move the sessions/<id> dir $1 to
+# sessions/.gc-quarantine/$2/<id>/ with one rename. Returns 1, having moved
+# nothing, when $1 or .gc-quarantine or the run dir is a symlink, the target
+# exists, or the run dir is on another filesystem than $1 (mv would fall back
+# to a non-atomic copy + unlink). Never deletes.
+_v11_quarantine_dir() {
+    local _src="$1" _run="$METRICS_DIR/sessions/.gc-quarantine/$2"
+    local _dst="$_run/${1##*/}"
+    [ -d "$_src" ] && [ ! -L "$_src" ] || return 1
+    [ ! -L "$METRICS_DIR/sessions/.gc-quarantine" ] || return 1
+    mkdir -p "$_run" 2>/dev/null && [ ! -L "$_run" ] && [ ! -e "$_dst" ] || return 1
+    [ "$(stat -c %d "$_src" 2>/dev/null)" = "$(stat -c %d "$_run" 2>/dev/null)" ] || return 1
+    mv -T -- "$_src" "$_dst" 2>/dev/null
+}
+
+# P4 + S1-R1 review #58: retire the ending session's scratch dir, on SessionEnd
+# only. A Stop comes from a live session, whose scratch (task-state,
+# context-estimate, the only copy of the verdicts the ledger drops, #102) must
+# survive between turns on every path, the FULL Stop path included.
+# V11_SESSION_GC_MODE picks what happens: quarantine (default) moves it to
+# sessions/.gc-quarantine/<utc-ts>/<id>/, which the GC purges after
+# V11_SESSION_GC_QUARANTINE_HOURS; remove deletes it (the S0 behaviour); off
+# leaves it in place. Whenever the dir stays (off, or a failed move) its
+# .sitting marker goes, so a resumed sitting still counts as a new one. Acts
+# once per run (the SessionEnd EXIT trap repeats the call); never fails
+# session-end.
+_v11_remove_scratch() {
+    [ "$_SE_EVENT" = "SessionEnd" ] && [ -z "${_SE_SCRATCH_DONE:-}" ] || return 0
+    _SE_SCRATCH_DONE=1
+    v11_valid_session_id "${V11_SESSION_ID:-}" || return 0
+    local _dir="$METRICS_DIR/sessions/$V11_SESSION_ID" _stamp
+    [ -d "$_dir" ] && [ ! -L "$_dir" ] || return 0
+    case "${V11_SESSION_GC_MODE:-quarantine}" in
+        remove)
+            rm -rf -- "$_dir" 2>/dev/null && _v11_se_log "scratch_removed_id=$V11_SESSION_ID" ;;
+        off)
+            rm -f -- "$_dir/.sitting" 2>/dev/null
+            _v11_se_log "scratch_kept_id=$V11_SESSION_ID why=mode-off" ;;
+        *)
+            _stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+            if _v11_quarantine_dir "$_dir" "$_stamp"; then
+                _v11_se_log "scratch_quarantined_id=$V11_SESSION_ID to=.gc-quarantine/$_stamp"
+            else
+                rm -f -- "$_dir/.sitting" 2>/dev/null
+                _v11_se_log "scratch_quarantine_failed_id=$V11_SESSION_ID kept=in-place"
+            fi ;;
+    esac
+    return 0
+}
+
+# S1-R1 (s0-close F2): session ids that a running Claude Code process owns, as
+# "<session_id> <pid>" lines. Claude Code (2.1.283) keeps
+# ${CLAUDE_CONFIG_DIR:-~/.claude}/sessions/<pid>.json ({pid, sessionId,
+# procStart, ...}) for each interactive process. An entry counts only while
+# /proc/<pid> exists, is not a zombie and, when procStart is set, its starttime
+# (field 22 of /proc/<pid>/stat) equals procStart, so a recycled pid does not
+# keep a dead session alive. /proc/<pid>/environ is not used: its
+# CLAUDE_CODE_SESSION_ID is inherited from whatever spawned the process (every
+# Zeus-launched session carries the launcher's id), and environ holds secrets.
+# Headless `claude -p` runs write no pid file; the mtime TTL covers them.
+_v11_gc_live_session_ids() {
+    local _f _pid _sid _start _stat
+    local _num_ere='^[0-9]+$' _sid_ere='^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$'
+    local -a _fields
+    for _f in "${CLAUDE_CONFIG_DIR:-$HOME/.claude}"/sessions/*.json; do
+        [ -f "$_f" ] || continue
+        IFS=$'\x1f' read -r _pid _sid _start < <(jq -r \
+            '[.pid, .sessionId, .procStart] | map(. // "" | tostring | gsub("[\u001f\n]"; " ")) | join("\u001f")' \
+            "$_f" 2>/dev/null) || continue
+        [[ "$_pid" =~ $_num_ere ]] && [[ "$_sid" =~ $_sid_ere ]] || continue
+        _stat="$(cat "/proc/$_pid/stat" 2>/dev/null)" || continue
+        # Fields after "pid (comm) ": [0] = state, [19] = starttime.
+        read -ra _fields <<< "${_stat##*) }"
+        [ "${_fields[0]:-Z}" != "Z" ] || continue
+        [ -z "$_start" ] || [ "${_fields[19]:-}" = "$_start" ] || continue
+        printf '%s %s\n' "$_sid" "$_pid"
+    done
+    return 0
+}
+
+# S0-T6 + S1-R1 (s0-close F1/F2): age-based GC of $METRICS_DIR/sessions/<id>
+# dirs left behind by sessions that never ran SessionEnd (killed windows). Only a
+# dir named like a Claude Code session UUID is eligible: legacy-cli,
+# legacy-bootstrap-<project> (scripts/v11-bootstrap-session) and
+# self-review-tool (scripts/report-self-review) are stable shared identities
+# whose task-state.json feeds the legacy fold. V11_SESSION_GC_ALL=on makes every
+# name eligible except legacy-cli.
+# An eligible dir is kept while its session is live, i.e. the first of these holds:
+#   live-current     it is the session running this hook;
+#   live-heartbeat   v11_session_is_live (a top-level file written within
+#                    V11_SESSION_LIVENESS_MINUTES, 15): a "definitely live"
+#                    shortcut only; failing it never makes a dir dead;
+#   live-by-process  a running claude process owns the id (_v11_gc_live_session_ids);
+#   live-scan-timeout  the tree walk the next check needs took over 5 s;
+#   live-by-mtime    the newest file anywhere in the tree is younger than the TTL.
+# Otherwise it is expired. The scratch holds the only copy of review verdicts
+# the ledger dropped (#102), so the TTL is V11_SESSION_GC_TTL_HOURS (default 168,
+# rotate-metrics' SESSIONS_TTL_DAYS; floor 1 h; S0's V11_SESSION_GC_HOURS is
+# still read when the new name is unset), and V11_SESSION_GC_MODE picks what
+# happens to an expired dir: quarantine (default) moves it to
+# sessions/.gc-quarantine/<utc-ts>/<id>/, remove deletes it (S0 behaviour), off
+# disables the GC (as does a TTL of off). Quarantine runs whose <utc-ts> is older
+# than V11_SESSION_GC_QUARANTINE_HOURS (default 168, floor 1 h, off = keep) are
+# purged first, in both modes, so no run deletes a dir it quarantined itself.
+# V11_SESSION_GC_DRYRUN=1 logs every change it would make and makes none.
+# Every quarantined, removed and purged id is logged.
+# $1 = run (default) | preview (--gc-preview: print each decision with its
+# reason and the counts to stdout; writes nothing). run stops after 10 s, and
+# at 55 s of hook time (it does not start after 50 s: gc_skipped=late).
+_v11_gc_session_dirs() {
+    local _preview=0 _dry=0
+    [ "${1:-run}" = "preview" ] && _preview=1
+    [ "${V11_SESSION_GC_DRYRUN:-0}" = "1" ] && _dry=1
+    local _mode="${V11_SESSION_GC_MODE:-quarantine}"
+    local _hours="${V11_SESSION_GC_TTL_HOURS:-${V11_SESSION_GC_HOURS:-168}}"
+    local _qhours="${V11_SESSION_GC_QUARANTINE_HOURS:-168}"
+    case "$_mode" in
+        quarantine|remove) : ;;
+        off) _hours="off" ;;
+        *) _mode="quarantine" ;;  # unknown value → the non-destructive default
+    esac
+    if [ "$_hours" = "off" ]; then
+        [ "$_preview" = 1 ] && echo "gc disabled (V11_SESSION_GC_MODE=${V11_SESSION_GC_MODE:-quarantine}, ttl=off)"
+        return 0
+    fi
+    local _num_ere='^[0-9]+$'
+    [[ "$_hours" =~ $_num_ere ]] || _hours=168
+    [ "$_qhours" = "off" ] || [[ "$_qhours" =~ $_num_ere ]] || _qhours=168
+    local _min_age=$(( _hours * 3600 )) _qmin_age=0
+    [ "$_min_age" -lt 3600 ] && _min_age=3600
+    if [ "$_qhours" != "off" ]; then
+        _qmin_age=$(( _qhours * 3600 ))
+        [ "$_qmin_age" -lt 3600 ] && _qmin_age=3600
+    fi
+    local _uuid_ere='^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
+    local _name_ere='^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$'
+    local _stamp_ere='^[0-9]{8}T[0-9]{6}Z$'
+    local _qroot="$METRICS_DIR/sessions/.gc-quarantine" _stamp _now _deadline
+    local _d _id _scan _scan_rc _newest _age _verdict _detail _q _qts _qepoch _s _p _ids
+    local _total=0 _live=0 _spared_name=0 _expired=0 _moved=0 _removed=0 _failed=0
+    local _q_total=0 _q_purge=0 _purged=0
+    local -A _proc=()
+    local -A _nverdict=()
+    _now=$(date +%s)
+    # Review #58: the GC runs last inside the 60 s SessionEnd budget, so it
+    # never starts after 50 s of hook time and never runs past 55 s.
+    local _budget=$(( 55 - SECONDS ))
+    [ "$_budget" -gt 10 ] && _budget=10
+    if [ "$_preview" != 1 ] && [ "$_budget" -le 5 ]; then
+        _v11_se_log "gc_skipped=late elapsed_s=$SECONDS"
+        return 0
+    fi
+    _deadline=$(( _now + _budget ))
+    _stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+    while read -r _s _p; do
+        [ -n "$_s" ] && _proc[$_s]="$_p"
+    done < <(_v11_gc_live_session_ids)
+
+    # 1. Purge quarantine runs older than the quarantine TTL, judged by the
+    #    <utc-ts> name (mv keeps the dir's own old mtime). The fixed-width stamp
+    #    compares as a string with the cutoff, so a week of per-SessionEnd runs
+    #    costs no date call each (review #58). Any other name is kept.
+    local _cutoff=""
+    [ "$_qhours" = "off" ] || _cutoff="$(date -u -d "@$(( _now - _qmin_age ))" +%Y%m%dT%H%M%SZ)"
+    if [ -d "$_qroot" ] && [ ! -L "$_qroot" ]; then
+        for _q in "$_qroot"/*; do
+            [ -d "$_q" ] && [ ! -L "$_q" ] || continue
+            _qts="${_q##*/}"
+            [[ "$_qts" =~ $_stamp_ere ]] || continue
+            _q_total=$(( _q_total + 1 ))
+            _verdict="quarantined-purge"
+            [ -n "$_cutoff" ] && [[ "$_qts" < "$_cutoff" ]] || _verdict="quarantined-kept"
+            [ "$_verdict" = "quarantined-kept" ] && [ "$_preview" != 1 ] && continue
+            [ "$_verdict" = "quarantined-purge" ] && _q_purge=$(( _q_purge + 1 ))
+            _ids=""
+            for _s in "$_q"/*; do
+                [ -e "$_s" ] && _ids="$_ids ${_s##*/}"
+            done
+            if [ "$_preview" = 1 ]; then
+                _qepoch=$(date -u -d "${_qts:0:4}-${_qts:4:2}-${_qts:6:2} ${_qts:9:2}:${_qts:11:2}:${_qts:13:2}" +%s 2>/dev/null) \
+                    || _qepoch=$_now
+                printf '%-18s %-44s age_h=%s ids=%s\n' "$_verdict" \
+                    "$_qts" "$(( (_now - _qepoch) / 3600 ))" "${_ids# }"
+            elif [ "$_dry" = 1 ]; then
+                _v11_se_log "gc_would_purge=.gc-quarantine/$_qts ids=${_ids# }"
+            elif [ "$(date +%s)" -gt "$_deadline" ]; then
+                _v11_se_log "gc_stopped=deadline"
+                break
+            elif rm -rf -- "$_q" 2>/dev/null; then
+                _purged=$(( _purged + 1 ))
+                _v11_se_log "gc_purged=.gc-quarantine/$_qts ids=${_ids# }"
+            fi
+        done
+    fi
+
+    # 2. Judge every session dir (dot-dirs such as .gc-quarantine never match *).
+    for _d in "$METRICS_DIR"/sessions/*; do
+        [ -d "$_d" ] && [ ! -L "$_d" ] || continue
+        if [ "$_preview" != 1 ] && [ "$(date +%s)" -gt "$_deadline" ]; then
+            _v11_se_log "gc_stopped=deadline"
+            break
+        fi
+        _total=$(( _total + 1 ))
+        _id="${_d##*/}"
+        # Review #58: one dir's scan is bounded; a scan that times out counts as live.
+        _scan="$(timeout 5 find "$_d" -printf '%T@\n' 2>/dev/null)"
+        _scan_rc=$?
+        _newest=$(printf '%s\n' "$_scan" | sort -rn | head -1)
+        _newest="${_newest%.*}"
+        _age=$(( _now - ${_newest:-$_now} ))
+        _detail="age_h=$(( _age / 3600 ))${_proc[$_id]:+ pid=${_proc[$_id]}}"
+        if [ "$_id" = "legacy-cli" ] || ! [[ "$_id" =~ $_name_ere ]] \
+           || { [ "${V11_SESSION_GC_ALL:-off}" != "on" ] && ! [[ "$_id" =~ $_uuid_ere ]]; }; then
+            _verdict="spared-non-uuid"
+        elif [ "$_id" = "${V11_SESSION_ID:-}" ]; then
+            _verdict="live-current"
+        elif v11_session_is_live "$_id"; then
+            _verdict="live-heartbeat"
+        elif [ -n "${_proc[$_id]:-}" ]; then
+            _verdict="live-by-process"
+        elif [ "$_scan_rc" = 124 ]; then
+            _verdict="live-scan-timeout"
+        elif [ "$_age" -lt "$_min_age" ]; then
+            _verdict="live-by-mtime"
+        else
+            _verdict="expired-$_mode"
+        fi
+        _nverdict[$_verdict]=$(( ${_nverdict[$_verdict]:-0} + 1 ))
+        case "$_verdict" in
+            spared-non-uuid) _spared_name=$(( _spared_name + 1 )) ;;
+            live-*)          _live=$(( _live + 1 )) ;;
+            expired-*)       _expired=$(( _expired + 1 )) ;;
+            *)               : ;;
+        esac
+        if [ "$_preview" = 1 ]; then
+            printf '%-18s %-44s %s\n' "$_verdict" "$_id" "$_detail"
+            continue
+        fi
+        case "$_verdict" in
+            expired-*)
+                if [ "$_dry" = 1 ]; then
+                    _v11_se_log "gc_would_${_mode}_id=$_id $_detail"
+                elif [ "$_mode" = "remove" ]; then
+                    if rm -rf -- "$_d" 2>/dev/null; then
+                        _removed=$(( _removed + 1 ))
+                        _v11_se_log "gc_removed_id=$_id $_detail"
+                    fi
+                elif _v11_quarantine_dir "$_d" "$_stamp"; then
+                    _moved=$(( _moved + 1 ))
+                    _v11_se_log "gc_quarantined_id=$_id $_detail to=.gc-quarantine/$_stamp"
+                else
+                    # Never falls back to rm: the dir stays for the next run.
+                    _failed=$(( _failed + 1 ))
+                    _v11_se_log "gc_quarantine_failed_id=$_id $_detail"
+                fi ;;
+            *)
+                : ;;  # live or non-UUID: kept
+        esac
+    done
+
+    local _counts="total=$_total live=$_live expired=$_expired spared_non_uuid=$_spared_name"
+    _counts="$_counts live_current=${_nverdict[live-current]:-0} live_heartbeat=${_nverdict[live-heartbeat]:-0}"
+    _counts="$_counts live_by_process=${_nverdict[live-by-process]:-0} live_by_mtime=${_nverdict[live-by-mtime]:-0}"
+    _counts="$_counts live_scan_timeout=${_nverdict[live-scan-timeout]:-0}"
+    _counts="$_counts quarantine_runs=$_q_total quarantine_purge=$_q_purge"
+    _counts="$_counts mode=$_mode ttl_h=$_hours quarantine_h=$_qhours running_sessions=${#_proc[@]}"
+    if [ "$_preview" = 1 ]; then
+        printf '%s\n' "$_counts"
+    elif [ "$_dry" = 1 ]; then
+        _v11_se_log "gc_dryrun=1 $_counts"
+    else
+        _v11_se_log "gc_quarantined=$_moved gc_removed=$_removed gc_purged=$_purged gc_failed=$_failed $_counts"
     fi
     return 0
 }
 
-# Legacy-order invocation (only when reorder is OFF). V11.25.1: auto-emit
-# runs BEFORE last-session.json — this means handoff reads STALE prior-session
-# enrichment fields. Kept solely as a rollback path.
-if [ "${V11_SESSION_END_REORDER:-on}" = "off" ]; then
-    ( _v11_auto_emit_handoff ) 2>/dev/null || true
-fi
+# --gc-run (S1-R1 review #58; scripts/rotate-metrics --sessions calls it): one
+# GC run outside a SessionEnd, its log lines echoed to stdout.
+case "${1:-}" in
+    --gc-preview)
+        _v11_gc_session_dirs preview
+        exit 0 ;;
+    --gc-run)
+        _SE_MODE="gc-run"; _SE_GC_ECHO=1
+        ( _v11_gc_session_dirs ) 2>/dev/null || true
+        exit 0 ;;
+    *)
+        : ;;
+esac
+
+# Task counts from $STATE_FILE into TOTAL COMPLETED PENDING IN_PROGRESS (integers).
+_v11_read_task_counts() {
+    TOTAL=$(jq -r '.total // 0' "$STATE_FILE" 2>/dev/null || echo "0")
+    COMPLETED=$(jq -r '.completed // 0' "$STATE_FILE" 2>/dev/null || echo "0")
+    PENDING=$(jq -r '.pending // 0' "$STATE_FILE" 2>/dev/null || echo "0")
+    IN_PROGRESS=$(jq -r '.in_progress // 0' "$STATE_FILE" 2>/dev/null || echo "0")
+
+    # Ensure all variables are valid integers (strip non-digits, default to 0 if empty)
+    TOTAL="${TOTAL//[!0-9]/}"; TOTAL="${TOTAL:-0}"
+    COMPLETED="${COMPLETED//[!0-9]/}"; COMPLETED="${COMPLETED:-0}"
+    PENDING="${PENDING//[!0-9]/}"; PENDING="${PENDING:-0}"
+    IN_PROGRESS="${IN_PROGRESS//[!0-9]/}"; IN_PROGRESS="${IN_PROGRESS:-0}"
+}
 
 # V11.7: Write emergency black-box state dump (last-session.json)
 # Wrapped entirely in a subshell — session-end must NEVER fail.
+# S0-T6: a function, because scripts/handoff reads its enrichment (active
+# subject, git_status, reasoning.*) on EVERY emit: the FULL path and the CHEAP
+# Stop path both call it right before the auto-emit, so neither emits the
+# previous session's state (the V11.25.1 bug). Needs PROJECT, STATE_FILE,
+# TIMESTAMP and _v11_read_task_counts.
+_v11_write_last_session() {
 (
     DUMP_FILE="$SESSIONS_ROOT/$PROJECT/last-session.json"
+    PLAN_CONTEXT_FILE="$SESSIONS_ROOT/$PROJECT/.plan-context.json"
 
     # --- task counts (already extracted above) ---
     BLOCKED=$(jq -r '.blocked // 0' "$STATE_FILE" 2>/dev/null || echo "0")
@@ -548,6 +804,401 @@ fi
     fi
     exit 0
 ) 2>/dev/null || true
+}
+
+# S0-T6 dispatch. The CHEAP path needs all of: a Stop event, a session id (real
+# Claude Code always sends one; hand-run/test payloads without one keep the
+# legacy behavior), the lever on, and SessionEnd wired in this project with a
+# timeout >= 30 s (else reason=sessionend-timeout, FULL path).
+# V11_STOP_SPLIT=off: a SessionEnd only logs (mode=off) and exits, as pre-S0-T6
+# when SessionEnd ran nothing; every Stop then runs the FULL path.
+_SE_MODE="full"; _SE_WHY=""
+if [ "$_SE_EVENT" = "SessionEnd" ] && [ "${V11_STOP_SPLIT:-on}" = "off" ]; then
+    _SE_MODE="off"
+elif [ "$_SE_EVENT" = "Stop" ] && [ "${V11_STOP_SPLIT:-on}" != "off" ] \
+   && [ -n "${V11_SESSION_ID:-}" ]; then
+    _v11_project_wires_session_end
+    case $? in
+        0) _SE_MODE="cheap" ;;
+        2) _SE_WHY="sessionend-timeout" ;;
+        *) : ;;  # 1 = not split-wired: FULL path, as pre-S0-T6
+    esac
+fi
+_v11_se_log "reason=${_SE_REASON:-${_SE_WHY:-none}}"
+[ "$_SE_MODE" = "off" ] && exit 0
+
+# V11.15.6 (Solution A): fold the session's FINAL state into the durable
+# aggregate BEFORE anything else — in particular before the no-aggregate-yet
+# early-exit below and before the per-session dir is destroyed at the end of
+# this hook. The aggregate is otherwise updated only by sync-tasks; a turn
+# that ended without a trailing sync-tasks call (or whose last sync raced, or
+# whose project had no aggregate yet) lost its final state entirely once the
+# per-session dir was removed — the exact mechanism by which a live session's
+# "5/5" evaporated. Keyed off the session's OWN .project stamp (never ambient
+# active-project — Bug E/H lesson); the Part 1 quarantine filter still applies
+# inside the rebuild so a mis-stamped session cannot poison another project.
+# Best-effort, never fails session-end. _SESS_PROJECT is also binding evidence
+# for _v11_project_gate (S2-R5).
+#
+# V11.16 (sprint-2 #4 cutover): this fold is now a BACKSTOP, not the primary
+# durability mechanism. v11_rebuild_project_aggregate is cutover-aware — when
+# the project ledger exists and is equal-or-superset of legacy, the rebuild it
+# performs here REPLAYS THE LEDGER (the durable, cross-session-identity source
+# of truth) rather than the lossy ephemeral session-fold. Solution A survives
+# only to bound worst-case loss for not-yet-seeded projects and to keep the
+# legacy guard-reference fresh; the append-only ledger (B) is what actually
+# carries a task completed in a *different* since-deleted session across the
+# handoff boundary. The auto-rollback guard in the rebuild guarantees this
+# call can never regress a project that has not been backfilled yet.
+_SESS_PROJECT=""
+if v11_valid_session_id "${V11_SESSION_ID:-}"; then
+    _SESS_STATE="$METRICS_DIR/sessions/$V11_SESSION_ID/task-state.json"
+    if [ -f "$_SESS_STATE" ] && [ -s "$_SESS_STATE" ] && jq empty "$_SESS_STATE" 2>/dev/null; then
+        # v11.33 (E1): drain any pending scratch-reconcile marker for THIS session
+        # BEFORE the rebuild folds the scratch. A race on the session's LAST
+        # TaskUpdate (the common real shape) leaves no subsequent locked sync-tasks
+        # call to drain it, so session-end is the backstop — otherwise the marker
+        # orphans permanently and handoff keeps seeing a stale under-count. Mirrors
+        # the sync-tasks top-of-hook drain (v11_apply_reconcile_markers), but on
+        # disk under its own bounded lock (FD 205 on the same scratch lock file;
+        # session-end holds no other lock here, so no deadlock). Best-effort; never
+        # fails session-end. Rollback: V11_SYNC_SCRATCH_RECONCILE=off.
+        _SE_MARKER="$_SESS_STATE.needs-reconcile"
+        if [ "${V11_SYNC_SCRATCH_RECONCILE:-on}" != "off" ] && [ -s "$_SE_MARKER" ]; then
+            (
+                exec 205>"$_SESS_STATE.lock"
+                if flock -w 5 205; then
+                    _SE_CUR="$(cat "$_SESS_STATE" 2>/dev/null)"
+                    _SE_NEW="$(printf '%s' "$_SE_CUR" | v11_apply_reconcile_markers "$_SE_MARKER" "$V11_SESSION_ID" "$(date -Iseconds)")"
+                    if [ -n "$_SE_NEW" ] && printf '%s' "$_SE_NEW" | jq empty 2>/dev/null; then
+                        _SE_TMP="$_SESS_STATE.tmp.$$"
+                        if printf '%s' "$_SE_NEW" | jq '.' > "$_SE_TMP" 2>/dev/null && [ -s "$_SE_TMP" ]; then
+                            mv "$_SE_TMP" "$_SESS_STATE" \
+                                && rm -f "$_SE_MARKER" "$_SESS_STATE".needs-reconcile.artifacts.*.json 2>/dev/null
+                        else
+                            rm -f "$_SE_TMP" 2>/dev/null
+                        fi
+                    fi
+                fi
+            ) 2>/dev/null || true
+        fi
+        _SESS_PROJECT="$(jq -r '.project // empty' "$_SESS_STATE" 2>/dev/null)"
+        if [ -n "$_SESS_PROJECT" ] \
+           && printf '%s' "$_SESS_PROJECT" | grep -qE '^[a-zA-Z0-9._-]{1,64}$'; then
+            v11_rebuild_project_aggregate "$_SESS_PROJECT" 2>/dev/null || true
+        fi
+    fi
+fi
+
+# S0-T6 CHEAP path (per-turn Stop in a SessionEnd-wired project): after the fold
+# above, only a digest-throttled auto-emit — the handoff is regenerated only when
+# the project's open set (task ids + statuses) changed since the last successful
+# emit, and last-session.json is refreshed right before it (the handoff reads
+# its enrichment). Also writes the sitting marker. No scratch removal, retro
+# counter, session-log row, orphan detector, align-aggregate, plan-sync or
+# discipline check.
+if [ "$_SE_MODE" = "cheap" ]; then
+    _v11_mark_sitting create
+    PROJECT="$(v11_read_active_project)"
+    STATE_FILE="$TASK_STATE_DIR/${PROJECT}.json"
+    if [ -n "$PROJECT" ] && [ -f "$STATE_FILE" ] && _v11_project_gate; then
+        _SE_DIGEST="$(_v11_open_set_digest "$PROJECT" || true)"
+        _SE_LAST_DIGEST="$(head -n 1 "$SESSIONS_ROOT/$PROJECT/.handoff-autoemit-digest" 2>/dev/null | tr -d '[:space:]')"
+        if [ -z "$_SE_DIGEST" ]; then
+            _v11_se_log "project=$PROJECT emit=skipped: aggregate unreadable"
+        elif [ "$_SE_DIGEST" = "$_SE_LAST_DIGEST" ]; then
+            _v11_se_log "project=$PROJECT emit=skipped: open set unchanged"
+        else
+            TIMESTAMP=$(date -Iseconds)
+            _v11_read_task_counts
+            [ -d "$SESSIONS_ROOT/$PROJECT" ] && _v11_write_last_session
+            ( _v11_auto_emit_handoff stop "$_SE_DIGEST" ) || true
+        fi
+    fi
+    exit 0
+fi
+
+# FULL path, optional work. _v11_full_path_finish runs it on every exit of the
+# full path (including the no-project early exits), AFTER the critical teardown,
+# each step bounded: a SessionEnd killed at the harness cap loses only this.
+
+# L2.5 (v11-handoff-cross-session-loop, sprint-02): orphan handoff detector.
+# Scans $SESSIONS_ROOT/*/.last-spawn-at for spawn latches older than
+# V11_LOOP_ORPHAN_MINUTES (default 60) with no matching handoff_ack OR
+# rehydrate_missed event in ~/.agent-metrics/loop-events.jsonl (ts >= latch
+# mtime, same project). Missing → emit HANDOFF_ORPHAN event. Fire-once per
+# orphan via {latch}.orphan-notified marker sibling to the latch file itself
+# (survives across sessions, not per-session-scoped, since the observer that
+# notices may not be the observer that later re-notices). Global scan (not
+# restricted to $PROJECT — orphans are cross-project by nature).
+# Rollback: V11_ORPHAN_DETECTOR=off. Never blocks session-end; hook always
+# exits 0 regardless.
+# S0-T6: bounded — the ledger scan runs under `timeout 5` and the latch loop
+# stops after 10 s.
+_v11_orphan_detector() {
+    if [ "${V11_ORPHAN_DETECTOR:-on}" != "off" ] && [ -d "$SESSIONS_ROOT" ]; then
+        _L25_MIN_MIN="${V11_LOOP_ORPHAN_MINUTES:-60}"
+        [[ "$_L25_MIN_MIN" =~ ^[0-9]+$ ]] || _L25_MIN_MIN=60
+        if [ "$_L25_MIN_MIN" -gt 0 ]; then
+            _L25_V11_HOME="${V11_HOME:-$(dirname "$(dirname "$(readlink -f "${BASH_SOURCE[0]:-$0}")")")}"
+            _L25_LOOP_EVENTS="$_L25_V11_HOME/scripts/lib/loop_events.py"
+            _L25_LEDGER="${HOME}/.agent-metrics/loop-events.jsonl"
+            if [ -f "$_L25_LOOP_EVENTS" ]; then
+                _L25_NOW=$(date +%s)
+                _L25_MIN_S=$(( _L25_MIN_MIN * 60 ))
+                _L25_DEADLINE=$(( _L25_NOW + 10 ))
+                for _L25_LATCH in "$SESSIONS_ROOT"/*/.last-spawn-at; do
+                    [ "$(date +%s)" -le "$_L25_DEADLINE" ] || break
+                    [ -f "$_L25_LATCH" ] || continue
+                    _L25_MARKER="${_L25_LATCH}.orphan-notified"
+                    [ -f "$_L25_MARKER" ] && continue
+                    _L25_MTIME=$(stat -c %Y "$_L25_LATCH" 2>/dev/null || echo 0)
+                    [ "$_L25_MTIME" -gt 0 ] || continue
+                    _L25_AGE_S=$(( _L25_NOW - _L25_MTIME ))
+                    [ "$_L25_AGE_S" -ge "$_L25_MIN_S" ] || continue
+                    _L25_PROJ=$(basename "$(dirname "$_L25_LATCH")")
+                    printf '%s' "$_L25_PROJ" | grep -qE '^[a-zA-Z0-9._-]{1,64}$' || continue
+                    _L25_SPAWN_ISO=$(date -Iseconds -d "@$_L25_MTIME" 2>/dev/null || echo "")
+                    [ -n "$_L25_SPAWN_ISO" ] || continue
+
+                    # Ledger scan — someone-woke-up if any handoff_ack OR
+                    # rehydrate_missed row for this project has ts >= spawn ISO.
+                    _L25_ACKED=0
+                    if [ -f "$_L25_LEDGER" ]; then
+                        _L25_ACKED=$(timeout 5 python3 -c "
+import json, sys
+project, spawn_ts = sys.argv[1], sys.argv[2]
+try:
+    with open(sys.argv[3]) as f:
+        for line in f:
+            line = line.strip()
+            if not line: continue
+            try:
+                d = json.loads(line)
+            except Exception:
+                continue
+            if d.get('project') != project: continue
+            if d.get('kind') not in ('handoff_ack', 'rehydrate_missed'): continue
+            if d.get('ts', '') >= spawn_ts:
+                print(1)
+                sys.exit(0)
+    print(0)
+except Exception:
+    print(0)
+" "$_L25_PROJ" "$_L25_SPAWN_ISO" "$_L25_LEDGER" 2>/dev/null || echo 0)
+                        [[ "$_L25_ACKED" =~ ^[01]$ ]] || _L25_ACKED=0
+                    fi
+                    [ "$_L25_ACKED" = "1" ] && continue
+
+                    _L25_AGE_MIN=$(( _L25_AGE_S / 60 ))
+                    _L25_DET_BY="${V11_SESSION_ID:-unknown}"
+                    if timeout 5 python3 "$_L25_LOOP_EVENTS" \
+                        --project "$_L25_PROJ" \
+                        --session-id "$_L25_DET_BY" \
+                        --kind handoff_orphan \
+                        --spawn-ts "$_L25_SPAWN_ISO" \
+                        --detected-by "$_L25_DET_BY" \
+                        --age-minutes "$_L25_AGE_MIN" \
+                        >/dev/null 2>&1; then
+                        : > "$_L25_MARKER" 2>/dev/null || true
+                    fi
+                done
+            fi
+        fi
+    fi
+}
+
+# v11.42 W2-T3 (RC2): review-sibling age-out via /align-aggregate skill.
+# When V11_ALIGN_ON_SESSION_END=apply, the skill's Shape 3 detection (parent
+# completed > V11_REVIEW_SIBLING_AGEOUT_DAYS ago + parent_status="pending") auto-
+# cancels stale V11.21 review siblings. Cancellation events carry EXACT
+# reason="review_sibling_ageout" — v11.42 W2-T2's guard-rollback carve-out in
+# hooks/lib/common.sh credits them so the resulting count drop doesn't trip
+# REGRESSION-GUARD and silently revert.
+# Default =dryrun: skill only lists what it WOULD cancel (stderr, quiet in normal use).
+# Rollback: V11_ALIGN_ON_SESSION_END=off skips the invocation entirely.
+# Best-effort — never blocks session-end (hook always exits 0).
+# S0-T6: runs after the teardown, so $PROJECT is the resolved project if any.
+_v11_align_on_session_end() {
+    _ALIGN_MODE="${V11_ALIGN_ON_SESSION_END:-dryrun}"
+    if [ "$_ALIGN_MODE" != "off" ] && [ -x "$HOME/.claude/skills/align-aggregate/align_aggregate.py" ]; then
+        _ALIGN_ARG=""
+        case "$_ALIGN_MODE" in
+            apply)   _ALIGN_ARG="--apply" ;;
+            *)       _ALIGN_ARG="--list-phantoms" ;;  # dryrun, empty, or a typo: list only (fail safe)
+        esac
+        _ALIGN_PROJ=""
+        # S2-R5: when the binding gate applies, only the bound $PROJECT; the
+        # raw global file (which skips even v11_read_active_project's owner
+        # check) is left to hand-run payloads.
+        if [ -n "${PROJECT:-}" ]; then
+            _ALIGN_PROJ="$PROJECT"
+        elif ! _v11_binding_gate_applies && [ -f "$SESSIONS_ROOT/../.agent-metrics/active-project" ]; then
+            _ALIGN_PROJ=$(head -1 "$SESSIONS_ROOT/../.agent-metrics/active-project" 2>/dev/null | tr -d '\n' | head -c 64)
+        fi
+        if [ -n "$_ALIGN_PROJ" ] && printf '%s' "$_ALIGN_PROJ" | grep -qE '^[a-zA-Z0-9._-]{1,64}$'; then
+            timeout 15 python3 "$HOME/.claude/skills/align-aggregate/align_aggregate.py" \
+                "$_ALIGN_PROJ" $_ALIGN_ARG >/dev/null 2>&1 || true
+        fi
+    fi
+}
+
+# S0-T6: the optional tail, then exit 0. On SessionEnd the scratch goes first,
+# on every exit (including the no-project early exits, which kept it before
+# S0-T6 when Stop removed it every turn anyway), and dead-session dirs are
+# GC'd last.
+_v11_full_path_finish() {
+    [ "$_SE_EVENT" = "SessionEnd" ] && _v11_remove_scratch
+
+    # V11.4: Sync plan file on session end (captures final state for context resume)
+    local _plan_sync
+    _plan_sync="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/scripts/plan-sync"
+    if [ -x "$_plan_sync" ] && [ -n "${PROJECT:-}" ] && [ -f "${STATE_FILE:-}" ]; then
+        timeout 10 "$_plan_sync" "$PROJECT" &>/dev/null || true
+    fi
+
+    ( _v11_align_on_session_end ) 2>/dev/null || true
+    _v11_orphan_detector || true
+    if [ "$_SE_EVENT" = "SessionEnd" ]; then
+        ( _v11_gc_session_dirs ) 2>/dev/null || true
+    fi
+    exit 0
+}
+
+# FULL path, critical work. On SessionEnd the EXIT trap backs up the scratch
+# removal, and a scratch without a sitting marker gets one (a sitting whose
+# Stops never took the cheap path).
+# SessionEnd has at most 60 s (harness cap), so the order is: fold (above) →
+# last_session_end stamp → discipline check → last-session.json → auto-emit →
+# exactly-once claim → session-log row + retro → manifest → scratch removal,
+# then the optional tail. Worst case with every wait maxed out, fold aside:
+# flock 5 + discipline 10 + git 2 + emit 20 + claim 2 + retro 5 = 44 s;
+# typically 3-6 s.
+if [ "$_SE_EVENT" = "SessionEnd" ]; then
+    trap '_v11_remove_scratch' EXIT
+    _v11_mark_sitting
+fi
+
+# Read active project from ACTIVE_PROJECT_FILE
+# SEC-C-02: sanitized read — rejects path-traversal / metacharacter payloads
+PROJECT="$(v11_read_active_project)"
+# S2-R5: none of the per-project work below for a project this session is not
+# bound to (see _v11_project_gate); the session's own scratch still retires.
+_v11_project_gate || PROJECT=""
+
+# If no active project, only the optional tail
+if [ -z "$PROJECT" ]; then
+    _v11_full_path_finish
+fi
+
+# Read task state from TASK_STATE_DIR
+STATE_FILE="$TASK_STATE_DIR/${PROJECT}.json"
+
+# If state file doesn't exist, only the optional tail
+if [ ! -f "$STATE_FILE" ]; then
+    _v11_full_path_finish
+fi
+
+# Extract stats from task state JSON
+_v11_read_task_counts
+
+# Update last_session_end timestamp in task state
+# Fix 1: Lock + atomicize — use same flock that sync-tasks holds, PID-suffixed tmp,
+# validate before mv so a concurrent TaskUpdate landing during jq read is not silently lost.
+TIMESTAMP=$(date -Iseconds)
+(
+    _TMP="$STATE_FILE.tmp.$$"
+    {
+        flock -w 5 200 || { echo "session-end: could not acquire lock for task-state update" >&2; exit 0; }
+        jq --arg ts "$TIMESTAMP" '.last_session_end = $ts' "$STATE_FILE" > "$_TMP" 2>/dev/null
+        if [ -s "$_TMP" ] && jq empty "$_TMP" 2>/dev/null; then
+            mv "$_TMP" "$STATE_FILE"
+        else
+            rm -f "$_TMP"
+            echo "session-end: skipped task-state update (jq produced invalid/empty output)" >&2
+        fi
+    } 200>"$STATE_FILE.lock"
+) 2>/dev/null || true
+
+# Write session summary to session-log.jsonl
+mkdir -p "$METRICS_DIR"
+SESSION_LOG="$METRICS_DIR/session-log.jsonl"
+
+# Read session-start for duration (used in both session-log and last-session.json)
+_SLOG_START_TS=""
+_SLOG_DURATION=0
+_SLOG_START_FILE="$SESSIONS_ROOT/$PROJECT/.session-start"
+if [ -f "$_SLOG_START_FILE" ]; then
+    _SLOG_START_TS=$(tr -d '[:space:]' < "$_SLOG_START_FILE" 2>/dev/null || true)
+    if [ -n "$_SLOG_START_TS" ]; then
+        _SE=$(date -d "$_SLOG_START_TS" +%s 2>/dev/null || echo 0)
+        _SLOG_DURATION=$(( $(date +%s) - _SE ))
+        [ "$_SLOG_DURATION" -lt 0 ] && _SLOG_DURATION=0
+    fi
+fi
+
+# Create session summary JSON
+SESSION_SUMMARY=$(jq -c -n \
+  --arg timestamp "$TIMESTAMP" \
+  --arg project "$PROJECT" \
+  --argjson total "$TOTAL" \
+  --argjson completed "$COMPLETED" \
+  --argjson pending "$PENDING" \
+  --argjson in_progress "$IN_PROGRESS" \
+  --arg session_start "$_SLOG_START_TS" \
+  --argjson duration_secs "$_SLOG_DURATION" \
+  '{
+    timestamp: $timestamp,
+    project: $project,
+    total: $total,
+    completed: $completed,
+    pending: $pending,
+    in_progress: $in_progress,
+    session_start: (if $session_start == "" then null else $session_start end),
+    duration_secs: $duration_secs
+  }')
+
+# V11.6: Enrich session summary with plan-context metadata
+PLAN_CONTEXT_FILE="$SESSIONS_ROOT/$PROJECT/.plan-context.json"
+if [ -f "$PLAN_CONTEXT_FILE" ]; then
+    PC_HYPO_COUNT=$(jq -r '(.hypotheses // []) | length' "$PLAN_CONTEXT_FILE" 2>/dev/null || echo "0")
+    PC_DEC_COUNT=$(jq -r '(.decisions // []) | length' "$PLAN_CONTEXT_FILE" 2>/dev/null || echo "0")
+    PC_CYNEFIN=$(jq -r '.domain.cynefin // ""' "$PLAN_CONTEXT_FILE" 2>/dev/null || echo "")
+    [ "$PC_CYNEFIN" = "null" ] && PC_CYNEFIN=""
+    SESSION_SUMMARY=$(printf '%s' "$SESSION_SUMMARY" | jq -c \
+        --argjson hypo "${PC_HYPO_COUNT:-0}" \
+        --argjson dec "${PC_DEC_COUNT:-0}" \
+        --arg cynefin "$PC_CYNEFIN" '
+        . + {hypothesis_count: $hypo, decision_count: $dec}
+        | if $cynefin != "" then . + {cynefin: $cynefin} else . end
+    ')
+fi
+
+# V11.18 T2 (v11-handoff-hygiene): run the discipline detector BEFORE auto-emit
+# so the resulting handoff.md includes "may need completion" warnings for any
+# in_progress task with recent file activity. Best-effort; honors
+# V11_DISCIPLINE_DETECTOR=off and never fails session-end.
+(
+    _DC="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/scripts/handoff-discipline-check"
+    [ -x "$_DC" ] && [ -n "$PROJECT" ] || exit 0
+    HERCULES_ROOT="$HERCULES_ROOT" \
+    SESSIONS_ROOT="$SESSIONS_ROOT" \
+    METRICS_DIR="$METRICS_DIR" \
+    timeout 10 "$_DC" "$PROJECT" >/dev/null 2>&1 || true
+    exit 0
+) 2>/dev/null || true
+
+# Legacy-order invocation (only when reorder is OFF). V11.25.1: auto-emit
+# runs BEFORE last-session.json — this means handoff reads STALE prior-session
+# enrichment fields. Kept solely as a rollback path. (_v11_auto_emit_handoff is
+# defined at the top of this hook; its stderr carries the S0-T6 status lines.)
+if [ "${V11_SESSION_END_REORDER:-on}" = "off" ]; then
+    ( _v11_auto_emit_handoff full ) || true
+fi
+
+# V11.7: Write emergency black-box state dump (last-session.json); see
+# _v11_write_last_session.
+_v11_write_last_session
 
 # V11.25.1 invoke: auto-emit handoff AFTER last-session.json is fresh on disk.
 # This is the corrected order — the handoff script reads last-session.json for
@@ -555,8 +1206,52 @@ fi
 # got the prior session's values because auto-emit ran first.
 # Default ON; rollback via V11_SESSION_END_REORDER=off (legacy order above).
 if [ "${V11_SESSION_END_REORDER:-on}" != "off" ]; then
-    ( _v11_auto_emit_handoff ) 2>/dev/null || true
+    ( _v11_auto_emit_handoff full ) || true
 fi
+
+# S0-T6: a SessionEnd counts its sitting once (session-log row, retro counter),
+# even if the event fires twice; a resumed sitting (same session_id) counts
+# again. Claimed AFTER the emit, which is never gated on it. The legacy full
+# path on Stop counts per turn, as it did before S0-T6.
+_SE_FIRST_END=1
+if [ "$_SE_EVENT" = "SessionEnd" ] && ! _v11_claim_session_end; then
+    _SE_FIRST_END=0
+    _v11_se_log "project=$PROJECT duplicate SessionEnd: session-log/retro skipped"
+fi
+
+# Append to session-log.jsonl
+[ "$_SE_FIRST_END" = 1 ] && printf '%s\n' "$SESSION_SUMMARY" >> "$SESSION_LOG" 2>/dev/null
+
+# V11.10: Retrospective counter — flywheel input for /v11 retrospective.
+# Project-aware: increments sessions/{project}/.retro-counter on every CLOSE.
+# Threshold env var: V11_RETRO_THRESHOLD (default 5; consumers read the counter directly).
+# Surfaced by: scripts/v11-retro PROJECT, /v11 retrospective, DETECT dashboard.
+# Reset by:    scripts/v11-retro PROJECT --reset (after running /v11 retrospective).
+[ "$_SE_FIRST_END" = 1 ] && (
+    RETRO_FILE="$SESSIONS_ROOT/$PROJECT/.retro-counter"
+    [ ! -d "$SESSIONS_ROOT/$PROJECT" ] && exit 0
+
+    # V11.27 T2: flock the read-increment-write so two concurrent session-end
+    # CLOSEs can't lose a write (read-read / inc-inc / write-write → +1 not +2).
+    # fd 201: 200 is held by the task-state flock, 202 by the aggregate flock
+    # (common.sh:535) — 201 is collision-free. Best-effort: a >5s timeout (never
+    # realistic for a microsecond critical section) falls through unlocked rather
+    # than blocking CLOSE. Honors V11_RETRO_SANITY_GUARD=off → original path.
+    if [ "${V11_RETRO_SANITY_GUARD:-on}" != "off" ]; then
+        exec 201>"$RETRO_FILE.lock" 2>/dev/null || true
+        flock -w 5 201 2>/dev/null || true
+    fi
+
+    _COUNT=0
+    [ -f "$RETRO_FILE" ] && _COUNT=$(tr -dc '0-9' < "$RETRO_FILE" 2>/dev/null || echo "0")
+    _COUNT="${_COUNT:-0}"
+    _COUNT=$((_COUNT + 1))
+
+    _TMP="$RETRO_FILE.tmp.$$"
+    printf '%s\n' "$_COUNT" > "$_TMP" 2>/dev/null && mv "$_TMP" "$RETRO_FILE" 2>/dev/null
+    rm -f "$_TMP" 2>/dev/null || true
+    exit 0
+) 2>/dev/null || true
 
 # V11.7: Refresh session manifest with current artifact status
 # Fix 2: Schema-correct artifact entries (name, exists, path, tier, category) + atomic write.
@@ -646,11 +1341,7 @@ fi
     exit 0
 ) 2>/dev/null || true
 
-# P4: clean up session-scoped active-project dir (best-effort, never fails session-end)
-if [ -n "${V11_SESSION_ID:-}" ] \
-   && printf '%s' "$V11_SESSION_ID" | grep -qE '^[a-zA-Z0-9._-]{1,64}$'; then
-    _SCOPED_DIR="$METRICS_DIR/sessions/$V11_SESSION_ID"
-    [ -d "$_SCOPED_DIR" ] && rm -rf "$_SCOPED_DIR" 2>/dev/null || true
-fi
+# P4: retire the session-scoped dir (SessionEnd only; see _v11_remove_scratch)
+_v11_remove_scratch
 
-exit 0
+_v11_full_path_finish

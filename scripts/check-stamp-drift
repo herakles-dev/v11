@@ -17,6 +17,16 @@
 #   README.md                       — "## Current Version: V11.x" heading
 #   VERSION.md                      — newest "## v11.x" section heading
 #   CLAUDE.md                       — "**Current: v11.x**" §17 pointer
+#   team-orchestrator SKILL.md      — frontmatter "version:" + footer "current: X.Y"
+#                                     pointer (ticket #89: this surface lives in its own
+#                                     repo outside V11_ROOT, so it is read from an
+#                                     absolute path rather than one relative to V11_ROOT
+#                                     like the surfaces above). Path overridable via
+#                                     V11_ORCH_SKILL_MD (fixture tests point this at a
+#                                     tmp file instead of the real skill). A missing
+#                                     SKILL.md is a FAIL (review #19 E2 — it must not
+#                                     silently drop out of a CLOSE gate); downgrade to a
+#                                     warning with V11_ORCH_SKILL_REQUIRED=off.
 #
 # A surface whose claimed version's MAJOR.MINOR != anchor's MAJOR.MINOR → STAMP_DRIFT
 # finding (patch-level differences are tolerated, mirroring check-changelog-drift's
@@ -134,6 +144,23 @@ extract_claude_md() {
         | grep -oE '11\.[0-9]+(\.[0-9]+)?'
 }
 
+extract_skill_frontmatter() {
+    # YAML frontmatter "version:" field, between the first two '---' lines only —
+    # a bare grep over the whole file could match a version-shaped string in body
+    # prose instead of the declared frontmatter value.
+    local f="$1"
+    awk '/^---$/{c++; if (c==2) exit; next} c==1' "$f" 2>/dev/null \
+        | grep -oE '^version:[[:space:]]*"?11\.[0-9]+(\.[0-9]+)?"?' | head -1 \
+        | grep -oE '11\.[0-9]+(\.[0-9]+)?'
+}
+
+extract_skill_footer() {
+    # Footer pointer: "**Version:** ... (source of truth — current: 11.43 ...)".
+    local f="$1"
+    grep -oiE 'current:[[:space:]]*[vV]?11\.[0-9]+(\.[0-9]+)?' "$f" 2>/dev/null | head -1 \
+        | grep -oE '11\.[0-9]+(\.[0-9]+)?'
+}
+
 # --- Collect findings: each row is "file<TAB>field<TAB>found" ---
 ROWS=()
 
@@ -163,6 +190,23 @@ for rel in "${SURFACES[@]}"; do
             ;;
     esac
 done
+
+# --- team-orchestrator SKILL.md (ticket #89 / S0-T8): outside V11_ROOT, its own repo ---
+ORCH_SKILL_MD="${V11_ORCH_SKILL_MD:-$HOME/.claude/skills/team-orchestrator/SKILL.md}"
+ORCH_SKILL_MISSING_FAIL=0
+if [ -f "$ORCH_SKILL_MD" ]; then
+    fm_v="$(extract_skill_frontmatter "$ORCH_SKILL_MD")"
+    [ -n "$fm_v" ] && ROWS+=("team-orchestrator/SKILL.md	frontmatter version	$fm_v")
+    ft_v="$(extract_skill_footer "$ORCH_SKILL_MD")"
+    [ -n "$ft_v" ] && ROWS+=("team-orchestrator/SKILL.md	footer current pointer	$ft_v")
+elif [ "${V11_ORCH_SKILL_REQUIRED:-on}" = "off" ]; then
+    say "⚠ check-stamp-drift: surface not found, skipping (team-orchestrator/SKILL.md at $ORCH_SKILL_MD) — V11_ORCH_SKILL_REQUIRED=off"
+else
+    # review #19 E2: a missing SKILL.md used to only warn, so this surface
+    # silently dropped out of a CLOSE gate instead of blocking it.
+    say "❌ check-stamp-drift: team-orchestrator/SKILL.md not found at $ORCH_SKILL_MD — this surface would silently drop out of the CLOSE gate. Set V11_ORCH_SKILL_MD if it lives elsewhere, or V11_ORCH_SKILL_REQUIRED=off to downgrade to a warning."
+    ORCH_SKILL_MISSING_FAIL=1
+fi
 
 # --- Compare each row against the anchor; dedupe identical (file,field,found) drift rows ---
 fail=0
@@ -334,7 +378,7 @@ fi
 PROJECT_FINDINGS_JSON+="]"
 
 anchor_fail="$fail"
-fail=$(( fail || project_fail ))
+fail=$(( fail || project_fail || ORCH_SKILL_MISSING_FAIL ))
 
 if [ "$JSON_MODE" -eq 1 ]; then
     printf '{"anchor":"%s","findings":%s,"project_extras":%s}\n' "$ANCHOR_MINOR" "$FINDINGS_JSON" "$PROJECT_FINDINGS_JSON"

@@ -4,6 +4,9 @@
 # V11.11: Tool policy cascade removed — native agent tool_profile handles it.
 # V11.34 (improvement 13, F4): observable Bash source-write bypass advisory.
 # V11.34.1 (Q5): narrowed F4 — drop command-substitution heredoc FP, exempt metadata targets.
+# v11.46 (improvements/82): HIGH blocks name the honest alternative (heredoc
+# data -> Write/Edit; rm on a $var path -> literal scratchpad path); F4 also
+# sees interpreter file writes. Messages and advisories only.
 #
 # Exit codes:
 #   0 - Allow operation (low risk or auto-approved)
@@ -137,7 +140,122 @@ _v11_bash_is_source_write() {
         fi
     fi
 
+    # improvements/82: interpreter file writes. A `python3 - <<'EOF'` script
+    # ending in open(p,'w').write(s) has no shell redirect, so the branches
+    # above never saw it (archivestream 2026-09-25: an Edit defining a
+    # function was blocked while the same-turn python3 script writing its
+    # call sites went through). The write call may sit anywhere (inside the
+    # heredoc or -c string); the interpreter must be a command word outside
+    # heredoc bodies and quotes, so a commit message naming python3 and
+    # open() stays quiet (the Q5 false-positive class).
+    # KNOWN GAP: same as tee above — target extraction not attempted.
+    # V11_BASH_WRITE_WARN=legacy skips this branch (pre-#82 matching).
+    case "${V11_BASH_WRITE_WARN:-on}" in
+        legacy) return 1 ;;
+        *) ;;
+    esac
+    if [[ "$cmd" =~ $_V11_BW_INTERP_WRITE_ERE ]] || [[ "$cmd" =~ $_V11_BW_PERL_INPLACE_ERE ]]; then
+        local shell_view
+        shell_view="$(_v11_ge_strip_heredoc_bodies "$cmd")" || shell_view="$cmd"
+        shell_view="$(printf '%s' "$shell_view" | sed -e "s/'[^']*'/ /g" -e 's/"[^"]*"/ /g')"
+        if [[ "$shell_view" =~ $_V11_BW_INTERP_ERE ]] && [[ "$cmd" =~ $_V11_BW_INTERP_WRITE_ERE ]]; then
+            return 0
+        fi
+        if [[ "$shell_view" =~ $_V11_BW_PERL_INPLACE_ERE ]]; then
+            return 0
+        fi
+    fi
+
     return 1
+}
+
+# improvements/82 interpreter-write patterns. EREs live in variables (v11.35.3).
+# open(<path>, 'w'|'a'|'x'...) allows one level of nested parens in the path
+# argument (open(os.path.join(a, b), 'w')); deeper nesting is missed.
+_V11_BW_QUOTE="['\"]"
+_V11_BW_INTERP_ERE='(^|[[:space:];&|(/])(python[0-9.]*|node)([[:space:]]|$)'
+_V11_BW_INTERP_WRITE_ERE='open\(([^()]|\([^()]*\))*,[[:space:]]*(mode[[:space:]]*=[[:space:]]*)?'"$_V11_BW_QUOTE"'[wax]|\.write_(text|bytes)\(|(writeFile|appendFile)(Sync)?\('
+# perl -i / -pi / -i.bak: only no-argument switches may precede i in the bundle.
+_V11_BW_PERL_INPLACE_ERE='(^|[[:space:];&|(/])perl([[:space:]]+-[^[:space:]]+)*[[:space:]]+-[pnlaws0-9]*i'
+
+# === improvements/82: honest-alternative hints on a HIGH block ===
+# v11_check_risk prints the block itself; these add one hint when the shape
+# of the command says what the honest path is. Text only: the block branch
+# exits 2 whatever happens here.
+
+# Heredoc bodies stripped, same awk as step (2) of
+# v11_risk_classification_text (common.sh), without its executor bail-out:
+# here the question is only WHERE a token sits. Unclosed heredoc -> exit
+# non-zero (callers then fall back to the raw command). Also used by the
+# interpreter-write branch of _v11_bash_is_source_write above.
+_v11_ge_strip_heredoc_bodies() {
+    printf '%s\n' "$1" | awk '
+      BEGIN { n = 0; i = 0 }
+      {
+        if (i < n) {
+          line = $0
+          sub(/^\t+/, "", line)
+          if (line == terms[i]) { i++ }
+          next
+        }
+        scan = $0
+        while (match(scan, /<<-?[ \t]*[^ \t<]+/)) {
+          m = substr(scan, RSTART, RLENGTH)
+          sub(/^<<-?[ \t]*/, "", m)
+          gsub(/["'"'"']/, "", m)
+          terms[n++] = m
+          scan = substr(scan, RSTART + RLENGTH)
+        }
+        print
+      }
+      END { if (i < n) exit 3 }
+    ' 2>/dev/null
+}
+
+# Does any recursive rm in CMD take a $-expanded argument ($d, "$x", ${x},
+# $(...))? The #20 scratchpad downgrade (v11_rm_is_scratchpad_only_delete)
+# rejects any command containing '$', so such a path can never downgrade.
+_V11_GE_RM_SEG_ERE=$'(^|[[:space:];&|(])rm[[:space:]]+([^;&|\n]*)'
+_v11_ge_rm_targets_var() {
+    local rest="$1" tok recursive has_var
+    local -a toks
+    while [[ "$rest" =~ $_V11_GE_RM_SEG_ERE ]]; do
+        read -ra toks <<< "${BASH_REMATCH[2]}"
+        rest="${rest#*"${BASH_REMATCH[0]}"}"
+        recursive=0 has_var=0
+        for tok in "${toks[@]}"; do
+            case "$tok" in
+                --recursive) recursive=1 ;;
+                --*) ;;
+                -*[rR]*) recursive=1 ;;
+                -*) ;;
+                *'$'*) has_var=1 ;;
+                *) ;;
+            esac
+        done
+        [ "$recursive" -eq 1 ] && [ "$has_var" -eq 1 ] && return 0
+    done
+    return 1
+}
+
+_V11_GE_HINT_HEREDOC="Hint: every match for this pattern is inside heredoc body text. Heredoc bodies are not masked when the command also runs an executor (python3, bash, sudo, find, ...), so they are classified as written.
+  If that text is file content (for example lines being inserted into a script), write the file with the Write or Edit tool: they write the text without running it.
+  If the heredoc is a script meant to run, the block stands: get explicit user approval."
+_V11_GE_HINT_RM_VAR="Hint: this recursive rm targets a shell variable or substitution, which the guard cannot resolve. Only a literal absolute path inside the session scratchpad is downgraded (improvements/20), and only when the whole command has no \$, quotes, backticks, globs, ~, .., backslashes or newlines.
+  If the target is in the scratchpad, run the delete as its own command with the literal path: rm -rf /tmp/claude-<uid>/<project>/<session>/scratchpad/<dir>
+  Otherwise the block stands: get explicit user approval."
+
+_v11_ge_high_block_hint() {
+    local cmd="$1" outside
+    outside="$(_v11_ge_strip_heredoc_bodies "$cmd")" || outside="$cmd"
+    # The block means the raw command matched; if the stripped view does
+    # not, every match sat inside a heredoc body.
+    if ! v11_matches_high_risk_pattern "$outside"; then
+        printf '\n%s\n' "$_V11_GE_HINT_HEREDOC" >&2
+    elif _v11_ge_rm_targets_var "$outside"; then
+        printf '\n%s\n' "$_V11_GE_HINT_RM_VAR" >&2
+    fi
+    return 0
 }
 
 # Parse hook input
@@ -155,6 +273,7 @@ if [ "$V11_TOOL_NAME" == "Bash" ]; then
 
     # v11_check_risk handles high-risk blocking + A4 auto-approval
     if ! v11_check_risk; then
+        _v11_ge_high_block_hint "$V11_COMMAND"
         exit 2  # High-risk blocked
     fi
 fi

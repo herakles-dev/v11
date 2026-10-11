@@ -3,6 +3,12 @@
 **Author:** orchestrator (sofly session 2026-06-22)
 **Severity:** HIGH — user explicitly flagged "handoffs got a little crazy. I think overcomplicated."
 **Scope:** `playbooks/close.md`, `scripts/handoff*`, `scripts/v11-resume-tasks`, session-dir layout
+**Status:** DEFERRED — schema v2 frozen 2026-09-25 (v11-leverage-program S0-T11), not scheduled; the v11.35.6 W5 half-handoff fixes remain in place
+
+**Frozen (2026-09-25, v11-leverage-program S0-T11): schema v2 is not scheduled.** v11.35.6 W5 landed the
+half-handoff fixes (EXIT trap, `.bak` cap, drift-scan glob, staging pattern). The two-file `handoff.json`
+schema v2 below is frozen: `~/sessions/v11-leverage-program/spec.md` lists it under "Not scheduled (S6
+candidates)", and that program's S1 handoff work (#75 truth, #57, #81) targets the current surface.
 
 ---
 

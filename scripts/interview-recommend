@@ -39,8 +39,8 @@ if [[ -n "$DOMAIN" ]]; then
   DOMAINS=("$DOMAIN")
 else
   DOMAINS=()
-  echo "$STACK_LOWER" | grep -qiE 'fastapi|flask|express|django' && DOMAINS+=("backend")
-  echo "$STACK_LOWER" | grep -qiE 'react|nextjs|next\.js|vue'    && DOMAINS+=("frontend")
+  grep -qiE 'fastapi|flask|express|django' <<<"$STACK_LOWER" && DOMAINS+=("backend")
+  grep -qiE 'react|nextjs|next\.js|vue' <<<"$STACK_LOWER"    && DOMAINS+=("frontend")
   [[ ${#DOMAINS[@]} -eq 0 ]] && DOMAINS+=("backend")
 fi
 
@@ -66,8 +66,8 @@ formation()  { case "${SCOPE,,}" in small) echo "single-file or lightweight-feat
 
 # ── Agent recommendations ─────────────────────────────────────────────────────
 has_backend=false; has_frontend=false
-echo "$STACK_LOWER" | grep -qiE 'fastapi|flask|express|django' && has_backend=true
-echo "$STACK_LOWER" | grep -qiE 'react|nextjs|next\.js|vue'    && has_frontend=true
+grep -qiE 'fastapi|flask|express|django' <<<"$STACK_LOWER" && has_backend=true
+grep -qiE 'react|nextjs|next\.js|vue' <<<"$STACK_LOWER"    && has_frontend=true
 ! $has_backend && ! $has_frontend && has_backend=true
 
 AGENTS_JSON="["
@@ -81,7 +81,7 @@ case "${SCOPE,,}" in
     ;;
   medium)
     if $has_backend; then
-      if echo "$STACK_LOWER" | grep -qiE 'auth|jwt|oauth|postgres|redis'; then
+      if grep -qiE 'auth|jwt|oauth|postgres|redis' <<<"$STACK_LOWER"; then
         add_agent "Backend" "backend-architect"    "Complex patterns → specialist"
       else
         add_agent "Backend" "spec-implementer-v11" "Routine backend → spec agent"

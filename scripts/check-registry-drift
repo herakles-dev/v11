@@ -16,6 +16,19 @@ ARCHIVE POLICY (v11.37 W1-T5): `~/.claude/agents/archive/*.md` files are
 inactive-by-convention and EXCLUDED from all disk scans (maxdepth 1). See
 docs/DRIFT_CHECKS.md § `~/.claude/agents/archive/` policy.
 
+LEDGER LABELS (S1-T12, #38): each windowed label is resolved before the
+compare — normalised ("X\\nX" → X, "X (note)" → X, "X — note" → X, "X x3" → X),
+then, if still unknown, aliased from a named spawn (TaskUpdate `owner`) to the
+`metadata.agent` of the same task identity's `created` event, joined on
+(subject_norm, create_seq) or (session_uuid, task_id) inside one ledger file,
+never bare task_id. An owner that is itself a plausible agent type (an .md in
+any project or archive/, a ledger agent field, dispatch-trace) is not a spawn
+name: it is never aliased, and a type mismatch WARNs (owner type X vs created
+type Y).
+Meta/built-in/human labels are ignored. The ledger project's own
+`<root>/<project>/.claude/agents/*.md` counts as an `.md`. Whatever still
+resolves to an unknown type WARNs under that type.
+
 Exit codes:
   0 = PASS (registry ↔ disk match; ledger noise below threshold)
   1 = FAIL (disk `.md` missing from registry — CRITICAL, hides live agents)
@@ -31,12 +44,20 @@ import argparse
 import json
 import os
 import re
+import subprocess
 import sys
 from pathlib import Path
 
 DEFAULT_AGENTS_DIR = Path.home() / ".claude" / "agents"
 DEFAULT_REGISTRY = Path.home() / ".agent-registry" / "agents.json"
 DEFAULT_LEDGER_DIR = Path.home() / ".agent-metrics" / "ledger"
+DEFAULT_DISPATCH_TRACE = Path.home() / ".agent-metrics" / "dispatch-trace.jsonl"
+# Roots holding <project>/.claude/agents/ for ledger <project>.jsonl
+# (~/sofly, ~/math-proof, ~/sessions/mastery-engine, ...).
+DEFAULT_PROJECT_ROOTS = [
+    Path.home(),
+    Path(os.environ.get("SESSIONS_ROOT") or Path.home() / "sessions"),
+]
 
 # `name:` frontmatter — same shape as scripts/reconcile-agent-registry uses.
 FRONTMATTER_NAME_RE = re.compile(r"^name:\s*(.+)$", re.MULTILINE)
@@ -57,7 +78,36 @@ LEDGER_LABEL_IGNORE = {
     "Explore",
     "explore",
     "general-purpose",
+    # S1-T12: the rest of the harness built-ins (scripts/lib/roster.py
+    # BUILTINS, plus the Agent tool's self-fork type) and the team-lead /
+    # "orchestrator does it directly" meta-labels.
+    "Plan",
+    "claude-code-guide",
+    "fork",
+    "team-lead",
+    "lead",
+    "direct",
 }
+# Owners that name a person, not an agent ("director" is worldforge's word for
+# the user). Extended at runtime with the git user.name and --human-owner.
+HUMAN_OWNERS = {"human", "director"}
+# The orchestrator writing its model id as the owner ("claude-opus-4-7",
+# "fable", "claude-opus-5-5[1m]"). Version parts only: "haiku-4-5-scout" is an
+# agent-shaped name and is not matched.
+MODEL_LABEL_RE = re.compile(
+    r"^(claude-)?(opus|sonnet|haiku|fable)(-\d+(\.\d+)?)*(\[[^\]]*\])?$", re.IGNORECASE
+)
+# Annotations writers append to a real label: " — note", " (note)", " x3".
+COMMENTARY_RE = re.compile(r"\s+[—–]\s.*$", re.DOTALL)
+PAREN_SUFFIX_RE = re.compile(r"\s*\([^()]*\)$")
+MULTIPLIER_RE = re.compile(r"\s+x\d+$")
+# Only a real session uuid makes (session_uuid, task_id) an identity;
+# "legacy-cli" / "migration-…" pseudo-sessions reduce it to bare task_id.
+SESSION_UUID_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+)
+# Ledger file stem → project dir name; rejects "..", dot-dirs and separators.
+PROJECT_STEM_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 # Labels matching these patterns are task-IDs / sprint tags / formation names
 # that got written into agent-attribution fields (a separate bug in the
 # ledger writers — see v11.38 seed). Not real agents; excluded from the check.
@@ -66,8 +116,10 @@ TASK_LIKE_RE = re.compile(
     re.IGNORECASE,
 )
 # Composite labels like "database-engineer+ci-cd-architect" or "foo & bar":
-# these are formation shorthand, not a single agent.
-COMPOSITE_RE = re.compile(r"[+&]| and ")
+# these are formation shorthand, not a single agent. Agent names never hold
+# whitespace, so any label still holding it after normalisation ("a and b",
+# "ORCHESTRATOR SELF-AUDIT") is free text.
+COMPOSITE_RE = re.compile(r"[+&\s]")
 
 
 def _env_off(name: str) -> bool:
@@ -121,54 +173,243 @@ def enumerate_registry(registry_path: Path) -> set[str]:
     return set((data.get("agents") or {}).keys())
 
 
-def enumerate_ledger_labels(ledger_dir: Path, since_days: int) -> set[str]:
-    """Distinct actor labels from the last N days of ledger events."""
-    if not ledger_dir.is_dir():
+def normalise_label(raw: str) -> str:
+    """Strip writer annotations off a ledger label. A multiline value collapses
+    to its one distinct line; distinct lines join as a composite ("a + b")."""
+    lines: list[str] = []
+    for ln in raw.splitlines():
+        ln = ln.strip()
+        if ln and ln not in lines:
+            lines.append(ln)
+    if len(lines) != 1:
+        return " + ".join(lines)
+    label = COMMENTARY_RE.sub("", lines[0])
+    label = PAREN_SUFFIX_RE.sub("", label)
+    label = MULTIPLIER_RE.sub("", label)
+    return label.strip()
+
+
+def git_user_name() -> str | None:
+    try:
+        proc = subprocess.run(
+            ["git", "config", "--get", "user.name"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return proc.stdout.strip() or None
+
+
+def _read_events(path: Path) -> list[dict]:
+    events: list[dict] = []
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    ev = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(ev, dict):
+                    events.append(ev)
+    except OSError:
+        pass
+    return events
+
+
+def _agent_fields(ev: dict) -> list[str]:
+    """The event's agent-type fields (metadata.agent, recommended_agent)."""
+    md = ev.get("metadata")
+    values = [md.get("agent") if isinstance(md, dict) else None, ev.get("recommended_agent")]
+    return [v for v in values if isinstance(v, str) and v]
+
+
+def _event_agent(ev: dict) -> str | None:
+    fields = _agent_fields(ev)
+    return fields[0] if fields else None
+
+
+def _identity_keys(ev: dict) -> list[tuple]:
+    """Task-identity join keys, strongest first. Never bare task_id: ids are
+    reused across sessions."""
+    keys: list[tuple] = []
+    subject, seq = ev.get("subject_norm"), ev.get("create_seq")
+    if isinstance(subject, str) and subject and isinstance(seq, int) and seq >= 1:
+        keys.append(("subject", subject, seq))
+    session, task = ev.get("session_uuid"), ev.get("task_id")
+    if isinstance(session, str) and SESSION_UUID_RE.match(session) and task:
+        keys.append(("session", session, str(task)))
+    return keys
+
+
+def _index_created(events: list[dict]) -> dict[tuple, set[str]]:
+    """identity key → agents named by `created` events (all time, not windowed:
+    a task created before the window can be claimed inside it)."""
+    index: dict[tuple, set[str]] = {}
+    for ev in events:
+        if ev.get("ev") != "created":
+            continue
+        agent = _event_agent(ev)
+        if not agent:
+            continue
+        for key in _identity_keys(ev):
+            index.setdefault(key, set()).add(agent)
+    return index
+
+
+def _alias(ev: dict, created: dict[tuple, set[str]]) -> str | None:
+    """The created-event agent for this event's task; None when unknown or
+    ambiguous (one key naming two agents)."""
+    for key in _identity_keys(ev):
+        agents = created.get(key)
+        if agents and len(agents) == 1:
+            return next(iter(agents))
+    return None
+
+
+def enumerate_project_agents(stem: str, project_roots: list[Path]) -> set[str]:
+    """A ledger project's own agents: <root>/<stem>/.claude/agents/*.md, where
+    <stem> is the ledger file's name. They have an .md, so a label naming one in
+    that project's ledger is not rename drift; another project's .md does not
+    count. They stay out of the disk ↔ registry compare (the registry is the
+    global roster)."""
+    if not PROJECT_STEM_RE.match(stem):
         return set()
-    labels: set[str] = set()
+    names: set[str] = set()
+    for root in project_roots:
+        names |= enumerate_disk(root / stem / ".claude" / "agents")
+    return names
+
+
+def enumerate_any_project_agents(project_roots: list[Path]) -> set[str]:
+    """Every project's agents: <root>/*/.claude/agents/*.md. Evidence that a
+    name is an agent type, never a reason to accept a label."""
+    names: set[str] = set()
+    for root in project_roots:
+        for agents_dir in sorted(root.glob("*/.claude/agents")):
+            if PROJECT_STEM_RE.match(agents_dir.parent.parent.name):
+                names |= enumerate_disk(agents_dir)
+    return names
+
+
+def enumerate_trace_types(trace_path: Path) -> set[str]:
+    """Agent types dispatch-trace recorded at spawn time."""
+    types: set[str] = set()
+    for ev in _read_events(trace_path):
+        for field in ("spawned_agent", "recommended_agent"):
+            v = ev.get(field)
+            if isinstance(v, str) and v:
+                types.add(normalise_label(v))
+    return types
+
+
+def scan_ledger(
+    ledger_dir: Path,
+    since_days: int,
+    known: set[str],
+    project_roots: list[Path],
+    ignore: set[str],
+    types: set[str],
+) -> tuple[dict[str, set[tuple[str, str, str]]], dict[str, set[str]]]:
+    """Resolve every actor label from the last N days of ledger events.
+
+    `types` holds agent types known from outside the ledger (dispatch-trace,
+    archive/); every ledger agent field is added to it. Returns (orphans,
+    stats): orphans maps each unresolved agent type to the (raw label, ledger
+    project, planned type or "") triples that led to it; stats maps each step
+    (raw, normalised, aliased, type_owner, ignored, filtered, project_local) to
+    the distinct raw labels it touched.
+    """
+    stats: dict[str, set[str]] = {
+        k: set()
+        for k in (
+            "raw", "normalised", "aliased", "type_owner",
+            "ignored", "filtered", "project_local",
+        )
+    }
+    orphans: dict[str, set[tuple[str, str, str]]] = {}
+    if not ledger_dir.is_dir():
+        return orphans, stats
     # cheap "since" filter: compare ISO ts prefix (YYYY-MM-DD)
     from datetime import datetime, timedelta, timezone
 
     cutoff = datetime.now(timezone.utc) - timedelta(days=since_days)
     cutoff_prefix = cutoff.strftime("%Y-%m-%d")
-    for f in ledger_dir.glob("*.jsonl"):
-        try:
-            with f.open("r", encoding="utf-8", errors="replace") as fh:
-                for line in fh:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    if line[:10] < cutoff_prefix:
-                        # cheap pre-filter; still parse if we want to be sure
-                        # but skip on old rows for speed
-                        pass
-                    try:
-                        ev = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    ts = ev.get("ts") or ""
-                    if ts[:10] < cutoff_prefix:
-                        continue
-                    for field in ("owner", "recommended_agent"):
-                        v = ev.get(field)
-                        if isinstance(v, str) and v:
-                            labels.add(v)
-                    md = ev.get("metadata") or {}
-                    v = md.get("agent")
-                    if isinstance(v, str) and v:
-                        labels.add(v)
-        except OSError:
-            continue
-    result: set[str] = set()
-    for lbl in labels:
-        if lbl in LEDGER_LABEL_IGNORE:
-            continue
-        if TASK_LIKE_RE.match(lbl):
-            continue
-        if COMPOSITE_RE.search(lbl):
-            continue
-        result.add(lbl)
-    return result
+
+    def is_ignored(label: str) -> bool:
+        return label in ignore or bool(MODEL_LABEL_RE.match(label))
+
+    # Pass 1: every ledger's created index and agent fields (all time), so an
+    # owner can be checked against types named in any project.
+    types = set(types)
+    ledgers: list[tuple[str, list[dict], dict[tuple, set[str]]]] = []
+    for f in sorted(ledger_dir.glob("*.jsonl")):
+        events = _read_events(f)
+        for ev in events:
+            types.update(normalise_label(v) for v in _agent_fields(ev))
+        windowed = [
+            ev for ev in events
+            if isinstance(ev.get("ts"), str) and ev["ts"][:10] >= cutoff_prefix
+        ]
+        ledgers.append((f.stem, windowed, _index_created(events)))
+
+    for stem, events, created in ledgers:
+        local = enumerate_project_agents(stem, project_roots)
+        for ev in events:
+            md = ev.get("metadata")
+            values = [
+                ("owner", ev.get("owner")),
+                ("recommended_agent", ev.get("recommended_agent")),
+                ("metadata.agent", md.get("agent") if isinstance(md, dict) else None),
+            ]
+            for field, raw in values:
+                if not (isinstance(raw, str) and raw):
+                    continue
+                stats["raw"].add(raw)
+                label = normalise_label(raw)
+                if label != raw:
+                    stats["normalised"].add(raw)
+                # A claim event's owner may be a spawn name; its task's created
+                # event names the real type. Only `owner` is aliased: the agent
+                # fields already name a type (a re-assignment to an unknown one
+                # must stay visible). Review events are keyed on the reviewed
+                # task, so their owner (the reviewer) is never aliased.
+                planned = ""
+                if (
+                    field == "owner"
+                    and ev.get("ev") not in ("created", "review")
+                    and not is_ignored(label)
+                    and label not in known
+                    and label not in local
+                ):
+                    alias = _alias(ev, created)
+                    if alias and normalise_label(alias) != label:
+                        if label in types:
+                            # The owner is itself a plausible agent type, not a
+                            # spawn name: type mismatch, owner X vs created Y.
+                            stats["type_owner"].add(raw)
+                            planned = alias
+                        else:
+                            stats["aliased"].add(raw)
+                            debug(f"alias {raw!r} → {alias!r} ({stem})")
+                            label = normalise_label(alias)
+                if is_ignored(label):
+                    stats["ignored"].add(raw)
+                    continue
+                if label in known:
+                    continue
+                if label in local:
+                    stats["project_local"].add(raw)
+                    continue
+                if not label or TASK_LIKE_RE.match(label) or COMPOSITE_RE.search(label):
+                    stats["filtered"].add(raw)
+                    continue
+                orphans.setdefault(label, set()).add((raw, stem, planned))
+    return orphans, stats
 
 
 def main() -> int:
@@ -187,21 +428,63 @@ def main() -> int:
         default=30,
         help="ledger label scan window (days)",
     )
+    parser.add_argument(
+        "--project-root",
+        type=Path,
+        action="append",
+        help="dir holding <project>/.claude/agents/ for ledger <project>.jsonl "
+        "(repeatable; default: $HOME and $SESSIONS_ROOT)",
+    )
+    parser.add_argument(
+        "--dispatch-trace",
+        type=Path,
+        default=DEFAULT_DISPATCH_TRACE,
+        help="spawn-time agent types (spawned_agent, recommended_agent)",
+    )
+    parser.add_argument(
+        "--human-owner",
+        action="append",
+        default=[],
+        help="owner label that names a person (repeatable; 'human', 'director' "
+        "and the git user.name are always included)",
+    )
     args = parser.parse_args()
 
     disk = enumerate_disk(args.agents_dir)
     registry = enumerate_registry(args.registry)
-    ledger = enumerate_ledger_labels(args.ledger_dir, args.ledger_since_days)
+    humans = HUMAN_OWNERS | set(args.human_owner)
+    git_name = git_user_name()
+    if git_name:
+        humans.add(git_name)
+    project_roots = args.project_root or DEFAULT_PROJECT_ROOTS
+    ledger_orphans_map, stats = scan_ledger(
+        args.ledger_dir,
+        args.ledger_since_days,
+        disk | registry,
+        project_roots,
+        LEDGER_LABEL_IGNORE | humans,
+        enumerate_trace_types(args.dispatch_trace)
+        | enumerate_disk(args.agents_dir / "archive")
+        | enumerate_any_project_agents(project_roots),
+    )
 
     disk_missing = sorted(disk - registry)
     dead_registry = sorted(registry - disk)
-    ledger_orphans = sorted(ledger - disk - registry)
+    ledger_orphans = sorted(ledger_orphans_map)
+    summary = (
+        f"registry-drift summary: ledger labels (last {args.ledger_since_days}d): "
+        f"{len(stats['raw'])} raw, {len(stats['normalised'])} normalised, "
+        f"{len(stats['aliased'])} aliased to a created-event agent, "
+        f"{len(stats['type_owner'])} type mismatches (owner is itself a type), "
+        f"{len(stats['ignored'])} ignored (meta/built-in/human), "
+        f"{len(stats['filtered'])} filtered (task-like/composite/free text), "
+        f"{len(stats['project_local'])} project-local .md; "
+        f"{len(ledger_orphans)} WARN remain.\n"
+    )
 
     if not disk_missing and not dead_registry and not ledger_orphans:
-        debug(
-            f"registry ↔ disk in sync ({len(disk)} agents); "
-            f"ledger clean ({len(ledger)} distinct labels)"
-        )
+        debug(f"registry ↔ disk in sync ({len(disk)} agents); ledger clean")
+        debug(summary.rstrip())
         return 0
 
     for name in disk_missing:
@@ -215,10 +498,27 @@ def main() -> int:
             f"Dead entry OR moved to archive/. Reconcile to prune.\n"
         )
     for name in ledger_orphans:
+        triples = ledger_orphans_map[name]
+        seen = sorted({r for r, _, _ in triples if r != name})
+        planned = sorted({t for _, _, t in triples if t})
+        seen_as = f" In: {', '.join(sorted({p for _, p, _ in triples}))}."
+        if seen:
+            shown = ", ".join(r.replace("\n", "\\n")[:60] for r in seen[:3])
+            more = f" (+{len(seen) - 3} more)" if len(seen) > 3 else ""
+            seen_as += f" Seen as: {shown}{more}."
+        if planned:
+            # The owner is a type in its own right that ran tasks created for
+            # another type; it is not a spawn name, so it was not aliased.
+            sys.stderr.write(
+                f"⚠ REGISTRY_DRIFT[WARN]: {name} — type mismatch: owner type {name} vs created type "
+                f"{', '.join(planned)}; {name} has no `.md` file for this project AND is not registered.{seen_as}\n"
+            )
+            continue
         sys.stderr.write(
-            f"⚠ REGISTRY_DRIFT[WARN]: {name} — active in ledger (last {args.ledger_since_days}d) but no `.md` file AND not registered. "
-            f"Likely rename/alias drift — investigate.\n"
+            f"⚠ REGISTRY_DRIFT[WARN]: {name} — active in ledger (last {args.ledger_since_days}d) but no `.md` file (global or its project's) AND not registered. "
+            f"Likely rename/alias drift — investigate.{seen_as}\n"
         )
+    sys.stderr.write(summary)
 
     if disk_missing:
         sys.stderr.write(

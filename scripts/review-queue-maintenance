@@ -12,7 +12,7 @@ event is neutralized to NONE and preserved in an `outcome` field.
 
 Usage:
   review-queue-maintenance --normalize [--apply] [--dry-run]   # default: dry-run
-  review-queue-maintenance --gc --days 90 [--apply]            # prune done events older than N days
+  review-queue-maintenance --gc --days 90 [--apply]            # drop tasks whose latest event is a done older than N days (whole history)
   review-queue-maintenance --stats                             # depth report per project
 
 Safe by default: --dry-run unless --apply. --apply writes a .bak-<ts> sidecar first.
@@ -147,27 +147,51 @@ def do_normalize(apply):
           f"{skip_note}{'' if apply else ' (dry-run — pass --apply)'}")
 
 
+def _older_than(ts, cutoff):
+    if not isinstance(ts, str) or not ts:
+        return False
+    try:
+        return datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp() < cutoff
+    except ValueError:
+        return False
+
+
 def do_gc(days, apply):
+    # S2-R4: gc works per task, keyed by str(task_id) like every queue reader
+    # (review-queue, status, drain: latest event per task_id wins). A task whose
+    # LATEST event is a done older than the cutoff is dropped whole, every row
+    # (pending/parked/done) together. Pruning the done row alone left the
+    # earlier pending row as the latest, so the resolved review read as pending
+    # again and the next review-daemon run paid to re-review it. A task whose
+    # latest event is anything else (pending, parked) keeps all its rows at any
+    # age, as undone entries always did. Rows with no task_id (and unparseable
+    # lines) are no reader's task and are kept verbatim.
     cutoff = time.time() - days * 86400
-    pruned_rows = pruned_files = skipped_files = 0
+    dropped_tasks = dropped_rows = kept_undone = kept_recent = 0
+    pruned_files = skipped_files = 0
     for path in sorted(glob.glob(os.path.join(QUEUE_DIR, "*.jsonl"))):
         try:
             with _QueueLock(path):
                 rows = load(path)
-                keep = []
+                latest = {}
                 for r in rows:
-                    ts = r.get("ts", "")
-                    old = False
-                    if r.get("ev") == "done" and ts:
-                        try:
-                            old = datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp() < cutoff
-                        except ValueError:
-                            old = False
-                    if old:
-                        pruned_rows += 1
+                    tid = str(r.get("task_id", ""))
+                    if "_raw" not in r and tid:
+                        latest[tid] = r
+                drop = {tid for tid, r in latest.items()
+                        if r.get("ev") == "done" and _older_than(r.get("ts"), cutoff)}
+                for tid, r in latest.items():
+                    if tid in drop:
+                        continue
+                    if r.get("ev") == "done":
+                        kept_recent += 1
                     else:
-                        keep.append(r)
-                if len(keep) != len(rows):
+                        kept_undone += 1
+                keep = [r for r in rows
+                        if "_raw" in r or str(r.get("task_id", "")) not in drop]
+                if drop:
+                    dropped_tasks += len(drop)
+                    dropped_rows += len(rows) - len(keep)
                     pruned_files += 1
                     if apply:
                         backup_and_write(path, keep)
@@ -177,35 +201,40 @@ def do_gc(days, apply):
                   f"writer after {LOCK_TIMEOUT_S}s ({e})", file=sys.stderr)
     verb = "pruned" if apply else "would prune"
     skip_note = f", {skipped_files} skipped (locked)" if skipped_files else ""
-    print(f"{verb}: {pruned_rows} resolved done-events older than {days}d across "
-          f"{pruned_files} files{skip_note}{'' if apply else ' (dry-run — pass --apply)'}")
+    print(f"{verb}: {dropped_tasks} tasks whole ({dropped_rows} rows) whose latest event is a "
+          f"done older than {days}d, across {pruned_files} files; kept {kept_undone + kept_recent} "
+          f"tasks ({kept_undone} pending/parked at any age, {kept_recent} resolved within {days}d)"
+          f"{skip_note}{'' if apply else ' (dry-run — pass --apply)'}")
 
 
 def do_stats():
-    total_pending = total_done = 0
+    # S2-R4: latest event per task_id wins (review-queue's own replay); a parked
+    # entry is counted apart, since no drain clears it.
+    total_pending = total_done = total_parked = 0
     rows_out = []
     for path in sorted(glob.glob(os.path.join(QUEUE_DIR, "*.jsonl"))):
         rows = load(path)
-        pend = {}
+        latest = {}
         for r in rows:
             tid = r.get("task_id")
             if not tid:
                 continue
-            if r.get("ev") == "pending":
-                pend.setdefault(tid, True)
-            elif r.get("ev") == "done":
-                pend[tid] = False
-        open_n = sum(1 for v in pend.values() if v)
-        done_n = sum(1 for v in pend.values() if not v)
+            latest[str(tid)] = r.get("ev")
+        states = list(latest.values())
+        open_n, done_n, parked_n = states.count("pending"), states.count("done"), states.count("parked")
         total_pending += open_n
         total_done += done_n
-        if open_n:
-            rows_out.append((open_n, done_n, os.path.basename(path)[:-6]))
+        total_parked += parked_n
+        if open_n or parked_n:
+            rows_out.append((open_n, parked_n, done_n, os.path.basename(path)[:-6]))
     rows_out.sort(reverse=True)
-    print(f"Review queue: {total_pending} open across {len(rows_out)} projects "
+    print(f"Review queue: {total_pending} open, {total_parked} parked across {len(rows_out)} projects "
           f"({total_done} resolved).")
-    for open_n, done_n, proj in rows_out[:12]:
-        print(f"  {open_n:4d} open  {done_n:4d} done  {proj}")
+    for open_n, parked_n, done_n, proj in rows_out[:12]:
+        print(f"  {open_n:4d} open  {parked_n:4d} parked  {done_n:4d} done  {proj}")
+    if total_parked:
+        print("  Parked entries are not drained; re-queue one with: "
+              "scripts/review-queue unpark PROJECT TASK_ID")
 
 
 def main():

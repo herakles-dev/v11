@@ -2,18 +2,58 @@
 # V11.21 Wave-Check — INV-12 gate enforcement for orchestrator wave dispatch.
 #
 # Usage: scripts/wave-check PROJECT WAVE
-#         WAVE accepts "02", "2", or "sprint-02-foo" forms.
+#         WAVE accepts "02", "2", "S2", or "sprint-02-foo" forms.
 #
 # Reads:
+#   ~/.agent-metrics/ledger/PROJECT.jsonl via v11_replay_ledger (hooks/lib/common.sh)
+#     — every identity of the wave, completed and cancelled included (improvements/96)
 #   sessions/PROJECT/.task-state.json (or ~/.agent-metrics/task-state/PROJECT.json fallback)
+#     — merged in; the only source for a ledger-less project
+#   ~/.agent-metrics/review-verdicts/PROJECT/*.json — only the file a task's latest
+#     ev:"review" references (verdict_ref), checked against its verdict_sha
+#
+# Wave membership: metadata.sprint "sprint-NN[-slug]" decides, compared as a number
+# (sprint-1-x is wave 01); a task without one falls back to metadata.wave (1, "01",
+# "W1", "wave-1"). Open tasks with neither are listed in a stderr WARNING.
+#
+# Review verdicts. A review's severity comes from, in order: its artifacts.review;
+# the completion's review_summary_delta counts (these survive the ledger's
+# PIPE_BUF cap when the verdict body is dropped, #102); the latest ev:"review" on
+# it or on what it reviews (review_severity, plus the verdict_ref file when its
+# sha256 matches verdict_sha). CRITICAL from any of them blocks (exit 3). A review
+# that completed with none of them has no verdict and keeps the wave open (exit 2).
+# Corrections (a later ev:"review" naming it by corrects_seqno + corrects_ts; the
+# rule is scripts/lib/review_corrections.py, shared with agent-scorecard):
+# outcome=void erases the review it names as if it never existed, and the void
+# row is no review either; outcome=waived makes it a waiver (below).
+#
+# Coverage. A completed work task at the pairing threshold (risk medium/high or
+# complexity medium/complex/novel) needs a review: a review task with a verdict,
+# an ev:"review", its own verdict, or its pair_ shadow completed with a verdict.
+# Policy on waivers (orchestrator decision): an outcome=waived review, or one a
+# waived correction points at, or a shadow cancelled with outcome=waived or a
+# reason starting "waived"/"INV-7", COVERS the task but is NEVER a clean verdict;
+# it is reported in its own "waived N" bucket. A shadow cancelled any other way
+# (align-aggregate's phantom cleanup, a hand cancel) is no review at all. A
+# task-state-only review (no ledger events) counts but is reported as "verdict
+# unchecked". metadata.skip_review exempts a task; on a task at the pairing
+# threshold it is always named in a stderr WARNING.
 #
 # Exit codes:
 #   0  → INV-12 conditions met. Wave N may close; Wave N+1 may dispatch.
 #        (Self-review CRITICAL still surfaces a stderr warning at exit 0.)
 #   1  → WORK_INCOMPLETE     — at least one wave-N work task is not completed.
-#   2  → REVIEW_INCOMPLETE   — work done but paired adversarial review siblings not complete.
-#   3  → CRITICAL_BLOCKING   — a completed adversarial-lite review carries CRITICAL severity.
-#   4  → BAD_USAGE           — missing args / unreadable task-state.
+#   2  → REVIEW_INCOMPLETE   — a review task (or awaited pair_ shadow) is open, a
+#                              completed review has no verdict, or a reviewable work
+#                              task has no review at all.
+#   3  → CRITICAL_BLOCKING   — a review verdict on record carries CRITICAL severity.
+#   4  → BAD_USAGE           — missing args / no task-state or ledger / CANNOT VERIFY
+#                              (ledger present but unreplayable) / no wave tasks.
+#
+# Cancelled tasks are terminal: listed, never counted as open work or open reviews.
+#
+# stdout: one tab-separated row per wave task (id, status, work|review, review
+# note, subject). stderr: the summary, warnings and the verdict line.
 #
 # INV-12 wording (verbatim from spec.md):
 #   Wave N is complete only when (a) all Wave N work tasks status=completed AND
@@ -22,12 +62,19 @@
 #   warning + creates a follow-up task but does NOT block the gate.
 #
 # Rollback: V11_WAVE_CHECK=off forces exit 0 with stderr notice (defensive bypass).
+#           V11_WAVE_CHECK_COVERAGE=off reports unreviewed reviewable tasks without exiting 2.
+#           V11_WAVE_CHECK_WAIVER_COVERAGE=off stops waivers counting as coverage.
+#           V11_WAVE_CHECK_EPOCH_BINDING=off binds review_of (and task-state entries)
+#           by (session, task_id) claim alone, even where a restart reused the id.
+# Stricter: V11_WAVE_CHECK_SKIP_REVIEW_STRICT=on counts skip_review without a
+#           metadata.skip_review_reason, on a task at the pairing threshold, as unreviewed.
 #
 # V11.21 — gate-1 (T3). Authored by spec-implementer-v11.
 
 from __future__ import annotations
 
 import fcntl
+import hashlib
 import json
 import os
 import re
@@ -37,6 +84,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+sys.dont_write_bytecode = True
+sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
+try:
+    import task_epoch  # S2-T0b-3: the shared (session, task_id) resolver
+except ImportError:
+    task_epoch = None
+
 EXIT_OK = 0
 EXIT_WORK_INCOMPLETE = 1
 EXIT_REVIEW_INCOMPLETE = 2
@@ -45,6 +99,15 @@ EXIT_BAD_USAGE = 4
 
 HOME = Path.home()
 HERCULES = Path(os.environ.get("HERCULES_ROOT", HOME))
+
+# Same project-name rule as hooks/lib/common.sh (improvements/59).
+PROJECT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+TERMINAL = ("completed", "cancelled")
+SPRINT_TAG_RE = re.compile(r"^sprint-0*(\d+)(?:-|$)")
+WAVE_TAG_RE = re.compile(r"^(?:w(?:ave)?[-_ ]?)?0*(\d+)$", re.IGNORECASE)
+# V11.21 auto-pair guard (hooks/sync-tasks): these tiers get a review sibling.
+REVIEWABLE_RISK = ("medium", "high")
+REVIEWABLE_COMPLEXITY = ("medium", "complex", "novel")
 
 
 def task_state_path(project: str) -> Path:
@@ -57,18 +120,33 @@ def task_state_path(project: str) -> Path:
 
 
 def parse_wave_arg(raw: str) -> str:
-    """Accept 02 / 2 / sprint-02-foo and return the numeric WAVE key (2-digit string)."""
-    m = re.match(r"(?:sprint-)?0*(\d+)", raw)
+    """Accept 02 / 2 / S2 / sprint-02-foo and return the numeric WAVE key (2-digit string)."""
+    m = re.match(r"(?:sprint-|s)?0*(\d+)", raw, re.IGNORECASE)
     if not m:
         return raw
     return f"{int(m.group(1)):02d}"
 
 
-def sprint_matches_wave(sprint: str | None, wave: str) -> bool:
-    """sprint field starts with sprint-NN or equals sprint-NN-anything."""
-    if not sprint:
+def task_in_wave(meta: dict[str, Any], wave: str) -> bool:
+    """A sprint-NN tag decides; only an untagged task falls back to metadata.wave.
+
+    Precedence keeps a project that uses metadata.wave for sub-waves inside a
+    sprint (W1..W4 of sprint-01) from leaking sprint-01's W2 into wave 02.
+    """
+    sprint = meta.get("sprint")
+    m = SPRINT_TAG_RE.match(sprint) if isinstance(sprint, str) else None
+    if m:
+        # Numeric, so an unpadded "sprint-1-x" is wave 01 like "sprint-01-x".
+        return wave.isdigit() and int(m.group(1)) == int(wave)
+    tag = meta.get("wave")
+    if tag is None or isinstance(tag, bool) or not wave.isdigit():
         return False
-    return sprint == f"sprint-{wave}" or sprint.startswith(f"sprint-{wave}-")
+    m = WAVE_TAG_RE.match(str(tag).strip())
+    return bool(m) and int(m.group(1)) == int(wave)
+
+
+def truthy(value: Any) -> bool:
+    return value is True or str(value).strip().lower() in ("true", "1", "yes", "on")
 
 
 def severity_rank(sev: str | None) -> int:
@@ -85,8 +163,12 @@ def extract_self_review_severity(task: dict[str, Any]) -> str | None:
 def extract_adversarial_severity(task: dict[str, Any]) -> str | None:
     """Return the worst severity in the adversarial review verdict's errors list, else verdict-level."""
     artifacts = (task.get("metadata") or {}).get("artifacts") or {}
-    review = artifacts.get("review") or {}
-    if not review:
+    return verdict_severity(artifacts.get("review"))
+
+
+def verdict_severity(review: Any) -> str | None:
+    """Worst severity of one review verdict: its errors, else its verdict word."""
+    if not isinstance(review, dict) or not review:
         return None
     worst = None
     for err in review.get("errors") or []:
@@ -106,6 +188,119 @@ def extract_adversarial_severity(task: dict[str, Any]) -> str | None:
     return "NONE"
 
 
+VERDICT_WORDS = ("PASS", "ISSUES_FOUND", "BLOCKED")
+
+
+def inline_verdict(task: dict[str, Any]) -> dict[str, Any] | None:
+    """metadata.artifacts.review when it is a real verdict (a verdict word or an
+    errors list), not an empty or partial object."""
+    review = ((task.get("metadata") or {}).get("artifacts") or {}).get("review")
+    if isinstance(review, dict) and (review.get("verdict") in VERDICT_WORDS
+                                     or isinstance(review.get("errors"), list)):
+        return review
+    return None
+
+
+def summary_reviewed(task: dict[str, Any]) -> bool:
+    """The completion's review_summary_delta says a review ran. These counts
+    survive the ledger's PIPE_BUF cap when the verdict body doesn't (#102)."""
+    rsd = task.get("review_summary_delta")
+    try:
+        return isinstance(rsd, dict) and int(rsd.get("tasks_reviewed") or 0) > 0
+    except (TypeError, ValueError):
+        return False
+
+
+def summary_severity(task: dict[str, Any]) -> str | None:
+    """Worst severity counted in the completion's review_summary_delta."""
+    by = (task.get("review_summary_delta") or {}).get("by_severity") \
+        if isinstance(task.get("review_summary_delta"), dict) else None
+    if not isinstance(by, dict):
+        return None
+    for sev in ("critical", "high", "medium", "low"):
+        try:
+            if int(by.get(sev) or 0) > 0:
+                return sev.upper()
+        except (TypeError, ValueError):
+            continue
+    return "NONE"
+
+
+def event_verdict(task: dict[str, Any]) -> str | None:
+    """"review" or "waived" for the latest ledger ev:"review" on this identity."""
+    if task.get("last_review_severity") is None and task.get("last_review_outcome") is None:
+        return None
+    return "waived" if str(task.get("last_review_outcome") or "").lower() == "waived" else "review"
+
+
+_VERDICT_FILE_WARNED: set[str] = set()
+
+
+def verdict_file(project: str, task: dict[str, Any]) -> tuple[dict[str, Any] | None, str]:
+    """(verdict, status) for the file the task's latest ev:"review" references
+    (review-queue mark-done --verdict-file writes it and records its sha256).
+
+    status: "none" (no ref), "outside" (not under
+    .agent-metrics/review-verdicts/PROJECT/, never read), "missing",
+    "unreadable", "sha mismatch" (changed since the event recorded it; not
+    trusted), or "ok".
+    """
+    ref = task.get("last_review_verdict_ref")
+    if not isinstance(ref, str) or not ref:
+        return None, "none"
+    root = (HERCULES / ".agent-metrics" / "review-verdicts" / project).resolve()
+    try:
+        path = Path(ref).resolve()
+    except (OSError, RuntimeError):
+        return None, "unreadable"
+    if root not in path.parents:
+        return None, "outside"
+    try:
+        if not path.is_file():
+            return None, "missing"
+        if path.stat().st_size > 2_000_000:
+            return None, "unreadable"
+        raw = path.read_bytes()
+    except OSError:
+        return None, "unreadable"
+    want = task.get("last_review_verdict_sha")
+    if isinstance(want, str) and want and hashlib.sha256(raw).hexdigest() != want.strip().lower():
+        return None, "sha mismatch"
+    try:
+        data = json.loads(raw.decode("utf-8", errors="replace"))
+    except ValueError:
+        return None, "unreadable"
+    if isinstance(data, dict) and "errors" not in data and isinstance(data.get("review"), dict):
+        data = data["review"]
+    return (data, "ok") if isinstance(data, dict) else (None, "unreadable")
+
+
+def worst_verdict(task: dict[str, Any], project: str) -> tuple[str | None, str]:
+    """(worst severity, where it came from) over every verdict on record for
+    this task, in the order the ledger keeps them: its artifacts.review, the
+    completion's review_summary_delta (what survives the PIPE_BUF cap that
+    drops a large verdict, #102), and its latest ev:"review": the event's
+    review_severity plus the verdict file it references, checked against the
+    event's verdict_sha."""
+    verdict, status = verdict_file(project, task)
+    ref = str(task.get("last_review_verdict_ref") or "")
+    if status not in ("none", "ok") and ref not in _VERDICT_FILE_WARNED:
+        _VERDICT_FILE_WARNED.add(ref)
+        print(f"[wave-check] WARNING — task {task.get('task_id')}: verdict file {status} ({ref}); "
+              f"using the ledger's review_severity only", file=sys.stderr)
+    found: list[tuple[str | None, str]] = [
+        (extract_adversarial_severity(task), ""),
+        (summary_severity(task), "summary counts"),
+        (task.get("last_review_severity"), "review event"),
+        (verdict_severity(verdict), "verdict file"),
+    ]
+    worst: tuple[str | None, str] = (None, "")
+    for sev, src in found:
+        if sev and (worst[0] is None or severity_rank(sev) > severity_rank(worst[0])):
+            worst = (sev, src)
+    return worst
+
+
 def is_review_task(task: dict[str, Any]) -> bool:
     meta = task.get("metadata") or {}
     if meta.get("review_of"):
@@ -114,36 +309,778 @@ def is_review_task(task: dict[str, Any]) -> bool:
     return agent.startswith("adversarial-")
 
 
-def collect_wave_tasks(state: dict[str, Any], wave: str) -> list[tuple[str, dict[str, Any]]]:
-    """Yield (task_id, task) pairs whose sprint matches the wave."""
-    out: list[tuple[str, dict[str, Any]]] = []
-    # Modern aggregate: open_tasks + completed map
+def task_state_entries(state: dict[str, Any]) -> list[tuple[str, str | None, dict[str, Any]]]:
+    """(task_id, session_uuid or None, record) for every task-state entry."""
+    out: list[tuple[str, str | None, dict[str, Any]]] = []
+    seen: set[tuple[str | None, str]] = set()
     for key in ("open_tasks", "completed", "blocked_tasks"):
         bucket = state.get(key) or {}
         if isinstance(bucket, dict):
-            items = bucket.items()
+            items = ((tid, None, t) for tid, t in bucket.items())
         elif key == "open_tasks" and isinstance(bucket, list):
             # improvements/18: open_tasks may be a list[record] (the
             # cross-session aggregate's collision-safe flat view, each
-            # record carrying its own task_id field) instead of
+            # record carrying its own task_id + session_uuid) instead of
             # dict[task_id]->record.
-            items = ((t.get("task_id"), t) for t in bucket if isinstance(t, dict))
+            items = ((t.get("task_id"), t.get("session_uuid"), t) for t in bucket if isinstance(t, dict))
         else:
             continue
-        for tid, t in items:
+        for tid, sess, t in items:
             if tid is None or not isinstance(t, dict):
                 continue
-            if sprint_matches_wave((t.get("metadata") or {}).get("sprint"), wave):
-                out.append((str(tid), t))
-    # De-duplicate (a task may appear in multiple buckets across cycles)
-    seen: set[str] = set()
-    uniq: list[tuple[str, dict[str, Any]]] = []
-    for tid, t in out:
-        if tid in seen:
+            # A task may appear in multiple buckets across cycles.
+            k = (str(sess) if sess else None, str(tid))
+            if k in seen:
+                continue
+            seen.add(k)
+            out.append((k[1], k[0], t))
+    return out
+
+
+def ledger_task(rec: dict[str, Any]) -> dict[str, Any]:
+    """A v11_replay_ledger identity record in wave-check's task shape.
+
+    The ledger carries artifacts at the event's top level; they are folded
+    into metadata.artifacts, where the severity extractors look.
+    """
+    meta = dict(rec.get("metadata") or {})
+    arts: dict[str, Any] = {}
+    if isinstance(rec.get("artifacts"), dict):
+        arts.update(rec["artifacts"])
+    if isinstance(meta.get("artifacts"), dict):
+        arts.update(meta["artifacts"])
+    if arts:
+        meta["artifacts"] = arts
+    if not meta.get("sprint") and rec.get("sprint"):
+        meta["sprint"] = rec["sprint"]
+    last_ids = {str(s): str(t) for s, t in (rec.get("task_id_by_session") or {}).items() if t is not None}
+    claims = set(last_ids.items())
+    tid = "" if rec.get("task_id") is None else str(rec["task_id"])
+    sess = str(rec["session_uuid"]) if rec.get("session_uuid") else None
+    if tid:
+        claims.add((sess, tid))
+    # S1-T2c: every id the identity was created under also claims it —
+    # task_id_by_session keeps only the last id per session, and a restart
+    # that renumbers the TaskList under the same hook session re-creates it.
+    created = [c for c in rec.get("created_claims") or []
+               if isinstance(c, dict) and c.get("session_uuid") and c.get("task_id") not in (None, "")]
+    if epoch_binding_on():
+        claims.update((str(c["session_uuid"]), str(c["task_id"])) for c in created)
+    return {
+        "task_id": tid,
+        "claims": claims,
+        "last_ids": last_ids,
+        "created": created,
+        "subject_norm": rec.get("subject_norm"),
+        "create_seq": rec.get("create_seq"),
+        "ledger_status": rec.get("status"),
+        "status": rec.get("status") or "pending",
+        "subject": rec.get("subject") or "",
+        "metadata": meta,
+        "last_review_severity": rec.get("last_review_severity"),
+        "last_review_outcome": rec.get("last_review_outcome"),
+        "last_review_verdict_ref": rec.get("last_review_verdict_ref"),
+        "last_review_verdict_sha": rec.get("last_review_verdict_sha"),
+        "review_summary_delta": rec.get("review_summary_delta"),
+        "cancelled_reason": rec.get("cancelled_reason"),
+        "cancelled_outcome": rec.get("cancelled_outcome"),
+        "cancelled_waiver_reason": rec.get("cancelled_waiver_reason"),
+        "source": "ledger",
+    }
+
+
+def match_ledger_task(
+    tid: str, sess: str | None, by_tid: dict[str, list[dict[str, Any]]],
+    tix: Any = None, entry: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    """The one ledger identity a task-state entry names, or None.
+
+    With a session_uuid the (session, task_id) claim is exact; a dict-shaped
+    (session-less) entry matches by task_id alone. Two or more claimants is
+    ambiguous (task ids repeat across sessions, and within one after a
+    TaskList wipe) and matches nothing, the same refusal v11_replay_ledger
+    applies to ambiguous (session_uuid, task_id) pairs. S1-T2c: with a
+    session, the row is the aggregate's open entry for an identity whose
+    last id in that session is tid, so the one open claimant whose last id
+    it is takes it (review #3: a stale open identity whose id was reused
+    must not merge into the newer task). The id's current holder (the
+    claimant created under it last, epoch_owner) breaks a tie, or decides
+    when no open claimant ends on tid.
+
+    S2-T0b-3 (#113): with the shared resolver (tix, a task_epoch.TaskIndex),
+    an entry stamped with its identity binds it (R0); otherwise the one open
+    claimant ending on tid, else the claimant task_epoch.resolve binds in the
+    entry's TaskList epoch (R1) or the session's current one (R4).
+    V11_TASK_RESOLVER=legacy keeps epoch_owner.
+    """
+    cands = by_tid.get(tid, [])
+    if sess:
+        cands = [lt for lt in cands if (sess, tid) in lt["claims"]]
+        if len(cands) > 1 and epoch_binding_on():
+            open_last = [lt for lt in cands
+                         if lt["ledger_status"] not in TERMINAL and lt["last_ids"].get(sess) == tid]
+            if tix is not None:
+                by_ident = {identity_of(lt): lt for lt in cands}
+                ident = (entry or {}).get("identity")
+                if isinstance(ident, dict):
+                    res = tix.resolve(None, tid, identity=(ident.get("subject_norm"), ident.get("create_seq")))
+                    if res.status == "bound" and res.identity in by_ident:
+                        return by_ident[res.identity]
+                if len(open_last) == 1:
+                    return open_last[0]
+                res = tix.resolve(sess, tid, epoch=task_epoch.tl_epoch_of(entry or {}),
+                                  subject=(entry or {}).get("subject") or None)
+                lt = by_ident.get(res.identity) if res.status == "bound" else None
+                return lt if lt is not None and lt in (open_last or cands) else None
+            if len(open_last) == 1:
+                return open_last[0]
+            return epoch_owner(open_last or cands, sess, tid)
+    return cands[0] if len(cands) == 1 else None
+
+
+def identity_of(lt: dict[str, Any]) -> tuple[Any, Any]:
+    return (lt.get("subject_norm"), lt.get("create_seq"))
+
+
+def resolver_shared() -> bool:
+    return os.environ.get("V11_TASK_RESOLVER", "shared") != "legacy"
+
+
+def task_index(project: str, identities: list[dict[str, Any]]) -> Any:
+    """The shared resolver's index of the project ledger (S2-T0b-3), or None
+    under V11_TASK_RESOLVER=legacy, V11_WAVE_CHECK_EPOCH_BINDING=off, or
+    when it cannot be built (then the v11.46 epoch_owner rule applies)."""
+    if task_epoch is None or not resolver_shared() or not epoch_binding_on():
+        return None
+    try:
+        return task_epoch.TaskIndex.from_ledger(
+            project, metrics_dir=str(HERCULES / ".agent-metrics"), identities=identities)
+    except (OSError, ValueError) as exc:
+        print(f"[wave-check] WARNING — task_epoch index unavailable ({exc}); "
+              f"binding reused ids by created order", file=sys.stderr)
+        return None
+
+
+def epoch_binding_on() -> bool:
+    return os.environ.get("V11_WAVE_CHECK_EPOCH_BINDING", "on").lower() != "off"
+
+
+_FLOOR = datetime.min.replace(tzinfo=timezone.utc)
+
+
+def epoch_key(created: dict[str, Any]) -> tuple[datetime, int]:
+    """Where one `created` event sits in v11_replay_ledger's order: UTC
+    instant, seqno tiebreak (improvements/60)."""
+    try:
+        d = datetime.fromisoformat(str(created.get("ts")).replace("Z", "+00:00"))
+        d = d.replace(tzinfo=timezone.utc) if d.tzinfo is None else d.astimezone(timezone.utc)
+    except (TypeError, ValueError):
+        d = _FLOOR
+    try:
+        seq = int(created.get("seqno") or 0)
+    except (TypeError, ValueError):
+        seq = 0
+    return (d, seq)
+
+
+def epoch_owner(
+    claimants: list[dict[str, Any]], sess: str, tid: str, bound: tuple[datetime, float] | None = None
+) -> dict[str, Any] | None:
+    """The claimant of (sess, tid) whose latest `created` under that id comes
+    last before `bound` (None: ever), or None when that is undecidable: a
+    claimant never created under the id (its claim came from a status event),
+    none created before the bound, or a tie. The v11.46 rule, used only under
+    V11_TASK_RESOLVER=legacy (task_epoch.py R2 is the same rule); it goes
+    with that lever at S3/S4."""
+    best: tuple[tuple[datetime, int], dict[str, Any]] | None = None
+    tie = False
+    for lt in claimants:
+        marks = [epoch_key(c) for c in lt.get("created") or []
+                 if str(c.get("session_uuid")) == sess and str(c.get("task_id")) == tid]
+        if not marks:
+            return None
+        prior = [m for m in marks if bound is None or m < bound]
+        if not prior:
             continue
-        seen.add(tid)
-        uniq.append((tid, t))
-    return uniq
+        if best is None or max(prior) > best[0]:
+            best, tie = (max(prior), lt), False
+        elif max(prior) == best[0]:
+            tie = True
+    return None if best is None or tie else best[1]
+
+
+def bind_review_epochs(ledger_tasks: list[dict[str, Any]], by_tid: dict[str, list[dict[str, Any]]],
+                       tix: Any = None) -> None:
+    """S1-T2c: stamp review_binding {session: parent} on each ledger review
+    whose review_of names an id two or more identities held in that session.
+
+    A restart that renumbers the TaskList under the same hook session reuses
+    ids, so (session, review_of) alone credited Review 69 of old #3 (S1-T1)
+    to the new #3 as well. The review binds to the claimant created under
+    that id last before the review's own earliest `created` carrying this
+    review_of (earliest: a review rehydrated with a stale review_of keeps its
+    first epoch). hooks/sync-tasks writes a pair_ shadow inside its parent's
+    TaskCreate with the same ts, just BEFORE the parent's created, so for a
+    shadow a claimant created at the same instant also precedes. Undecidable
+    (see epoch_owner) leaves no binding, and reviews_parent keeps its
+    claim-only rule. Rollback: V11_WAVE_CHECK_EPOCH_BINDING=off.
+    S2-T0b-3 (#113): with tix the binding is task_epoch.resolve at that
+    created: its TaskList epoch (R1) and position (ts, seqno), +inf for a
+    shadow; V11_TASK_RESOLVER=legacy keeps epoch_owner.
+    """
+    if not epoch_binding_on():
+        return
+    for rt in ledger_tasks:
+        ro = (rt.get("metadata") or {}).get("review_of")
+        if ro in (None, ""):
+            continue
+        ro = str(ro)
+        binding: dict[str, dict[str, Any]] = {}
+        for sess in {c[0] for c in rt["claims"] if c[0]}:
+            claimants = [lt for lt in by_tid.get(ro, []) if lt is not rt and (sess, ro) in lt["claims"]]
+            own = [epoch_key(c) for c in rt["created"]
+                   if str(c.get("session_uuid")) == sess and str(c.get("review_of")) == ro]
+            if len(claimants) < 2 or not own:
+                continue
+            at, seq = min(own)
+            bound = (at, float("inf")) if is_pair_shadow(rt) else (at, seq)
+            if tix is not None:
+                first = min((c for c in rt["created"]
+                             if str(c.get("session_uuid")) == sess and str(c.get("review_of")) == ro),
+                            key=epoch_key)
+                res = tix.resolve(sess, ro, epoch=task_epoch.tl_epoch_of(first), at=bound)
+                by_ident = {identity_of(lt): lt for lt in claimants}
+                owner = by_ident.get(res.identity) if res.status == "bound" else None
+            else:
+                owner = epoch_owner(claimants, sess, ro, bound)
+            if owner is not None:
+                binding[sess] = owner
+        if binding:
+            rt["review_binding"] = binding
+
+
+def has_wave_tag(meta: dict[str, Any]) -> bool:
+    """A parseable sprint-NN tag or metadata.wave, i.e. the task is in some wave."""
+    sprint = meta.get("sprint")
+    if isinstance(sprint, str) and SPRINT_TAG_RE.match(sprint):
+        return True
+    tag = meta.get("wave")
+    return (tag is not None and not isinstance(tag, bool)
+            and bool(WAVE_TAG_RE.match(str(tag).strip())))
+
+
+def collect_wave_tasks(
+    state: dict[str, Any], wave: str, identities: list[dict[str, Any]] | None = None,
+    tix: Any = None,
+) -> tuple[list[tuple[str, dict[str, Any]]], list[dict[str, Any]]]:
+    """((task_id, task) pairs in the wave, open tasks in no wave at all).
+
+    The wave's tasks are ledger identities merged with task-state.
+
+    The ledger replay is the source of truth and the only place a closed
+    task survives (the aggregate keeps completed as a count). A task-state
+    entry that names a ledger identity merges into it: the ledger's terminal
+    status and metadata win, except that task-state "completed" over a
+    ledger that never saw the close keeps the task completed, which is the
+    terminal-but-open case GATE_AUTOCLOSE backstops. Unmatched task-state
+    entries (ledger-less projects) stand on their own.
+    """
+    ledger_tasks = [ledger_task(r) for r in (identities or [])]
+    by_tid: dict[str, list[dict[str, Any]]] = {}
+    for lt in ledger_tasks:
+        for tid in {c[1] for c in lt["claims"]}:
+            by_tid.setdefault(tid, []).append(lt)
+    bind_review_epochs(ledger_tasks, by_tid, tix)
+
+    state_only: list[dict[str, Any]] = []
+    for tid, sess, t in task_state_entries(state):
+        ts_meta = t.get("metadata") if isinstance(t.get("metadata"), dict) else {}
+        ts_status = t.get("status") or "pending"
+        lt = match_ledger_task(tid, sess, by_tid, tix, t)
+        if lt is None:
+            state_only.append({
+                "task_id": tid,
+                "claims": {(sess, tid)},
+                "subject_norm": None,
+                "create_seq": None,
+                "ledger_status": None,
+                "status": ts_status,
+                "subject": t.get("subject") or "",
+                "metadata": ts_meta,
+                "last_review_severity": None,
+                "source": "task-state",
+            })
+            continue
+        lt["source"] = "ledger+task-state"
+        if sess:
+            # A session-less (dict-shaped) entry adds no claim: (None, tid)
+            # would bind review_of=tid from every session to this identity.
+            lt["claims"].add((sess, tid))
+        if lt["ledger_status"] not in TERMINAL and ts_status == "completed":
+            lt["status"] = "completed"
+        arts = dict(ts_meta.get("artifacts") or {})
+        arts.update(lt["metadata"].get("artifacts") or {})
+        merged = {**ts_meta, **lt["metadata"]}
+        if arts:
+            merged["artifacts"] = arts
+        lt["metadata"] = merged
+
+    everything = ledger_tasks + state_only
+    untagged = [t for t in everything
+                if (t.get("status") or "pending") not in TERMINAL and not has_wave_tag(t["metadata"])]
+    return [(t["task_id"], t) for t in everything if task_in_wave(t["metadata"], wave)], untagged
+
+
+def reviews_parent(rt: dict[str, Any], parent: dict[str, Any]) -> bool:
+    """rt's metadata.review_of names parent.
+
+    review_of is the parent's session-local task_id, so it binds through a
+    (session, task_id) claim of the parent; a session-less side (dict-shaped
+    task-state) falls back to task_id alone. When the id was reused in that
+    session, only the epoch owner bind_review_epochs chose binds (S1-T2c).
+    """
+    ro = (rt.get("metadata") or {}).get("review_of")
+    if ro in (None, "") or rt is parent:
+        return False
+    ro = str(ro)
+    claims = parent.get("claims") or set()
+    if (None, ro) in claims:
+        return True
+    tids = {c[1] for c in claims}
+    sessions = {c[0] for c in (rt.get("claims") or set())} or {None}
+    binding = rt.get("review_binding") or {}
+    return any((s is None and ro in tids)
+               or ((s, ro) in claims and binding.get(s, parent) is parent)
+               for s in sessions)
+
+
+def is_pair_shadow(task: dict[str, Any]) -> bool:
+    """A hooks/sync-tasks auto-pair sibling (pair_<sid8>_<n>_<hex>).
+
+    It is not a TaskList task, so no reviewer can TaskUpdate it, and its
+    pending_parent -> pending activation is written only to the per-session
+    scratch, never to the ledger. Its state is judged from its parent.
+    """
+    return str(task.get("task_id") or "").startswith("pair_")
+
+
+def stand_ins(shadow: dict[str, Any], review_tasks: list[tuple[str, dict[str, Any]]]) -> list[dict[str, Any]]:
+    """Real review tasks naming this pair_ shadow in metadata.pair_shadow, from
+    a session the shadow lives in."""
+    sid = str(shadow.get("task_id") or "")
+    sessions = {c[0] for c in (shadow.get("claims") or set())}
+    out = []
+    for _rtid, rt in review_tasks:
+        if rt is shadow or is_pair_shadow(rt):
+            continue
+        if str((rt.get("metadata") or {}).get("pair_shadow") or "") != sid:
+            continue
+        rt_sessions = {c[0] for c in (rt.get("claims") or set())}
+        if None in sessions or None in rt_sessions or sessions & rt_sessions:
+            out.append(rt)
+    return out
+
+
+def review_siblings(
+    work: dict[str, Any], review_tasks: list[tuple[str, dict[str, Any]]]
+) -> list[dict[str, Any]]:
+    """Review tasks for this work task: those whose review_of names it, plus
+    real review tasks that name one of its pair_ shadows in pair_shadow."""
+    out = [rt for _rtid, rt in review_tasks if reviews_parent(rt, work)]
+    seen = {id(rt) for rt in out}
+    for shadow in [rt for rt in out if is_pair_shadow(rt)]:
+        for rt in stand_ins(shadow, review_tasks):
+            if id(rt) not in seen:
+                seen.add(id(rt))
+                out.append(rt)
+    return out
+
+
+def has_review_relation(rt: dict[str, Any]) -> bool:
+    """A review of something: review_of, a pair_shadow it stands in for, or a
+    hook shadow. Fixers and sprint-close reviewers have none."""
+    meta = rt.get("metadata") or {}
+    return (meta.get("review_of") not in (None, "") or bool(meta.get("pair_shadow"))
+            or is_pair_shadow(rt))
+
+
+def own_verdict(task: dict[str, Any]) -> bool:
+    """A verdict on the task's own record: a real artifacts.review, the
+    completion's review_summary_delta, or a non-waived ev:"review"."""
+    return bool(inline_verdict(task)) or summary_reviewed(task) or event_verdict(task) == "review"
+
+
+# A cancellation that waives the review rather than just closing the task.
+WAIVER_REASON_RE = re.compile(r"^\s*(waived|inv-7)\b", re.IGNORECASE)
+
+
+def waiver_cancel(task: dict[str, Any]) -> str | None:
+    """The waiver behind a cancellation, or None. Accepted: the cancel event's
+    outcome=waived, or a reason starting with "waived" or "INV-7". Anything
+    else (align-aggregate's phantom cleanup, a hand cancel) is not a review."""
+    if task.get("status") != "cancelled":
+        return None
+    if str(task.get("cancelled_outcome") or "").lower() == "waived":
+        return str(task.get("cancelled_waiver_reason") or task.get("cancelled_reason") or "outcome=waived")
+    reason = str(task.get("cancelled_reason") or "")
+    return reason if WAIVER_REASON_RE.match(reason) else None
+
+
+def owes_verdict(rt: dict[str, Any], parents: list[dict[str, Any]], work_ids: set[int]) -> bool:
+    """A completed review of work owes a verdict. A fix task whose review_of
+    names the review it answers (the orchestrator's convention for review
+    fixes) reviews nothing; with no parent resolved, only reviewer agents owe
+    one."""
+    if not has_review_relation(rt):
+        return False
+    if parents:
+        return any(id(p) in work_ids for p in parents)
+    return str((rt.get("metadata") or {}).get("agent") or "").startswith("adversarial-")
+
+
+def review_task_verdict(rt: dict[str, Any], parents: list[dict[str, Any]]) -> str | None:
+    """What a completed review task rests on: "verdict" (its own record, or the
+    latest ev:"review" on a task it reviews), "waived", "unchecked" (a
+    task-state-only record has no events to hold one), or None."""
+    if rt.get("source") == "task-state":
+        return "unchecked"
+    if own_verdict(rt) or any(event_verdict(p) == "review" for p in parents):
+        return "verdict"
+    if event_verdict(rt) == "waived" or any(event_verdict(p) == "waived" for p in parents):
+        return "waived"
+    return None
+
+
+def waivers_cover() -> bool:
+    return os.environ.get("V11_WAVE_CHECK_WAIVER_COVERAGE", "on").lower() != "off"
+
+
+def skip_review_strict() -> bool:
+    return os.environ.get("V11_WAVE_CHECK_SKIP_REVIEW_STRICT", "off").lower() == "on"
+
+
+def at_pairing_threshold(task: dict[str, Any]) -> bool:
+    """The V11.21 auto-pair tiers, whatever skip_review says."""
+    meta = task.get("metadata") or {}
+    return (str(meta.get("risk") or "").lower() in REVIEWABLE_RISK
+            or str(meta.get("complexity") or "").lower() in REVIEWABLE_COMPLEXITY)
+
+
+def skip_exempt(task: dict[str, Any]) -> bool:
+    """metadata.skip_review exempts a task from review, except under
+    V11_WAVE_CHECK_SKIP_REVIEW_STRICT=on for a task at the pairing threshold
+    that gives no metadata.skip_review_reason."""
+    meta = task.get("metadata") or {}
+    if not truthy(meta.get("skip_review")):
+        return False
+    if (skip_review_strict() and at_pairing_threshold(task)
+            and not str(meta.get("skip_review_reason") or "").strip()):
+        return False
+    return True
+
+
+def is_reviewable(task: dict[str, Any]) -> bool:
+    return not skip_exempt(task) and at_pairing_threshold(task)
+
+
+# Coverage kinds that are a checked review verdict ("reviewed"); "unchecked"
+# and "waived" cover the task but are reported in their own buckets.
+VERIFIED_KINDS = ("review-task", "review-event", "inline", "pair")
+
+
+def review_evidence(task: dict[str, Any], siblings: list[dict[str, Any]]) -> tuple[str, str] | None:
+    """(kind, detail) for how a work task was reviewed, or None. First match:
+
+      review-task   a real review task for it (review_of, or pair_shadow of its
+                    shadow) completed with a verdict on its own record
+      review-event  a non-waived ledger ev:"review" on it or a review task
+      inline        its own verdict (artifacts.review or review_summary_delta)
+      pair          its pair_ shadow completed with a verdict
+      unchecked     a task-state-only review task completed (no events to
+                    check a verdict in)
+      waived        an outcome=waived ev:"review" on it or a review task, or a
+                    shadow cancelled as a waiver; V11_WAVE_CHECK_WAIVER_COVERAGE
+                    =off stops this counting
+
+    A review task closed without a verdict (closed by hand, reviewer crashed,
+    shadow cancelled by align-aggregate) is not evidence. Every kind but
+    "pair" supersedes a pair_ shadow that is still open.
+    """
+    for s in siblings:
+        if (not is_pair_shadow(s) and s.get("status") == "completed"
+                and s.get("source") != "task-state" and own_verdict(s)):
+            return ("review-task", str(s.get("task_id")))
+    for x in [task, *siblings]:
+        if event_verdict(x) == "review":
+            where = "" if x is task else f" on {x.get('task_id')}"
+            return ("review-event", f"{x.get('last_review_severity')}{where}")
+    if inline_verdict(task) or summary_reviewed(task):
+        return ("inline", "verdict")
+    for s in siblings:
+        if is_pair_shadow(s) and s.get("status") == "completed" and own_verdict(s):
+            return ("pair", f"{s.get('task_id')} completed")
+    for s in siblings:
+        if not is_pair_shadow(s) and s.get("status") == "completed" and s.get("source") == "task-state":
+            return ("unchecked", f"review-task {s.get('task_id')}, task-state")
+    if waivers_cover():
+        for x in [task, *siblings]:
+            if event_verdict(x) == "waived":
+                return ("waived", f"ev:review on {x.get('task_id')}")
+        for s in siblings:
+            w = waiver_cancel(s)
+            if w:
+                return ("waived", f"{s.get('task_id')} cancelled: {w[:60]}")
+    return None
+
+
+def evidence_note(evidence: tuple[str, str]) -> str:
+    kind, detail = evidence
+    if kind == "unchecked":
+        return f"verdict unchecked ({detail})"
+    if kind == "waived":
+        return f"waived ({detail})"
+    return f"reviewed ({kind} {detail})"
+
+
+def work_coverage(
+    work_tasks: list[tuple[str, dict[str, Any]]],
+    review_tasks: list[tuple[str, dict[str, Any]]],
+) -> list[tuple[str, dict[str, Any], dict[str, Any]]]:
+    """(task_id, task, {"tier", "evidence", "open_review", "unreviewed", "note"}) per work task.
+
+    tier: "reviewable" (at the pairing threshold), "skip_review", "below"
+    (under the threshold), or "cancelled". Evidence is recorded for every
+    tier; only a completed reviewable task without it, and without a review
+    task still running, is unreviewed.
+    """
+    out = []
+    for tid, t in work_tasks:
+        status = t.get("status") or "pending"
+        if status == "cancelled":
+            tier = "cancelled"
+        elif skip_exempt(t):
+            tier = "skip_review"
+        else:
+            tier = "reviewable" if at_pairing_threshold(t) else "below"
+        siblings = review_siblings(t, review_tasks)
+        evidence = review_evidence(t, siblings)
+        running = [s for s in siblings
+                   if not is_pair_shadow(s) and (s.get("status") or "pending") not in TERMINAL]
+        open_review = str(running[0].get("task_id")) if running else None
+        if tier == "cancelled":
+            note = "cancelled"
+        elif evidence:
+            note = evidence_note(evidence)
+        elif tier == "reviewable":
+            if open_review:
+                note = f"review running ({open_review})"
+            elif status != "completed":
+                note = "review pending"
+            elif any(event_verdict(x) == "waived" or waiver_cancel(x) for x in [t, *siblings]):
+                note = "UNREVIEWED (waived; V11_WAVE_CHECK_WAIVER_COVERAGE=off)"
+            else:
+                dead = [str(s.get("task_id")) for s in siblings
+                        if is_pair_shadow(s) and s.get("status") == "cancelled"]
+                note = "UNREVIEWED" + (f" (shadow {dead[0]} cancelled, not a waiver)" if dead else "")
+        else:
+            note = "skip_review" if tier == "skip_review" else "not required"
+        unreviewed = (tier == "reviewable" and not evidence and not open_review
+                      and status == "completed")
+        out.append((tid, t, {"tier": tier, "evidence": evidence, "open_review": open_review,
+                             "unreviewed": unreviewed, "note": note}))
+    return out
+
+
+# review_state values that keep a wave open (exit 2 once all work is closed).
+OPEN_REVIEW_STATES = ("open", "awaiting review", "awaiting parent", "verdict missing")
+SHADOW_RESOLVED_STATES = ("reviewed", "superseded", "represented", "exempt")
+
+
+def review_parents(
+    rt: dict[str, Any], candidates: list[dict[str, Any]],
+    review_tasks: list[tuple[str, dict[str, Any]]],
+) -> list[dict[str, Any]]:
+    """Tasks this review task reviews: by review_of, or, for a stand-in,
+    through the pair_ shadow it names."""
+    out = [p for p in candidates if reviews_parent(rt, p)]
+    seen = {id(p) for p in out}
+    for _sid, sh in review_tasks:
+        if is_pair_shadow(sh) and any(x is rt for x in stand_ins(sh, review_tasks)):
+            for p in candidates:
+                if id(p) not in seen and reviews_parent(sh, p):
+                    seen.add(id(p))
+                    out.append(p)
+    return out
+
+
+def shadow_parent_state(
+    parents: list[dict[str, Any]], work_cov: dict[int, dict[str, Any]]
+) -> dict[str, str]:
+    """{state: why} for a pair_ shadow, judged from each parent."""
+    found: dict[str, str] = {}
+    for p in parents:
+        cov = work_cov.get(id(p))
+        pid = str(p.get("task_id"))
+        if cov is None:
+            found.setdefault("exempt", f"parent {pid} is a review")
+        elif skip_exempt(p):
+            found.setdefault("exempt", f"parent {pid} skip_review")
+        elif p.get("status") == "cancelled":
+            found.setdefault("exempt", f"parent {pid} cancelled")
+        elif p.get("status") != "completed":
+            found.setdefault("awaiting parent", f"parent {pid} {p.get('status') or 'pending'}")
+        elif cov["evidence"] and cov["evidence"][0] != "pair":
+            found.setdefault("superseded", evidence_note(cov["evidence"]))
+        elif cov["open_review"]:
+            found.setdefault("represented", f"review task {cov['open_review']}")
+        else:
+            found.setdefault("awaiting review", f"parent {pid} completed")
+    return found
+
+
+def classify_reviews(
+    coverage: list[tuple[str, dict[str, Any], dict[str, Any]]],
+    review_tasks: list[tuple[str, dict[str, Any]]],
+) -> None:
+    """Stamp review_state + review_note on every review task.
+
+    cancelled        closed; a waiver only when waiver_cancel() accepts it
+    completed        closed with a verdict on record (or task-state only:
+                     noted "verdict unchecked"), or a task that owes none
+                     (a review fix whose review_of names a review task)
+    waived           closed or resolved by an outcome=waived review
+    verdict missing  a review completed with no verdict on any record (its
+                     own artifacts.review, summary counts, or ev:"review",
+                     nor an ev:"review" on what it reviews): OPEN
+    open             a real review task not closed yet: OPEN
+
+    A pair_ shadow still open is judged from itself, its stand-in, then its
+    parent, because the ledger never records its activation (parent_status
+    stays pending_parent there):
+      reviewed / waived  an ev:"review" landed on the shadow itself
+      superseded         a stand-in (metadata.pair_shadow) completed with a
+                         verdict, or the parent was covered another way
+      represented        a real review task for it is still running
+      exempt             parent is skip_review or itself a review (INV-7; the
+                         hook minted these until S2-R1, #101), or parent cancelled
+      awaiting parent    parent not closed yet: OPEN
+      awaiting review    parent completed with no review: OPEN
+    A shadow whose parent is not in this wave stays open.
+    """
+    work_cov = {id(t): cov for _tid, t, cov in coverage}
+    work_ids = set(work_cov)
+    candidates = [t for _tid, t, _cov in coverage] + [t for _tid, t in review_tasks]
+    for _rtid, rt in review_tasks:
+        ro = (rt.get("metadata") or {}).get("review_of")
+        base = f"review_of {ro}" if ro not in (None, "") else "-"
+        status = rt.get("status") or "pending"
+        parents = review_parents(rt, candidates, review_tasks) if has_review_relation(rt) else []
+
+        def put(state: str, note: str) -> None:
+            rt["review_state"] = state
+            rt["review_note"] = note
+
+        if status == "cancelled":
+            w = waiver_cancel(rt)
+            put("cancelled", base + (f", waived ({w[:60]})" if w else
+                                     ", cancelled, not a waiver" if is_pair_shadow(rt) else ""))
+            continue
+        if status == "completed":
+            v = review_task_verdict(rt, parents) if owes_verdict(rt, parents, work_ids) else "verdict"
+            if v == "verdict":
+                put("completed", base)
+            elif v == "unchecked":
+                put("completed", base + ", task-state, verdict unchecked")
+            elif v == "waived":
+                put("waived", base + ", waived")
+            else:
+                found = shadow_parent_state(parents, work_cov) if is_pair_shadow(rt) else {}
+                if found and all(k in ("superseded", "exempt") for k in found):
+                    k = "superseded" if "superseded" in found else "exempt"
+                    put(k, f"{base}, completed with no verdict, shadow {k} ({found[k]})")
+                else:
+                    put("verdict missing", f"{base}, completed with no verdict")
+            continue
+        if not is_pair_shadow(rt):
+            put("open", base)
+            continue
+        # An open pair_ shadow. Resolved on its own: a verdict on the shadow,
+        # or a finished stand-in.
+        own = event_verdict(rt)
+        if own:
+            put("waived" if own == "waived" else "reviewed",
+                f"{base}, shadow {'waived' if own == 'waived' else 'reviewed'} "
+                f"(ev:review {rt.get('last_review_severity')} on the shadow)")
+            continue
+        subs = stand_ins(rt, review_tasks)
+        done = [x for x in subs if x.get("status") == "completed"
+                and review_task_verdict(x, parents) == "verdict"]
+        if done:
+            put("superseded", f"{base}, shadow superseded (stand-in review task {done[0].get('task_id')})")
+            continue
+        found = shadow_parent_state(parents, work_cov)
+        running = [x for x in subs if (x.get("status") or "pending") not in TERMINAL]
+        if running:
+            found.setdefault("represented", f"stand-in review task {running[0].get('task_id')}")
+        if not found:
+            put("open", base + ", shadow, parent not in wave")
+            continue
+        # Any unreviewed completed parent keeps it open.
+        for state in ("awaiting review", "awaiting parent", "represented", "superseded", "exempt"):
+            if state in found:
+                put(state, f"{base}, shadow {state} ({found[state]})")
+                break
+
+
+def report_wave(
+    wave: str,
+    review_tasks: list[tuple[str, dict[str, Any]]],
+    coverage: list[tuple[str, dict[str, Any], dict[str, Any]]],
+) -> None:
+    """One stdout line per wave task (id, status, kind, review note, subject),
+    then the stderr summary lines. Review tasks must be classified first."""
+    rows = [(tid, t, "work", cov["note"]) for tid, t, cov in coverage]
+    rows += [(tid, t, "review", t.get("review_note") or "-") for tid, t in review_tasks]
+    for tid, t, kind, note in rows:
+        subject = str(t.get("subject") or t.get("subject_norm") or "")
+        subject = " ".join("".join(c if c.isprintable() else " " for c in subject).split())[:80]
+        print(f"{tid}\t{t.get('status') or 'pending'}\t{kind}\t{note}\t{subject}")
+    sys.stdout.flush()  # table before the stderr verdict lines when both hit one terminal
+
+    work = [t for _, t, _ in coverage]
+    reviews = [t for _, t in review_tasks]
+    n_done = sum(1 for t in work if t.get("status") == "completed")
+    n_cancel = sum(1 for t in work if t.get("status") == "cancelled")
+    states = [t.get("review_state") for t in reviews]
+    n_ledger = sum(1 for t in work + reviews if t.get("source") != "task-state")
+    print(
+        f"[wave-check] wave {wave}: {len(work) + len(reviews)} task(s) ({n_ledger} from the ledger "
+        f"replay, {len(work) + len(reviews) - n_ledger} task-state only) — work {len(work)}: "
+        f"{n_done} completed, {n_cancel} cancelled, {len(work) - n_done - n_cancel} open; "
+        f"review {len(reviews)}: {states.count('completed')} completed, "
+        f"{states.count('cancelled')} cancelled, {states.count('waived')} waived, "
+        f"{sum(1 for s in states if s in OPEN_REVIEW_STATES)} open "
+        f"({states.count('verdict missing')} with no verdict), "
+        f"{sum(1 for s in states if s in SHADOW_RESOLVED_STATES)} pair_ shadow(s) "
+        f"reviewed/superseded/represented/exempt",
+        file=sys.stderr,
+    )
+    tiers = [cov["tier"] for _, _, cov in coverage]
+    reviewable = [cov for _, _, cov in coverage if cov["tier"] == "reviewable"]
+    kinds: dict[str, int] = {}
+    for cov in reviewable:
+        if cov["evidence"]:
+            kinds[cov["evidence"][0]] = kinds.get(cov["evidence"][0], 0) + 1
+    how = ", ".join(f"{k} {kinds[k]}" for k in VERIFIED_KINDS if k in kinds) or "none"
+    print(
+        f"[wave-check] review coverage — wave {wave}: "
+        f"{sum(1 for c in reviewable if c['evidence'])}/{len(reviewable)} reviewable work task(s) "
+        f"covered: reviewed {sum(kinds.get(k, 0) for k in VERIFIED_KINDS)} ({how}), "
+        f"waived {kinds.get('waived', 0)}, verdict unchecked {kinds.get('unchecked', 0)}; "
+        f"{tiers.count('skip_review')} skip_review, "
+        f"{tiers.count('below')} below the pairing threshold, {tiers.count('cancelled')} cancelled",
+        file=sys.stderr,
+    )
 
 
 def v11_home_dir() -> Path:
@@ -187,53 +1124,55 @@ def print_review_queue_pending(project: str) -> None:
     print(f"[wave-check] review-queue pending for project={project!r}: {count}", file=sys.stderr)
 
 
-def replay_ledger_by_task_id(ledger_file: Path, project: str) -> dict[str, dict[str, Any]]:
-    """Latest-wins replay of a project ledger, keyed by task_id.
+def replay_ledger_identities(project: str) -> list[dict[str, Any]] | None:
+    """Every task identity in the project ledger, closed ones included.
 
-    Mirrors the replay approach in scripts/lib/postcommit_analysis.py, but
-    indexes by task_id (rather than subject_norm+create_seq identity) since
-    that's the key wave-check already has from task-state. Each record
-    retains subject_norm/create_seq (needed to construct a valid closing
-    event) and the most recent non-empty metadata blob (carried on
-    "created" events per hooks/sync-tasks).
+    Runs the canonical fold, v11_replay_ledger (hooks/lib/common.sh), with
+    its opt-in V11_REPLAY_EMIT_IDENTITIES=on view, so wave-check keys tasks
+    exactly as the aggregate does: identity = (subject_norm, create_seq),
+    cancelled is terminal, subject_norm-less events heal through the
+    (session_uuid, task_id) index. It replaces a local task_id-keyed replay
+    that merged every session's task "2" into one record.
+
+    Returns [] when the project has no ledger, None when the replay could
+    not run (the caller then exits 4 rather than judge from task-state,
+    which lists only open tasks). Read-only.
     """
-    records: dict[str, dict[str, Any]] = {}
-    if not ledger_file.exists():
-        return records
+    if not ledger_path(project).exists():
+        return []
+    common_sh = v11_home_dir() / "hooks" / "lib" / "common.sh"
+    if not common_sh.exists():
+        print(f"[wave-check] ledger replay: common.sh not found at {common_sh} — "
+              f"cannot judge the wave", file=sys.stderr)
+        return None
+    env = dict(os.environ)
+    env["HERCULES_ROOT"] = str(HERCULES)
+    env["V11_HOME"] = str(v11_home_dir())
+    env["V11_REPLAY_EMIT_IDENTITIES"] = "on"
     try:
-        raw_lines = ledger_file.read_text(encoding="utf-8", errors="replace").split("\n")
-    except OSError:
-        return records
-
-    for raw in raw_lines:
-        raw = raw.strip()
-        if not raw:
-            continue
-        try:
-            ev = json.loads(raw)
-        except json.JSONDecodeError:
-            continue
-        if not isinstance(ev, dict) or ev.get("v") != 1 or ev.get("project") != project:
-            continue
-        tid = ev.get("task_id") or ""
-        if not tid:
-            continue
-        rec = records.setdefault(
-            tid, {"status": "unknown", "subject_norm": "", "create_seq": None, "metadata": {}}
+        result = subprocess.run(
+            ["bash", "-c", 'source "$1" && v11_replay_ledger "$2"', "bash", str(common_sh), project],
+            capture_output=True, text=True, timeout=60, env=env,
         )
-        ev_type = ev.get("ev", "")
-        if ev_type in ("pending", "in_progress", "completed", "blocked"):
-            rec["status"] = ev_type
-        elif ev_type == "created" and rec["status"] == "unknown":
-            rec["status"] = "pending"
-        if ev.get("subject_norm"):
-            rec["subject_norm"] = ev["subject_norm"]
-        if ev.get("create_seq") is not None:
-            rec["create_seq"] = ev["create_seq"]
-        meta = ev.get("metadata")
-        if isinstance(meta, dict) and meta:
-            rec["metadata"] = meta
-    return records
+    except (OSError, subprocess.SubprocessError) as exc:
+        print(f"[wave-check] ledger replay raised: {exc} — cannot judge the wave", file=sys.stderr)
+        return None
+    if result.returncode != 0:
+        err = (result.stderr.strip().splitlines() or ["no stderr"])[-1]
+        print(f"[wave-check] ledger replay failed (exit {result.returncode}): {err} — "
+              f"cannot judge the wave", file=sys.stderr)
+        return None
+    try:
+        agg = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        print("[wave-check] ledger replay emitted invalid JSON — cannot judge the wave", file=sys.stderr)
+        return None
+    identities = agg.get("identities") if isinstance(agg, dict) else None
+    if not isinstance(identities, list):
+        print(f"[wave-check] ledger replay has no identity view ({common_sh} predates "
+              f"V11_REPLAY_EMIT_IDENTITIES) — cannot judge the wave", file=sys.stderr)
+        return None
+    return [r for r in identities if isinstance(r, dict)]
 
 
 def append_gate_close_event(project: str, event: dict[str, Any]) -> bool:
@@ -281,7 +1220,9 @@ def close_terminal_but_open_tasks(
     Reuses the exact append pattern hooks/post-commit-close-tasks uses:
     ev=completed, caller_kind="hook". Never closes a task whose paired
     review sibling (metadata.review_of pointing at it) is open or carries
-    an unresolved CRITICAL adversarial verdict.
+    an unresolved CRITICAL adversarial verdict. Tasks are looked up by
+    ledger identity (subject_norm, create_seq), never by bare task_id,
+    which repeats across sessions.
 
     Concurrency: the whole read-decide-append critical section is serialized
     behind a dedicated flock (acquired BEFORE the ledger replay read, not
@@ -311,27 +1252,23 @@ def _close_terminal_but_open_tasks_locked(
     is held. Re-reading the ledger here (rather than reusing a snapshot taken
     before the lock) is what makes a second, lock-losing caller idempotent:
     once it acquires the lock, it sees the first caller's close events and
-    skips them via the rec.get("status") == "completed" check below.
+    skips them via the terminal-status check below.
     """
-    records = replay_ledger_by_task_id(ledger_path(project), project)
-    if not records:
+    identities = replay_ledger_identities(project)
+    if not identities:
         return
-
-    # sibling lookup: parent work task_id -> review task dict
-    siblings: dict[str, dict[str, Any]] = {}
-    for _rtid, rt in review_tasks:
-        parent = (rt.get("metadata") or {}).get("review_of")
-        if parent:
-            siblings[str(parent)] = rt
+    records = {(r.get("subject_norm"), r.get("create_seq")): r for r in identities}
 
     now_ts = datetime.now(timezone.utc).isoformat()
     closed: list[str] = []
 
-    for tid, _t in work_tasks:
-        rec = records.get(str(tid))
+    for tid, t in work_tasks:
+        if t.get("status") != "completed" or t.get("source") == "task-state":
+            continue  # cancelled, or never entered the ledger — nothing to backstop
+        rec = records.get((t.get("subject_norm"), t.get("create_seq")))
         if not rec:
-            continue  # never entered the ledger — nothing to backstop
-        if rec.get("status") == "completed":
+            continue
+        if rec.get("status") in TERMINAL:
             continue  # ledger already agrees; not terminal-but-open
 
         if not rec.get("subject_norm") or rec.get("create_seq") is None:
@@ -342,18 +1279,22 @@ def _close_terminal_but_open_tasks_locked(
             )
             continue
 
-        sib = siblings.get(str(tid))
-        if sib is not None:
-            if (sib.get("status") or "pending") != "completed":
-                continue  # unresolved review sibling — never close
-            adv_sev = extract_adversarial_severity(sib)
+        blocked = False
+        for sib in review_siblings(t, review_tasks):
+            if sib.get("review_state", "open") in OPEN_REVIEW_STATES:
+                blocked = True  # unresolved review sibling — never close
+                break
+            adv_sev = worst_verdict(sib, project)[0]
             if severity_rank(adv_sev) >= severity_rank("CRITICAL"):
                 print(
                     f"[wave-check] GATE_AUTOCLOSE: skipping task {tid} — paired review "
                     f"carries unresolved CRITICAL severity",
                     file=sys.stderr,
                 )
-                continue
+                blocked = True
+                break
+        if blocked:
+            continue
 
         event = {
             "v": 1,
@@ -362,7 +1303,7 @@ def _close_terminal_but_open_tasks_locked(
             "project": project,
             "subject_norm": rec["subject_norm"],
             "create_seq": rec["create_seq"],
-            "task_id": str(tid),
+            "task_id": str(rec.get("task_id") or tid),
             "session_uuid": "wave-check-gate",
             "counters_delta": {"in_progress": -1, "completed": 1},
             "closed_by": "wave-check",
@@ -394,24 +1335,47 @@ def main() -> int:
         return EXIT_BAD_USAGE
 
     project, raw_wave = sys.argv[1], sys.argv[2]
+    if not PROJECT_RE.match(project):
+        print(f"[wave-check] invalid project name: {project!r}", file=sys.stderr)
+        return EXIT_BAD_USAGE
     wave = parse_wave_arg(raw_wave)
 
     ts_path = task_state_path(project)
-    if not ts_path.exists():
-        print(f"[wave-check] task-state not found for project={project!r}: {ts_path}",
-              file=sys.stderr)
+    if not ts_path.exists() and not ledger_path(project).exists():
+        print(f"[wave-check] neither task-state nor ledger found for project={project!r}: "
+              f"{ts_path}, {ledger_path(project)}", file=sys.stderr)
         return EXIT_BAD_USAGE
 
-    try:
-        state = json.loads(ts_path.read_text())
-    except (OSError, json.JSONDecodeError) as e:
-        print(f"[wave-check] failed to read {ts_path}: {e}", file=sys.stderr)
-        return EXIT_BAD_USAGE
+    state: dict[str, Any] = {}
+    if ts_path.exists():
+        try:
+            state = json.loads(ts_path.read_text())
+        except (OSError, json.JSONDecodeError) as e:
+            print(f"[wave-check] failed to read {ts_path}: {e}", file=sys.stderr)
+            return EXIT_BAD_USAGE
+        if not isinstance(state, dict):
+            print(f"[wave-check] {ts_path} is not a JSON object", file=sys.stderr)
+            return EXIT_BAD_USAGE
 
     # V11 R3 mid-sprint visibility (best-effort, never affects exit code).
     print_review_queue_pending(project)
 
-    tasks = collect_wave_tasks(state, wave)
+    identities = replay_ledger_identities(project)
+    if identities is None:
+        # Task-state lists only open tasks: judging from it alone would drop
+        # every closed task's coverage and CRITICAL verdicts and could pass.
+        print(f"[wave-check] CANNOT VERIFY — {project!r} has a ledger but it could not be "
+              f"replayed; not judging wave {wave} from task-state alone", file=sys.stderr)
+        return EXIT_BAD_USAGE
+    tasks, untagged = collect_wave_tasks(state, wave, identities, task_index(project, identities))
+    if untagged:
+        # An open task with no parseable sprint-NN / wave tag is in no wave, so
+        # no gate would ever wait for it.
+        listed = ", ".join(f"{t['task_id']} {str(t.get('subject') or t.get('subject_norm') or '')[:40]!r}"
+                           for t in untagged[:5])
+        print(f"[wave-check] WARNING — {len(untagged)} open task(s) in {project!r} have no parseable "
+              f"sprint/wave tag (sprint-NN[-slug] or metadata.wave) and are in no wave: {listed}",
+              file=sys.stderr)
     if not tasks:
         print(f"[wave-check] no tasks found for project={project!r} wave={wave!r}",
               file=sys.stderr)
@@ -419,9 +1383,28 @@ def main() -> int:
 
     work_tasks = [(tid, t) for tid, t in tasks if not is_review_task(t)]
     review_tasks = [(tid, t) for tid, t in tasks if is_review_task(t)]
+    coverage = work_coverage(work_tasks, review_tasks)
+    classify_reviews(coverage, review_tasks)
+    report_wave(wave, review_tasks, coverage)
 
-    # (a) all work tasks completed
-    work_open = [tid for tid, t in work_tasks if (t.get("status") or "pending") != "completed"]
+    # skip_review is honoured, but never silently on a task the pairing guard
+    # would have reviewed.
+    skipped = [(tid, t) for tid, t in work_tasks
+               if t.get("status") != "cancelled" and truthy((t.get("metadata") or {}).get("skip_review"))
+               and at_pairing_threshold(t)]
+    if skipped:
+        def why(t: dict[str, Any]) -> str:
+            r = str((t.get("metadata") or {}).get("skip_review_reason") or "").strip()
+            return f"reason {r[:50]!r}" if r else "no skip_review_reason"
+        listed = "; ".join(f"{tid} {str(t.get('subject') or '')[:40]!r} ({why(t)})" for tid, t in skipped)
+        mode = ("V11_WAVE_CHECK_SKIP_REVIEW_STRICT=on: those without a reason count as unreviewed"
+                if skip_review_strict() else
+                "set V11_WAVE_CHECK_SKIP_REVIEW_STRICT=on to require skip_review_reason")
+        print(f"[wave-check] WARNING — skip_review exempts {len(skipped)} work task(s) at the pairing "
+              f"threshold from review: {listed}. {mode}", file=sys.stderr)
+
+    # (a) all work tasks completed (cancelled is terminal, not open work)
+    work_open = [tid for tid, t in work_tasks if (t.get("status") or "pending") not in TERMINAL]
     if work_open:
         print(
             f"[wave-check] WORK_INCOMPLETE — wave {wave}: "
@@ -431,23 +1414,58 @@ def main() -> int:
         return EXIT_WORK_INCOMPLETE
 
     # (b) all paired review tasks completed (self CRITICAL warns, adversarial CRITICAL blocks)
-    review_open = [tid for tid, t in review_tasks if (t.get("status") or "pending") != "completed"]
+    no_verdict = [tid for tid, t in review_tasks if t.get("review_state") == "verdict missing"]
+    review_open = [tid for tid, t in review_tasks
+                   if t.get("review_state") in OPEN_REVIEW_STATES and tid not in no_verdict]
+    if no_verdict:
+        print(
+            f"[wave-check] REVIEW_INCOMPLETE — wave {wave}: review has no verdict (unverifiable): "
+            f"{len(no_verdict)} review task(s) completed with no artifacts.review, summary counts "
+            f"or ev:\"review\" on it or what it reviews: {no_verdict[:5]}",
+            file=sys.stderr,
+        )
     if review_open:
         print(
             f"[wave-check] REVIEW_INCOMPLETE — wave {wave}: "
             f"{len(review_open)} review task(s) not completed: {review_open[:5]}",
             file=sys.stderr,
         )
+    if no_verdict or review_open:
         return EXIT_REVIEW_INCOMPLETE
+
+    # (b') every completed reviewable work task was reviewed somehow.
+    unreviewed = [tid for tid, _t, cov in coverage if cov["unreviewed"]]
+    if unreviewed:
+        if os.environ.get("V11_WAVE_CHECK_COVERAGE", "on").lower() == "off":
+            print(
+                f"[wave-check] V11_WAVE_CHECK_COVERAGE=off — not blocking on {len(unreviewed)} "
+                f"unreviewed reviewable work task(s): {unreviewed[:5]}",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                f"[wave-check] REVIEW_INCOMPLETE — wave {wave}: {len(unreviewed)} reviewable work "
+                f"task(s) completed with no review verdict on record (review task, ledger review "
+                f"event, inline verdict or counts, pair_ sibling, or waiver): {unreviewed[:5]}",
+                file=sys.stderr,
+            )
+            return EXIT_REVIEW_INCOMPLETE
 
     # Severity scan — adversarial CRITICAL blocks; self-review CRITICAL warns-not-blocks
     critical_blockers: list[str] = []
     self_critical_warnings: list[str] = []
 
-    for tid, t in review_tasks:
-        adv_sev = extract_adversarial_severity(t)
-        if severity_rank(adv_sev) >= severity_rank("CRITICAL"):
-            critical_blockers.append(f"{tid}({adv_sev})")
+    # Every verdict on record for a wave task: its artifacts.review, the
+    # completion's review_summary_delta (the counts survive the ledger's
+    # PIPE_BUF cap when the verdict body is dropped, #102), and the latest
+    # ledger ev:"review" plus the verdict file it references. A later, lower
+    # ev:"review" on the same identity resolves an earlier one.
+    for tid, t in work_tasks + review_tasks:
+        if t.get("status") == "cancelled":
+            continue
+        sev, src = worst_verdict(t, project)
+        if severity_rank(sev) >= severity_rank("CRITICAL"):
+            critical_blockers.append(f"{tid}({sev}{', ' + src if src else ''})")
 
     # Self-review CRITICAL on the WORK tasks (Layer A lives on the parent task)
     for tid, t in work_tasks:
@@ -480,7 +1498,7 @@ def main() -> int:
         print("[wave-check] V11_GATE_AUTOCLOSE=off — skipping ledger close-on-gate", file=sys.stderr)
 
     print(f"[wave-check] OK — wave {wave}: {len(work_tasks)} work + {len(review_tasks)} "
-          f"review task(s) all completed; INV-12 satisfied", file=sys.stderr)
+          f"review task(s) all closed (completed or cancelled); INV-12 satisfied", file=sys.stderr)
     return EXIT_OK
 
 

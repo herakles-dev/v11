@@ -100,16 +100,27 @@ check_v11_hooks() {
     return
   fi
 
-  # Count hook entries pointing to v11/hooks/
+  # Count hook entries pointing to v11/hooks/ (any at all = a V11 project)
   local hook_count
   hook_count=$(grep -o 'v11/hooks/' "$settings" 2>/dev/null | wc -l | tr -d ' ')
 
-  if [ "$hook_count" -ge 13 ]; then
-    result_pass "V11 hooks (${hook_count} entries wired)"
-  elif [ "$hook_count" -gt 0 ]; then
-    result_fail "V11 hooks: only $hook_count hook entries found (need at least 10) in $settings"
-  else
+  # PASS needs every template-managed (event, matcher, command) wiring present
+  # (wiring_diff.managed_coverage, S0-T5 review) — unmanaged opt-in/custom
+  # v11 hooks don't count, so a drifted project can't pass on raw volume.
+  local coverage present expected
+  coverage=$(python3 "$V11_HOME/scripts/lib/wiring_diff.py" managed-coverage \
+    --template "$V11_HOME/.claude/settings.json" --settings "$settings" 2>/dev/null) || coverage=""
+  present="${coverage%% *}"
+  expected="${coverage##* }"
+
+  if [ "$hook_count" -eq 0 ]; then
     result_fail "V11 hooks: no v11/hooks/ entries in $settings"
+  elif [ -z "$coverage" ] || [ "$expected" -lt 1 ]; then
+    result_fail "V11 hooks: could not reconcile $settings against the template (invalid JSON/shape, or template unreadable)"
+  elif [ "$present" -ge "$expected" ]; then
+    result_pass "V11 hooks (${present}/${expected} template-managed wirings present)"
+  else
+    result_fail "V11 hooks: only $present/$expected template-managed wirings present in $settings (see: scripts/v11-update PATH --dry-run)"
   fi
 }
 
@@ -397,7 +408,9 @@ check_legacy_artifacts() {
 }
 
 # ---------------------------------------------------------------------------
-# Check 13: Hook executability — all 13 hook scripts are executable
+# Check 13: Hook executability — every hook wired in the canonical template
+# is executable. The hook list is derived live (S0-T5, ticket #86) — never
+# hardcoded — via wiring_diff.py's diff-of-nothing-against-the-template.
 # ---------------------------------------------------------------------------
 
 check_hook_executability() {
@@ -407,15 +420,25 @@ check_hook_executability() {
     return
   fi
 
+  local expected_hooks
+  expected_hooks=$(jq -r '[.hooks[][].hooks[]?.command // empty] | unique | .[]' \
+    "$V11_HOME/.claude/settings.json" 2>/dev/null | grep '/v11/hooks/' | xargs -n1 basename 2>/dev/null)
+
+  if [ -z "$expected_hooks" ]; then
+    # Degraded fallback only — canonical template unreadable/unparseable.
+    expected_hooks="detect-project guard-write-gates guard-enforcement guard-effort
+enforce-test-coverage verify-syntax track-autonomy sync-tasks
+guard-agent-stall track-agents fix-team-model post-compact session-end"
+  fi
+
   local total=0 executable=0
-  for hook in detect-project guard-write-gates guard-enforcement guard-effort \
-              enforce-test-coverage verify-syntax track-autonomy sync-tasks \
-              guard-agent-stall track-agents fix-team-model post-compact session-end; do
+  while IFS= read -r hook; do
+    [ -z "$hook" ] && continue
     total=$((total + 1))
     if [ -x "$hooks_dir/$hook" ]; then
       executable=$((executable + 1))
     fi
-  done
+  done <<< "$expected_hooks"
 
   if [ "$executable" -eq "$total" ]; then
     result_pass "Hook executability ($executable/$total executable)"

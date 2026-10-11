@@ -136,19 +136,55 @@ case "$MODE" in
             # fix shipped may still carry nulls — recover them here too rather than
             # printing "(no subject)".
             _RT_LEDGER_FILE="$METRICS_DIR/ledger/${PROJECT}.jsonl"
-            _RT_SUBJ_MAP="{}"
+            # S1-T2 (#75b): task ids are session-local, so a bare-id map printed
+            # another session's subject for a reused id. An entry with an
+            # identity is looked up by "<subject_norm>#<create_seq>" only; one
+            # without (pre-S1) by "<session>|<id>" (the entry's
+            # source_session_uuid, else the file's), then an id every ledger
+            # subject agrees on. Mirrors scripts/handoff _v11_fill_null_subjects.
+            # Rollback: V11_HANDOFF_IDENTITY_KEYS=off.
+            # improvements/23: the map scales with the ledger — slurpfile it.
+            _RT_SUBJ_MAPF=$(mktemp)
+            echo '{}' > "$_RT_SUBJ_MAPF"
             if [ -f "$_RT_LEDGER_FILE" ]; then
-                _RT_SUBJ_MAP=$(jq -s -c '
-                    reduce .[] as $ev ({};
+                jq -s -c '
+                    reduce .[] as $ev ({i: {}, s: {}, t: {}, all: {}};
                         if (($ev.task_id // "") != "") and (($ev.subject // null) != null) and (($ev.subject // "") != "") then
-                            .[$ev.task_id] = $ev.subject
+                            ($ev.task_id | tostring) as $tid
+                            | .t[$tid] = $ev.subject
+                            | .all[$tid][$ev.subject] = true
+                            | if ($ev.session_uuid // "") != "" then
+                                .s[($ev.session_uuid | tostring) + "|" + $tid] = $ev.subject
+                              else . end
+                            | if ($ev.subject_norm // "") != "" and (($ev.create_seq | type) == "number")
+                                 and $ev.create_seq >= 0 then
+                                .i[$ev.subject_norm + "#" + ($ev.create_seq | tostring)] = $ev.subject
+                              else . end
                         else . end
                     )
-                ' "$_RT_LEDGER_FILE" 2>/dev/null || echo "{}")
+                    | .u = (.all | with_entries(select((.value | length) == 1) | .value = (.value | keys[0])))
+                    | del(.all)
+                ' "$_RT_LEDGER_FILE" > "$_RT_SUBJ_MAPF" 2>/dev/null || echo '{}' > "$_RT_SUBJ_MAPF"
             fi
-            jq -r --argjson lsm "$_RT_SUBJ_MAP" '
-                .open_tasks[] | "  #\(.id) [\(.status // "pending")]\((.metadata.is_review_sibling // false | if . then " {orphan-review}" else "" end)) \(.subject // $lsm[.id] // "(no subject)")"
+            jq -r --slurpfile lsm_sf "$_RT_SUBJ_MAPF" --arg keys "${V11_HANDOFF_IDENTITY_KEYS:-on}" '
+                (($lsm_sf[0]) // {}) as $lsm
+                | (.source_session_uuid // "") as $file_sess
+                | .open_tasks[]
+                | ((.id // "") | tostring) as $tid
+                | (if $keys == "off" then ($lsm.t[$tid] // null)
+                   else
+                       (.identity // {}) as $x
+                       | if ($x.subject_norm // "") != "" and (($x.create_seq | type) == "number") then
+                           ($lsm.i[$x.subject_norm + "#" + ($x.create_seq | tostring)] // null)
+                         else
+                           ((((.source_session_uuid // $file_sess) // "") | tostring) as $s
+                            | if $s != "" and $tid != "" then $lsm.s[$s + "|" + $tid] else null end)
+                           // ($lsm.u[$tid] // null)
+                         end
+                   end) as $recovered
+                | "  #\(.id) [\(.status // "pending")]\((.metadata.is_review_sibling // false | if . then " {orphan-review}" else "" end)) \(.subject // $recovered // "(no subject)")"
             ' "$HANDOFF_TASKS"
+            rm -f "$_RT_SUBJ_MAPF" 2>/dev/null || true
         fi
         ;;
 
@@ -198,37 +234,53 @@ case "$MODE" in
         fi
         printf '\n%s\n' "Task payloads (JSON array):"
 
+        # S1-T2 (#75b): each payload names the task it rehydrates by identity
+        # (S1-T1 .identity {subject_norm, create_seq}) plus its source id and
+        # session — the id alone is session-local and says nothing in the new
+        # session. Family members carry their own. An entry without an
+        # identity (a pre-S1 file) gets nothing, so it rehydrates exactly as
+        # before. Rollback: V11_HANDOFF_IDENTITY_KEYS=off (no rehydrated_from).
+        _RT_PROV_DEF='def prov($e; $fs):
+            if $keys == "off" or (($e.identity | type) != "object")
+               or (($e.identity.subject_norm // "") == "") then {}
+            else {rehydrated_from: {identity: $e.identity, id: ($e.id // null),
+                                    session: ($e.source_session_uuid // $fs // null)}} end;'
         if [ "$_UNFOLD" = "yes" ]; then
             # Unfold: emit one entry per family_member (or the family itself when size=1)
-            jq -c '
-                .open_tasks | map(
+            jq -c --arg keys "${V11_HANDOFF_IDENTITY_KEYS:-on}" "$_RT_PROV_DEF"'
+                (.source_session_uuid // null) as $fs
+                | .open_tasks | map(
                     (.size // 1) as $sz |
                     if $sz <= 1 or (.family_members // []) == [] then
                         [{
                             subject: (.subject // "untitled (rehydrated)"),
                             description: (.description // .subject // "rehydrated from handoff"),
                             status_at_handoff: (.status // "pending"),
-                            metadata: (.metadata // {})
+                            metadata: ((.metadata // {}) + {source: "rehydrate"} + prov(.; $fs))
                         }]
                     else
                         (.family_members // []) | map({
                             subject: (.subject // "untitled (rehydrated)"),
                             description: (.description // .subject // "rehydrated from handoff"),
                             status_at_handoff: (.status // "pending"),
-                            metadata: {}
+                            metadata: ({source: "rehydrate"} + prov(.; $fs))
                         })
                     end
                 ) | add // []
             ' "$HANDOFF_TASKS"
         else
             # Family-aware: one TaskCreate per family entry, family_members[] in metadata
-            jq -c '.open_tasks | map(
+            jq -c --arg keys "${V11_HANDOFF_IDENTITY_KEYS:-on}" "$_RT_PROV_DEF"'
+                (.source_session_uuid // null) as $fs
+                | .open_tasks | map(
                 . as $f |
                 {
                     subject: (.subject // "untitled (rehydrated)"),
                     description: (.description // .subject // "rehydrated from handoff"),
                     status_at_handoff: (.status // "pending"),
                     metadata: ((.metadata // {})
+                        + {source: "rehydrate"}
+                        + prov($f; $fs)
                         + (if (.size // 1) > 1 then {
                             family_size: ($f.size // 1),
                             family_member_subjects: ($f.family_members // [] | map(.subject)),

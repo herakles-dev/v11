@@ -405,7 +405,7 @@ echo -e "${BOLD}4. Temp File Debris${NC}"
 DEBRIS_COUNT=0
 DEBRIS_LIST=""
 for pattern in "*.tmp" "*.bak" "*.orig" "*.swp" "*.swo" "*~" ".DS_Store" "Thumbs.db"; do
-    found=$(find "$PROJECT_DIR" -maxdepth 3 -name "$pattern" -not -path "$PROJECT_DIR/.tmp" 2>/dev/null | head -10)
+    found=$(find "$PROJECT_DIR" -maxdepth 3 -name "$pattern" -not -path "$PROJECT_DIR/.tmp" 2>/dev/null | head -10 || true)
     if [ -n "$found" ]; then
         count=$(echo "$found" | wc -l)
         ((DEBRIS_COUNT+=count)) || true
@@ -415,7 +415,7 @@ done
 
 # Check for cache dirs
 for dir_pattern in "__pycache__" ".pytest_cache" ".mypy_cache" ".ruff_cache"; do
-    found=$(find "$PROJECT_DIR" -maxdepth 3 -type d -name "$dir_pattern" 2>/dev/null | head -5)
+    found=$(find "$PROJECT_DIR" -maxdepth 3 -type d -name "$dir_pattern" 2>/dev/null | head -5 || true)
     if [ -n "$found" ]; then
         count=$(echo "$found" | wc -l)
         ((DEBRIS_COUNT+=count)) || true
@@ -569,7 +569,7 @@ if [ -d "$PROJECT_DIR" ]; then
             [ -f "$d/MODULE.json" ] && MANIFEST_FILE="$d/MODULE.json"
             if [ -f "$MANIFEST_FILE" ]; then
                 MANIFEST_MTIME=$(stat -c %Y "$MANIFEST_FILE" 2>/dev/null || echo 0)
-                NEWEST_CODE=$(find "$d" -maxdepth 1 -type f \( -name "*.py" -o -name "*.ts" -o -name "*.tsx" -o -name "*.js" -o -name "*.go" -o -name "*.rs" \) -printf '%T@\n' 2>/dev/null | sort -nr | head -1 | cut -d. -f1)
+                NEWEST_CODE=$(find "$d" -maxdepth 1 -type f \( -name "*.py" -o -name "*.ts" -o -name "*.tsx" -o -name "*.js" -o -name "*.go" -o -name "*.rs" \) -printf '%T@\n' 2>/dev/null | sort -nr | head -1 | cut -d. -f1 || true)
                 if [ -n "$NEWEST_CODE" ] && [ "$NEWEST_CODE" -gt "$MANIFEST_MTIME" ] && [ "$NEWEST_CODE" -gt "$THIRTY_DAYS_AGO" ]; then
                     MOD_STALE=$((MOD_STALE + 1))
                 fi
