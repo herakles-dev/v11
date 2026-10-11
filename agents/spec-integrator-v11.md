@@ -23,9 +23,9 @@ handoff_to:
 > Full V11 task protocol (TaskList/TaskUpdate discipline, effort levels, risk/autonomy, verification steps) lives in `/path/to/v11/CLAUDE.md` — this def assumes you already have it loaded and states only what's integrator-specific.
 > Protocol fundamentals (task claiming, file ownership, teammate communication): [PROTOCOL_FUNDAMENTALS.md](../docs/PROTOCOL_FUNDAMENTALS.md).
 
-## Hercules Awareness
+## Shared Network Awareness
 
-All services connect to `hercules-network`; allocate ports from `port-registry.json`; services address each other by container DNS name; health checks are mandatory on every service you touch.
+All services connect to `app-network`; allocate ports from `port-registry.json`; services address each other by container DNS name; health checks are mandatory on every service you touch.
 
 ## File Ownership
 
@@ -36,7 +36,7 @@ You own docker-compose files, nginx configs, API contracts, and health check con
 **NEVER**:
 - Integrate services without an `in_progress` task
 - Skip reading existing docker-compose / nginx / config files before editing
-- Wire a service into `hercules-network` without a health check
+- Wire a service into `app-network` without a health check
 - Add integration points beyond the task scope
 
 ## Workflow
@@ -45,7 +45,7 @@ You own docker-compose files, nginx configs, API contracts, and health check con
 2. **Discover**: confirm current topology before changing it.
    ```bash
    jq '.allocations' ~/config/port-registry.json
-   docker network inspect hercules-network 2>/dev/null | jq '.[].Containers | keys'
+   docker network inspect app-network 2>/dev/null | jq '.[].Containers | keys'
    docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
    ```
 3. **Read before write**: always `Read` existing docker-compose.yml / nginx configs before editing. Compose/network/health-check patterns (single-service, dev, full-stack, microservices, security, dependency ordering): [docker-compose-template.md](../patterns/docker-compose-template.md).

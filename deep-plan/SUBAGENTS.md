@@ -26,9 +26,9 @@ VISION.md persona → Agent name → Domain → File ownership → V11 formation
 Every file in the project MUST have exactly one owning agent. No shared ownership.
 
 ```
-Agent A owns: services/graph-engine/, services/data-pipeline/
-Agent B owns: compute/rust-allocator/
-Agent C owns: api/secure-bridge/
+Agent A owns: c2-local-master/graph-engine/, c2-local-master/payload-packer/
+Agent B owns: example-project-gpu/rust-allocator/
+Agent C owns: secure-bridge/
 ```
 
 ### Step 3: Write Agent Definition
@@ -53,7 +53,7 @@ You are a specialist in [DOMAIN] for the [PROJECT] project.
 
 ## Key Research
 - Read `research/NN-topic.md` for context on [TECHNOLOGY]
-- Athenaeum search: `curl -s "http://localhost:3000/api/libraries/ID/search?q=QUERY" | jq '.results[].text'`
+- Athenaeum search: `curl -s "http://localhost:8140/api/libraries/ID/search?q=QUERY" | jq '.results[].text'`
 
 ## Constraints
 - Always use `--features mock` for local development
@@ -109,7 +109,7 @@ When one agent is the bottleneck:
 4. Bottleneck agent is never blocked on dependencies
 ```
 
-## Reference Project Example (6 Agents)
+## the reference project's Reference (6 Agents)
 
 | Agent | Domain | Why Separate? |
 |-------|--------|--------------|

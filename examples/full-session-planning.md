@@ -50,7 +50,7 @@ then search and organize photos into albums.
 ## Constraints
 - Must run in Docker containers
 - Hot reload required for development
-- Follow Hercules platform conventions
+- Follow platform conventions
 
 ## Integrations
 - OpenAI Vision API for image tagging
