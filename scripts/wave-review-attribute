@@ -143,7 +143,16 @@ V11_WRA_HERCULES_ROOT="${HERCULES_ROOT:-$HOME}" \
 V11_WRA_V11_HOME="$V11_HOME" \
 V11_WRA_REVIEW_QUEUE_SCRIPT="$V11_HOME/scripts/review-queue" \
 python3 - <<'PYEOF'
-import os, sys, json, hashlib, datetime, fcntl, pathlib, subprocess, re
+import os, sys, json, hashlib, datetime, pathlib, subprocess, re
+try:
+    import fcntl  # POSIX advisory file locking
+except ImportError:  # Windows: no fcntl — degrade to no-op advisory locks (single-user; see windows-portability notes)
+    class _NoFcntl:
+        LOCK_EX = LOCK_SH = LOCK_NB = LOCK_UN = 0
+        @staticmethod
+        def flock(*_a, **_k):
+            return None
+    fcntl = _NoFcntl()
 
 project       = os.environ["V11_WRA_PROJECT"]
 if not re.match(r'^[A-Za-z0-9_.-]+$', project):

@@ -72,7 +72,16 @@ V11_GB_PROJECT="$PROJECT" V11_GB_SINCE="$SINCE" V11_GB_JSON="$JSON" V11_GB_APPLY
 V11_GB_LEDGER="$LEDGER_FILE" V11_GB_ERRORS="$ERRORS_LEDGER" V11_GB_REGISTRY="$REGISTRY_FILE" \
 V11_GB_OVERRIDE_JSON="$OVERRIDE_JSON" V11_GB_METRICS="$METRICS_DIR" \
 python3 - <<'PYEOF'
-import os, sys, json, re, hashlib, datetime, fcntl
+import os, sys, json, re, hashlib, datetime
+try:
+    import fcntl  # POSIX advisory file locking
+except ImportError:  # Windows: no fcntl — degrade to no-op advisory locks (single-user; see windows-portability notes)
+    class _NoFcntl:
+        LOCK_EX = LOCK_SH = LOCK_NB = LOCK_UN = 0
+        @staticmethod
+        def flock(*_a, **_k):
+            return None
+    fcntl = _NoFcntl()
 
 def env(k, d=""): return os.environ.get(k, d)
 
