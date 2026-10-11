@@ -12,7 +12,32 @@ Phase 4r — marking a task completed and its `metadata.artifacts` is empty
 
 ---
 
+## Contract mode: one batch review per wave (default)
+
+Contract mode (`V11_CONTRACT_MODE`, prompt-level, default on) replaces per-task pairing with ONE batch review per wave.
+
+- The reviewer must have Bash: `code-quality-engineer`, model sonnet. It reviews the whole wave's diff and re-runs each contract's VERIFY commands.
+- Findings go out as micro-contracts. Fixer: `contract-executor`. Each has its own WRITE SET and VERIFY. A task run by an `adversarial-*` agent counts as a review task in wave-check (INV-7) and needs its own verdict.
+- Fail-without-fix rule: every fix test must be shown to fail without its fix. Run `git stash push -- <fixed file>`, run the test, see it FAIL, run `git stash pop`, see it pass. A test that passes without the fix is not a fix test. The reviewer rejects it.
+- Log findings to agent-errors.jsonl with `cause_kind`: `execution_defect` (agent erred against a sound contract) or `briefing_defect` (the contract was wrong or silent).
+- Each batch review appends any new gotcha to `docs/CONTRACT_HOUSE_RULES.md`.
+- A wave that changes config or emitted JSON runs `./scripts/run-tests --regression-extended` in a background shell before the commit.
+
+### Interim recipe (until Part B ships the review-mode switch)
+
+0. At TaskCreate, set a numeric `metadata.wave` that is unique within the project (e.g. 91, 92 …). wave-check reads the tag only from the ledger's `created` event, so a tag added later is invisible. "W1" parses as wave 01 and collides with older sprints.
+1. Set `V11_AUTO_PAIR_REVIEW=off` for the session, so sync-tasks mints no per-task pairs (sync-tasks ~:1239). One way: an `env` block in the project's `.claude/settings.local.json`. Claude Code applies it without a restart — confirm with `echo $V11_AUTO_PAIR_REVIEW` in Bash (prints `off`). The lever also reaches pytest: run full-suite tests as `env -u V11_AUTO_PAIR_REVIEW …`, because tests/test_v11_21_auto_pair.py and one epoch test read the ambient lever (`--regression` does not select them). With `V11_CONTRACT_MODE=off`, remove this env block (or set `V11_AUTO_PAIR_REVIEW=on`) so V11.21 pairing works again.
+2. After the wave's batch review, TaskUpdate each covered task with `metadata.artifacts.review={verdict, errors[], wave_review:<id>}` where `verdict` must be one of `PASS`, `ISSUES_FOUND`, `BLOCKED` (wave-check:191), or `metadata.skip_review=true` plus `skip_review_reason="wave review <id>"` (`skip_review_reason` is optional unless `V11_WAVE_CHECK_SKIP_REVIEW_STRICT=on` and the task is at the pairing threshold (wave-check:762-771)). wave-check exempts these (:769-780) and counts inline verdicts (~:817).
+3. Write the verdict in the same TaskUpdate that sets `completed` (step 2); sync-tasks then closes the queue row itself. Run `scripts/review-queue mark-done <project> <task_id> <sev> <session>` only for rows already pending (e.g. a task completed before its verdict existed) (review-queue ~:266-300).
+4. `scripts/wave-check` must exit 0.
+
+SC-A4d proves this recipe with a dry wave. Deviations are recorded in the sprint spec (sessions/v11-leverage-program/sprint-SC-contract-mode.md).
+
+---
+
 ## V11.21 Dual-Layer Workflow (canonical when `V11_AUTO_PAIR_REVIEW=on`)
+
+Legacy path — applies under `V11_CONTRACT_MODE=off`, and (once Part B ships `V11_REVIEW_MODE`) to tasks without `metadata.contract=true`.
 
 V11.21 replaces V11.19's queue-driven *out-of-band* review with a **paired-task, in-band** model. Every reviewable work task is shadowed by a sibling review task created in the same orchestrator turn — review is normal V11 work, not an exception.
 
@@ -81,7 +106,7 @@ sync-tasks: emit Layer B agent-errors entries (found_by_layer=lite_adversarial, 
 
 ### Rollback to V11.19 queue (single env var)
 
-When `V11_AUTO_PAIR_REVIEW=off`, V11.21 falls back to the V11.19 queue-driven workflow documented below. The queue path remains fully functional; orchestrator pairing is layered on top, never replacing it. Per-task mutual exclusion: when a parent has `metadata.review_task_id` set, sync-tasks does NOT enqueue to V11.19 (avoids double-review).
+When `V11_AUTO_PAIR_REVIEW=off`, V11.21 falls back to the V11.19 queue-driven workflow documented below. The queue path remains fully functional; orchestrator pairing is layered on top, never replacing it. Per-task mutual exclusion: when a parent has `metadata.review_task_id` set, sync-tasks does NOT enqueue to V11.19 (avoids double-review), unless that id is a `pair_` shadow this session does not hold (a rehydrated task's, S2-R1): nothing activates it here, so the queue row is its review.
 
 ---
 
@@ -121,8 +146,13 @@ Multiple Claude sessions can run against the same project concurrently (one in `
 **Cross-session verdict fold-back (`mark-done --verdict-file`, W5-T16 / improvements/09)** — when THIS session reviews a task that another session completed, fold the full verdict JSON back into the queue + the task's per-agent ledgers with:
 
 ```bash
-./scripts/review-queue mark-done PROJECT TASK_ID [SEV] [SESSION_UUID] --verdict-file verdict.json
+./scripts/review-queue mark-done PROJECT TASK_ID [SEV] PARENT_SESSION_UUID --verdict-file verdict.json
 ```
+
+`PARENT_SESSION_UUID` is the reviewed task's session: the `session_uuid` of its pending entry in `./scripts/review-queue pending PROJECT --json`. It is never the drainer's own session, and never an id like `review-daemon@host`. Task ids are session-local and reused across sessions (#97). The ledger row binds the verdict to the task that session holds under `TASK_ID` (S1-P3). Pass `""` for `SEV` to derive it.
+- **Id reused across sessions and no session given:** the command exits 2 with the candidate tasks and writes nothing.
+- **A value that is not a session UUID, or a session that holds no task under the id:** treated as no session. An unambiguous id still binds, with a note; a reused id exits 2.
+- **One session reused the id:** the task that completed wins. If none or several did, the command exits 2.
 
 `--verdict-file FILE` writes the complete reviewer verdict (not just the severity) into the queue entry, so the fold-back survives the session boundary — the originating agent still gets V11.20 attribution even though a *different* session ran the reviewer. If `SEV` is omitted it is derived as the max severity in the verdict file. This is the cross-session complement to the in-session `TaskUpdate(metadata.artifacts.review = verdict)` path above.
 

@@ -4,6 +4,13 @@
 > knobs for context-budget reasons (v11.35.5, W2-2) — this file is the canonical source for
 > per-hook Trigger/Purpose detail, the git-event cooperation note, and dormant-hook rationale.
 
+**Fleet wiring (S0-T5, ticket #86):** a project's wiring doesn't reliably match this table —
+`scripts/check-wiring-parity` measured only ~10% of the ~99 fleet `settings.json` files at
+template parity. `scripts/v11-update` reconciles: **managed** = any command wired anywhere in
+the canonical template (`v11/.claude/settings.json`), forced to match the template's exact
+`(event, matcher)` wiring; **unmanaged** = everything else (custom project hooks, opt-in v11
+hooks — see "Dormant vs. Opt-in" below), preserved byte-for-byte, never deleted.
+
 ---
 
 ## Current Hook Table (22 wired: 20 tool-event + 2 git-event)
@@ -16,7 +23,7 @@
 | `guard-write-gates` | Pre: Write/Edit | Task-state: blocks on genuine stall, advises on fresh session (V11.34); plan mode: file-count advisory |
 | `guard-enforcement` | Pre: Write/Edit/Bash | Risk + autonomy + tool policy cascade |
 | `require-producer-script` | Pre: Bash | Block git commit when validation artifacts lack sibling producer scripts |
-| `guard-effort` | Pre: Task | Effort level advisory (never blocks) |
+| `guard-effort` | Pre: Task|Agent | Effort level advisory (never blocks) |
 | `enforce-test-coverage` | Pre: Bash | Block deploy without tests |
 | `guard-validation-lint` | Pre: Bash | Validate `Validation:` tag on `git commit` commands; warn/block per severity matrix (V11.25) |
 | `verify-syntax` | Post: Write/Edit | Check syntax of written files |
@@ -24,13 +31,13 @@
 | `track-autonomy` | Post: Write/Edit/Bash | Update autonomy state + audit log + `caller_kind` (V11.20) |
 | `guard-fat-read` | Post: Read | Advisory when a Read pulls a heavy payload into the main session's context — image >100KB on-disk, or any other file >50KB (v11.35.5); rate-limited to ~1 advisory per 5 qualifying Reads/session. Rollback: `V11_FAT_READ_ADVISORY=off` |
 | `sync-tasks` | Post: TaskCreate/Update/List/Get | Task state, artifacts, review queue, durable ledger, attribution |
-| `guard-agent-stall` | Post: TaskList | Detect stalled agents by task-state timestamps (advisory) |
+| `guard-agent-stall` | Post: TaskList | Detect stalled agents by task-state timestamps (advisory). S2-T3 (#87): reads `.last_progress_at` (sync-tasks, written only on TaskCreate/TaskUpdate status changes) in preference to `.last_updated` (also bumped by a passive TaskList/TaskGet poll, which could otherwise reset the clock to ~0). Rollback: `V11_STALL_PROGRESS_CLOCK=off` |
 | `guard-stale-task` | Post: TaskList | Detect zombie-task pattern: in_progress tasks with recent edits but no completion event (V11.23 §H9) |
-| `track-agents` | Post: Task | Agent metrics + escalation |
-| `guard-worktree-isolation` | Post: Task/Agent, TaskList | `isolation:"worktree"` silent no-op safety net (improvements/12 H1): records a worktree-count baseline at spawn, reconciles at the next TaskList fire once a grace period elapses |
+| `track-agents` | Post: Task|Agent | Agent metrics + escalation |
+| `guard-worktree-isolation` | Post: Task/Agent, TaskList | `isolation:"worktree"` silent no-op safety net (improvements/12 H1): records a worktree-count baseline at spawn, reconciles at the next TaskList fire once a grace period elapses — one `hooks/lib/worktree_registry.py` pass that judges only the current repo's pending rows, prunes terminal rows past `V11_WORKTREE_REGISTRY_TTL_DAYS` (S2-R6), and prunes any pending row past `V11_WORKTREE_PENDING_TTL_DAYS` regardless of scope (review #11 MED-1); both the reconcile and the spawn-side append flock a sibling `$REGISTRY.lock` against each other (review #11 LOW-2) |
 | `fix-team-model` | Pre+Post: TeamCreate/Agent | Dormant safety net for legacy TeamCreate |
 | `post-compact` | PostCompact | Re-inject V11 state after context compaction |
-| `session-end` | Stop | Save session summary + auto-handoff |
+| `session-end` | Stop, SessionEnd | Dispatches on `hook_event_name` (S0-T6, #90). **SessionEnd**: session teardown, critical work first — aggregate fold, discipline check, `last-session.json`, auto-handoff, then session-log row + retro counter (exactly once per sitting: session_id + the `.sitting` marker, so a `--resume` sitting counts again), manifest, the ending scratch moved to `sessions/.gc-quarantine/` (`V11_SESSION_GC_MODE`) — then bounded optional work: plan-sync, align-aggregate, orphan detector, GC of dead-session scratch dirs named like a session UUID: kept while a claude process owns the id or a file in it is younger than `V11_SESSION_GC_TTL_HOURS` (168), otherwise moved to `sessions/.gc-quarantine/<utc-ts>/` and purged 7 d later (`V11_SESSION_GC_MODE`, S1-R1; preview: `hooks/session-end --gc-preview`). **Stop** (every turn): aggregate fold + `last-session.json` + an auto-handoff throttled on the open-set digest — when the project also wires SessionEnd with a `timeout` >= 30; otherwise the full teardown, as before, except that a Stop never removes the live session's scratch (S1-R1 review #58). Auto-handoff never passes `--force` (a hand-edited handoff.md is kept, reported as `skipped: hand-edited`) and never consumes a pending steer on Stop. The SessionEnd entry needs `"timeout": 60`: Claude Code otherwise kills SessionEnd hooks after 1.5 s. Rollback: `V11_STOP_SPLIT=off` (SessionEnd then only logs) |
 | `spawn-claude-window.py` | Post: Skill | Zeus spawn handoff bootstrap — re-reads handoff.md, extracts V11.28 steer span, prepends `/v11` (host-level hook at `~/.claude/hooks/`, unversioned; wired in `v11/.claude/settings.json`) |
 
 Tool-event hooks fire automatically in scaffolded projects. For manual adoption: copy `v11/.claude/settings.json` to project. Hooks should **not** be added to `~/.claude/settings.json` globally — they would fire on every project across the platform, causing false enforcement.
@@ -50,12 +57,18 @@ Closures carry `caller_kind:"hook"` — counted in project throughput but NOT in
 
 > **Post-commit / validation-lint cooperation**: When a commit body contains `Validation: HYPOTHESIZED` followed by `Pairs: T<ids>`, the post-commit hook excludes those task IDs from auto-close, keeping them open until a follow-up commit carries a `MEASURED-LIVE-PARTIAL` or `LIVE` tag. This means discipline mechanisms cooperate rather than deadlock: you can iterate on an unmeasured claim across multiple commits without the hook prematurely closing the work task.
 
-### Dormant Hook Scripts
+> **Contract mode and V11.21 auto-pair**: in Contract mode (`V11_CONTRACT_MODE`, default on) the session sets `V11_AUTO_PAIR_REVIEW=off` (Interim recipe, `playbooks/per-task-review.md`) until Part B ships `V11_REVIEW_MODE=wave`. See `playbooks/per-task-review.md` §"Contract mode: one batch review per wave (default)" Interim recipe for the wave-tag rule, the pytest `env -u` caveat, and the off-mode revert.
 
-Present in `hooks/` but intentionally NOT wired — presence-without-wiring is deliberate, not missing config:
-- `guard-teammate-timeout` — superseded by `guard-agent-stall`; kept for reference.
+### Dormant vs. Opt-in Hook Scripts
+
+**Correction (S0-T5, ticket #86, 2026-09-25):** this section previously called `guard-teammate-timeout` and `enforce-subagent` "dormant" — false. A fleet-wide measurement (`scripts/check-wiring-parity`) found `guard-teammate-timeout` wired in ~54 of 99 project `settings.json` files and `enforce-subagent` wired in example-project. Neither is in the *template* (`v11/.claude/settings.json`). `scripts/v11-update` keeps `enforce-subagent` as **unmanaged/custom** (preserved byte-for-byte); since #25 it removes `guard-teammate-timeout` as **superseded** by `guard-agent-stall` (change type `superseded`, counts as drift).
+
+Only one hook is genuinely dormant (present in `hooks/`, wired nowhere in the fleet):
 - `refresh-freshness-tags` — auto-refreshes `<!-- Validated: -->` markers at session-end; opt-in only since it mutates files (wire to `Stop` + `V11_FRESHNESS_REFRESH=on` to enable).
-- `enforce-subagent` (S42) — warn-only delegation advisor, but it warns per *open task* on every spawn (the Agent payload carries no task_id, so it can't correlate a spawn to its task → fires N advisories per spawn). **Needs spawn→task correlation before it's wirable**; a `V11_ENFORCE_SUBAGENT=off` guard is already in place for when it is.
+
+The other two are **correctly absent from the template**:
+- `guard-teammate-timeout` — **superseded** by `guard-agent-stall` (same stall-detection idea). `v11-update` removes it wherever it places `guard-agent-stall` (change type `superseded`, `SUPERSEDED_BY` in `scripts/lib/wiring_diff.py`), i.e. every project after the S0-T7 fleet sync.
+- `enforce-subagent` (S42) — warn-only delegation advisor, but it warns per *open task* on every spawn (the Agent payload carries no task_id, so it can't correlate a spawn to its task → fires N advisories per spawn). **Needs spawn→task correlation before it's fit for the template**; a `V11_ENFORCE_SUBAGENT=off` guard is already in place for projects (like example-project) that wire it manually today.
 
 ---
 

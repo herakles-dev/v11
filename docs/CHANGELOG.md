@@ -9,6 +9,536 @@
 
 ---
 
+## v11.46 "Stop the Bleeding" (v11-leverage-program S1) — 2026-09-26
+
+**Fix the defects that lose work or misreport it.** Sprint S1 of v11-leverage-program (spec: `sessions/v11-leverage-program/spec.md`,
+roadmap §S1, gate G1), plus the S1 window of Lane D (D0, #88). The rows stay out of `sync-tasks`. S1 was the program's first
+wired sprint: S0 ran unwired (#98). Targets:
+- **#75:** `/handoff` dropped open tasks (M1 baseline: 0/5 and 1/6 live) and nudged the session that wrote it.
+- **#76, #82:** the write gate blocked the handoff's own files, and block messages named no way forward.
+- **#70:** background waits went unseen. **#72:** there was no cost visibility.
+- **#53, #38:** the routing scorecard and the registry-drift check trusted self-filled or unnormalised labels.
+- **#55:** CRITICAL findings could never be resolved. S1 delivers the ADR only.
+- **S0 sprint-close findings:** the session GC deleted with no backup (R1), `run-tests`' lints checked master from a worktree (R3a), unwired session dirs were invisible (R3b, #98), and `--restore` had a repoint race (R4, #100).
+
+Every row got a paired adversarial-lite review: #30–#34, #37, #38, #41–#43, #47–#50, #54, #55, #58–#61, #69, #70, #73 and #74. S1-T13 got a
+full adversarial review (#35). Findings were fixed in fix tasks #36, #39, #40, #44–#46, #52, #53, #56, #62–#64, #71 and #72. The S1-T11
+follow-ups b–f (#57, #65–#68) are two blind hand-checks, their comparison and two read-side fixes. The last review round:
+- **#69** (S1-T1, ISSUES_FOUND: 1 HIGH, 3 MEDIUM, 2 LOW) was fixed by fix task #71 (merge `3d75638`).
+- **#70** (S1-T2, PASS: 1 MEDIUM, 2 LOW) was fixed by fix task #72: `a8df95a` (E1, E3) and the E2 test `28741e7`.
+- **#73** (S1-T3, PASS: 1 MEDIUM, 1 LOW) was fixed in `7623a96`.
+- **#74** (S1-T4, PASS: 4 LOW) was fixed in `3d75638` (E1, E4), team-orchestrator `d4efa64` (E2) and `~/.claude/skills` `fd2925a` (E3).
+- The S1-T15 round-2 fixes (`88d65c3`) got a paired review (#6 of the 10:25 list): PASS, 3 MEDIUM and 3 LOW. Its fixes merged as `c778e57` (see T15).
+
+The conversation resumed twice, at 10:25 and 19:40, and each resume restarted the TaskList at #1 (see Known limits). Task numbers
+above are from the first list unless marked. The last round is from the 19:40 list:
+- **#3** (S1-T2c, PASS_WITH_CONDITIONS: 1 HIGH, 2 MEDIUM, 2 LOW) was fixed by fix task #11 (merge `7bbb0bf`). One LOW went to ticket #111.
+- **#4** (the S1-T15 review-#6 fixes, FAIL: 1 HIGH, 1 MEDIUM, 1 LOW) was fixed by fix task #7 (merge `3911e7e`).
+- **#5** (S1-R2, PASS_WITH_CONDITIONS: 1 MEDIUM, 1 LOW) was fixed by fix task #8 (merge `75d50c7`).
+- **#6** (S1-T11d/T11f, PASS: 1 MEDIUM, 7 LOW) was fixed by fix task #9 (merge `17cdd04`). The 4 LOWs it left are ticket #112.
+- **#10**, the sprint-close adversarial review of `399beb8..7d15f4b`: PASS_WITH_CONDITIONS, 3 HIGH, 7 MEDIUM, 4 LOW. Fix task #12 (merge `8c71664`) fixed the `review-daemon` MEDIUM and the `guard-agent-stall` LOW, and `artifacts/fold-review.sh` now fails loudly. The three HIGHs and four of the MEDIUMs share one root cause. It is caveated under Known limits and leads S2 (#113). This entry settles the review's CHANGELOG, M1, M3 and M7 findings.
+- Fix tasks #71 and #72 and the S1-T15 handoff test budgets (`a9df8e0`) got no paired review of their own. The sprint-close review covered them, since its range includes them. The fix tasks from the 19:40 list (#7, #8, #9, #11, #12) got one batched lite review, #15 (`7d15f4b..d07ddd6`): PASS_WITH_CONDITIONS, 0 HIGH, 1 MEDIUM, 3 LOW (ledger seqno 574). Fix task #16 (merge `c010db0`) fixed the MEDIUM (the cutover alias carve-out now adds back only the aliases new since the prior aggregate) and two LOWs (`review-daemon` parks only on the AMBIGUOUS refusal; a unit test pins run-tests' `, N errors` Results line). The third LOW, `scripts/status` and `review-queue-maintenance --stats` counting parked entries as open, is deferred to S2.
+- Two verdicts are kept as files, not ledger rows: review #3's (`artifacts/s1-review3-t2c-verdict.json`) and the sprint-close verdict (`artifacts/s1-sprint-close-review.json`). #102 dropped the first, and `mark-done` refuses both parents' reused ids (F33).
+- Fix task #13 (merge `15bd991`, test-only), found by this CLOSE's `--regression-extended` phase 2: `tests/integration/harness.py` drove `session-end` with a Stop payload, so the two `TestCrossSessionLegacyPath` tests failed once S1-R1 (review #58) made only SessionEnd retire the scratch. The harness now sends Stop, checks the scratch survives it, then sends SessionEnd and accepts the quarantine. The `LEDGER_READY`-gated `TestCrossSessionReopen` runs an external script with `V11_ROOT` hardcoded and HOME not isolated (F34); it is skipped by default.
+
+Commits `399beb8..c010db0` in v11 (90 commits + 64 merges, 144 files changed, +22,119/−884), plus the orchestrator's CLOSE
+commit that carries this write-through and the `--regression-extended` result. `d1afc7b..adcbea3` in the team-orchestrator
+skill repo (17 commits), plus the `journal/decisions.md` commit at CLOSE: the ADR-55, G1 and resume-epoch decisions. `e929981`,
+`b913dbd`, `fd2925a` and `422163c` in `~/.claude/skills` (the handoff skill).
+
+### Handoff truth (#75 → M1)
+
+**T1: #75a handoff emission from the ledger replay ∪ the live snapshot** (`V11_HANDOFF_SOURCE_CHECK`, `V11_HANDOFF_LIVE_WINDOW_SECS`).
+- `scripts/handoff` builds `open_tasks` from the live session's ledger replay, plus any live-snapshot tasks the ledger never saw.
+- The live session is the env session when its last ledger event is within the window. Otherwise it is the newest Claude session with a UUID-shaped id; a tool pseudo-session such as `legacy-cli` never wins (`84970b5`).
+- Every entry carries `identity {subject_norm, create_seq}`. Ledger entries skip the family fold and the stale-session heuristic.
+- `handoff-tasks.json` gains `live_session_uuid`, `open_tasks_source` and `source_check`.
+- A shrink breaker mirrors the 2x growth breaker, and an emission of 0 open tasks exits 2 unless `--allow-empty`. Both fire only when a dropped task is not closed in the ledger.
+- **M1: met.** 6/6, 5/5 and 6/6 on the three #75 archivestream fixtures (`tests/fixtures/handoff_m1/`), where the pre-S1 emission gives 0/0/1. 8/8 live at the 2026-09-26 handoff. Both real resumes were recovered with it: 5/5 at 10:25 and 2/2 at 19:40 on the fixed replay (see M1 under Metrics for the caveat).
+- That live handoff also found F25. The shrink breaker counted 11 hook-minted `pair_` review shadows as dropped and refused the correct 8-task emission. The orchestrator verified 8/8 and promoted `.autoemit-proposed.json` by hand.
+- **Fix task #71: the review #69 fixes (F25/F26; merge `3d75638`)** (new lever `V11_HANDOFF_SOURCE_BUDGET_SECS`):
+  - **Scope.** The drop audit counts only the live session's prior entries, matched by identity (`subject_norm` + `create_seq`). Another session's still-open task goes to `source_check.dropped_foreign` with a WARN and never trips a guard. An idle live session, a fallback emission or a failed source check counts every prior entry.
+  - **Shadows.** `pair_` review shadows and pending_parent siblings never count (`dropped_by_policy`).
+  - **Paired promotion.** A refused emission promotes no `handoff.md`, so the pair stays the last accepted one, and `--spawn` exits 2. The shrink floor goes from 5 to 3, because the counted set is now smaller.
+  - **Env session authoritative.** `hooks/session-end` passes `V11_SESSION_ID_SOURCE=hook-stdin` (a state channel, not a lever), and `scripts/handoff` takes that session outright. A manual run's env session is also live when a running claude process owns it.
+  - **Loud fallback.** A replay that fails or times out prints a WARN and sets `open_tasks_source: "legacy-fallback:<reason>"`, and the `handoff.md` footer names it. The replay, the live-set pass and the drop audit share one budget, `V11_HANDOFF_SOURCE_BUDGET_SECS` (default 12, clamped to 3..14), inside session-end's 20 s kill.
+  - **Surfaced refusal.** Both refusals print `handoff: refused — <reason>`, write `.handoff-refused` and add one note line to the kept `handoff.md`. session-end stamps the open-set digest, so a Stop does not retry until the task set changes.
+  - **Lever-off byte diff.** A test runs `72ef8e3`'s `scripts/handoff` and the current one with `V11_HANDOFF_SOURCE_CHECK=off` and compares `handoff-tasks.json` byte for byte.
+  - **F25 replay.** On the refused 2026-09-26 input, the fixed script accepts the same 8 tasks the live run proposed: 11 dropped by policy, 0 unexplained. The p95 is 6.47 s on a 5,920-event ledger.
+  - **S1-T4 review nits.** The summary keeps its title when Blockers fill the budget, and both paths count lost lines the same way. `v11-bootstrap-session` `%q`-quotes the resume command and anchors a relative `V11_HOME` at `$PWD`.
+
+**T2: #75b consumers keyed on identity** (`V11_HANDOFF_IDENTITY_KEYS`). New `scripts/lib/handoff_identity.py`.
+- `detect-project`'s rehydrate verification compares subject_norm multisets. A clean rehydrate with fresh task ids is acked, and different tasks that reuse ids are a mismatch.
+- `handoff` and `v11-resume-tasks --list` recover a null subject by identity, never through another session's task id.
+- Resume payloads carry `metadata.rehydrated_from`. A pre-S1 `handoff-tasks.json` rehydrates byte-identical.
+- **Fix task #72: the review #70 fixes** (`a8df95a`, `28741e7`), under the same lever:
+  - A rehydrated live task is keyed on its `metadata.rehydrated_from.identity`, so a task renamed before the handoff no longer gives a false `identity_mismatch`.
+  - A helper failure, or an unreadable handoff file, records `identity_matched=false` on the ack, with a stderr line. It is never a silent match.
+  - E2: a test checks that a pre-S1 file rehydrates byte-identical against a frozen copy of the pre-S1-T2 `v11-resume-tasks` (`tests/fixtures/handoff_identity/`).
+
+**T2c: restart identity, read side (F31)** (`V11_REPLAY_REHYDRATE_ALIAS`, `V11_WAVE_CHECK_EPOCH_BINDING`; merge `76e5a74`). After the
+10:25 resume the TaskList renumbered from 1 while the hooks kept session `a059e6ae`. The CLOSE wave-check found two defects.
+- **Rehydrate alias.** Old #71 was renamed (seqno 487) before the resume and rehydrated as #1 under its new `subject_norm`, so the ledger minted a new identity and #71 stayed open for good. `v11_replay_ledger` now treats a `created` whose `metadata.rehydrated_from.identity` names another identity already folded as an alias, and folds its events into the original.
+  - Only an identity's first event can alias it. A malformed or unknown target is ignored, and chains resolve with a loop guard.
+  - It is read-side, so existing ledgers heal with no rewrite. The replay's identity view also emits `created_claims`.
+- **Epoch binding.** `wave-check` bound `review_of` through `(session, task_id)` claims alone. Review 69 of old #3 (S1-T1) also covered the new #3 (CLOSE prep), and task-state rows for reused ids matched two identities.
+  - A review now binds to the claimant created under the id last before the review's own `created`. A `pair_` shadow also accepts a same-instant parent.
+  - A task-state row takes the id's current holder. Undecidable cases keep the claim-only rule.
+  - Live: WORK_INCOMPLETE went from `['5','4','71','7','5']` to `['5','4','7']`.
+- **Review #3 fixes (19:40 list; fix task #11, merge `7bbb0bf`):**
+  - **Terminal-target guard (HIGH).** A target already completed or cancelled at the alias's `created` is never aliased. A stale handoff that rehydrates finished work stays a separate task instead of reopening the original.
+  - **Cutover alias carve-out.** Each alias lowered the replay total by 1, so the cutover REGRESSION-GUARD blocked the rebuild twice live (prior 178, ledger 177). The replay now reports `alias_count`, and the guard adds it back and logs `alias_carveout` to `ledger-cutover.jsonl`. Review #15 (fix #16): the guard adds back only `max(0, alias_count − prior alias_count)`, so once an aggregate already holds the fold, a real loss is not masked; the ledger-vs-legacy check keeps the full count, because the legacy fold counts both identities.
+  - **Open-claimant preference.** A task-state row goes to the one open claimant whose last id in the session is the row's id. `epoch_owner` only breaks a tie, so a stale open identity's row-only metadata (`skip_review`) no longer leaks into the newer task.
+  - **Lever gating.** `V11_WAVE_CHECK_EPOCH_BINDING=off` also drops the `created_claims` claim expansion, so `=off` matches the pre-T2c output.
+- The write side is ticket #111: `sync-tasks` should key a rehydrated TaskCreate on `rehydrated_from.identity`, and `GATE_AUTOCLOSE` closes an aliased identity under the target's key.
+- The rows: `V11_WAVE_CHECK_EPOCH_BINDING` is in the v11.46 wave-check table of `docs/ROLLBACK_REFERENCE.md`. `V11_REPLAY_REHYDRATE_ALIAS` sits with the other `v11_replay_ledger` levers under "Unreleased — 2026-09-22 triage fixes".
+
+**T3: #75c no self-nudge** (`V11_HANDOFF_SELF_NUDGE_SUPPRESS`). When `handoff-tasks.json`'s `live_session_uuid` is the reading
+session, `detect-project` skips the rehydrate nudge and the L2.3 verification, and `post-compact` omits "Handoff waiting". Any doubt
+(a pre-S1 file, a missing id) keeps the nudge. Review #73 (`7623a96`): a self match writes `.handoff-surfaced`, so the check runs once
+per stamp, and another session's re-stamp mid-session does not nudge the writer. A resume keeps the session id, so T3 also
+suppressed the nudge at both of S1's resumes (see Known limits).
+
+**T4: #57 + #81** (`V11_HANDOFF_SUMMARY_LINES`, default 40).
+- One helper, `_v11_summary_excerpt`, replaces two silent `head -20` cuts. A long `.session-summary.md` keeps every heading, puts Blockers / Open Questions first, and ends with a marker that names the full summary.
+- The rehydrate command, everywhere it is emitted, is the absolute `$V11_HOME/scripts/v11-resume-tasks PROJECT`. This part has no lever.
+
+**T14: handoff-surface docs.**
+- `docs/HANDOFF_SMOOTH.md` gains a "S1 behaviour (v11.46)" section.
+- The `docs/SCRIPTS.md` rows use `$V11_HOME/scripts/…`.
+- The skill's `close.md`/`quickstart.md` (`4e6263c`) and `~/.claude/skills/handoff/SKILL.md` match T1 and T4.
+- The CLOSE fixed the remaining relative or literal paths:
+  - CLAUDE.md §0/§9 and the skill's `scripts.md` (F27);
+  - the team-orchestrator `SKILL.md` DETECT 1e `plan-resume --list` (`d4efa64`);
+  - two handoff `SKILL.md` examples (`fd2925a`);
+  - all three now use `${V11_HOME:-/path/to/v11}` or `$V11_HOME` (S1-T4 review #74).
+- The S1-T14 re-check after fix tasks #71 and #72:
+  - `docs/HANDOFF_SMOOTH.md` "S1 behaviour" already matched the #71 breaker (`8a5c962`). This CLOSE adds the review #70 rename keying and `identity_matched=false`, and the review #73 once-per-stamp self check.
+  - The handoff skill's Step 3 and Arguments row (`~/.claude/skills` `422163c`) and the CLOSE playbook (team-orchestrator `adcbea3`) said "prior ≥ 5" and "the old file is kept". Both now give the floor of 3 live-session tasks and say that `handoff.md` is kept too and `--spawn` exits 2. The skill also names `.handoff-refused` and the loud fallback.
+- Carried, not docs: `scripts/handoff`'s header comments still show `./scripts/handoff` (:3) and say a plain run "is unchanged" (:34), but a plain run can now exit 2 (F27). The handoff skill's other literal `/path/to/v11` command examples (:39, :169, :232, :255, :297 after `422163c`) stay as they are, since review #74 named only the `--spawn-anyway` line and the Related row.
+
+### Gates and messages (#76, #82, #70 → M7)
+
+**T5: #76 write-gate-scoped exemption** (`V11_WRITE_GATE_SCRATCH_EXEMPT`).
+- New `v11_is_write_gate_exempt` runs on the block path only. It exempts the harness scratchpad (the shared `V11_SCRATCHPAD_ERE`) and six exact `sessions/<project>/` handoff basenames.
+- `v11_is_metadata_file` is unchanged.
+- T5 merged first, because T7 and the dogfood depended on it.
+
+**T6: #82 honest blocks** (`V11_BASH_WRITE_WARN`, new value `=legacy`).
+- HIGH blocks add a heredoc-data hint or a `$var`-path `rm` hint.
+- Write-gate blocks add a "Possible half-applied change" line.
+- The F4 advisory also matches interpreter file writes: `python`/`node` `open(…, 'w')`, `write_text`, `writeFile`, `perl -i`.
+- Exit codes are unchanged: a 31-case matrix was diffed against master.
+
+**T7: #70 wait contract, hook side** (`V11_BG_WAIT_CONTRACT`; `STALL_WAIT_MAX_MARKERS`/`_MAX_NUDGES`/`_RENUDGE_MINUTES`/`_STALE_HOURS`).
+- `guard-agent-stall` scans `~/.agent-metrics/waiting/<project>/*-waiting.json` before its `in_progress==0` exit.
+- It nudges through PostToolUse `additionalContext` when:
+  - the pid is dead or reused;
+  - a `done_marker` appears in the log;
+  - the log's last line is terminal and the pid is gone;
+  - `expect_by` has passed.
+- A marker gets at most 3 nudges, then one STALE line.
+- Three review rounds: reviews #31 and #42, fix #45.
+- **Sprint-close review fix** (fix task #12, `4fcaed0`, no lever). The WAIT NUDGE, STALE and MALFORMED lines print the marker filename JSON-escaped and capped at 80 characters under the waiting dir. Any local writer chooses that name, so a newline in it could inject a line of hook-trusted text into `additionalContext`. Valid `<agent>-waiting.json` names print unchanged.
+- **M7: mechanism verified live** (see Metrics). No agent writes waiting markers yet.
+
+**T8: #70 wait contract, prompt side.** The Spawn Contract clause (`context-tiered-mode.md`) and a `monitor.md` §5f row (skill
+`d1afc7b`). Commits `049cbe0`, `bcfae42` and `dfd3ae2` align the text with the hook.
+
+### Cost visibility (#72 → M6)
+
+**T9: `scripts/cost-ledger`.** No lever: it is opt-in by invocation. `V11_MODEL_PRICING` overrides the price table.
+- It reports tokens and a $ estimate per task, agent or sprint, with a capture rate.
+- Spawns come from dispatch-trace and are joined on exact keys to subagent transcripts. Each transcript belongs to one Agent call, and fork replays are skipped: they had double-counted 1.43M tokens ($1.08).
+- Prices come from the new `config/model-pricing.json`.
+- The fallback token sources (task-notification, dispatch `tokens`, ledger `artifacts.tokens`) hold the last turn's context size, so they stay unpriced.
+- New `scripts/lib/task_notification.py` is the shared `<task-notification>` parser (#69). New `schemas/cost-ledger.schema.json`.
+- `--json` states `pricing.basis=api_list_price_equivalent` and `pricing.scope=subagents_only`.
+- S1-P2 (the Q6 SubagentStop spike, `artifacts/s1-spike-q6-subagentstop.md`) chose the token sources.
+
+**T10: the cost line** (`V11_COST_STATUS`, `V11_COST_STATUS_TIMEOUT`, `V11_COST_STATUS_FRESH`, `V11_COST_LEDGER`).
+- `scripts/status` prints one `Cost:` line from a cached, single-flight `cost-ledger` run, bounded at 3 s.
+- The skill's `monitor.md` dashboard and `journal.md` retrospective copy the line (`a1c5e3b`).
+
+### Honest signals (#53 → M3, #38 → M4, #55, #96, #97)
+
+**T11: #53 scorecard read side** (`V11_AS_ROUTING_RAW`, `V11_AS_ROTATED`, `V11_AS_TRANSCRIPTS`, `V11_AS_TRANSCRIPTS_DIR`; `--live-window H`).
+- `agent-scorecard --routing` judges each dispatch-trace row against the ledger's own `created.metadata.agent` for the task live at the spawn, not against the row's self-filled recommendation.
+- Buckets: agreed, diverged, self_executed, companion, unknown.
+- The headline is the decided rate, with coverage and floor..ceiling bounds.
+- Excluded: WAIVED verdicts, void and waived corrections, backfill rows, and rows whose project has no ledger.
+- The b–f follow-ups:
+  - two independent blind 50-row hand-checks, S1-T11b and S1-T11e (n = 100), and their comparison (S1-T11c); see M3 below;
+  - completion-only spawns are counted (S1-T11d, `26c1cb2`);
+  - liveness is judged before the spawn (`--live-window H`, default 2 h);
+  - rotated ledgers are merged;
+  - a served-task search finds the task a spawn actually served;
+  - a ledger served-task match counts only when unambiguous (S1-T11f, `e6263e7`).
+- The waiver writer (`review-queue mark-done`) ledgers `outcome=waived` (`5536697`).
+- Live: 198 of 2,145 decided rows diverged (9.2%), coverage 43.5%.
+- **Review #6 fixes (19:40 list; fix task #9, merge `17cdd04`):**
+  - The transcript served-task path judged a prompt that named several tasks by all their plans together, so one matching plan made the spawn agreed. Each named task is now judged on its own. The row counts only when every task gives the same bucket, and is otherwise unknown with `ambiguous_served_task`. A teammate name that owns exactly one named task picks that task.
+  - Task-id capture strips a trailing `.` or `-` (`task #7.` → 7).
+  - A completion row counts from its start (ts − duration) for the companion and self-exec windows.
+  - Session liveness accepts ledger events up to 5 min after the spawn, the same grace as owner/in_progress.
+  - Measured on one frozen copy of `~/.agent-metrics`: the headline stays 9.4% (205/2,191 → 205/2,181), and coverage goes 43.7% → 43.5%.
+  - The 4 LOWs left are #112.
+
+**T12: #38 registry-drift read side.** The lever is unchanged: `V11_REGISTRY_CHECK`.
+- Ledger labels are normalised.
+- A named background spawn is aliased to its created event's agent, joined inside one ledger file and never on a bare task_id.
+- An owner that is itself a plausible agent type is never aliased. It WARNs as a type mismatch instead.
+- **M4: 232 → 13** at merge (6 real drift, 5 writer gaps, 2 cross-project). The target, <10, is not met. 14 at the CLOSE prep. The user accepted 14 at G1 (see Metrics).
+
+**T13: #55 ADR** (`sessions/v11-leverage-program/adr-55-dispositions.md`). Revision 4.1 was **accepted by the user at G1 on 2026-09-26**:
+- dispositions live in a side ledger keyed by `attribution_key`, and the latest row wins;
+- only a daemon re-review or the user may close a CRITICAL without a fix;
+- the historical CRITICALs are triaged first;
+- sibling ingest goes through #102.
+
+The implementation is S3-T5/T6/T7.
+
+**T16: #96 wave-check replays the ledger** (`V11_WAVE_CHECK_COVERAGE`, `V11_WAVE_CHECK_WAIVER_COVERAGE`, `V11_WAVE_CHECK_SKIP_REVIEW_STRICT`; opt-in replay view `V11_REPLAY_EMIT_IDENTITIES`).
+- The wave is built from `v11_replay_ledger`'s identity view, keyed by `(subject_norm, create_seq)`, so a closed sprint is visible.
+- Exit codes:
+  - unreviewed reviewable work exits 2;
+  - a CRITICAL from any verdict source (artifacts, summary counts, `ev:"review"`, the verdict file) exits 3;
+  - an unreplayable ledger exits 4.
+- `pair_` shadows are judged from their parent. Waivers get their own bucket.
+- The default replay output is byte-identical.
+
+**S1-P1** re-encoded the 19 S0-CLOSE waivers in the live ledger as `outcome=waived`.
+
+**S1-P3: #97 verdict binding.**
+- `review-queue mark-done` resolves the parent by `(session, task_id)` (`ea3cf2a`). A reused id with no session exits 2 and writes nothing. A non-UUID session, or one that holds no task under the id, counts as no session (`1047fc6`).
+- `review-daemon` passes the entry's session, which is the parent's (review #61 HIGH, `f012ba0`). The fix landed at 06:19, before the next 03:30 review-cadence cron run.
+- New `scripts/lib/review_corrections.py` is the one waived/void correction rule (`48888aa`). The scorecard, the fold and wave-check all use it, and the default fold skips void rows.
+- The seqno-311 misfile was corrected live (seqnos 421/422).
+- **Refused folds are parked** (sprint-close review, fix task #12, `4fcaed0`; `V11_REVIEW_DAEMON_PARK`, default on).
+  - When `mark-done --verdict-file` refuses with the AMBIGUOUS message (exit 2 plus "names more than one task" / "tasks under task_id"; review #15), `review-daemon` parks the queue entry. Any other exit 2, such as a CLI usage error, stays pending. Before, the entry stayed pending, and after a same-id resume each nightly cadence run paid for a new headless review that could never bind.
+  - `v11_review_queue_park` appends an `ev:"parked"` copy of the row: the claim cleared, `parked_at`, `park_reason`, `park_rc`, `verdict_kept` (the kept verdict file) and `parked_by`. Drain paths take `ev=="pending"` only. Any other non-zero rc leaves the entry pending, since it may be transient.
+  - `review-queue` gains `park` and `unpark`. `dashboard`, `backstop` and `stats` report parked entries apart. `pending --json` is unchanged unless you pass `--include-parked`.
+  - **Un-park:** `review-queue unpark PROJECT TASK_ID` makes the entry drainable again, and the next drain re-reviews it. Or fold the kept verdict with `review-queue mark-done PROJECT TASK_ID "" SESSION --verdict-file <verdict_kept>`, since a done event closes a parked entry. A new enqueue of the task also re-pends it. When the id names several tasks inside one session (a resume), neither route binds until #113 gives `mark-done` an identity argument: the fold refuses, and an un-parked entry pays for one more review and parks again. Keep the verdict file until then.
+  - `=off` restores the pre-fix behavior: the entry stays pending and is re-drained on every run.
+
+### Test and GC rails (S0 sprint-close findings)
+
+**T15: #95 the extended gate.**
+- **Gate 13 honours fixture project dirs** (`ee0fa9b`). `v11-compliance-check` accepts a path, and the 4 slow `test_gate13_skipdirs_wave.py` tests pass. Before the meta-test fix, `test_full_suite_green_and_grown` timed out: its nested suite ran serially and overran the 2,850 s budget.
+- **The meta-test** (`88d65c3`). Outside an xdist worker, `test_full_suite_green_and_grown` runs the nested suite at `-n 8`. Inside a worker it skips, with the reason, when the serial estimate is over budget. One real run took 1,381 s for 3,761 tests, well inside the 2,850 s budget. The run was red on two load flakes, and both are fixed below.
+- **The pipefail SIGPIPE race** (`8292051`). Under `set -o pipefail`, `echo "$out" | grep -q P` can fail with 141: `grep -q` exits between bash's two writes of a multi-line value. The race was the cause of the v11-retro self-test flake, which is **resolved**: 56/640 failures under stress before, 0/640 after.
+  - The audit covered every early-exit reader behind a pipe in the 85 pipefail shell files, plus `hooks/lib/common.sh`: 147 hits, **43 lines fixed in 19 files**, and 104 left with a reason code.
+  - The fixes use here-strings, `grep … >/dev/null` for multi-write writers, and `|| true` on display-only `| head`.
+  - New `tests/test_pipefail_early_exit.py` is a static check plus a deterministic mechanism test.
+- `tests/test_handoff_context.py` tests its own tree, not a hardcoded `/path/to/v11`, with a realistic timeout (`1d94c35`).
+- Every subprocess budget under 30 s in `tests/test_handoff_*.py` is now 30 s: 38 call sites in 11 files (`a9df8e0`). Under load, four `test_handoff_resume` tests had timed out, and all four pass alone. `test_handoff_resume` also runs its own tree's `handoff-bak-gc`.
+- **Review #6 fixes (10:25 list; merge `c778e57`):**
+  - **Here-strings in `common.sh`** (M1, `f7b48fa`). The audit had skipped `hooks/lib/common.sh`, which 31 pipefail scripts source. Its four `printf | grep -q` lines now use here-strings with the same flags. One of them is the dangerous-command match in `v11_check_risk`, which missed 7 of 3,000 multi-line values. `tests/test_pipefail_early_exit.py` now also scans the libs those files source, transitively, and asserts `common.sh` is among them.
+  - **verify-gate Results parsing** (M2, `c0ac46c`, F29). The gates decided with `grep '0 failed'`, which also matches "10 failed" (pre-existing since `de0cf00`). Gates 1 and 2 reported all-pass with 10, 20 or 30 failures, and gate0 FAILed every clean run. Each gate now matches `run-tests`' `Results:` line with an anchored regex. An absent failed clause is 0, and no `Results:` line is a named FAIL. New `tests/test_verify_gate_results.py`.
+  - **The meta-test runs inside an xdist worker** (M3, `7a1a797`). `run-tests --full`, which the gates call, runs at `-n 8`, so the meta-test always skipped on the gate path. The nested suite now always runs at `-n min(8, cpus)`, with the outer run's xdist env stripped. The serial fallback and its skip are gone, and a missing pytest-xdist fails loudly.
+  - **`ledger-archive --before`** matches a whole `YYYY-MM-DD` (LOW, `878eebf`). The date lands in the archive file name, and the old check anchored only the start.
+  - **`worktree-sweep` globs** (`3cfdfaf`, found when the meta-test first ran in a worker). An unquoted `for glob in $GENERATED_GLOBS` expanded against a cwd that held `tests/.reports/`, so a generated-only worktree was reported UNCOMMITTED. The globs are now split with `read -ra`.
+- **Review #4 fix (19:40 list; fix task #7, merge `3911e7e`).** The review FAILed the Results parsing on one HIGH: the line left out pytest's error count and nothing guarded a zero total, so "2990/3000 passed" with 10 setup errors and "0/0 passed" both passed.
+  - `run-tests`' `Results:` line now carries `, N errors`.
+  - Each gate sets a failed count only when T > 0, E == 0 and P+F+S == T. A missing, unparseable or short line fails closed, and so does any outcome the line doesn't name (xfail, xpass).
+  - The one-failure autonomy-grant allowance is kept and documented.
+- None of the T15 changes has a lever.
+- **`run-tests --regression-extended` exits 0 on `1d781e7`** (2026-09-27, 37.9 min). Phase 1: 3,875 passed, 17 skipped. Phase 2, the serial slow tier: 22 passed, 8 skipped, including the meta-test's nested full suite and the Gate 13 fixtures (#95). The stamp and changelog lints pass. So S1-T15 is done.
+  - Two earlier CLOSE runs were red, and neither was a code failure. On `7d15f4b`, phase 2's meta-test failed one hook-timing test under concurrent agent load; that test passes alone in 2.7–2.9 s against a 5 s budget. Two harness-drift tests also failed there, fixed by #13. On `15bd991`, phase 1 had 6 hook-subprocess timeouts while a fix agent was testing, at a 15-min load of about 17. All 6 pass when run serially, and phase 2 was green.
+  - Lesson (retro): run the extended CLOSE gate only when no agents are testing on the host.
+
+**R1: the session GC quarantines** (`V11_SESSION_GC_MODE`, `V11_SESSION_GC_TTL_HOURS` = 168, `V11_SESSION_GC_QUARANTINE_HOURS`).
+- Liveness is checked in order: current session, heartbeat, owning process (pid + `procStart`), mtime.
+- Expired dirs move to `sessions/.gc-quarantine/<utc-ts>/` and are purged after 7 days.
+- The review #58 follow-up (`02933c4`): SessionEnd teardown quarantines the scratch, and a Stop never removes it.
+- New `hooks/session-end --gc-run`; `--gc-preview` prints every decision.
+- `rotate-metrics --sessions` runs the GC instead of `rm -rf` (`02933c4`).
+
+**R3a: lint-test-honesty is a hard gate** (`V11_LINT_HONESTY_GATE`) in every mode except `--fast`. `run-tests` exports
+`V11_HOME=$V11_ROOT` for its lint/check phase, so a worktree run checks the worktree.
+
+**R3b: #98 item 3.** `check-wiring-parity`:
+- lists unwired V11 session dirs (`--strict-unwired`, `--unwired-since`);
+- writes weekly reports (`--report-dir`, `--keep`);
+- manages one `# v11-wiring-parity` cron line (`--install-cron` / `--uninstall-cron`, Sun 04:30). The line is installed live.
+
+**R4: #100 `--restore` hardening.** The restore writes to the path it inspected and refuses a repointed target. An unreadable
+backup dir exits 1.
+
+**R2: #94 tests never write the real `~/.agent-metrics/sessions`** (`d4df4c7`; `V11_TEST_HOME_GUARD`).
+- `scripts/lib/context_tracker.py` resolves `$METRICS_DIR`, else `$HERCULES_ROOT/.agent-metrics`, else `~/.agent-metrics`. It had hardcoded the last, so `hooks/sync-tasks` wrote `context-estimate.json` into the real dir from any test that isolated only `METRICS_DIR`/`HERCULES_ROOT`.
+- `tests/conftest.py` gains an autouse, module-scoped guard. It snapshots the real sessions dir and fails a module that creates or writes a test-shaped entry the module owns. An unowned change only warns, since concurrent runs share the dir. It never deletes anything.
+- The two self-review test modules also set `HOME`. They had leaked `v11-myproj.md` into `~/.claude/plans` through plan-sync.
+- New `tests/test_real_home_isolation.py`. The debris that already exists is left for manual removal.
+- **Review #5 fix (19:40 list; fix task #8, `c136a24`).** The guard banner says that an owned change may come from a concurrent run using the same id, such as another worktree on pre-#94 code or an xdist worker. It suggests a re-run or `V11_TEST_HOME_GUARD=off`. The isolation fixture sets `HOME` before `exec_module` and uses test-shaped session ids, so the guard would catch a regression.
+
+### Lane D: D0 (#88, groundwork for M11)
+
+- **D0-1:** `scripts/lib/roster.py` is the live roster of agents and skills, with a `roster_hash` and a cache (`V11_ROSTER_CACHE`). Live: 102 agents + 4 built-ins, 70 skills + 1 plugin skill.
+- **D0-2:** `scripts/dispatch-advise --engine baseline`.
+  - Fixed routes come first, each with its provenance. Otherwise it ranks by BM25, plus the META_MAP prior and a scorecard tie-break.
+  - It returns the top-3 agents and skills and an `advice_id`.
+  - It logs to `~/.agent-metrics/dispatch-advice.jsonl` (`V11_DISPATCH_ADVICE_LOG`, `=off`). `V11_AGENT_SCORECARD=off` drops the tie-break.
+  - New `schemas/dispatch-advice.schema.json`.
+- **D0-3:** `dispatch-trace-append --advice-id` is additive. With no id, the line is byte-identical.
+- **D0-4:** skill wiring (`V11_DISPATCH_ADVISE`, prompt-only): the Phase 3 STEP 3 `--pending` table and the Phase 4 spawn step.
+- **D0-5:** `reconcile-agent-registry` field-syncs existing entries from `.md` frontmatter (description, model, tools, triggers, version). The hardcoded 11.37.0 is gone. Applied live to 59 entries; backup `.bak-pre-d0-5`.
+
+**Also shipped.** `scripts/publish` tolerates non-object PORT_REGISTRY entries and registers Next.js sites with `websocket: true`
+(`bc67e71`). This was a pre-existing edit from another session; the user approved it riding in S1.
+
+### Metrics (G1)
+
+| Metric | Target | Result |
+|---|---|---|
+| M1 handoff carries the open tasks | 100% on fixtures + live | **Met.** 6/6, 5/5, 6/6 on the fixtures; 8/8 live on 2026-09-26. The live emission was promoted by hand after the F25 breaker refusal. With fix task #71 the script accepts the same 8 on that input. Both real resumes were recovered with it: 5/5 at 10:25, and 2/2 at 19:40 on the fixed replay. Caveat: M1's command reads `~/.claude/tasks/session-<sid8>` with sid8 = `live_session_uuid`. After a resume that is the frozen first-list store (`session-a059e6ae`, last written 08:15), not the live one. The 2/2 was checked by hand against the live list's store (`session-87a619b2`: #4 and #5 in progress). `handoff-tasks.json` does not name its store (#113). |
+| M3 routing override honesty | within ±2 pp of a hand-check | **Fails on legacy data.** Restated at G1; see below. |
+| M4 registry-drift WARNs | <10 | **Accepted at G1; the target is not met.** 232 → 13 at merge. 14 WARN and 0 FAIL at this write-through, since G1 registered `secret-jar`, an agent another session had added without registering it (the registry has 103 entries). |
+| M6 cost visibility | per task, agent and sprint | **Met for sprint and agent.** Per task holds only within one TaskList. See M6 below. |
+| M7 silent waits detected | within 1 TaskList | **Mechanism verified.** It was verified live on this wired project with one dead-pid marker the orchestrator wrote. The nudge came within 1 TaskList, and a marker with a live pid stayed silent. No agent writes waiting markers yet, so detection of real silent waits against the 5+ baseline is unmeasured. |
+
+**M3.** Two independent blind 50-row hand-checks were run (S1-T11b and S1-T11e, n = 100).
+- ±2 pp cannot be resolved at this n: one row moves the rate by 11–13 pp.
+- Under the helper=agreed rubric, the scorecard (0.165 pooled, after S1-T11f) sits **outside** the blind spawn-keyed 95% interval, 0.040 [0, 0.131].
+- Under helper=diverged it sits inside: 0.209 [0.065, 0.364].
+- The largest contributor to the gap is the trace writer (#103: trace rows name the wrong task or project). It is not the sole cause; see the G1 decisions.
+- Evidence: `artifacts/s1-t11b-blind-handcheck.md`, `s1-t11c-m3-comparison.md`, `s1-t11e-blind2.md`.
+
+**G1 decisions** (the user, 2026-09-26; recorded in the team-orchestrator `journal/decisions.md`):
+- **M3 is restated.** It is spawn-keyed. It passes when the scorecard's diverged rate lies inside the 95% bootstrap interval of a spawn-keyed blind hand-check, and helper spawns count as agreed. It is measured on NEW trace rows only, after #103 and #54 land in S3. S1 records **FAIL** on legacy data.
+- **The cause of the FAIL.** #103 is the largest contributor, not the sole cause. Of the 12 disagreements, 5 are trace-writer rows, 3 are rubric, 1 was a classifier bug (fixed in S1-T11f) and 3 are other. The in-interval counterfactual moves only rows 4 and 11, and row 4 is a bare task_id bound through the 2 h window: the id-reuse family (#113).
+- **M4 is accepted** at 14 WARN / 0 FAIL, after `secret-jar` was registered through `reconcile-agent-registry` (103 registry entries). The writer-gap WARNs ride with #103 (S3), and the alias WARNs with #108.
+- **F21 is kept:** the 5-min sibling grace, name-matched review siblings and the 2 h `--live-window`. S3 may tune them.
+- **ADR-55** rev 4.1 is accepted (see T13).
+- **The resume epoch** (sprint-close review): caveated in S1 (see Known limits). The epoch key leads S2 (#113).
+- **spawn-claude-window.** The G1 re-run item found `~/.claude/hooks/__tests__/test_spawn_claude_window.py` obsolete: it imports the module S0-T10 deleted. A smoke test of the live `spawn-claude-window.py` against the current `handoff.md` passed. The rewrite is #110.
+
+**M6.** `scripts/cost-ledger v11-leverage-program --by sprint`, re-run at this write-through (2026-09-26 23:36 CEST). All figures are the **API list-price equivalent, subagents only**. The orchestrator session is not included.
+- S1 (`sprint-01-bleeding`): **$516.02** over 64 spawns (62 with tokens), 1,037.2M tokens.
+- Program total: $655.54 over 122 spawns. Capture is 116/122 (95.1%), and all 116 are priced from transcripts.
+- The other rows are unchanged: S0 (`sprint-00-rails`) $99.23, planning $22.92, planning-r3 $17.37.
+- Earlier figures for S1 and the program: $400.26 and $539.78 at the CLOSE prep, and $457.10 and $596.62 at the first write-through (11:37).
+- **Per task is caveated.** `--by task`, the default, groups on the bare task id. After a resume one key merges 2–3 tasks under the first one's label. Live: key `7` sums S1-T5, S1-T2c and the review #4 fix (19:40 list), labelled S1-T5. `--by sprint` and `--by agent` do not group on task ids. The fix is in #113.
+
+### Known limits (the resume epoch; S2 leads with #113)
+
+A resumed conversation keeps the hook session id (`a059e6ae` all through S1) but gets a fresh TaskList that renumbers from 1 (stores
+`session-87a619b2` at 10:25 and `session-dedc750b` at 19:40). Nothing records that TaskList epoch, so ids 1–14 of the session each name
+2–3 tasks. At G1 the user chose to caveat this in S1 and lead S2 with the epoch key (#113). Until then:
+- **S1-T3 suppresses the rehydrate nudge after a resume.** The resumed session matches `live_session_uuid`, so `detect-project` (:81) treats it as the writer, and the nudge and L2.3 stayed silent at both resumes. Manual recovery, used twice in S1: `$V11_HOME/scripts/handoff PROJECT`, then `$V11_HOME/scripts/v11-resume-tasks PROJECT` and one TaskCreate per payload. The rehydrated tasks continue their ledger identities.
+- **`review-queue mark-done` refuses reused ids after a resume** (S1-P3, F33). It exits 2 and writes nothing when the parent's id names several tasks in the session. Verdicts are kept as files: review #3 of S1-T2c (`artifacts/s1-review3-t2c-verdict.json`) and the sprint-close verdict (`artifacts/s1-sprint-close-review.json`), both under `sessions/v11-leverage-program/`. `review-daemon` parks such entries instead of re-reviewing them.
+- **`cost-ledger --by task` merges tasks that share an id** (see M6).
+- **M1's command reads the frozen first-list store** after a resume (see the M1 row).
+- `dispatch-advise --task-id` matches a bare id across every session's open tasks, so after a resume use `--pending` or pass the task text (F28).
+
+### Tickets filed, findings carried
+
+- **#101** (MEDIUM, S2): `sync-tasks` auto-pair ignores `skip_review`, `review_of` and `adversarial-*` (INV-7 isn't enforced on the producer side). Addenda: each resume minted `pair_` shadows for the rehydrated tasks again, the skip_review CLOSE included (F28, and pair_36/_37 at 19:40).
+- **#102** (HIGH, with S3-T6): the ledger's 4 KB line cap drops finding-heavy review verdicts. Worse case, F11: the ADR review's completion has no artifacts and a 0/0/0/0 summary. The S1 rescue is `artifacts/fold-review.sh`. It is not safe after a resume: when the parent's id names several tasks in one session, `mark-done` refuses (F33), and the script now reports the refusal and keeps the verdict file instead of printing an unrelated ledger row.
+- **#103** (HIGH, with S3-T2/T3): `track-agents` stamps the wrong task on dispatch-trace rows and fills in its own recommendation. F23 adds a wrong-project row and a false self-executed record.
+- **#104** (LOW): `check-rollback-lever-drift` can't see a lever read through an `env("V11_…")` helper in bash-wrapped Python, so `V11_AS_ROUTING_RAW`, `V11_AS_ROTATED` and `V11_AS_TRANSCRIPTS` are bullets, not table rows, in `docs/ROLLBACK_REFERENCE.md`.
+- **#105** (MEDIUM): `check-stamp-drift` anchors on the newest version string in any commit subject, not just `release(v11.x)`, so a mid-sprint `docs(v11.N)` subject turns `--regression` red until the release (F14).
+- **#106** (LOW): three drift lints default `V11_HOME` to the main tree, so run directly from a worktree they check master (F17). `run-tests` itself was fixed in S1-R3a.
+- **#107** (MEDIUM, S2): `sync-tasks` ledger fidelity. A completed event takes the active task's subject (F2), and the `pair_` activation is never ledgered (F5).
+- **#108** (LOW): registry hygiene after D0-5. `version` mixes V11 stamps and agent semver, five `file` paths point at nothing, and nine models are `inherit` (F20). The M4 alias WARNs ride here.
+- **#109** (MEDIUM): `adversarial-lite-reviewer` has no search tool, so its integration lens can't enumerate callers (F9).
+- **#110** (LOW, with S5-T5): `test_spawn_claude_window.py` tests the deleted module, so the live `spawn-claude-window.py` has no unit test (F30).
+- **#111** (MEDIUM, S2): the write side of S1-T2c. A rehydrated TaskCreate is keyed on its new subject, not on `rehydrated_from.identity`, and `GATE_AUTOCLOSE` closes an aliased identity under the target's key.
+- **#112** (LOW, S3 with the M3 re-measure): the `agent-scorecard --routing` read-side residuals that the review #6 fix left: the one-live-ledgered-session rule, filtered counters, docs and test gaps.
+- **#113** (HIGH, leads S2): the resume epoch. A resumed conversation keeps the hook session id but gets a fresh TaskList, and nothing records the epoch. Seven `(session, task_id)` resolvers diverge. It proposes one epoch-aware resolver, and it absorbs the Known limits above.
+- **#97** gains an addendum: the review queue is keyed by a bare task_id too (F6, F19).
+- **Carried in `artifacts/s1-close-findings.md`:**
+  - F12: stall output is plain stdout the model never sees (#87, S2-T3);
+  - F13: load-sensitive test timeouts (S3-T1 re-tunes the harness; F15, the v11-retro flake, is resolved);
+  - F32: `scripts/wave-review` crashes when an aggregate `task_artifacts` entry holds a count instead of a list, and it reads the aggregate by bare id (#97). It is a LOW ticket candidate, and the S1 sprint-close prompt was written by hand.
+- **Carried from the S1-T15 fix review** (#6 of the 10:25 list). Four of its six findings were fixed in `c778e57` (see T15). Two are carried:
+  - the pipefail detector's pattern gaps;
+  - a here-string can spill to a TMPDIR temp file in the hooks.
+
+**New scripts and flags.**
+- Scripts: `scripts/cost-ledger`, `scripts/dispatch-advise`.
+- Libraries: `scripts/lib/roster.py`, `review_corrections.py`, `handoff_identity.py`, `task_notification.py`.
+- Config: `config/model-pricing.json`.
+- Schemas: `schemas/cost-ledger.schema.json`, `schemas/dispatch-advice.schema.json`, and `advice_id` in `dispatch-trace.schema.json`.
+- New flags:
+  - `handoff --allow-empty`;
+  - `check-wiring-parity --strict-unwired`/`--unwired-since`/`--report-dir`/`--keep`/`--install-cron`/`--uninstall-cron`;
+  - `hooks/session-end --gc-run`;
+  - `agent-scorecard --live-window`;
+  - `check-registry-drift --human-owner`/`--project-root`/`--dispatch-trace`;
+  - `dispatch-trace-append --advice-id`;
+  - a path argument to `v11-compliance-check`;
+  - `review-queue park`/`unpark` and `pending --json --include-parked` (fix task #12).
+- `rotate-metrics --sessions` now runs the GC.
+- `run-tests`' `Results:` line gains `, N errors` (fix task #7).
+
+All are registered in `docs/SCRIPTS.md`. All but the `review-queue` subcommands are also in the skill's `playbooks/scripts.md`, which
+has no `review-queue` row. `cost-ledger` and `dispatch-advise` are also in CLAUDE.md §9.
+
+**Net-new levers.**
+- Handoff: `V11_HANDOFF_SOURCE_CHECK`, `V11_HANDOFF_LIVE_WINDOW_SECS`, `V11_HANDOFF_SOURCE_BUDGET_SECS` (fix task #71), `V11_HANDOFF_IDENTITY_KEYS`, `V11_HANDOFF_SELF_NUDGE_SUPPRESS`, `V11_HANDOFF_SUMMARY_LINES`.
+- Gates and waits: `V11_WRITE_GATE_SCRATCH_EXEMPT`, `V11_BG_WAIT_CONTRACT` (+`STALL_WAIT_*`).
+- Cost: `V11_COST_STATUS` (+`_TIMEOUT`/`_FRESH`), `V11_COST_LEDGER`, `V11_MODEL_PRICING`.
+- Scorecard: `V11_AS_ROUTING_RAW`, `V11_AS_ROTATED`, `V11_AS_TRANSCRIPTS` (+`_DIR`).
+- wave-check: `V11_WAVE_CHECK_COVERAGE`, `V11_WAVE_CHECK_WAIVER_COVERAGE`, `V11_WAVE_CHECK_SKIP_REVIEW_STRICT`, `V11_REPLAY_EMIT_IDENTITIES`.
+- Restart identity (S1-T2c): `V11_REPLAY_REHYDRATE_ALIAS`, `V11_WAVE_CHECK_EPOCH_BINDING`.
+- Review queue: `V11_REVIEW_DAEMON_PARK` (fix task #12).
+- Session GC: `V11_SESSION_GC_MODE`, `V11_SESSION_GC_TTL_HOURS`, `V11_SESSION_GC_QUARANTINE_HOURS`.
+- Test gates: `V11_LINT_HONESTY_GATE`, and `V11_TEST_HOME_GUARD` (S1-R2; read only by `tests/conftest.py`).
+- Lane D: `V11_ROSTER_CACHE`, `V11_DISPATCH_ADVICE_LOG`, `V11_AGENT_SCORECARD`, and the prompt-only `V11_DISPATCH_ADVISE`.
+
+`V11_BASH_WRITE_WARN` gains `=legacy`. The pre-existing silent lever `V11_STEER_MAX_CHARS` (v11.40) now has its row (F27).
+
+**Tests added** (`399beb8..6b00659`; the later fix merges added cases to existing files, listed with each fix).
+- 18 new test files:
+  - `test_block_honest_alternative`, `test_check_registry_drift`, `test_cost_ledger`, `test_dispatch_advise`, `test_handoff_identity_keys`
+  - `test_handoff_self_nudge`, `test_handoff_source_budget`, `test_handoff_source_check`, `test_handoff_summary_resume`, `test_pipefail_early_exit`
+  - `test_real_home_isolation`, `test_review_corrections`, `test_roster`, `test_run_tests_lint_gate`, `test_stall_wait_contract`
+  - `test_status_cost_line`, `test_verify_gate_results`, `test_write_gate_scratch_exempt`
+- Fixtures:
+  - the M1 fixtures are in `tests/fixtures/handoff_m1/archivestream/`;
+  - the frozen pre-S1-T2 `v11-resume-tasks` is in `tests/fixtures/handoff_identity/`.
+- 38 files were extended: 36 test modules (9 of them only for the S1-T15 handoff test budgets), `tests/conftest.py` (the S1-R2 guard) and `tests/hooks/test-bash-write-warn.sh`.
+- In total, 467 test functions were added and 6 removed (rewrites).
+
+**Rollback levers:** see `docs/ROLLBACK_REFERENCE.md` § "v11.46 — Stop the Bleeding". `V11_REPLAY_REHYDRATE_ALIAS` is the one
+exception: its row sits with the other `v11_replay_ledger` levers under "Unreleased — 2026-09-22 triage fixes". No lever covers the four
+live data changes:
+- the S1-P1 waiver rows and the S1-P3 correction rows are append-only ledger rows. Undo one by appending an `outcome=void` correction that names it (`scripts/lib/review_corrections.py`: a voided correction corrects nothing). The apply scripts are `artifacts/s1-p1-apply.sh` and `s1-p3-apply.sh`.
+- the D0-5 registry sync is undone by restoring `~/.agent-registry/agents.json.bak-pre-d0-5-20260926T030740Z`.
+- the G1 `secret-jar` registration is undone by restoring `~/.agent-registry/agents.json.bak-pre-secret-jar-20260926194935`.
+
+---
+
+## v11.45 "Rails" (v11-leverage-program S0) — 2026-09-26
+
+**Make the system safe to change.** Sprint S0 of v11-leverage-program (spec: `sessions/v11-leverage-program/spec.md`,
+roadmap §S0, gate G0). Every later sprint relies on these rails. Four tickets:
+- **#90:** `session-end` was wired to `Stop`, so session teardown ran every turn. This was the root cause behind #75's same-session drops, the dead context tracker, retro-counter inflation and steer loss.
+- **#86:** the fleet couldn't receive hook changes: 8/98 projects were at template parity, `v11-update` was frozen at v11.11 and its `--all --dry-run` wrote for real.
+- **#85:** a sprint-prefixed commit could close tasks in another live session's project.
+- **#89:** the CLOSE checks couldn't see the skill, and new scripts never reached the orchestrator.
+
+Every row was adversarially reviewed (review tasks #13–#22), and every finding was fixed in fix tasks #23–#26 before merge.
+Commits `346137f..d5d1938` (23 commits).
+
+**T1 — regression lock.** `scripts/run-tests --regression*` takes an exclusive, host-global `flock`
+(`$HOME/.cache/v11/regression.lock`, so worktrees with different `V11_ROOT`s still serialize). It covers pytest, the drift lints
+and the extended slow tier. A second run waits up to `V11_REGRESSION_LOCK_TIMEOUT`, then exits 75. The lock fd is closed in
+children (review fix `6085618`). Lever `V11_REGRESSION_LOCK`.
+
+**T2 — hook-surface spike.** `sessions/v11-leverage-program/recon/spike-hook-surface.md` answers nine hook-surface questions with
+citations, plus an orchestrator-verification section with corrections: Q4 `TaskUpdate` is its own tool; SessionEnd on tmux kill is
+undocumented. Design rule adopted for T6: correctness must not depend on SessionEnd firing.
+
+**T3 — #85 post-commit resolves the project from the committing repo.** `hooks/post-commit-close-tasks` resolves in this order:
+`$V11_PROJECT`, then the repo's `.v11-project` pin (exactly one valid line), then the repo basename. The basename tier fires only
+when the repo sits at its project's canonical root (realpath match) and that project's ledger exists. It never reads the host-global
+active-project file. The repo root is the main worktree root (`--git-common-dir`), or the submodule's own toplevel inside a
+submodule. Anything ambiguous refuses with a warning. `scripts/lib/postcommit_analysis.py` treats `cancelled` as terminal.
+
+**T4 — #86 `v11-update` rebuilt as a template diff.** New `scripts/lib/wiring_diff.py` is the pure diff core, and `scripts/v11-update`
+is a thin CLI over it:
+- A hook command wired anywhere in the template is **managed** and reconciled to the template's exact `(event, matcher)` wiring. Every other command is **custom** and preserved byte-for-byte.
+- The report distinguishes `fields_preserved` (per-hook keys such as `async`/`statusMessage`), `timeout_preserved` (custom timeouts only) and `superseded` (`guard-teammate-timeout` is removed wherever `guard-agent-stall` is wired).
+- Writes keep the file's indent and newline, rewrite `hooks` in place, and are atomic and mode/symlink-safe. Errors are per-file: the batch continues and exits 1 at the end.
+- `--dry-run` really writes zero bytes (it creates no backup dir either). Changed files are backed up under `V11_UPDATE_BACKUP_ROOT` first.
+- `--all` discovers every wired `settings.json` under `V11_UPDATE_SCAN_ROOT`, not just `$SESSIONS_ROOT`. Discovery prunes dated backup and snapshot dirs (`v11.backup.*`, `*.bak`, `.v11-backups`), so a backup copy is never treated as a fleet project.
+- `--scan` is deprecated and points at `check-wiring-parity`.
+
+**T5 — #86 wiring truth.**
+- `scaffold` builds a new project's `settings.json` from the template via `wiring_diff.py new-project-settings`. The stale 16-hook heredoc and the orphan `templates/project-settings.json` are gone.
+- `v11-compliance-check` and `validate-project-setup` read hook counts live from the template.
+- `tests/test_hooks_selftest.py` covers `ALL_HOOKS` and is regression-marked.
+- New `scripts/check-wiring-parity` is the read-only fleet report, with a matcher-parity column (bare `Task` vs `Task|Agent`).
+- `CLAUDE.md` §13 and `docs/ENFORCEMENT.md` correct the "dormant" docs: `guard-teammate-timeout` is superseded, `enforce-subagent` is opt-in/custom, and only `refresh-freshness-tags` is dormant.
+
+**T6 — #90 Stop/SessionEnd split** (`V11_STOP_SPLIT`). `hooks/session-end` dispatches on `hook_event_name`.
+- **Stop** takes the cheap path only when the project wires SessionEnd→session-end with a timeout of at least 30 s: the aggregate fold, plus an auto-emit throttled on the open-set digest. Otherwise it keeps the full per-turn path, so unsynced projects never lose teardown.
+- **SessionEnd** runs the critical work first, then an exactly-once-per-sitting claim (one session-log row, one retro increment), manifest and scratch removal, then the bounded optional work. The claim is keyed on `session_id` plus a `.sitting` marker, so `--resume` counts again and a duplicate SessionEnd does not.
+- A UUID-only GC removes dead-session dirs (`V11_SESSION_GC_HOURS`/`_ALL`/`_DRYRUN`, `--gc-preview`). It never touches `legacy-cli` or the other shared identities.
+- `.handoff-autoemit-at` and the digest are stamped only on a successful emit. The #41 hand-edit guard holds on both paths (`skipped: hand-edited`).
+- Behaviour change: session-end now runs align-aggregate *after* project resolution, so it uses the session's own project rather than the global active-project file. It still falls back to the global file when no project resolves (fix task #26, `b24bacf`).
+- The template's SessionEnd entry carries `"timeout": 60`. The canary (`artifacts/s0-t6-canary.md`) found that the harness kills an untimed SessionEnd hook at ~1.5 s, before the emit, the retro counter and scratch removal.
+
+**T7 — fleet sync (HIGH, user-approved).** `v11-update --all` was applied to 97/97 discovered projects, which are now at template
+parity: M10 = 100%, against a baseline of 8/98. This carries the SessionEnd wiring, `guard-agent-stall` and `Task|Agent` fleet-wide.
+example-project's custom hooks are preserved. Backups: `~/.v11-backups/v11-update/20260925T223523Z` (96 files) and
+`~/.v11-backups/v11-update/20260925T223306Z` (1 file).
+
+**T8 — #89 meta-rails.**
+- `check-stamp-drift` also checks the team-orchestrator `SKILL.md` frontmatter and footer (`V11_ORCH_SKILL_MD`). A missing file FAILs unless `V11_ORCH_SKILL_REQUIRED=off`.
+- `check-index-body-status-consistency` is scoped to the `**Status:**` line. Its README matching is case-sensitive for the ALL-CAPS tokens, and its warnings name any rejected lowercase words. This clears #73's false WARN.
+- `check-class-included` judges every occurrence of an identifier: FAIL dominates (#40 F1).
+- The skill's `close.md` lists the CLOSE gates, and `scripts.md` carries the registration rule and the backfill.
+
+**T9 — #89 data rails.** `rotate-metrics` has a per-subdir policy:
+- `ledger/<project>.jsonl`/`.seq`/`.lock` are never moved; `ledger/*.bak*`/`*.stale*` older than `LEDGER_BAK_TTL_DAYS` (14) are archived.
+- `review-queue/` is report-only.
+- `outbox/<project>/*.md` older than `OUTBOX_TTL_DAYS` (30) are archived.
+- Top-level rotation is locked, with `V11_ROTATE_SETTLE_SECS` between `mv` and `gzip`.
+
+New `scripts/install-rotate-cadence` installs the weekly cron line (`# v11-rotate-metrics`, Sun 04:15).
+
+**T10 — #89 governance (user-approved).** `~/typesafe` and `~/.claude/skills` were git-init'd locally, with no remote. The skills repo
+uses an allowlist `.gitignore` covering the 14 V11-family skills. Secret and large-file scans were clean before the first commit.
+New `scripts/backup-surface` backs up, lists and restores the remaining non-git surfaces. The stale `~/.claude/hooks/spawn_claude_window.py`
+was backed up, then deleted.
+
+**T11 — ticket-index reconciliation.**
+- Closed: #26 (a harness issue), #40-F2, #58 (residuals moved to S5).
+- #01's schema v2 is frozen.
+- #38 is re-scoped and out of CRITICAL (M4 re-baselined at 232).
+- #59 → MEDIUM; #61 item 4 is closed.
+- New #91.
+
+**New scripts.** `scripts/backup-surface`, `scripts/check-wiring-parity`, `scripts/install-rotate-cadence`, and `scripts/lib/wiring_diff.py`
+(library + `new-project-settings` subcommand). Rebuilt: `scripts/v11-update`. Deleted: `templates/project-settings.json`.
+All are registered in `docs/SCRIPTS.md` and the skill's `playbooks/scripts.md`.
+
+**Net-new levers.** `V11_REGRESSION_LOCK` (+`_FILE`/`_TIMEOUT`/`_PROBE`), `V11_STOP_SPLIT`, `V11_SESSION_GC_HOURS`/`_ALL`/`_DRYRUN`,
+`V11_ORCH_SKILL_REQUIRED`, `V11_ORCH_SKILL_MD`, `V11_ROTATE_SETTLE_SECS`, `LEDGER_BAK_TTL_DAYS`, `OUTBOX_TTL_DAYS`,
+`V11_UPDATE_TEMPLATE`/`_SCAN_ROOT`/`_BACKUP_ROOT`, `V11_SURFACE_BACKUP_ROOT`.
+
+**Tests added.** 13 new test files:
+- `test_backup_surface`, `test_check_class_included`, `test_check_index_body_status_consistency`, `test_check_wiring_parity`
+- `test_install_rotate_cadence`, `test_postcommit_project_resolution`, `test_rotate_metrics_subdirs`, `test_run_tests_regression_lock`
+- `test_scaffold_wiring_parity`, `test_session_end_split`, `test_v11_update`, `test_validate_project_setup_wiring`, `test_wiring_diff`
+
+4 files were extended: `test_check_stamp_drift`, `test_hooks_selftest`, `test_v11_compliance_check_wave`, and `test_scripts_smoke`
+(+4 manifest entries). The new fixtures are in `tests/fixtures/wiring/`, including the frozen pre-S0-T4 `v11-update`, which proves the
+dry-run bug. In total: **158 new test functions** (173 collected items in the new files), 0 removed.
+
+**Deferred (named, not faked).**
+- #91: `v11-compliance-check` Gate 3 reads the `~/sessions/` mirror.
+- #92: `v11-update` does not propagate a new template key into a hook a project already has.
+- #93: `v11-compliance-check --scan` still scores against a hardcoded 10.
+- #94: tests write `context-estimate.json` into the real `~/.agent-metrics/sessions/`, because `scripts/lib/context_tracker.py` ignores `METRICS_DIR`. The UUID-only GC spares the resulting test-named dirs; removing them is manual.
+- #89 residuals: prompt-only levers in playbook markdown are still invisible to `check-rollback-lever-drift`. `~/.claude/docs/README.md` still says 96 agents (the live count is 102; this predates S0).
+- Pushing v11 is the user's call.
+
+**Rollback levers:** see `docs/ROLLBACK_REFERENCE.md` § "v11.45 — Rails". For the fleet wiring, restore from the per-file
+`~/.v11-backups/v11-update/<ts>/` backups, or remove the template's SessionEnd entry and re-run `v11-update --all`.
+
+**Addendum: landed after the release commit `6113602`** (the S0 CLOSE owed this; written at the S1 CLOSE).
+- `77e20ab`: **`v11-update --restore STAMP [STAMP ...] [--apply]`** (review #18 E1) is a one-command rollback of an apply.
+  - Without `--apply` it lists every file backed up under `$V11_UPDATE_BACKUP_ROOT/STAMP` (backup → target, sha256 differs?) and writes nothing.
+  - `--apply` restores each file byte-exact with the backup's mode, atomically and through a symlinked target. It first saves the current file under `<root>/<now>-pre-restore/`, which is itself restorable.
+  - Stamps run oldest first. An unknown or invalid stamp refuses the whole call (exit 2); a path escape, a target inside the backup root or a missing target fails that file only (exit 1).
+  - `wiring_diff.atomic_write` takes bytes and an explicit mode. A real-data dry-run of the S0-T7 stamps listed 97 files and wrote 0.
+  - Test: `tests/test_v11_update_restore.py` (7). Hardened in v11.46 (S1-R4, #100).
+- `fd150df`: the two `case` statements S0-T6 added to `hooks/session-end` (the GC verdict and the split-wiring check) get explicit `*)` arms. `--regression-extended`'s lint-test-honesty found them at the S0 CLOSE, after a green `--regression`: from a worktree the lint had scanned master (s0-close F7, fixed in v11.46 S1-R3a).
+- `02d6dfe`: filed from the S0 CLOSE:
+  - #95 (HIGH): `--regression-extended` is red on 4 Gate 13 slow tests, pre-existing;
+  - #96 (MEDIUM): `wave-check` reads only `open_tasks`, so a closed sprint reports no tasks;
+  - #97 (LOW): `task_artifacts` is keyed by numeric task id;
+  - #98 (HIGH): a session started in a dir without `.claude/settings.json` runs with no V11 hooks. The S0 sprint itself ran unwired.
+  - v11.46 shipped #95's Gate 13 fix (S1-T15), #96 (S1-T16), #98 item 3 (S1-R3b), and the review-verdict binding half of the #97 family (S1-P3).
+- `72ef8e3`: filed #99 (align-aggregate bypasses the seqno counter; backfilled rows read as live; executor naming) and #100 (`--restore` hardening) from the #27/#28 lite reviews. v11.46 took #99 items 2–3 (S1-P1, S1-T11) and #100 (S1-R4).
+
+---
+
+
 ## v11.44 "Orchestrator Quality" — 2026-09-08
 
 **Make the orchestrator a first-class, scoreable actor and grade the briefs it authors.**

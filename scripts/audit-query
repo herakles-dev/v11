@@ -81,7 +81,7 @@ if [ "$SHOW_STATS" = true ]; then
     echo ""
 
     echo "By project:"
-    jq -r '.project // "unknown"' "$AUDIT_LOG" | sort | uniq -c | sort -rn | head -10
+    jq -r '.project // "unknown"' "$AUDIT_LOG" | sort | uniq -c | sort -rn | head -10 || true
     NULL_PROJECT=$(jq '[select(.project == null or .project == "")] | length' "$AUDIT_LOG" 2>/dev/null)
     echo "  (null/empty project: $NULL_PROJECT / $TOTAL)"
     echo ""

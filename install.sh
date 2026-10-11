@@ -23,7 +23,7 @@
 #      shipped template.
 #   4. Prints a summary + next steps.
 #
-# Session/task state defaults to $HOME/.v11 (override with V11_WORKSPACE_ROOT).
+# Session/task state defaults to $HOME/sessions (override with HERCULES_ROOT or SESSIONS_ROOT).
 # See README.md for the full architecture explanation.
 
 set -euo pipefail
@@ -145,6 +145,8 @@ ADDITIONS_JSON=$(jq -nc \
   --arg track_agents        "$H/track-agents" \
   --arg post_compact        "$H/post-compact" \
   --arg session_end         "$H/session-end" \
+  --arg guard_fat_read      "$H/guard-fat-read" \
+  --arg guard_worktree_iso  "$H/guard-worktree-isolation" \
   '[
     {event:"PreToolUse",  matcher:"Read",       command:$detect_project},
     {event:"PreToolUse",  matcher:"Write|Edit", command:$guard_write_gates},
@@ -162,6 +164,9 @@ ADDITIONS_JSON=$(jq -nc \
     {event:"PostToolUse", matcher:"TaskList",   command:$guard_agent_stall},
     {event:"PostToolUse", matcher:"TaskList",   command:$guard_stale_task},
     {event:"PostToolUse", matcher:"Task|Agent", command:$track_agents},
+    {event:"PostToolUse", matcher:"Read",       command:$guard_fat_read},
+    {event:"PostToolUse", matcher:"TaskList",   command:$guard_worktree_iso},
+    {event:"PostToolUse", matcher:"Task|Agent", command:$guard_worktree_iso},
     {event:"PostCompact", matcher:"",           command:$post_compact},
     {event:"Stop",        matcher:"",           command:$session_end}
   ]')
@@ -222,15 +227,15 @@ echo "[2/4] Hook registrations merged -> $SETTINGS_FILE"
 # 3. Bootstrap session scaffolding
 # ---------------------------------------------------------------------------
 
-# V11_WORKSPACE_ROOT / SESSIONS_ROOT default to $HOME/.v11 (see hooks/lib/common.sh);
-# override V11_WORKSPACE_ROOT in your shell if you want session state to live
-# somewhere else. This is deliberately a per-user central location shared
-# across every V11 project you install (mirrors the upstream architecture),
-# NOT a directory inside TARGET.
+# Session root must match what the hooks resolve (hooks/lib/common.sh):
+# SESSIONS_ROOT defaults to $HERCULES_ROOT/sessions, and HERCULES_ROOT defaults
+# to $HOME. Override HERCULES_ROOT or SESSIONS_ROOT in your environment to move
+# it. This is deliberately a per-user central location shared across every V11
+# project you install, NOT a directory inside TARGET.
 "$V11_INSTALL_DIR/scripts/v11-bootstrap-session" "$PROJECT_NAME"
 
-_V11_WORKSPACE_ROOT="${V11_WORKSPACE_ROOT:-$HOME/.v11}"
-_SESSIONS_ROOT="${SESSIONS_ROOT:-$_V11_WORKSPACE_ROOT/sessions}"
+_HERCULES_ROOT="${HERCULES_ROOT:-$HOME}"
+_SESSIONS_ROOT="${SESSIONS_ROOT:-$_HERCULES_ROOT/sessions}"
 SESSION_DIR="$_SESSIONS_ROOT/$PROJECT_NAME"
 
 # Seed spec.md from the shipped template if the session doesn't have one yet.
@@ -280,8 +285,8 @@ echo "     — settings.json is read once at session boot, so hooks in an"
 echo "       ALREADY-RUNNING session won't pick this up."
 echo "  2. Fill in $SESSION_DIR/spec.md (intent, stack, constraints)."
 echo "  3. Inside the session, run TaskList, then TaskCreate to start the"
-echo "     task-as-truth loop. guard-write-gates will now block Write/Edit"
-echo "     without an in-progress task."
+echo "     task-as-truth loop. With 2+ tasks, guard-write-gates blocks Write/Edit when"
+echo "     this session has open work but no task in_progress (fresh sessions get an advisory)."
 echo "  4. Read README.md in this distribution for the CORE-vs-OPTIONAL"
 echo "     tiering and a one-line-per-hook index."
 echo ""

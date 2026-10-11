@@ -1,6 +1,6 @@
 #!/bin/bash
 # V11 Handoff - Generate session continuation context from task state
-# Usage: ./scripts/handoff [project] [--copy] [--json] [--file PATH] [--spawn] [--spawn-anyway] [--steer TEXT]
+# Usage: ./scripts/handoff [project] [--copy] [--json] [--file PATH] [--spawn] [--spawn-anyway] [--steer TEXT] [--allow-empty]
 #   --steer TEXT : orchestrator grounding/steering prompt injected into the next session's
 #                  first message. For multi-line/rich steering, write sessions/<project>/.handoff-steer.md
 #                  instead (lossless, no shell-quoting). File wins if both are present.
@@ -39,6 +39,13 @@ set -euo pipefail
 HERCULES_ROOT="${HERCULES_ROOT:-$HOME}"
 SESSIONS_ROOT="${SESSIONS_ROOT:-$HERCULES_ROOT/sessions}"
 V11_HOME="${V11_HOME:-$HERCULES_ROOT/v11}"
+# S1-T4 (#81): the rehydrate command handoff emits is absolute. A resumed
+# session runs from the project directory, where ./scripts/ does not exist.
+case "$V11_HOME" in
+    /*) _V11_RESUME_CMD="$V11_HOME/scripts/v11-resume-tasks" ;;
+    *)  _V11_RESUME_CMD="$PWD/$V11_HOME/scripts/v11-resume-tasks" ;;
+esac
+_V11_RESUME_CMD=$(printf '%q' "$_V11_RESUME_CMD")
 METRICS_DIR="$HERCULES_ROOT/.agent-metrics"
 TASK_STATE_DIR="$METRICS_DIR/task-state"
 ACTIVE_PROJECT_FILE="$METRICS_DIR/active-project"
@@ -62,10 +69,18 @@ _v11_read_active_project_safe() {
 # R2.3 (W1-T2): ledger-fallback subject lookup. Root cause of "Task #N: unknown"
 # in handoffs was TaskCreate storing a null subject when tool_input.subject was
 # empty (fixed at the sync-tasks source, V11.W1). This helper covers the
-# remaining case: pre-existing null-subject tasks already on disk. It builds a
-# task_id -> subject map from the durable append-only ledger
+# remaining case: pre-existing null-subject tasks already on disk. It builds
+# task -> subject maps from the durable append-only ledger
 # ($METRICS_DIR/ledger/$PROJECT.jsonl) — the last non-null/non-empty .subject
-# recorded for a task_id wins, since the ledger is append-only-chronological.
+# recorded wins, since the ledger is append-only-chronological.
+# S1-T2 (#75b): task_id is session-local (every session's TaskCreate counter
+# starts at 1), so a bare task_id key filled "Task #3" with whichever session
+# last wrote a task 3. The map now has keys, tried in this order by
+# _v11_fill_null_subjects (i for entries with an identity; s, then u, without):
+#   i  "<subject_norm>#<create_seq>"  the canonical identity (S1-T1 .identity)
+#   s  "<session_uuid>|<task_id>"
+#   u  "<task_id>" only when every subject the ledger holds for it agrees
+#   t  "<task_id>" last subject wins (the pre-S1-T2 key; V11_HANDOFF_IDENTITY_KEYS=off)
 # Read-only; no flock needed. Returns "{}" (never fails) on any error so
 # callers can unconditionally merge the result.
 _v11_ledger_subject_map() {
@@ -81,14 +96,25 @@ _v11_ledger_subject_map() {
     # rendered "Task #N: unknown". Fixing the reader (not the writer) also
     # repairs the rows already on disk.
     jq -s -c '
-        reduce .[] as $ev ({};
+        reduce .[] as $ev ({i: {}, s: {}, t: {}, all: {}};
             if (($ev.task_id // "") != "")
                and (($ev.subject // null) != null)
                and (($ev.subject // "") != "")
                and ($ev.subject != "unknown") then
-                .[$ev.task_id] = $ev.subject
+                ($ev.task_id | tostring) as $tid
+                | .t[$tid] = $ev.subject
+                | .all[$tid][$ev.subject] = true
+                | if ($ev.session_uuid // "") != "" then
+                    .s[($ev.session_uuid | tostring) + "|" + $tid] = $ev.subject
+                  else . end
+                | if ($ev.subject_norm // "") != "" and (($ev.create_seq | type) == "number")
+                     and $ev.create_seq >= 0 then
+                    .i[$ev.subject_norm + "#" + ($ev.create_seq | tostring)] = $ev.subject
+                  else . end
             else . end
         )
+        | .u = (.all | with_entries(select((.value | length) == 1) | .value = (.value | keys[0])))
+        | del(.all)
     ' "$ledger_file" 2>/dev/null || echo "{}"
 }
 
@@ -103,8 +129,25 @@ _v11_ledger_subject_map() {
 # ledger hit, .subject is reset to null (not left as "unknown") so downstream
 # `// "untitled"`/`// "blocked task"` placeholders render instead of the
 # swallowed literal.
+# S1-T2 (#75b): an entry with a canonical .identity (subject_norm + numeric
+# create_seq) is looked up by identity only. An entry without one (pre-S1,
+# or create_seq unknown) falls back to its task id: by (session, id) — the
+# entry's own .source_session_uuid / .session_uuid, else $3 (default: the
+# per-session state file's session) — then by an id the whole ledger agrees
+# on (the S1-P3 resolver's rule: a reused id with no session never binds).
+# Rollback: V11_HANDOFF_IDENTITY_KEYS=off (bare task_id, last subject wins).
 _v11_fill_null_subjects() {
-    local tasks_json="$1" project="$2"
+    local tasks_json="$1" project="$2" sess="${3-}"
+    if [ $# -lt 3 ] && [ "${STATE_SOURCE:-}" = "per-session" ]; then
+        sess="${SOURCE_SESSION_UUID:-}"
+    fi
+    # Nothing to fill (the common case; S1-T1 ledger entries carry subjects):
+    # skip the ledger scan (~0.4 s on a 1.6 MB ledger, up to 7 calls per run).
+    if ! printf '%s' "$tasks_json" | jq -e \
+            'any(.[]; .subject == null or .subject == "" or .subject == "unknown")' >/dev/null 2>&1; then
+        printf '%s' "$tasks_json"
+        return 0
+    fi
     local map mapf
     map=$(_v11_ledger_subject_map "$project")
     [ -n "$map" ] || map='{}'
@@ -113,11 +156,811 @@ _v11_fill_null_subjects() {
     # MAX_ARG_STRLEN (128KB); builtins (printf >file) are not.
     mapf=$(mktemp) || { printf '%s' "$tasks_json"; return; }
     printf '%s' "$map" > "$mapf"
-    printf '%s' "$tasks_json" | jq -c --slurpfile lsm_sf "$mapf" '
+    printf '%s' "$tasks_json" | jq -c --slurpfile lsm_sf "$mapf" --arg sess "$sess" \
+            --arg keys "${V11_HANDOFF_IDENTITY_KEYS:-on}" '
         (($lsm_sf[0]) // {}) as $lsm
-        | map(if (.subject == null or .subject == "" or .subject == "unknown") then (.subject = ($lsm[.id] // null)) else . end)
+        | map(if (.subject == null or .subject == "" or .subject == "unknown") then
+            ((.id // "") | tostring) as $tid
+            | (.subject = (
+                if $keys == "off" then ($lsm.t[$tid] // null)
+                else
+                    (.identity // {}) as $x
+                    | if ($x.subject_norm // "") != "" and (($x.create_seq | type) == "number") then
+                        ($lsm.i[$x.subject_norm + "#" + ($x.create_seq | tostring)] // null)
+                      else
+                        ((((.source_session_uuid // .session_uuid // $sess) // "") | tostring) as $s
+                         | if $s != "" and $tid != "" then $lsm.s[$s + "|" + $tid] else null end)
+                        // ($lsm.u[$tid] // null)
+                      end
+                end))
+          else . end)
     ' 2>/dev/null || printf '%s' "$tasks_json"
     rm -f "$mapf" 2>/dev/null || true
+}
+
+# S1-T1 (#75a): ledger-authoritative open set. Before S1, open_tasks came from
+# the per-session scratch (deleted on every Stop, #90) or the project
+# aggregate, and a stale V11_SESSION_ID could point at an older session:
+# /handoff carried 0/5 and 1/6 of the live open tasks (archivestream-service,
+# 2026-09-25). This replays the ledger with the canonical fold
+# (v11_replay_ledger), keeps the open identities of the LIVE session, and adds
+# the live-snapshot tasks the ledger has never seen (created before it
+# existed). The live session (#71, review #69 E2):
+#   - V11_SESSION_ID when V11_SESSION_ID_SOURCE=hook-stdin (hooks/session-end
+#     read it from the hook's stdin): authoritative, even with no ledger events
+#     yet or far behind another session, so an idle session never emits another
+#     session's in-flight tasks as its own;
+#   - else an env id (V11_SESSION_ID, then CLAUDE_CODE_SESSION_ID, which a
+#     Zeus-spawned process can inherit from its launcher) whose last ledger
+#     activity is within V11_HANDOFF_LIVE_WINDOW_SECS (default 600) of the
+#     newest, or that a running claude process owns (S1-R1's pid-file rule);
+#   - else the Claude session (UUID id, never a tool pseudo-session such as
+#     legacy-cli) with the newest ledger activity.
+# Writes one JSON object to $2:
+#   mode               "ledger"; "legacy" when the project has no ledger
+#                      activity (the caller then keeps the per-session/aggregate
+#                      path); "replay_failed" when it has some but the replay
+#                      produced nothing (the caller falls back loudly, reason in
+#                      fallback_reason)
+#   live_session_uuid, live_reason, live_active (the live session has ledger
+#                      events in this project)
+#   entries[]          open tasks, each with identity {subject_norm, create_seq}
+#   sn_open[], sn_known[]  project-wide subject_norms (drop audit, no create_seq)
+#   open_ids[]         [subject_norm, create_seq, owning session] of open identities
+#   known_ids[]        [subject_norm, create_seq] of every identity ever seen
+#   claims[]           [session, task_id, [[subject_norm, create_seq], ...]]
+#   resolved_shadows[] pair_ shadow ids whose parent closed or that a stand-in
+#                      names in metadata.pair_shadow
+#   snapshot_done_sn[], snapshot_done_ids[], disagreements[]  live-snapshot cross-check
+#   stamps             S2-T0b-4 top-level fields for handoff-tasks.json:
+#                      live_sitting, live_tl_epoch, task_store,
+#                      task_store_basis, task_store_verified (each only when known)
+# The replay, this python pass and the drop audit share one budget,
+# V11_HANDOFF_SOURCE_BUDGET_SECS (default 12, 3..14; only their own run time
+# counts), so the S1 steps stay inside session-end's 20 s kill (review #69 E3).
+# Fails open: returns 1 on any error ($_V11_SRC_FAIL says why) and the caller
+# keeps today's path, loudly.
+_v11_now_ms() { date +%s%3N; }
+# Prints the timeout ("S.mmm", at most 10 s) the next S1 step may use, holding
+# back $1 ms for the steps after it; returns 1 when less than 0.5 s is left.
+_v11_src_timeout() {
+    local left=$(( _V11_SRC_BUDGET * 1000 - _V11_SRC_SPENT_MS - ${1:-0} ))
+    [ "$left" -gt 10000 ] && left=10000
+    [ "$left" -ge 500 ] || return 1
+    printf '%d.%03d' $(( left / 1000 )) $(( left % 1000 ))
+}
+_v11_live_open_set() {
+    local project="$1" out="$2" agg="" ledger="$METRICS_DIR/ledger/${1}.jsonl" rc=0 to t0
+    local snap="$LIVE_SNAP_FILE" replay_reason=""
+    # V11_HANDOFF_LIVE_RECONCILE=off disables the snapshot writer: never read a leftover.
+    [ "${V11_HANDOFF_LIVE_RECONCILE:-on}" = "off" ] && snap=""
+    if [ -s "$ledger" ]; then
+        agg=$(mktemp) || return 1
+        if to=$(_v11_src_timeout 2000); then
+            t0=$(_v11_now_ms)
+            case "${V11_TEST_REPLAY_FAIL:-}" in
+                1)    false ;;
+                hang) timeout "$to" sleep 60 ;;
+                *)    # S2-T0b-3: the identity view carries the rehydrate aliases the
+                      # shared resolver folds (V11_TASK_RESOLVER=legacy: v11.46 call).
+                      local _emit_ids=on
+                      [ "${V11_TASK_RESOLVER:-shared}" = "legacy" ] && _emit_ids="${V11_REPLAY_EMIT_IDENTITIES:-off}"
+                      HERCULES_ROOT="$HERCULES_ROOT" METRICS_DIR="$METRICS_DIR" V11_HOME="$V11_HOME" \
+                      V11_REPLAY_EMIT_IDENTITIES="$_emit_ids" \
+                      timeout "$to" bash -c 'source "$V11_HOME/hooks/lib/common.sh" 2>/dev/null && v11_replay_ledger "$1"' \
+                          _ "$project" > "$agg" 2>/dev/null ;;
+            esac || { [ $? -eq 124 ] && replay_reason="replay_timeout" || replay_reason="replay_failed"; : > "$agg"; }
+            _V11_SRC_SPENT_MS=$(( _V11_SRC_SPENT_MS + $(_v11_now_ms) - t0 ))
+        else
+            replay_reason="budget"
+        fi
+    fi
+    if ! to=$(_v11_src_timeout 1000); then
+        _V11_SRC_FAIL="budget"
+        [ -n "$agg" ] && rm -f "$agg" 2>/dev/null
+        return 1
+    fi
+    t0=$(_v11_now_ms)
+    V11_LOS_V11_SESSION_ID="${V11_SESSION_ID:-}" \
+    V11_LOS_CLAUDE_CODE_SESSION_ID="${CLAUDE_CODE_SESSION_ID:-}" \
+    V11_LOS_SESSION_ID_SOURCE="${V11_SESSION_ID_SOURCE:-}" \
+    V11_LOS_CLAUDE_CONFIG_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}" \
+    V11_LOS_REPLAY_REASON="${replay_reason:-replay_failed}" \
+    timeout "$to" python3 - "$agg" "$ledger" "$snap" "$project" "$V11_HOME" \
+        "${V11_HANDOFF_LIVE_WINDOW_SECS:-600}" > "$out" 2>/dev/null <<'PYEOF' || rc=$?
+import datetime, json, os, re, sys
+
+agg_path, ledger_path, snap_path, project, v11_home, window = sys.argv[1:7]
+try:
+    window = int(window)
+except ValueError:
+    window = 600
+sys.path.insert(0, os.path.join(v11_home, "scripts", "lib"))
+try:
+    from normalize_subject import normalize_subject
+except ImportError:
+    def normalize_subject(s):
+        return " ".join((s or "").casefold().split()) or "__empty__"
+
+UTC = datetime.timezone.utc
+FLOOR = datetime.datetime.min.replace(tzinfo=UTC)
+DONE = ("completed", "deleted")
+
+
+def inst(ts):
+    try:
+        d = datetime.datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    return d.replace(tzinfo=UTC) if d.tzinfo is None else d.astimezone(UTC)
+
+
+def seq(ev):
+    try:
+        return int(ev.get("seqno") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def load(path):
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return None
+
+
+agg = load(agg_path) if agg_path else None
+# Read the ledger even when the replay failed: a project with ledger events
+# but no replay is "replay_failed", never the silent "legacy" of a ledger-less
+# project (review #69 E3).
+events = []
+try:
+    with open(ledger_path, encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            try:
+                ev = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(ev, dict) and ev.get("project") == project:
+                events.append(ev)
+except OSError:
+    events = []
+ledger_events = len(events)
+if not isinstance(agg, dict):
+    events = []
+events.sort(key=lambda ev: (inst(ev.get("ts")) or FLOOR, seq(ev)))
+
+# S2-T0b-3 (#113): (session, task_id) binds through scripts/lib/task_epoch.py,
+# the resolver every reader shares: claims are its claims (created events;
+# review, prescope and voided rows never claim), an aggregate record stamped
+# with an identity binds it (R0), one stamped with a TaskList epoch binds in
+# that epoch (R1), a live-snapshot task binds in the session's current epoch
+# (R4) and an unstamped record binds the latest claim, preferring the subject
+# (R2). V11_TASK_RESOLVER=legacy keeps the v11.46 rule: every
+# identity-bearing event claims, latest wins.
+tix = None
+if os.environ.get("V11_TASK_RESOLVER", "shared") != "legacy" and isinstance(agg, dict):
+    try:
+        import task_epoch
+        tix = task_epoch.TaskIndex.from_ledger(
+            project, events=events, identities=agg.get("identities") or [],
+            metrics_dir=os.path.dirname(os.path.dirname(os.path.abspath(ledger_path))))
+    except Exception:
+        tix = None
+UUID_RE = re.compile(r"[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}")
+
+# (session_uuid, task_id) -> identities that claimed it, latest last.
+claims, last_seen, ident_last, sn_known, known_ids = {}, {}, {}, set(), set()
+for ev in events:
+    sess = str(ev.get("session_uuid") or "")
+    d = inst(ev.get("ts"))
+    if sess and not sess.startswith("migration") and d is not None:
+        if sess not in last_seen or d > last_seen[sess]:
+            last_seen[sess] = d
+    sn, cs, tid = ev.get("subject_norm"), ev.get("create_seq"), ev.get("task_id")
+    if not sn or isinstance(cs, bool) or not isinstance(cs, int) or cs < 0:
+        continue
+    sn_known.add(sn)
+    known_ids.add((sn, cs))
+    if d is not None:
+        ident_last[(sn, cs)] = d
+    if sess and tid not in (None, ""):
+        lst = claims.setdefault((sess, str(tid)), [])
+        if (sn, cs) in lst:
+            lst.remove((sn, cs))
+        lst.append((sn, cs))
+if tix is not None:
+    # Any failure here degrades to the v11.46 claims above rather than killing
+    # this read (review #23).
+    try:
+        epoch_claims = {}
+        for (sess, tid), cl in tix.claim_items():
+            lst = epoch_claims.setdefault((sess, tid), [])
+            for c in cl:
+                if c.identity in lst:
+                    lst.remove(c.identity)
+                lst.append(c.identity)
+        claims = epoch_claims
+    except Exception:
+        tix = None
+
+
+def resolve(sess, tid, subject, rec=None, at=None, live=False):
+    sess, tid = str(sess or ""), str(tid)
+    if tix is not None:
+        ident = (rec or {}).get("identity")
+        if isinstance(ident, dict) and task_epoch.valid_identity(ident.get("subject_norm"), ident.get("create_seq")):
+            res = tix.resolve(None, tid, identity=(ident["subject_norm"], ident["create_seq"]))
+            if res.status == task_epoch.BOUND:
+                return res.identity
+        cl = tix.claims(sess, tid)
+        if not cl:
+            return None
+        tle = task_epoch.tl_epoch_of(rec) if rec else None
+        if UUID_RE.fullmatch(sess) and (tle is not None or live or at is not None):
+            res = tix.resolve(sess, tid, epoch=tle, at=at, subject=subject)
+            return res.identity if res.status == task_epoch.BOUND else None
+        want = normalize_subject(subject) if subject else None
+        pool = [c for c in cl if want and want in tix.norms(c.identity)] or cl
+        return pool[-1].identity
+    lst = claims.get((sess, tid))
+    if not lst:
+        return None
+    if len(lst) > 1:
+        want = normalize_subject(subject or "")
+        for key in reversed(lst):
+            if key[0] == want:
+                return key
+    return lst[-1]
+
+
+open_recs = [r for r in ((agg or {}).get("open_tasks") or []) if isinstance(r, dict)]
+open_keys, sn_open, open_owner = set(), set(), {}
+for r in open_recs:
+    key = resolve(r.get("session_uuid"), r.get("task_id"), r.get("subject"), rec=r)
+    if key is None:
+        sn_open.add(normalize_subject(r.get("subject") or ""))
+    else:
+        open_keys.add(key)
+        sn_open.add(key[0])
+        open_owner[key] = str(r.get("session_uuid") or "")
+# Blocked is open work too, but the replay leaves it out of open_tasks.
+for r in (agg or {}).get("blocked_tasks") or []:
+    if isinstance(r, dict):
+        key = resolve(r.get("session_uuid"), r.get("task_id"), r.get("subject"), rec=r)
+        sn_open.add(key[0] if key else normalize_subject(r.get("subject") or ""))
+        if key:
+            open_owner.setdefault(key, str(r.get("session_uuid") or ""))
+
+# F25: hooks/sync-tasks pair_ shadows never close in the ledger (their
+# activation lives only in the per-session scratch). One is resolved when its
+# parent (metadata.review_of, same session) is closed, or when a real review
+# task names it in metadata.pair_shadow (a stand-in; scripts/wave-check rule).
+resolved_shadows, shadow_parent = set(), {}
+for ev in events:
+    md = ev.get("metadata") if isinstance(ev.get("metadata"), dict) else {}
+    if md.get("pair_shadow"):
+        resolved_shadows.add(str(md["pair_shadow"]))
+    tid = str(ev.get("task_id") or "")
+    if tid.startswith("pair_") and md.get("review_of") not in (None, ""):
+        shadow_parent[tid] = (ev.get("session_uuid"), str(md["review_of"]), ev)
+shadow_of = {}  # open identity -> its latest pair_ shadow id (S2-T0b-4)
+for tid, (sess, parent, sev) in shadow_parent.items():
+    # A shadow is written inside its parent's TaskCreate, at the same ts just
+    # before the parent's created: its parent is the claim at (ts, +inf).
+    key = resolve(sess, parent, None, rec={"tl_epoch": sev.get("tl_epoch")},
+                  at=(sev.get("ts"), float("inf")) if tix is not None and inst(sev.get("ts")) else None)
+    if key is not None and key in known_ids and key not in open_owner:
+        resolved_shadows.add(tid)
+    elif key is not None and key in open_owner:
+        shadow_of[key] = tid
+
+
+def proc_live_ids(config_dir):
+    """Session ids a running claude process owns: S1-R1's rule
+    (hooks/session-end _v11_gc_live_session_ids) — <config>/sessions/<pid>.json
+    whose /proc/<pid> exists, is not a zombie and, when procStart is set, has
+    that starttime (a recycled pid does not keep a dead session alive)."""
+    ids = set()
+    sdir = os.path.join(config_dir, "sessions")
+    try:
+        names = os.listdir(sdir)
+    except OSError:
+        return ids
+    for name in names:
+        if not name.endswith(".json"):
+            continue
+        d = load(os.path.join(sdir, name))
+        if not isinstance(d, dict):
+            continue
+        pid, sid, start = str(d.get("pid") or ""), d.get("sessionId"), d.get("procStart")
+        if not pid.isdigit() or not isinstance(sid, str):
+            continue
+        try:
+            with open(f"/proc/{pid}/stat", encoding="utf-8", errors="replace") as fh:
+                fields = fh.read().rsplit(")", 1)[-1].split()
+        except OSError:
+            continue
+        if not fields or fields[0] == "Z":
+            continue
+        if start not in (None, "") and (len(fields) < 20 or fields[19] != str(start)):
+            continue
+        ids.add(sid)
+    return ids
+
+
+cands = []
+for var in ("V11_SESSION_ID", "CLAUDE_CODE_SESSION_ID"):
+    val = os.environ.get("V11_LOS_" + var, "")
+    if re.fullmatch(r"[A-Za-z0-9._-]{1,64}", val) and val not in [c for _, c in cands]:
+        cands.append((var, val))
+# Only a real Claude session id (UUID) can win the newest-activity fallback;
+# ledgers also carry tool pseudo-sessions (legacy-cli, git-hook, cleanup-*).
+real = {s: d for s, d in last_seen.items()
+        if re.fullmatch(r"[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}", s)}
+newest = max(real, key=real.get) if real else ""
+live, reason, owned = "", "", False
+if (os.environ.get("V11_LOS_SESSION_ID_SOURCE") == "hook-stdin"
+        and cands and cands[0][0] == "V11_SESSION_ID"):
+    live, owned = cands[0][1], True
+    reason = "hook stdin V11_SESSION_ID" + ("" if live in last_seen else " (no ledger activity yet)")
+if not live:
+    for var, cand in cands:
+        if cand in last_seen and (
+                not newest or (last_seen[newest] - last_seen[cand]).total_seconds() <= window):
+            live, reason = cand, "env " + var
+            break
+if not live and cands:
+    running = proc_live_ids(os.environ.get("V11_LOS_CLAUDE_CONFIG_DIR", ""))
+    for var, cand in cands:
+        if cand in running:
+            live, owned = cand, True
+            reason = "env " + var + " (a running claude process owns it)"
+            break
+if not live and newest:
+    notes = []
+    for var, cand in cands:
+        if cand in last_seen:
+            lag = int((last_seen[newest] - last_seen[cand]).total_seconds())
+            notes.append(f"{var}={cand[:8]} last ledger activity {lag}s before the newest")
+        else:
+            notes.append(f"{var}={cand[:8]} has no ledger activity")
+    live = newest
+    reason = "newest ledger activity (" + ("; ".join(notes) or "no session id in env") + ")"
+elif not live and cands:
+    live, reason = cands[0][1], "env " + cands[0][0] + " (no ledger activity)"
+if ledger_events and not isinstance(agg, dict):
+    mode = "replay_failed"
+elif live in last_seen or (owned and last_seen):
+    # An owned live session with no ledger events yet emits its own (empty)
+    # open set from the ledger, never the per-session/aggregate path.
+    mode = "ledger"
+else:
+    mode = "legacy"
+
+entries = {}
+if mode == "ledger":
+    for r in open_recs:
+        if str(r.get("session_uuid") or "") != live:
+            continue
+        key = resolve(live, r.get("task_id"), r.get("subject"), rec=r)
+        if key is None:
+            key = (normalize_subject(r.get("subject") or ""), None)
+        if key in entries:
+            continue
+        md = dict(r.get("metadata") or {})
+        md.setdefault("project", project)
+        entries[key] = {
+            "id": str(r.get("task_id")),
+            "subject": r.get("subject") or None,
+            "description": r.get("description") or None,
+            "status": r.get("status") or "pending",
+            "metadata": md,
+            "source_session_uuid": live,
+            "identity": {"subject_norm": key[0], "create_seq": key[1]},
+            "origin": "ledger",
+            "_ledger_auth": True,
+        }
+
+# Live snapshot: the live session's TaskList as of its last unfiltered
+# TaskList call. The ledger stays authoritative for every task it knows; the
+# snapshot adds only tasks the ledger never saw, and a snapshot newer than a
+# task's last ledger event that disagrees with it is reported, not applied.
+snap = load(snap_path) if snap_path else None
+snapshot_used, snap_done_sn, snap_done_ids, disagreements = False, set(), set(), []
+if (isinstance(snap, dict) and snap.get("project") == project and live
+        and snap.get("session_uuid") == live):
+    snapshot_used = True
+    snap_ts = inst(snap.get("ts"))
+    ledger_sns = {key[0] for key in entries}
+    for t in snap.get("tasks") or []:
+        if not isinstance(t, dict):
+            continue
+        tid, status, subject = str(t.get("id") or ""), t.get("status") or "pending", t.get("subject")
+        sn = normalize_subject(subject or "")
+        key = resolve(live, tid, subject, live=True) if tid else None
+        if status in DONE:
+            snap_done_sn.add(sn)
+            if key is not None:
+                snap_done_ids.add(key)
+        if mode != "ledger" or not tid:
+            continue
+        if key is not None:
+            fresher = snap_ts is not None and snap_ts > ident_last.get(key, FLOOR)
+            if fresher and (key in open_keys) == (status in DONE):
+                disagreements.append({"id": tid, "subject": subject, "snapshot": status,
+                                      "ledger": "open" if key in open_keys else "closed"})
+            continue
+        if status in DONE or sn in ledger_sns:
+            continue
+        entries[("live-snapshot", tid)] = {
+            "id": tid,
+            "subject": subject,
+            "description": None,
+            "status": status,
+            "metadata": {"project": project},
+            "source_session_uuid": live,
+            "identity": {"subject_norm": sn, "create_seq": None},
+            "origin": "live-snapshot",
+            "_ledger_auth": False,
+        }
+
+# S2-T0b-4 (design §3, §5, §6.7): TaskList stamps.
+#   live_sitting   "<CLAUDE_PID>:<starttime>" of the writer, only when the
+#                  writer is the live session (the hook's own session under
+#                  session-end, else CLAUDE_CODE_SESSION_ID, which comes with
+#                  CLAUDE_PID from the same claude process); hooks/detect-project
+#                  and hooks/post-compact suppress the self-nudge only in that
+#                  sitting (hooks/lib/common.sh v11_handoff_self_sitting).
+#   live_tl_epoch  the live session's epoch record, 0 for a seed line
+#                  (task_epoch.record_epoch = the hooks' _V11_TLR_EPOCH).
+#   entry tl_epoch the tl_epoch of the entry's latest create in the live session.
+#   Rollback: V11_TASKLIST_EPOCH=off (none of the three).
+#   task_store, task_store_basis, task_store_verified: the ~/.claude/tasks/<dir>
+#                  holding the live session's current TaskList
+#                  (TaskIndex.find_task_store: a team config first, verified;
+#                  else a content match, unverified). Absent under
+#                  V11_TASK_RESOLVER=legacy or with no match.
+#   entry metadata.review_task_id: the identity's pair_ shadow (latest), so
+#                  v11-resume-tasks carries it and sync-tasks auto-pair guard 3
+#                  mints no second shadow for the rehydrated task (#101, S2-R1).
+#                  An id already in the metadata is kept. The named shadow lives
+#                  in the old session's scratch, so at TaskUpdate(completed)
+#                  sync-tasks keeps the V11.19 queue row for it (S2-R1).
+#                  Rollback: V11_HANDOFF_REVIEW_TASK_ID=off (no stamp).
+metrics_dir = os.path.dirname(os.path.dirname(os.path.abspath(ledger_path)))
+stamps = {}
+if os.environ.get("V11_TASKLIST_EPOCH", "on") != "off" and live:
+    src = os.environ.get("V11_LOS_SESSION_ID_SOURCE", "")
+    writer = os.environ.get("V11_LOS_V11_SESSION_ID" if src == "hook-stdin"
+                            else "V11_LOS_CLAUDE_CODE_SESSION_ID", "")
+    pid = os.environ.get("CLAUDE_PID", "")
+    if writer == live and re.fullmatch(r"[0-9]{1,10}", pid):
+        try:
+            with open(f"/proc/{pid}/stat", encoding="utf-8", errors="replace") as fh:
+                fields = fh.read().rsplit(") ", 1)[-1].split()
+            if len(fields) > 19 and re.fullmatch(r"[0-9]{1,20}", fields[19]):
+                stamps["live_sitting"] = f"{pid}:{fields[19]}"
+        except OSError:
+            pass
+    try:
+        import task_epoch
+        tle = task_epoch.record_epoch(live, metrics_dir)
+    except Exception:
+        tle = None
+    if tle is not None:
+        stamps["live_tl_epoch"] = tle
+    if tix is not None:
+        for e in entries.values():
+            if e["origin"] != "ledger":
+                continue
+            key = (e["identity"]["subject_norm"], e["identity"]["create_seq"])
+            ctle = next((c.tl_epoch for c in reversed(tix.claims(live, e["id"]))
+                         if c.identity == key and c.ev == "created"), None)
+            if ctle is not None:
+                e["tl_epoch"] = ctle
+if tix is not None and live:
+    try:
+        sm = tix.find_task_store(live)
+    except Exception:
+        sm = None
+    if sm is not None and sm.name:
+        stamps.update(task_store=sm.name, task_store_basis=sm.basis, task_store_verified=bool(sm.verified))
+if os.environ.get("V11_HANDOFF_REVIEW_TASK_ID", "on") != "off":
+    for key, e in entries.items():
+        if key in shadow_of and not e["metadata"].get("review_task_id"):
+            e["metadata"]["review_task_id"] = shadow_of[key]
+
+json.dump({
+    "mode": mode,
+    "fallback_reason": os.environ.get("V11_LOS_REPLAY_REASON") if mode == "replay_failed" else None,
+    "live_session_uuid": live,
+    "live_reason": reason,
+    "live_active": live in last_seen,
+    "entries": list(entries.values()),
+    "sn_open": sorted(sn_open),
+    "sn_known": sorted(sn_known),
+    "open_ids": sorted([sn, cs, owner] for (sn, cs), owner in open_owner.items()),
+    "known_ids": sorted([sn, cs] for sn, cs in known_ids),
+    "claims": [[s, t, [list(k) for k in lst]] for (s, t), lst in claims.items()],
+    "resolved_shadows": sorted(resolved_shadows),
+    "ledger_events": ledger_events,
+    "snapshot_used": snapshot_used,
+    "snapshot_done_sn": sorted(snap_done_sn),
+    "snapshot_done_ids": sorted([sn, cs] for sn, cs in snap_done_ids),
+    "disagreements": disagreements,
+    **({"stamps": stamps} if stamps else {}),
+}, sys.stdout)
+PYEOF
+    _V11_SRC_SPENT_MS=$(( _V11_SRC_SPENT_MS + $(_v11_now_ms) - t0 ))
+    [ -n "$agg" ] && rm -f "$agg" 2>/dev/null
+    if [ "$rc" -eq 0 ] && [ -s "$out" ] && jq empty "$out" 2>/dev/null; then
+        return 0
+    fi
+    if [ "$rc" -eq 124 ]; then _V11_SRC_FAIL="live_set_timeout"; else _V11_SRC_FAIL="live_set_failed"; fi
+    return 1
+}
+
+# S1-T1 (#75a): stamp identity on entries that lack one (the per-session /
+# aggregate fallback path) and audit what the new emission drops from the
+# prior handoff-tasks.json. Counts include family_members. Review #69:
+#   - identity, not subject_norm (E4): a prior entry is matched by
+#     (subject_norm, create_seq) — its own, or resolved from the ledger claims
+#     of (its session, its id). It is "kept" when the new emission has that
+#     identity (or, for an emission without identities, that subject_norm), and
+#     "explained" when the ledger has the identity closed. A ledger-open
+#     identity beats a completed live snapshot. Entries without any identity
+#     fall back to the subject_norm rules.
+#   - scope (E1): with a ledger-mode emission for a live session that has
+#     ledger events here, only the prior entries of the live session count —
+#     the owner of a still-open identity, else a session that claimed it, else
+#     the entry's session. Other sessions' dropped entries are listed as
+#     "foreign" (a WARN, never a guard). An idle live session, a fallback
+#     emission or no source check counts every prior entry.
+#   - policy (F25): entries the emission filters by design never count: a
+#     pending_parent review sibling, and a hooks/sync-tasks pair_ shadow that
+#     is tagged is_review_sibling, whose parent closed, or that a stand-in names
+#     in metadata.pair_shadow.
+# Prints {open_tasks, new_count, prior_count, kept, explained, explained_list[],
+# unexplained[], foreign[], policy, scope}.
+_v11_source_audit() {
+    local ot_file="$1" los_file="$2" prior_file="$3" to
+    to=$(_v11_src_timeout 0) || to=1
+    timeout "$to" python3 - "$ot_file" "$los_file" "$prior_file" "$V11_HOME" 2>/dev/null <<'PYEOF'
+import json, os, sys
+
+ot_path, los_path, prior_path, v11_home = sys.argv[1:5]
+sys.path.insert(0, os.path.join(v11_home, "scripts", "lib"))
+try:
+    from normalize_subject import normalize_subject
+except ImportError:
+    def normalize_subject(s):
+        return " ".join((s or "").casefold().split()) or "__empty__"
+
+
+def load(path):
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return None
+
+
+def num(cs):
+    return isinstance(cs, int) and not isinstance(cs, bool) and cs >= 0
+
+
+def stamp(t):
+    if not isinstance(t.get("identity"), dict):
+        t["identity"] = {"subject_norm": normalize_subject(t.get("subject") or ""),
+                         "create_seq": None}
+
+
+def members(t):
+    fm = t.get("family_members")
+    fm = [m for m in fm if isinstance(m, dict)] if isinstance(fm, list) else []
+    return fm or [t]
+
+
+def sn_of(t):
+    ident = t.get("identity")
+    if isinstance(ident, dict) and ident.get("subject_norm"):
+        return ident["subject_norm"]
+    return normalize_subject(t.get("subject") or "")
+
+
+tasks = load(ot_path)
+tasks = [t for t in tasks if isinstance(t, dict)] if isinstance(tasks, list) else []
+for t in tasks:
+    stamp(t)
+    for m in members(t):
+        stamp(m)
+los = load(los_path) if los_path else None
+los = los if isinstance(los, dict) else {}
+live = str(los.get("live_session_uuid") or "")
+scope = "live" if los.get("mode") == "ledger" and los.get("live_active") and live else "all"
+sn_open = set(los.get("sn_open") or [])
+sn_known = set(los.get("sn_known") or [])
+snap_done = set(los.get("snapshot_done_sn") or [])
+snap_done_ids = {tuple(k) for k in los.get("snapshot_done_ids") or []}
+known = {tuple(k) for k in los.get("known_ids") or []}
+open_owner, sn_owners = {}, {}
+for sn, cs, owner in los.get("open_ids") or []:
+    open_owner[(sn, cs)] = owner
+    sn_owners.setdefault(sn, set()).add(owner)
+claims, claimed_by, sn_claimed_by = {}, {}, {}
+for sess, tid, ids in los.get("claims") or []:
+    claims[(sess, tid)] = [tuple(k) for k in ids]
+    for k in ids:
+        claimed_by.setdefault(tuple(k), set()).add(sess)
+        sn_claimed_by.setdefault(k[0], set()).add(sess)
+shadows_done = set(los.get("resolved_shadows") or [])
+
+
+def ident(m, sess):
+    x = m.get("identity")
+    if isinstance(x, dict) and x.get("subject_norm") and num(x.get("create_seq")):
+        return (x["subject_norm"], x["create_seq"])
+    lst = claims.get((sess, str(m.get("id") or "")))
+    if not lst:
+        return None
+    if len(lst) > 1:
+        want = sn_of(m)
+        for key in reversed(lst):
+            if key[0] == want:
+                return key
+    return lst[-1]
+
+
+def policy_filtered(m):
+    md = m.get("metadata") if isinstance(m.get("metadata"), dict) else {}
+    if m.get("status") == "pending_parent" or md.get("parent_status") == "pending_parent":
+        return True
+    mid = str(m.get("id") or "")
+    return mid.startswith("pair_") and (md.get("is_review_sibling") is True or mid in shadows_done)
+
+
+def owned_by_live(pid, sn, sess):
+    if pid is not None:
+        if pid in open_owner:
+            return open_owner[pid] == live
+        if pid in claimed_by:
+            return live in claimed_by[pid]
+        return sess == live
+    if sn in sn_owners:
+        return live in sn_owners[sn]
+    if sn in sn_claimed_by:
+        return live in sn_claimed_by[sn]
+    return sess == live
+
+
+def explained(pid, sn):
+    """Why the ledger (or the live snapshot) accounts for a dropped entry, or None."""
+    if pid is not None and (pid in open_owner or pid in known):
+        return None if pid in open_owner else "completed/cancelled in the ledger"
+    if sn in sn_open:
+        return None
+    if sn in sn_known:
+        return "completed/cancelled in the ledger"
+    if pid in snap_done_ids or sn in snap_done:
+        return "completed in the live snapshot"
+    return None
+
+
+new_ids, new_sn, new_sn_noid = set(), set(), set()
+for t in tasks:
+    for m in members(t):
+        sn, cs = sn_of(m), m["identity"].get("create_seq")
+        new_sn.add(sn)
+        if num(cs):
+            new_ids.add((sn, cs))
+        else:
+            new_sn_noid.add(sn)
+
+prior = load(prior_path) if prior_path else None
+prior = prior if isinstance(prior, dict) else {}
+prior_sess = str(prior.get("live_session_uuid") or prior.get("source_session_uuid") or "")
+prior_tasks = prior.get("open_tasks")
+prior_tasks = [t for t in prior_tasks if isinstance(t, dict)] if isinstance(prior_tasks, list) else []
+prior_count = kept = policy = 0
+explained_list, unexplained, foreign = [], [], []
+for t in prior_tasks:
+    for m in members(t):
+        if policy_filtered(m):
+            policy += 1
+            continue
+        sess = str(m.get("source_session_uuid") or t.get("source_session_uuid") or prior_sess)
+        sn = sn_of(m)
+        pid = ident(m, sess)
+        mine = scope == "all" or owned_by_live(pid, sn, sess)
+        if pid is not None:
+            is_kept = pid in new_ids or pid[0] in new_sn_noid
+        else:
+            is_kept = sn in new_sn
+        why_done = None if is_kept else explained(pid, sn)
+        if not mine:
+            if not is_kept and why_done is None:
+                owner = open_owner.get(pid) if pid is not None else None
+                foreign.append({"id": m.get("id"), "subject": m.get("subject"),
+                                "owner": owner or sess or None})
+            continue
+        prior_count += 1
+        if is_kept:
+            kept += 1
+        elif why_done:
+            explained_list.append({"id": m.get("id"), "subject": m.get("subject"), "why": why_done})
+        else:
+            if pid in open_owner or (pid is None and sn in sn_open):
+                why = "still open in the ledger, not in this emission"
+            elif los.get("mode") in ("ledger", "legacy"):
+                why = "not in the ledger"
+            else:
+                why = "the ledger replay is unavailable"
+            unexplained.append({"id": m.get("id"), "subject": m.get("subject"), "why": why})
+json.dump({
+    "open_tasks": tasks,
+    "new_count": sum(len(members(t)) for t in tasks),
+    "prior_count": prior_count,
+    "kept": kept,
+    "explained": len(explained_list),
+    "explained_list": explained_list,
+    "unexplained": unexplained,
+    "foreign": foreign,
+    "policy": policy,
+    "scope": scope,
+}, sys.stdout)
+PYEOF
+}
+
+# Review #69 E1/E5: a refused emission (the empty refusal, the shrink breaker)
+# keeps handoff.md and handoff-tasks.json as the last accepted pair: the
+# staging handoff.md is dropped, never promoted over a tasks file that refused
+# the set it describes. The refusal is written to $SESSION_DIR/.handoff-refused
+# and as one note line under the title of the kept handoff.md (its mtime kept,
+# so the #41 guard still sees an auto-emit). hooks/session-end reads the
+# "handoff: refused —" stderr line and stamps the open-set digest, so a Stop
+# does not retry until the task set changes. The next accepted emission
+# removes the marker (and writes a handoff.md without the note).
+_v11_audit_first() {
+    printf '%s' "$1" | jq -r '.unexplained[0] | "e.g. #\(.id // "?") \((.subject // "") | .[:60]) — \(.why)"' 2>/dev/null || echo "see stderr"
+}
+_v11_record_refusal() {
+    local kind="$1" reason="${2//$'\n'/ }" proposed="${3:-}" marker="$SESSION_DIR/.handoff-refused"
+    _V11_REFUSED="$kind"
+    jq -n --arg at "$TIMESTAMP" --arg kind "$kind" --arg reason "$reason" \
+          --arg live "$LIVE_SESSION_UUID" --arg proposed "$proposed" \
+        '{refused_at: $at, kind: $kind, reason: $reason, live_session_uuid: $live,
+          proposed: (if $proposed == "" then null else $proposed end)}' \
+        > "$marker.tmp.$$" 2>/dev/null && mv -f "$marker.tmp.$$" "$marker" 2>/dev/null
+    rm -f "$marker.tmp.$$" 2>/dev/null || true
+    echo "handoff: refused — $reason. handoff.md and handoff-tasks.json stay the last accepted pair (marker: $marker)." >&2
+    [ -f "$HANDOFF_FILE" ] || return 0
+    python3 - "$HANDOFF_FILE" "> **Auto-handoff refused ($TIMESTAMP):** $reason — this file and handoff-tasks.json are the last accepted pair. <!-- v11-handoff-refused -->" <<'PYEOF' 2>/dev/null || true
+import os, sys
+
+path, note = sys.argv[1], sys.argv[2]
+st = os.stat(path)
+with open(path, encoding="utf-8", errors="surrogateescape") as fh:
+    lines = fh.read().split("\n")
+out, skip = [], False
+for ln in lines:
+    if ln.endswith("<!-- v11-handoff-refused -->"):
+        skip = True
+        continue
+    if not (skip and ln == ""):
+        out.append(ln)
+    skip = False
+at = 0
+if out and out[0].startswith("# "):
+    at = 2 if len(out) > 1 and out[1] == "" else 1
+out[at:at] = [note, ""]
+tmp = "%s.refused.%d" % (path, os.getpid())
+with open(tmp, "w", encoding="utf-8", errors="surrogateescape") as fh:
+    fh.write("\n".join(out))
+os.utime(tmp, ns=(st.st_atime_ns, st.st_mtime_ns))
+os.replace(tmp, path)
+PYEOF
 }
 
 # Fix A: synthetic summary when .session-summary.md is absent or empty.
@@ -211,7 +1054,7 @@ _v11_generate_summary_stub() {
         local recent recent_json
         # R2.3 (W1-T2): recover null subjects from the ledger before rendering
         # (jq builds an {id, subject} array first, then falls back to "untitled").
-        recent_json=$(jq -c '(.recent_completed // [])[:3] | map({id: (.id // null), subject: (.subject // null)})' "$state_file" 2>/dev/null || echo "[]")
+        recent_json=$(jq -c '(.recent_completed // [])[:3] | map({id: (.id // null), subject: (.subject // null), session_uuid: (.session_uuid // null)})' "$state_file" 2>/dev/null || echo "[]")
         recent_json=$(_v11_fill_null_subjects "$recent_json" "$project")
         recent=$(printf '%s' "$recent_json" | jq -r '.[] | "- Task #\(.id // "?"): \(.subject // "untitled")"' 2>/dev/null || echo "")
         if [ -n "$recent" ]; then
@@ -227,7 +1070,7 @@ _v11_generate_summary_stub() {
     # Section 2: Key Decisions (from plan-context.decisions, last 3)
     out="${out}## Key Decisions${V11_NL}"
     if [ -f "$plan_context_file" ] && [ -s "$plan_context_file" ]; then
-        decisions=$(jq -r '(.decisions // [])[-3:] | .[] | "- \(.title // "?") → \(.chosen // "?")"' "$plan_context_file" 2>/dev/null || echo "")
+        decisions=$(jq -r '[(.decisions // [])[] | select(type == "object" and ((.title // "") | tostring) != "" and ((.chosen // "") | tostring) != "")] | .[-3:] | .[] | "- \(.title) → \(.chosen)"' "$plan_context_file" 2>/dev/null || echo "")
         if [ -n "$decisions" ] && [ "$decisions" != "- ? → ?" ]; then
             out="${out}${decisions}${V11_NL}"
         else
@@ -275,7 +1118,7 @@ V11_NL=$'\n'
 if [ "${1:-}" == "--help" ] || [ "${1:-}" == "-h" ]; then
     echo "V11 Handoff - Generate session continuation context"
     echo ""
-    echo "Usage: ./scripts/handoff [project] [--copy] [--json] [--file PATH] [--spawn] [--spawn-anyway] [--force] [--steer TEXT]"
+    echo "Usage: ./scripts/handoff [project] [--copy] [--json] [--file PATH] [--spawn] [--spawn-anyway] [--force] [--steer TEXT] [--allow-empty]"
     echo ""
     echo "Options:"
     echo "  --copy           Copy prompt to clipboard"
@@ -295,7 +1138,16 @@ if [ "${1:-}" == "--help" ] || [ "${1:-}" == "-h" ]; then
     echo "                   both given; consumed → archived to .handoff-steer.md.prev,"
     echo "                   a single recovery slot — a new steer overwrites the prior"
     echo "                   .prev. Triple-backticks in the steer are collapsed to one."
-    echo "                   Rollback: V11_HANDOFF_STEER=off."
+    echo "                   Every later regeneration keeps the steer until a different"
+    echo "                   session Reads or regenerates handoff.md, or it is older than"
+    echo "                   V11_STEER_PERSIST_MAX_AGE_SECS (72 h) (.handoff-steer.consumed.md;"
+    echo "                   V11_STEER_PERSIST=off → one-shot). Rollback: V11_HANDOFF_STEER=off."
+    echo "  --allow-empty    Write the emission even when it drops open tasks from the"
+    echo "                   prior handoff-tasks.json that the ledger cannot account for"
+    echo "                   as completed/cancelled. Without it an emission of 0 open"
+    echo "                   tasks is refused with exit 2 and a large shrink goes to"
+    echo "                   handoff-tasks.json.autoemit-proposed.json."
+    echo "                   Rollback: V11_HANDOFF_SOURCE_CHECK=off."
     echo ""
     echo "Quality gate: --spawn refuses if the handoff has < 2 substantive"
     echo "sections (summary, completed, next-up, decisions, key-files). V11.17"
@@ -322,6 +1174,7 @@ SPAWN_ANYWAY_FLAG=""
 NO_STUB_FLAG=""
 FORCE_FLAG=""     # Ticket #41 F1: bypass mtime-guard for user-in-loop paths
 SKIP_DRIFT_FLAG="" # v11.37 W2-T4: bypass all check-*-drift siblings at handoff
+ALLOW_EMPTY_FLAG="" # S1-T1 (#75a): accept an emission that drops unexplained open tasks
 STEER_INLINE=""   # V11.28: orchestrator steering prompt (inline --steer convenience path)
 for arg in "$@"; do
     case "$arg" in
@@ -332,6 +1185,7 @@ for arg in "$@"; do
         --no-stub) NO_STUB_FLAG="1" ;;
         --force) FORCE_FLAG="1" ;;
         --skip-drift-checks) SKIP_DRIFT_FLAG="1" ;;
+        --allow-empty) ALLOW_EMPTY_FLAG="1" ;;
         --file) FILE_PATH="__NEXT__" ;;
         --steer=*) STEER_INLINE="${arg#--steer=}" ;;
         --steer) STEER_INLINE="__NEXT__" ;;
@@ -426,7 +1280,9 @@ _resolve_session_state_file() {
     local sid candidate latest=""
     # 1. Direct: V11_SESSION_ID in env (with Bug-H quarantine)
     sid="${V11_SESSION_ID:-}"
-    if [ -n "$sid" ] && printf '%s' "$sid" | grep -qE '^[a-zA-Z0-9._-]{1,64}$'; then
+    # common.sh's v11_valid_session_id rule, as one [[ =~ ]] over the whole
+    # value: grep matched line by line, so 'a\n../x' passed (review #23).
+    if [ -n "$sid" ] && [[ "$sid" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]]; then
         candidate="$METRICS_DIR/sessions/$sid/task-state.json"
         if [ -f "$candidate" ] && [ -s "$candidate" ] && jq empty "$candidate" 2>/dev/null; then
             local stamp_check
@@ -571,6 +1427,7 @@ fi
 # Task state
 TOTAL=0; COMPLETED=0; PENDING=0; IN_PROGRESS=0; BLOCKED=0
 ACTIVE_TASKS="none"
+ACTIVE_TASK_SUBJECT=""  # S1-T1: was unset (set -u abort) when no state file but a live snapshot
 RECENT_COMPLETED=""
 HAS_TASK_STATE=0
 if [ -f "$STATE_FILE" ] && [ -s "$STATE_FILE" ]; then
@@ -593,7 +1450,7 @@ if [ -f "$STATE_FILE" ] && [ -s "$STATE_FILE" ]; then
     # Pre-existing bug meant RECENT_COMPLETED was always empty, causing the spawn-quality gate to
     # count this section as missing even when sync-tasks had populated it.
     # R2.3 (W1-T2): recover null subjects from the ledger before rendering.
-    _RECENT_COMPLETED_JSON=$(jq -c '(.recent_completed // [])[:5] | map({id: (.id // null), subject: (.subject // null)})' "$STATE_FILE" 2>/dev/null || echo "[]")
+    _RECENT_COMPLETED_JSON=$(jq -c '(.recent_completed // [])[:5] | map({id: (.id // null), subject: (.subject // null), session_uuid: (.session_uuid // null)})' "$STATE_FILE" 2>/dev/null || echo "[]")
     _RECENT_COMPLETED_JSON=$(_v11_fill_null_subjects "$_RECENT_COMPLETED_JSON" "$PROJECT")
     RECENT_COMPLETED=$(printf '%s' "$_RECENT_COMPLETED_JSON" | jq -r '.[] | "  - Task #\(.id): \(.subject // "untitled")"' 2>/dev/null || echo "")
     # active_task is a string (subject of latest in_progress); use it for Next Up if no other source
@@ -641,7 +1498,9 @@ if [ -n "$LIVE_SNAP_TOTAL" ]; then
         _ACTIVE_TASK_JSON=$(jq -c '
             [.tasks[]? | select(.status == "in_progress") | {id: (.id // null), subject: (.subject // null)}][:1]
         ' "$LIVE_SNAP_FILE" 2>/dev/null || echo "[]")
-        _ACTIVE_TASK_JSON=$(_v11_fill_null_subjects "$_ACTIVE_TASK_JSON" "$PROJECT")
+        # S1-T2: snapshot ids belong to the snapshot's session.
+        _ACTIVE_TASK_JSON=$(_v11_fill_null_subjects "$_ACTIVE_TASK_JSON" "$PROJECT" \
+            "$(jq -r '.session_uuid // ""' "$LIVE_SNAP_FILE" 2>/dev/null || echo "")")
         ACTIVE_TASK_SUBJECT=$(printf '%s' "$_ACTIVE_TASK_JSON" | jq -r '.[0].subject // empty' 2>/dev/null || true)
         [ "$ACTIVE_TASK_SUBJECT" = "null" ] && ACTIVE_TASK_SUBJECT=""
     fi
@@ -753,6 +1612,109 @@ _v11_summary_looks_stub() {
     fi
     return 1
 }
+# S1-T4 (#57): the one reader of .session-summary.md for handoff.md. The old
+# `head -20` cut the summary silently, and the last section it cut was Blockers /
+# Open Questions. Now: a summary within V11_HANDOFF_SUMMARY_LINES (default 40)
+# is passed through unchanged. A longer one keeps every `## ` heading, puts the
+# Blockers / Open Questions sections first after the title, shares the rest of
+# the budget across the other sections (short ones stay whole) and ends with a
+# marker naming the full file. One stderr line reports the overage.
+# Rollback: V11_HANDOFF_SUMMARY_LINES=20 (old cap); =0 (no cap).
+_v11_summary_excerpt() {
+    local f="$1" cap="${V11_HANDOFF_SUMMARY_LINES:-40}" n out more
+    [[ "$cap" =~ ^[0-9]+$ ]] || cap=40
+    n=$(awk 'END { print NR }' "$f" 2>/dev/null || echo 0)
+    [[ "$n" =~ ^[0-9]+$ ]] || n=0
+    if [ "$cap" -gt 0 ] && [ "$n" -gt "$cap" ]; then
+        out=$(timeout 5 python3 - "$f" "$cap" 2>/dev/null <<'PYEOF'
+import re, sys
+
+path, cap = sys.argv[1], int(sys.argv[2])
+with open(path, encoding="utf-8", errors="surrogateescape") as fh:
+    lines = fh.read().split("\n")
+if lines[-1] == "":
+    lines.pop()
+sys.stdout.reconfigure(encoding="utf-8", errors="surrogateescape")
+
+def strip_blank(body):
+    while body and not body[0].strip():
+        body = body[1:]
+    while body and not body[-1].strip():
+        body = body[:-1]
+    return body
+
+# blocks: [heading or None, body]; the preamble (title, stub banner) has no heading.
+blocks = [[None, []]]
+for ln in lines:
+    if re.match(r"##\s", ln):
+        blocks.append([ln, []])
+    else:
+        blocks[-1][1].append(ln)
+blocks = [[h, strip_blank(b)] for h, b in blocks]
+blocks = [blk for blk in blocks if blk[0] is not None or blk[1]]
+
+def is_blocker(h):
+    return bool(h) and re.search(r"blocker|open question", h, re.I) is not None
+
+pre = [blk for blk in blocks if blk[0] is None]
+first = [blk for blk in blocks if is_blocker(blk[0])]
+rest_blocks = [blk for blk in blocks if blk[0] is not None and not is_blocker(blk[0])]
+ordered = pre + first + rest_blocks
+
+# Fixed cost: headings, the title (the preamble's first line, kept even when
+# Blockers would fill the budget), one blank line between blocks, the marker.
+title = 1 if pre and pre[0][1] else 0
+room = cap - 1 - sum(1 for h, _ in ordered if h) - title - (len(ordered) - 1)
+room = max(room, 0)
+alloc = {id(blk): 0 for blk in ordered}
+if title:
+    alloc[id(pre[0])] = 1
+for blk in first:
+    alloc[id(blk)] = min(len(blk[1]), room)
+    room -= alloc[id(blk)]
+# Max-min fair share: short sections stay whole, long ones share what is left.
+others = sorted(pre + rest_blocks, key=lambda blk: len(blk[1]) - alloc[id(blk)])
+for i, blk in enumerate(others):
+    add = min(len(blk[1]) - alloc[id(blk)], room // (len(others) - i))
+    alloc[id(blk)] += add
+    room -= add
+
+out, more, cut = [], 0, []
+for blk in ordered:
+    h, body = blk
+    kept = strip_blank(body[:alloc[id(blk)]])
+    lost = sum(1 for ln in body[len(kept):] if ln.strip())
+    if lost:
+        more += lost
+        cut.append(h.lstrip("#").strip() if h else "the preamble")
+    if out:
+        out.append("")
+    if h:
+        out.append(h)
+    out.extend(kept)
+print(more)
+if more:
+    print("\n".join(out))
+    where = " from " + ", ".join(cut) if any(h for h, _ in ordered) else ""
+    print("… [%d more lines%s — full summary: %s]" % (more, where, path))
+PYEOF
+) || out=""
+        more="${out%%$'\n'*}"
+        if [[ "$more" =~ ^[1-9][0-9]*$ ]]; then
+            echo "NOTE: .session-summary.md is ${n} lines, over the ${cap}-line handoff cap — ${more} line(s) left out of handoff.md behind a marker (headings kept, Blockers / Open Questions first). Trim it, or set V11_HANDOFF_SUMMARY_LINES (0 = no cap)." >&2
+            printf '%s\n' "${out#*$'\n'}" | sed 's/^/  /'
+            return 0
+        elif [ "$more" != "0" ]; then
+            # python3 unavailable or failed: flat cut, still marked. The marker
+            # counts the non-blank lines left out, as the python path does.
+            more=$(awk -v c="$((cap - 1))" 'NR > c && NF { k++ } END { print k + 0 }' "$f" 2>/dev/null || echo 0)
+            echo "NOTE: .session-summary.md is ${n} lines, over the ${cap}-line handoff cap — cut at line $((cap - 1)) behind a marker. Trim it, or set V11_HANDOFF_SUMMARY_LINES (0 = no cap)." >&2
+            { head -n "$((cap - 1))" "$f"; printf '… [%s more lines — full summary: %s]\n' "$more" "$f"; } | sed 's/^/  /'
+            return 0
+        fi
+    fi
+    sed 's/^/  /' "$f" 2>/dev/null
+}
 # V11.25.1: stale-summary detection.
 # Before V11.25.1, an existing .session-summary.md was unconditionally treated as
 # canonical — there was no freshness check. Result: a summary written in session N
@@ -817,7 +1779,7 @@ if [ "$_SS_STALE" -eq 1 ]; then
 fi
 
 if [ -f "$SESSION_SUMMARY_FILE" ] && [ -s "$SESSION_SUMMARY_FILE" ]; then
-    SESSION_SUMMARY=$(head -20 "$SESSION_SUMMARY_FILE" 2>/dev/null | sed 's/^/  /')
+    SESSION_SUMMARY=$(_v11_summary_excerpt "$SESSION_SUMMARY_FILE")
     # Preserve 'stale-replaced'/'stale-unarchived' sentinels — they signal that
     # the read content is not the canonical disk truth and confidence must downgrade.
     # V11.25.2 T6-E2: extended preserve list to include stale-unarchived.
@@ -840,7 +1802,7 @@ elif [ -z "$NO_STUB_FLAG" ] && [ "${V11_STUB_SUMMARY:-}" != "off" ]; then
         mkdir -p "$SESSION_DIR" 2>/dev/null || true
         if printf '%s' "$_STUB_CONTENT" > "$_STUB_TMP" 2>/dev/null && [ -s "$_STUB_TMP" ]; then
             if mv "$_STUB_TMP" "$SESSION_SUMMARY_FILE" 2>/dev/null; then
-                SESSION_SUMMARY=$(head -20 "$SESSION_SUMMARY_FILE" 2>/dev/null | sed 's/^/  /')
+                SESSION_SUMMARY=$(_v11_summary_excerpt "$SESSION_SUMMARY_FILE")
                 # V11.25.1 swarm-review L1-1/L4-2: differentiated NOTE only;
                 # SOURCE must promote to 'written' regardless of pre-stub state
                 # so the spawn quality gate counts the freshly written stub
@@ -1018,7 +1980,7 @@ fi
 RECENT_DECISIONS=""
 if [ -f "$PLAN_CONTEXT_FILE" ]; then
     RECENT_DECISIONS=$(jq -r '
-        (.decisions // [])[-3:] |
+        [(.decisions // [])[] | select(type == "object" and ((.title // "") | tostring) != "" and ((.chosen // "") | tostring) != "")] | .[-3:] |
         if length > 0 then
             map("- \(.title) -> \(.chosen)") | join("\n")
         else ""
@@ -1056,10 +2018,11 @@ if [ -f "$AUDIT_LOG" ]; then
                     _foreign_proj=$(printf '%s' "$_kf_path" | sed -E "s|^$SESSIONS_ROOT/([^/]+)/.*|\\1|")
                     if [ "$_foreign_proj" != "$PROJECT" ]; then _keep=0; fi
                     ;;
+                *) : ;;   # outside sessions/ entirely — keep
             esac
             # (b) Reject if the path mentions another project's /tmp scratchpad
             # marker: /tmp/claude-*/-home-hercules-OTHERPROJECT-*/ etc.
-            if [ "$_keep" -eq 1 ] && echo "$_kf_path" | grep -qE "/-home-hercules-[a-zA-Z0-9_.-]+"; then
+            if [ "$_keep" -eq 1 ] && grep -qE "/-home-hercules-[a-zA-Z0-9_.-]+" <<<"$_kf_path"; then
                 _scratch_proj=$(printf '%s' "$_kf_path" | sed -E 's|.*/-home-hercules-([a-zA-Z0-9_.-]+)/.*|\1|; t; d')
                 # Normalize: sofly-debug becomes sofly-debug; strip trailing session shard suffixes.
                 if [ -n "$_scratch_proj" ] && [ "$_scratch_proj" != "$PROJECT" ]; then
@@ -1137,6 +2100,9 @@ REVIEW_PENDING=$(( TOTAL - COMPLETED - PENDING - IN_PROGRESS - BLOCKED ))
 [ "$REVIEW_PENDING" -lt 0 ] && REVIEW_PENDING=0
 _REVIEW_PENDING_SEG=""
 [ "$REVIEW_PENDING" -gt 0 ] && _REVIEW_PENDING_SEG=" | Review-pending: ${REVIEW_PENDING}"
+# An aggregate sums counts across sessions, so the residual is meaningless there
+# (field review: "Review-pending: 347"). V11_HANDOFF_REVIEW_SEG_SCOPE=off restores it.
+[ "$STATE_SOURCE" = "aggregate" ] && [ "${V11_HANDOFF_REVIEW_SEG_SCOPE:-on}" != "off" ] && _REVIEW_PENDING_SEG=""
 
 # Percent — clamp to [0,100] and flag drift when COMPLETED > TOTAL.
 # Counter drift surfaces as 100%+ values (archivestream:191%, tos-analyzer:2100%, etc).
@@ -1241,7 +2207,8 @@ if [ "${V11_HANDOFF_CATEGORY:-on}" != "off" ] && [ "${BLOCKED:-0}" -gt 0 ]; then
         _BLOCKER_JSON=$(jq -c '
             [.tasks[]? | select(.status == "blocked") | {id: (.id // null), subject: (.subject // null)}]
         ' "$LIVE_SNAP_FILE" 2>/dev/null || echo "[]")
-        _BLOCKER_JSON=$(_v11_fill_null_subjects "$_BLOCKER_JSON" "$PROJECT")
+        _BLOCKER_JSON=$(_v11_fill_null_subjects "$_BLOCKER_JSON" "$PROJECT" \
+            "$(jq -r '.session_uuid // ""' "$LIVE_SNAP_FILE" 2>/dev/null || echo "")")
         _BLOCKER_RAW=$(printf '%s' "$_BLOCKER_JSON" | jq -r '.[] | "  - #\(.id // "?"): \(.subject // "blocked task")"' 2>/dev/null || echo "")
     fi
     if [ -z "$_BLOCKER_RAW" ] && [ -f "$STATE_FILE" ] && [ -s "$STATE_FILE" ]; then
@@ -1251,7 +2218,7 @@ if [ "${V11_HANDOFF_CATEGORY:-on}" != "off" ] && [ "${BLOCKED:-0}" -gt 0 ]; then
         # to_entries[] works on both shapes; prefer .value.task_id when
         # present (list shape) else fall back to .key (dict shape).
         _BLOCKER_JSON=$(jq -c '
-            [(.open_tasks // {}) | to_entries[] | select(.value.status == "blocked") | {id: (.value.task_id // .key), subject: (.value.subject // null)}]
+            [(.open_tasks // {}) | to_entries[] | select(.value.status == "blocked") | {id: (.value.task_id // .key), subject: (.value.subject // null), session_uuid: (.value.session_uuid // null)}]
         ' "$STATE_FILE" 2>/dev/null || echo "[]")
         _BLOCKER_JSON=$(_v11_fill_null_subjects "$_BLOCKER_JSON" "$PROJECT")
         _BLOCKER_RAW=$(printf '%s' "$_BLOCKER_JSON" | jq -r '.[] | "  - #\(.id // "?"): \(.subject // "blocked task")"' 2>/dev/null || echo "")
@@ -1432,6 +2399,22 @@ fi
 # Reasoning context
 if [ -n "$PC_DOMAIN" ] || [ -n "$PC_HYPOTHESES" ] || [ -n "$PC_BOTTLENECK" ]; then
     _REASONING="## Reasoning Context"
+    if [ "${V11_HANDOFF_REASONING_STAMP:-}" != "off" ] && [ -f "$PLAN_CONTEXT_FILE" ]; then
+        _RC_MT=$(stat -c %Y "$PLAN_CONTEXT_FILE" 2>/dev/null || echo 0)
+        if [ "${_RC_MT:-0}" -gt 0 ] 2>/dev/null; then
+            _RC_DATE=$(date -u -d "@$_RC_MT" +%Y-%m-%d 2>/dev/null || echo "")
+            _RC_MAX="${V11_HANDOFF_REASONING_MAX_AGE_DAYS:-14}"
+            case "$_RC_MAX" in ''|*[!0-9]*) _RC_MAX=14 ;; esac
+            _RC_DAYS=$(( ($(date +%s) - _RC_MT) / 86400 ))
+            if [ -n "$_RC_DATE" ]; then
+                if [ "$_RC_DAYS" -gt "$_RC_MAX" ]; then
+                    _REASONING="## Reasoning Context (as of ${_RC_DATE} — STALE: ${_RC_DAYS} days old, may be from an earlier sprint)"
+                else
+                    _REASONING="## Reasoning Context (as of ${_RC_DATE})"
+                fi
+            fi
+        fi
+    fi
     [ -n "$PC_DOMAIN" ] && _REASONING="${_REASONING}
 - Domain: $PC_DOMAIN"
     [ -n "$PC_HYPOTHESES" ] && _REASONING="${_REASONING}
@@ -1569,6 +2552,7 @@ if [ "${V11_HANDOFF_DOC_DRIFT:-on}" != "off" ] && [ -n "$SESSION_DIR" ]; then
 
 "
                 ;;
+            *) : ;;   # A/B or unknown grade — no warning
         esac
     fi
 fi
@@ -1627,6 +2611,7 @@ if [ -z "$SKIP_DRIFT_FLAG" ] && [ "${V11_SKIP_DRIFT_CHECKS:-}" != "1" ] && [ -n 
             # they're hygiene, not correctness.
             case "$_DRIFT_SCRIPT_NAME" in
                 check-class-included|check-registry-drift) _DRIFT_FAIL=1 ;;
+                *) : ;;   # hygiene checks report but never block
             esac
             # v11.37 W2-T4 swarm S7: print FAIL blocks always (they're real
             # errors), WARN blocks only under verbose. Prevents 8-block noise
@@ -1674,6 +2659,69 @@ if [ "${V11_HANDOFF_ADDENDUM:-on}" != "off" ] \
     date -Iseconds > "$SESSION_DIR/.handoff-addendum-preserved-at" 2>/dev/null || true
 fi
 
+# S1-T1 (#75a): open_tasks = ledger replay ∪ live snapshot for the live
+# session (see _v11_live_open_set). _V11_OT_MODE=ledger routes the early fold
+# below and _emit_handoff_tasks_json to that set; "legacy" keeps the
+# per-session / aggregate path (no ledger activity for this project, or the
+# replay failed). Rollback: V11_HANDOFF_SOURCE_CHECK=off (pre-S1 emission: no
+# identity, no live_session_uuid, no shrink breaker, no empty refusal).
+_V11_SOURCE_CHECK="on"
+[ "${V11_HANDOFF_SOURCE_CHECK:-on}" = "off" ] && _V11_SOURCE_CHECK="off"
+_V11_OT_MODE="legacy"
+_V11_LOS_FILE=""
+_V11_OT_FOOTER=""
+_V11_LEGACY_FALLBACK=""   # review #69 E3: why a ledger project fell back (never silent)
+_V11_SRC_FAIL=""
+_V11_REFUSED=""           # review #69 E1: empty|shrink when the emission was refused
+LIVE_SESSION_UUID=""
+if [ "$_V11_SOURCE_CHECK" = "on" ]; then
+    # One budget for the S1 steps (replay, live-set pass, drop audit); only
+    # their own run time counts. 3..14 s, so with the audit's 1 s floor they
+    # end within 15 s of session-end's 20 s kill.
+    _V11_SRC_BUDGET="${V11_HANDOFF_SOURCE_BUDGET_SECS:-12}"
+    [[ "$_V11_SRC_BUDGET" =~ ^[0-9]+$ ]] || _V11_SRC_BUDGET=12
+    [ "$_V11_SRC_BUDGET" -lt 3 ] && _V11_SRC_BUDGET=3
+    [ "$_V11_SRC_BUDGET" -gt 14 ] && _V11_SRC_BUDGET=14
+    _V11_SRC_SPENT_MS=0
+    _V11_LOS_FILE=$(mktemp 2>/dev/null || echo "")
+    if [ -n "$_V11_LOS_FILE" ] && _v11_live_open_set "$PROJECT" "$_V11_LOS_FILE"; then
+        _V11_OT_MODE=$(jq -r '.mode // "legacy"' "$_V11_LOS_FILE" 2>/dev/null || echo legacy)
+        case "$_V11_OT_MODE" in
+            ledger|legacy) : ;;
+            replay_failed)
+                _V11_LEGACY_FALLBACK=$(jq -r '.fallback_reason // "replay_failed"' "$_V11_LOS_FILE" 2>/dev/null || echo replay_failed)
+                echo "handoff: WARN — the ledger replay for $PROJECT did not complete (${_V11_LEGACY_FALLBACK}; $(jq -r '.ledger_events // 0' "$_V11_LOS_FILE" 2>/dev/null) ledger events, budget ${_V11_SRC_BUDGET}s); open_tasks fall back to the $STATE_SOURCE path (open_tasks_source=legacy-fallback:${_V11_LEGACY_FALLBACK})" >&2
+                _V11_OT_MODE="legacy" ;;
+            *) _V11_OT_MODE="legacy" ;;
+        esac
+        LIVE_SESSION_UUID=$(jq -r '.live_session_uuid // ""' "$_V11_LOS_FILE" 2>/dev/null || echo "")
+        _V11_LIVE_REASON=$(jq -r '.live_reason // ""' "$_V11_LOS_FILE" 2>/dev/null || echo "")
+        case "$_V11_LIVE_REASON" in
+            "newest ledger activity"*)
+                echo "handoff: live session = ${LIVE_SESSION_UUID:0:8} — $_V11_LIVE_REASON" >&2 ;;
+            *) : ;;
+        esac
+        _V11_DISAGREE=$(jq -r '(.disagreements // []) | length' "$_V11_LOS_FILE" 2>/dev/null || echo 0)
+        [[ "$_V11_DISAGREE" =~ ^[0-9]+$ ]] || _V11_DISAGREE=0
+        if [ "$_V11_DISAGREE" -gt 0 ]; then
+            echo "handoff: live snapshot (newer) disagrees with the ledger on ${_V11_DISAGREE} task(s); the ledger wins:" >&2
+            jq -r '.disagreements[:10][] | "  - #\(.id) \(.subject // "") — snapshot=\(.snapshot), ledger=\(.ledger)"' \
+                "$_V11_LOS_FILE" >&2 2>/dev/null || true
+        fi
+        if [ "$_V11_OT_MODE" = "ledger" ]; then
+            _V11_OT_FOOTER=" | open_tasks: ledger+live-snapshot (live ${LIVE_SESSION_UUID:0:8})"
+        fi
+    else
+        _V11_LEGACY_FALLBACK="${_V11_SRC_FAIL:-live_set_failed}"
+        echo "handoff: WARN — S1-T1 source check unavailable (${_V11_LEGACY_FALLBACK}; budget ${_V11_SRC_BUDGET}s) — open_tasks from the $STATE_SOURCE path (open_tasks_source=legacy-fallback:${_V11_LEGACY_FALLBACK})" >&2
+        rm -f "$_V11_LOS_FILE" 2>/dev/null || true
+        _V11_LOS_FILE=""
+    fi
+    if [ -n "$_V11_LEGACY_FALLBACK" ]; then
+        _V11_OT_FOOTER=" | open_tasks: legacy-fallback:${_V11_LEGACY_FALLBACK}"
+    fi
+fi
+
 # V11.18 T1 (v11-handoff-hygiene): RUN the family fold EARLY so the
 # manifest is fresh by the time T6 reads it for the AUTHORITATIVE-vs-caveats
 # decision. The fold is idempotent — _emit_handoff_tasks_json (called later)
@@ -1686,7 +2734,10 @@ if [ "${V11_FOLD_FAMILIES:-on}" != "off" ] \
    && [ -f "$V11_HOME/scripts/lib/family_fold.py" ]; then
     # Build open_tasks_json early (mirror logic from _emit_handoff_tasks_json)
     _EARLY_OPEN_TASKS="[]"
-    if [ "$STATE_SOURCE" = "per-session" ] && [ -f "$STATE_FILE" ]; then
+    if [ "$_V11_OT_MODE" = "ledger" ]; then
+        # S1-T1: every ledger / live-snapshot entry skips the fold.
+        _EARLY_OPEN_TASKS="[]"
+    elif [ "$STATE_SOURCE" = "per-session" ] && [ -f "$STATE_FILE" ]; then
         _EARLY_OPEN_TASKS=$(jq -c '
             (.open_tasks // {}) | to_entries | map({
                 id: .key,
@@ -1995,9 +3046,32 @@ esac
 # .handoff-steer.md.prev (see the `mv -f` below). Task metadata authors should
 # NOT list `.handoff-steer.md` in `files_changed` after handoff completes —
 # reference `.handoff-steer.md.prev` or note the consume-semantics explicitly.
+# S2-R3 (F38): a steer baked from the sidecar or --steer is also kept in
+# .handoff-steer.consumed.md (line 1: consuming session + time; the rest: the
+# sanitized steer). Every later regeneration re-injects it until a DIFFERENT
+# session Reads handoff.md (hooks/detect-project renames it to .acked). A new
+# sidecar or --steer supersedes it. This replaces the .prev freshness window,
+# which lost the steer when SessionEnd regenerated more than 300 s after
+# /handoff. Rollback: V11_STEER_PERSIST=off (one-shot + .prev window).
+# Review #20: a regeneration retires the kept steer (.acked) instead of
+# re-injecting it when this run is a different interactive session than the
+# header's (the successor regenerated: it has resumed), or when the kept copy
+# is older than V11_STEER_PERSIST_MAX_AGE_SECS (mtime; default 259200 = 72 h,
+# 0 = no cap). An empty header or run session id leaves the age cap only. A
+# headless run (CLAUDE_CODE_ENTRYPOINT sdk-*, mcp or the GitHub action; `claude
+# -p` sets sdk-cli) is no successor, so only the age cap applies to it.
 STEER_FILE="$SESSION_DIR/.handoff-steer.md"
+STEER_CONSUMED_FILE="$SESSION_DIR/.handoff-steer.consumed.md"
 STEER_TEXT=""
 STEER_SOURCE=""
+# The session this run belongs to: the hook-stdin id under session-end, else
+# Claude Code's own id for a /handoff Bash call; empty for a plain terminal run.
+if [ "${V11_SESSION_ID_SOURCE:-}" = "hook-stdin" ] && [ -n "${V11_SESSION_ID:-}" ]; then
+    _steer_sid="$V11_SESSION_ID"
+else
+    _steer_sid="${CLAUDE_CODE_SESSION_ID:-${V11_SESSION_ID:-}}"
+fi
+[[ "$_steer_sid" =~ ^[A-Za-z0-9._-]{1,64}$ ]] || _steer_sid=""
 if [ "${V11_HANDOFF_STEER:-on}" != "off" ]; then
     if [ -f "$STEER_FILE" ] && [ -s "$STEER_FILE" ]; then
         STEER_TEXT="$(cat "$STEER_FILE")"
@@ -2008,6 +3082,42 @@ if [ "${V11_HANDOFF_STEER:-on}" != "off" ]; then
     elif [ -n "$STEER_INLINE" ]; then
         STEER_TEXT="$STEER_INLINE"
         STEER_SOURCE="flag"
+    elif [ "${V11_STEER_PERSIST:-on}" != "off" ]; then
+        if [ -s "$STEER_CONSUMED_FILE" ]; then
+            _steer_hdr="" _steer_by="" _steer_retire=""
+            IFS= read -r _steer_hdr < "$STEER_CONSUMED_FILE" 2>/dev/null || true
+            [[ "$_steer_hdr" =~ session=([A-Za-z0-9._-]*) ]] && _steer_by="${BASH_REMATCH[1]}"
+            _steer_max="${V11_STEER_PERSIST_MAX_AGE_SECS:-259200}"
+            [[ "$_steer_max" =~ ^[0-9]+$ ]] || _steer_max=259200
+            _steer_age=$(( $(date +%s) - $(stat -c %Y "$STEER_CONSUMED_FILE" 2>/dev/null || echo 0) ))
+            case "${CLAUDE_CODE_ENTRYPOINT:-}" in
+                sdk-*|mcp|claude-code-github-action) _steer_headless=1 ;;
+                *) _steer_headless=0 ;;
+            esac
+            if [ -n "$_steer_by" ] && [ -n "$_steer_sid" ] && [ "$_steer_by" != "$_steer_sid" ] \
+               && [ "$_steer_headless" = "0" ]; then
+                _steer_retire="regen"
+            elif [ "$_steer_max" -gt 0 ] && [ "$_steer_age" -ge "$_steer_max" ]; then
+                _steer_retire="age"
+            fi
+            if [ -n "$_steer_retire" ]; then
+                if mv -f "$STEER_CONSUMED_FILE" "$STEER_CONSUMED_FILE.acked" 2>/dev/null; then
+                    printf '<!-- v11-steer-acked session=%s at=%s via=%s -->\n' \
+                        "$_steer_sid" "$(date -Iseconds)" "$_steer_retire" >> "$STEER_CONSUMED_FILE.acked" 2>/dev/null || true
+                    if [ "$_steer_retire" = "regen" ]; then
+                        echo "NOTE: retired the consumed steer — session $_steer_sid regenerated handoff.md after $_steer_by baked it (.handoff-steer.consumed.md.acked)." >&2
+                    else
+                        echo "NOTE: retired the consumed steer — ${_steer_age}s old, past V11_STEER_PERSIST_MAX_AGE_SECS=${_steer_max} (.handoff-steer.consumed.md.acked)." >&2
+                    fi
+                fi
+            else
+                STEER_TEXT="$(tail -n +2 "$STEER_CONSUMED_FILE" 2>/dev/null || true)"
+                if [ -n "$STEER_TEXT" ]; then
+                    STEER_SOURCE="consumed"   # already kept — do NOT re-consume or re-stamp below
+                    echo "NOTE: re-injected the consumed steer (.handoff-steer.consumed.md) — no new session has read handoff.md yet." >&2
+                fi
+            fi
+        fi
     elif [ -f "${STEER_FILE}.prev" ] && [ -s "${STEER_FILE}.prev" ]; then
         # V11.28.2 STRUCTURAL FIX (idempotent re-bake): the sidecar was consumed to .prev
         # by a PRIOR run this episode (e.g. a first --spawn), then this run regenerates
@@ -2060,6 +3170,14 @@ $STEER_TEXT
 "
 fi
 
+# Active tasks come from the ledger-authoritative open set when it is available
+# (stale active_task_ids named tasks that were no longer open). Legacy value kept
+# when the open set is unavailable; V11_HANDOFF_ACTIVE_FROM_OPEN_SET=off disables.
+if [ "${V11_HANDOFF_ACTIVE_FROM_OPEN_SET:-on}" != "off" ] && [ "${_V11_OT_MODE:-legacy}" = "ledger" ] && [ -n "${_V11_LOS_FILE:-}" ] && [ -s "$_V11_LOS_FILE" ]; then
+    _V11_ACTIVE_FROM_OS=$(jq -r '[(.entries // [])[] | select(.status == "in_progress") | .id | tostring] | if length == 0 then "none" else join(", ") end' "$_V11_LOS_FILE" 2>/dev/null || echo "")
+    [ -n "$_V11_ACTIVE_FROM_OS" ] && ACTIVE_TASKS="$_V11_ACTIVE_FROM_OS"
+fi
+
 PROMPT="Continue V11 session: \"$PROJECT\"
 
 ${_WARNING_BLOCK}Read: $HERCULES_ROOT/v11/CLAUDE.md, $SPEC_FILE, TaskList
@@ -2083,12 +3201,12 @@ ${_FILES_SECTION}
 ## Rehydration (V11.13)
 Claude Code TaskList is per-session — your TaskList starts empty.
 To rebuild it with the open tasks from the prior session, run:
-    ./scripts/v11-resume-tasks $PROJECT
+    $_V11_RESUME_CMD $PROJECT
 …then issue TaskCreate calls per the emitted <v11-resume> block.
 
 ## Instructions
 1. Read spec.md for project context
-2. Run scripts/v11-resume-tasks to rehydrate TaskList (if handoff-tasks.json exists)
+2. Run $_V11_RESUME_CMD $PROJECT to rehydrate TaskList (if handoff-tasks.json exists)
 3. Run TaskList to verify current state
 4. Resume from next pending task (lowest ID, not blocked)
 5. Report status to user
@@ -2096,7 +3214,7 @@ To rebuild it with the open tasks from the prior session, run:
 ---
 V11 Protocol | Generated: $TIMESTAMP
 Session: $PROJECT | ${DISPLAY_COMPLETED}/${TOTAL} complete (${PERCENT}%)${PROGRESS_NOTE}
-Task state source: $STATE_SOURCE ($SOURCE_SESSION_UUID)${LIVE_SNAP_SOURCE:+ | live-snapshot: ${LIVE_SNAP_SOURCE}}"
+Task state source: $STATE_SOURCE ($SOURCE_SESSION_UUID)${LIVE_SNAP_SOURCE:+ | live-snapshot: ${LIVE_SNAP_SOURCE}}${_V11_OT_FOOTER}"
 
 # Write handoff.md to a staging file first — only promoted to final after
 # handoff-tasks.json emits successfully. This kills the half-handoff class:
@@ -2172,6 +3290,8 @@ _v11_handoff_cleanup() {
     rm -f "$HANDOFF_TASKS_FILE.tmp.$$" 2>/dev/null || true
     rm -f "$SESSION_DIR/.handoff-fold-manifest.json.tmp.$$" 2>/dev/null || true
     rm -f "${_HANDOFF_STAGING:-/dev/null}" 2>/dev/null || true
+    rm -f "${_V11_LOS_FILE:-/dev/null}" 2>/dev/null || true
+    rm -f "${STEER_CONSUMED_FILE:-/dev/null}.tmp.$$" 2>/dev/null || true
     # Steer restore (improvements/23 contract, preserved)
     if [ "$_rc" -ne 0 ] && [ "${_STEER_CONSUMED_THIS_RUN:-0}" = "1" ] \
        && [ ! -s "${STEER_FILE:-/dev/null}" ] && [ -s "${STEER_FILE:-/dev/null}.prev" ]; then
@@ -2186,6 +3306,8 @@ trap '_v11_handoff_cleanup' EXIT
 # a LATER handoff (same discipline as the V11.25.1 stale-summary archive). The steer
 # is already baked into handoff.md above, so clearing the source is safe. Archive to
 # .prev for recoverability. Only the file path is consumed; --steer flags are ephemeral.
+# S2-R3: a new session's read is what retires the steer now (V11_STEER_PERSIST); the
+# kept copy is written when handoff.md is promoted, below.
 if [ "$STEER_SOURCE" = "file" ] && [ "${V11_HANDOFF_STEER:-on}" != "off" ]; then
     if mv -f "$STEER_FILE" "${STEER_FILE}.prev" 2>/dev/null; then
         echo "NOTE: consumed .handoff-steer.md → archived to .handoff-steer.md.prev (steer baked into handoff.md)." >&2
@@ -2208,7 +3330,10 @@ fi
 _emit_handoff_tasks_json() {
     local source_kind="$STATE_SOURCE" file="$STATE_FILE"
     local open_tasks_json="[]"
-    if [ "$source_kind" = "per-session" ] && [ -f "$file" ]; then
+    if [ "$_V11_OT_MODE" = "ledger" ]; then
+        # S1-T1 (#75a): ledger replay ∪ live snapshot, one entry per identity.
+        open_tasks_json=$(jq -c '.entries // []' "$_V11_LOS_FILE" 2>/dev/null || echo "[]")
+    elif [ "$source_kind" = "per-session" ] && [ -f "$file" ]; then
         # Per-session: open_tasks is {id: {subject, description, status, metadata}} — flatten to array.
         # V11.14: description preserved so v11-resume-tasks can rehydrate the full task body
         # (subject alone strips the rationale/progress notes the receiving session needs).
@@ -2338,7 +3463,10 @@ _emit_handoff_tasks_json() {
         map(
             (nrm(.subject)) as $ns
             | . + {_stale: (
-                if $ledger_auth then false
+                # S1-T1: per-entry _ledger_auth (and live-snapshot entries,
+                # which are the live TaskList) are never stale.
+                if $ledger_auth or (._ledger_auth // false)
+                   or (.origin // "") == "live-snapshot" then false
                 else
                   ((.source_session_uuid // null) as $u
                    | if $u == null then false
@@ -2346,7 +3474,13 @@ _emit_handoff_tasks_json() {
                   or (($done | index($ns)) != null)
                 end)}
         )
-        | group_by(nrm(.subject))
+        # S1-T1: ledger entries dedupe by identity and live-snapshot entries
+        # by task id — a shared normalized subject is not the same task.
+        | group_by(
+            if (._ledger_auth // false) then
+                "i:" + (.identity.subject_norm // "") + "#" + (.identity.create_seq | tostring)
+            elif (.origin // "") == "live-snapshot" then "s:" + (.id | tostring)
+            else nrm(.subject) end)
         | map(
             ( sort_by([ (if ._stale then 1 else 0 end),
                         (if .status == "in_progress" then 0 else 1 end),
@@ -2475,15 +3609,34 @@ _emit_handoff_tasks_json() {
 
     local _fold_manifest_json="null"
     local _families_emit_form="" # how to surface families in the handoff prompt
+    local _fold_bypass_json="[]" _fold_bypassed=0
     if [ "$_fold_enabled" = "on" ]; then
+        # S1-T1 (#75a): ledger and live-snapshot entries are distinct live
+        # tasks with a canonical identity; the token-overlap fold merged them
+        # (11 → 9 live). They skip the fold and only legacy entries fold.
+        local _fold_in="$open_tasks_json"
+        if [ "$_V11_SOURCE_CHECK" = "on" ]; then
+            local _bypass_sel='(._ledger_auth // false) or (.origin // "") == "live-snapshot"'
+            _fold_bypass_json=$(printf '%s' "$open_tasks_json" | jq -c "[.[] | select($_bypass_sel)]" 2>/dev/null || echo "")
+            _fold_in=$(printf '%s' "$open_tasks_json" | jq -c "[.[] | select(($_bypass_sel) | not)]" 2>/dev/null || echo "")
+            if [ -z "$_fold_bypass_json" ] || [ -z "$_fold_in" ]; then
+                _fold_bypass_json="[]"
+                _fold_in="$open_tasks_json"
+            fi
+            _fold_bypassed=$(printf '%s' "$_fold_bypass_json" | jq -r 'length' 2>/dev/null || echo 0)
+            [[ "$_fold_bypassed" =~ ^[0-9]+$ ]] || _fold_bypassed=0
+        fi
         local _fold_raw
-        _fold_raw=$(printf '%s' "$open_tasks_json" | timeout 10 python3 "$_family_fold_py" 2>/dev/null || echo "")
+        _fold_raw=$(printf '%s' "$_fold_in" | timeout 10 python3 "$_family_fold_py" 2>/dev/null || echo "")
         if [ -n "$_fold_raw" ] && printf '%s' "$_fold_raw" | jq empty 2>/dev/null; then
             # Replace open_tasks_json with the .families array — schema is
             # backward-compatible (canonical task fields at top level), with
             # .family_members[] and .size for new consumers (T9).
             local _new_open_tasks
             _new_open_tasks=$(printf '%s' "$_fold_raw" | jq -c '.families // []' 2>/dev/null || echo "")
+            if [ -n "$_new_open_tasks" ] && [ "$_fold_bypassed" -gt 0 ]; then
+                _new_open_tasks=$(printf '%s\n%s\n' "$_fold_bypass_json" "$_new_open_tasks" | jq -c -s 'add' 2>/dev/null || echo "")
+            fi
             if [ -n "$_new_open_tasks" ] && printf '%s' "$_new_open_tasks" | jq empty 2>/dev/null; then
                 open_tasks_json="$_new_open_tasks"
                 _fold_manifest_json=$(printf '%s' "$_fold_raw" | jq -c '.manifest // null' 2>/dev/null || echo "null")
@@ -2508,6 +3661,44 @@ _emit_handoff_tasks_json() {
         fi
     fi
 
+    # S1-T1 (#75a): stamp identity on every entry and audit what this
+    # emission drops from the prior handoff-tasks.json (feeds the empty
+    # refusal and the shrink breaker below). Fails open: no audit, no guard.
+    local _audit_json="" _src_new=0 _src_prior=0 _src_unexplained=0
+    if [ "$_V11_SOURCE_CHECK" = "on" ]; then
+        local _auf
+        _auf=$(mktemp)
+        printf '%s' "${open_tasks_json:-[]}" > "$_auf"
+        _audit_json=$(_v11_source_audit "$_auf" "${_V11_LOS_FILE:-}" "$HANDOFF_TASKS_FILE" || echo "")
+        rm -f "$_auf" 2>/dev/null || true
+        local _stamped=""
+        if [ -n "$_audit_json" ] && printf '%s' "$_audit_json" | jq empty 2>/dev/null; then
+            _stamped=$(printf '%s' "$_audit_json" | jq -c '.open_tasks // empty' 2>/dev/null || echo "")
+        fi
+        if [ -n "$_stamped" ]; then
+            open_tasks_json="$_stamped"
+            _src_new=$(printf '%s' "$_audit_json" | jq -r '.new_count // 0' 2>/dev/null || echo 0)
+            _src_prior=$(printf '%s' "$_audit_json" | jq -r '.prior_count // 0' 2>/dev/null || echo 0)
+            _src_unexplained=$(printf '%s' "$_audit_json" | jq -r '(.unexplained // []) | length' 2>/dev/null || echo 0)
+            [[ "$_src_new" =~ ^[0-9]+$ ]] || _src_new=0
+            [[ "$_src_prior" =~ ^[0-9]+$ ]] || _src_prior=0
+            [[ "$_src_unexplained" =~ ^[0-9]+$ ]] || _src_unexplained=0
+            # Review #69 E4/E1: a drop is never silent — one line each for the
+            # drops the ledger explains and for other sessions' tasks.
+            printf '%s' "$_audit_json" | jq -r '
+                def few: .[:5] | map("#\(.id // "?") \((.subject // "") | .[:50])") | join("; ");
+                (if (.explained_list | length) > 0 then
+                    "handoff: \(.explained_list | length) prior task(s) dropped as completed/cancelled (ledger or live snapshot): \(.explained_list | few)"
+                 else empty end),
+                (if (.foreign | length) > 0 then
+                    "handoff: WARN — \(.foreign | length) prior task(s) of another session are still open there and not carried (not counted by the breakers): \(.foreign | few)"
+                 else empty end)' >&2 2>/dev/null || true
+        else
+            _audit_json=""
+            echo "handoff: S1-T1 drop audit failed — identity not stamped; shrink breaker and empty refusal skipped" >&2
+        fi
+    fi
+
     local tmp="$HANDOFF_TASKS_FILE.tmp.$$"
     # improvements/23 (the observed E2BIG kill site): open_tasks and the fold
     # manifest BOTH scale with project age and were passed as single execve
@@ -2528,7 +3719,8 @@ _emit_handoff_tasks_json() {
         --slurpfile fold_manifest_sf "$_fmf" \
         --argjson filtered_pending_parent "${_filtered_pending_parent:-0}" \
         --argjson tagged_review_siblings "${_tagged_review_siblings:-0}" \
-        --arg review_filter_enabled "${_review_filter_enabled:-off}" '
+        --arg review_filter_enabled "${_review_filter_enabled:-off}" \
+        --arg resume_cmd "$_V11_RESUME_CMD $PROJECT" '
         {
             handoff_at: $handoff_at,
             project: $project,
@@ -2542,10 +3734,56 @@ _emit_handoff_tasks_json() {
                 tagged_review_siblings: $tagged_review_siblings,
                 note: "V11.21 T15: pending_parent siblings filtered out (auto-recreated by Phase 4 recovery scan when parent rehydrates). Orphan reviews (parent already completed) tagged is_review_sibling=true. Rollback: V11_HANDOFF_REVIEW_FILTER=off."
             },
-            rehydration_note: "Run scripts/v11-resume-tasks PROJECT to print TaskCreate payloads the receiving Claude session can execute. Each entry MAY include .family_members[]: when present, the entry represents a cluster of near-duplicate subjects from multiple sessions — verify before treating as a single task."
+            rehydration_note: "Run \($resume_cmd) to print TaskCreate payloads the receiving Claude session can execute. Each entry MAY include .family_members[]: when present, the entry represents a cluster of near-duplicate subjects from multiple sessions — verify before treating as a single task."
         }
     ' > "$tmp" 2>/dev/null
     rm -f "$_otf" "$_fmf" 2>/dev/null || true
+
+    # S1-T1 (#75a): stamp the live session and the source-check result, so
+    # source/live drift is visible in the file (source_session_uuid is the
+    # counter source above; live_session_uuid is whose open tasks these are).
+    if [ "$_V11_SOURCE_CHECK" = "on" ] && [ -s "$tmp" ]; then
+        local _lsf _adf _xtmp
+        _lsf=$(mktemp); _adf=$(mktemp); _xtmp=$(mktemp)
+        if [ -s "${_V11_LOS_FILE:-}" ]; then cp -f "$_V11_LOS_FILE" "$_lsf"; else echo '{}' > "$_lsf"; fi
+        if [ -n "$_audit_json" ]; then printf '%s' "$_audit_json" > "$_adf"; else echo '{}' > "$_adf"; fi
+        if jq --slurpfile los_sf "$_lsf" --slurpfile aud_sf "$_adf" \
+              --arg live "$LIVE_SESSION_UUID" --argjson bypassed "${_fold_bypassed:-0}" \
+              --arg fallback "${_V11_LEGACY_FALLBACK:-}" '
+            (($los_sf[0]) // {}) as $los | (($aud_sf[0]) // {}) as $aud
+            | . + {
+                live_session_uuid: $live,
+                open_tasks_source: (if $fallback != "" then "legacy-fallback:" + $fallback
+                                    elif ($los.mode // "") == "ledger" then "ledger+live-snapshot"
+                                    else .source_kind end),
+                source_check: {
+                    mode: ($los.mode // "unavailable"),
+                    fallback_reason: (if $fallback != "" then $fallback else null end),
+                    live_reason: ($los.live_reason // ""),
+                    scope: ($aud.scope // null),
+                    ledger_entries: ([.open_tasks[] | select(.origin == "ledger")] | length),
+                    live_snapshot_entries: ([.open_tasks[] | select(.origin == "live-snapshot")] | length),
+                    snapshot_used: ($los.snapshot_used // false),
+                    fold_bypassed: $bypassed,
+                    prior_count: ($aud.prior_count // 0),
+                    kept: ($aud.kept // 0),
+                    dropped_explained: ($aud.explained // 0),
+                    dropped_unexplained: (($aud.unexplained // [])[:20]),
+                    dropped_foreign: (($aud.foreign // [])[:20]),
+                    dropped_by_policy: ($aud.policy // 0),
+                    disagreements: (($los.disagreements // [])[:20]),
+                    note: "S1-T1 (#75a): open_tasks = ledger replay ∪ live snapshot for live_session_uuid; each entry carries identity {subject_norm, create_seq}. Rollback: V11_HANDOFF_SOURCE_CHECK=off."
+                }
+              }
+            # S2-T0b-4: live_sitting, live_tl_epoch, task_store(_basis/_verified)
+            # from the live-set pass (_v11_live_open_set).
+            + ($los.stamps // {} | if type == "object" then . else {} end)
+        ' "$tmp" > "$_xtmp" 2>/dev/null && [ -s "$_xtmp" ]; then
+            cat "$_xtmp" > "$tmp"
+        fi
+        rm -f "$_lsf" "$_adf" "$_xtmp" 2>/dev/null || true
+    fi
+
     if [ -s "$tmp" ] && jq empty "$tmp" 2>/dev/null; then
         # Carry V5 (struck twice 2026-07-15): guard the overwrite. A session-end
         # autoemit regenerated this file from a ledger-derived aggregate and
@@ -2569,7 +3807,7 @@ _emit_handoff_tasks_json() {
         if [ -f "$HANDOFF_TASKS_FILE" ]; then
             local _existing_source
             if _existing_source=$(jq -r '.source // empty' "$HANDOFF_TASKS_FILE" 2>/dev/null); then
-                if printf '%s' "$_existing_source" | grep -q "MANUAL"; then
+                if grep -q "MANUAL" <<<"$_existing_source"; then
                     _guard_block=1
                     _guard_reason="existing handoff-tasks.json has source=\"$_existing_source\" (MANUAL-protected)"
                 fi
@@ -2577,6 +3815,22 @@ _emit_handoff_tasks_json() {
                 _guard_block=1
                 _guard_reason="could not parse existing handoff-tasks.json to verify it is not MANUAL-sourced (failing closed)"
             fi
+        fi
+
+        # S1-T1 (#75a): refuse an empty emission that drops open tasks the
+        # ledger cannot account for (#75 wrote open_tasks=[] over live work).
+        # A prior task counts as accounted for when the ledger has it
+        # completed/cancelled or the live snapshot shows it completed, so a
+        # session that finished everything still emits. The trap restores the
+        # steer and drops the handoff.md staging file. --allow-empty overrides.
+        if [ "$_guard_block" -eq 0 ] && [ -n "$_audit_json" ] && [ -z "$ALLOW_EMPTY_FLAG" ] \
+           && [ "$_src_new" -eq 0 ] && [ "$_src_prior" -gt 0 ] && [ "$_src_unexplained" -gt 0 ]; then
+            echo "handoff: refusing to write 0 open tasks — the prior $HANDOFF_TASKS_FILE had $_src_prior, and $_src_unexplained of them are not completed/cancelled in the ledger:" >&2
+            printf '%s' "$_audit_json" | jq -r '.unexplained[:20][] | "  - #\(.id // "?") \(.subject // "(no subject)") — \(.why)"' >&2 2>/dev/null || true
+            echo "  Re-run with --allow-empty to write the empty emission anyway. Rollback: V11_HANDOFF_SOURCE_CHECK=off." >&2
+            rm -f "$tmp" 2>/dev/null || true
+            _v11_record_refusal empty "0 open tasks vs $_src_prior in the prior handoff-tasks.json, $_src_unexplained of them not completed/cancelled ($(_v11_audit_first "$_audit_json")); --allow-empty writes it"
+            exit 2
         fi
 
         # (b) Magnitude breaker. Best-effort — any error evaluating this check
@@ -2592,6 +3846,20 @@ _emit_handoff_tasks_json() {
             fi
         fi
 
+        # (c) S1-T1 (#75a): shrink breaker, the mirror of (b). Counts include
+        # family_members, and a shrink the ledger explains (the dropped tasks
+        # were completed/cancelled) is normal progress, not a breaker trip.
+        # Review #69: the counts are the audit's (the live session's prior
+        # entries, review shadows excluded), so the floor is 3, not 5.
+        local _shrink_refused=0
+        if [ "$_guard_block" -eq 0 ] && [ -n "$_audit_json" ] && [ -z "$ALLOW_EMPTY_FLAG" ] \
+           && [ "$_src_prior" -ge 3 ] && [ $((_src_new * 2)) -lt "$_src_prior" ] \
+           && [ "$_src_unexplained" -gt 0 ]; then
+            _guard_block=1
+            _shrink_refused=1
+            _guard_reason="new emission has $_src_new open task(s) vs existing $_src_prior (<1/2 shrink breaker); $_src_unexplained dropped task(s) are not completed/cancelled in the ledger"
+        fi
+
         if [ "$_guard_block" -eq 1 ]; then
             echo "handoff: refusing to overwrite $HANDOFF_TASKS_FILE — $_guard_reason. Writing proposed emission to $_proposed_file instead." >&2
             local _prop_tmp="$_proposed_file.tmp.$$"
@@ -2599,7 +3867,16 @@ _emit_handoff_tasks_json() {
                 mv -f "$_prop_tmp" "$_proposed_file" 2>/dev/null || rm -f "$_prop_tmp" 2>/dev/null || true
             fi
             rm -f "$tmp" 2>/dev/null || true
+            if [ "$_shrink_refused" -eq 1 ]; then
+                _v11_record_refusal shrink "$_src_new open task(s) vs $_src_prior in the prior handoff-tasks.json, $_src_unexplained dropped task(s) not completed/cancelled ($(_v11_audit_first "$_audit_json")); proposed set in $(basename "$_proposed_file"), --allow-empty writes it" "$_proposed_file"
+            fi
         else
+            # S1-T1 (#75a): below the breaker floor a drop still must not be
+            # silent (it is also listed in source_check.dropped_unexplained).
+            if [ "$_src_unexplained" -gt 0 ]; then
+                echo "handoff: WARN — $_src_unexplained task(s) from the prior handoff-tasks.json are dropped but not completed/cancelled in the ledger:" >&2
+                printf '%s' "$_audit_json" | jq -r '.unexplained[:10][] | "  - #\(.id // "?") \(.subject // "(no subject)") — \(.why)"' >&2 2>/dev/null || true
+            fi
             # (d) Always keep a timestamped .bak of any file we're about to
             # overwrite (if one for this second doesn't already exist).
             # 15-F2/W5: cap at 5 most recent .bak files (was unbounded — 2,616 files)
@@ -2710,7 +3987,7 @@ fi
 # the handoff, but the handoff can never ship without the writer being tried).
 # Load-bearing for L2.1 boot-delta, L2.3 rehydrate verification, L2.4 loop-ack.
 # Rollback: V11_LOOP_BASELINE=off skips the write entirely.
-if [ "${V11_LOOP_BASELINE:-on}" != "off" ] \
+if [ "${V11_LOOP_BASELINE:-on}" != "off" ] && [ -z "$_V11_REFUSED" ] \
    && [ -n "$PROJECT" ] && [ -n "$SESSION_DIR" ] \
    && [ -f "$V11_HOME/scripts/lib/loop_baseline.py" ]; then
     _LB_UUID="${V11_SESSION_ID:-${CLAUDE_CODE_SESSION_ID:-unknown}}"
@@ -2731,8 +4008,37 @@ fi
 # W5 ordering fix: promote staging → final AFTER emit + reconcile both succeed.
 # The staging pattern ensures handoff.md never ships before handoff-tasks.json,
 # killing the half-handoff class (323 observed orphans).
-if [ -f "${_HANDOFF_STAGING:-}" ]; then
-    mv -f "$_HANDOFF_STAGING" "$HANDOFF_FILE"
+# Review #69 E1: a refused emission (the shrink breaker; the empty refusal
+# already exited 2) promotes nothing, and a consumed steer goes back, as on the
+# exit-2 path. An accepted emission clears the refusal marker.
+if [ -n "$_V11_REFUSED" ]; then
+    rm -f "${_HANDOFF_STAGING:-/dev/null}" 2>/dev/null || true
+    if [ "${_STEER_CONSUMED_THIS_RUN:-0}" = "1" ] && [ ! -s "$STEER_FILE" ] && [ -s "$STEER_FILE.prev" ]; then
+        cp -f "$STEER_FILE.prev" "$STEER_FILE" 2>/dev/null \
+          && echo "NOTE: emission refused — restored .handoff-steer.md from .prev so the next run keeps its steer." >&2
+    fi
+else
+    if [ -f "${_HANDOFF_STAGING:-}" ]; then
+        mv -f "$_HANDOFF_STAGING" "$HANDOFF_FILE"
+        # S2-R3 (F38): keep the steer this handoff.md now carries until a
+        # different session reads it. The consumer is this process's session
+        # (_steer_sid, set before the steer block). Empty (a plain terminal
+        # run) → any session's read retires it. Fail-open: a failed write only
+        # loses the persistence.
+        if [ "${V11_STEER_PERSIST:-on}" != "off" ] && [ -n "$STEER_TEXT" ] \
+           && { [ "$STEER_SOURCE" = "file" ] || [ "$STEER_SOURCE" = "flag" ]; }; then
+            if { printf '<!-- v11-steer-consumed session=%s at=%s source=%s -->\n' \
+                     "$_steer_sid" "$(date -Iseconds)" "$STEER_SOURCE"
+                 printf '%s\n' "$STEER_TEXT"; } > "$STEER_CONSUMED_FILE.tmp.$$" 2>/dev/null \
+               && mv -f "$STEER_CONSUMED_FILE.tmp.$$" "$STEER_CONSUMED_FILE" 2>/dev/null; then
+                echo "NOTE: steer kept in .handoff-steer.consumed.md until a new session reads handoff.md (V11_STEER_PERSIST)." >&2
+            fi
+            rm -f "$STEER_CONSUMED_FILE.tmp.$$" 2>/dev/null || true
+        fi
+    fi
+    if [ "$_V11_SOURCE_CHECK" = "on" ]; then
+        rm -f "$SESSION_DIR/.handoff-refused" 2>/dev/null || true
+    fi
 fi
 
 # QR-7 (2026-09-01): lifecycle for handoff-tasks.json.autoemit-proposed.json.
@@ -2825,6 +4131,15 @@ if [ -n "$SPAWN_FLAG" ]; then
         fi
     fi
 
+    # Review #69 E1: never spawn a window on a refused emission — handoff.md
+    # is the previous one.
+    if [ -n "$_V11_REFUSED" ]; then
+        echo "" >&2
+        echo "ERROR: the emission was refused ($_V11_REFUSED breaker) — spawn blocked; handoff.md is the last accepted one." >&2
+        echo "  Check the dropped tasks listed above, then re-run (--allow-empty writes the emission)." >&2
+        exit 2
+    fi
+
     # V11.36 W2-T5: pre-spawn drift gate. _DRIFT_FAIL was set above (same
     # invocation) when check-class-included confirmed a missing #Include/import
     # (exit 1) — the other three siblings only WARN and never set this.
@@ -2866,7 +4181,7 @@ if [ -n "$SPAWN_FLAG" ]; then
     # the "No tasks yet" planning-pointer boilerplate. Pending-only NEXT_UP
     # ("Next pending: lowest-ID of N pending tasks") DOES count, since real pending
     # work exists (Completeness MED-2).
-    if [ -n "$NEXT_UP" ] && ! printf '%s' "$NEXT_UP" | grep -q "No tasks yet"; then
+    if [ -n "$NEXT_UP" ] && ! grep -q "No tasks yet" <<<"$NEXT_UP"; then
         _SUBSTANCE=$((_SUBSTANCE + 1))
     fi
 
@@ -2890,7 +4205,7 @@ if [ -n "$SPAWN_FLAG" ]; then
         [ -n "$KEY_FILES" ]        && echo "    [x] key files"        >&2 || echo "    [ ] key files        (edits not yet captured in audit log)" >&2
         # NEXT_UP checkbox (R2: was previously omitted from the printed checklist
         # despite the denominator claiming 5).
-        if [ -n "$NEXT_UP" ] && ! printf '%s' "$NEXT_UP" | grep -q "No tasks yet"; then
+        if [ -n "$NEXT_UP" ] && ! grep -q "No tasks yet" <<<"$NEXT_UP"; then
             echo "    [x] next up" >&2
         else
             echo "    [ ] next up          (no active or pending tasks — run /v11 or TaskCreate)" >&2
@@ -2923,7 +4238,7 @@ if [ -n "$SPAWN_FLAG" ]; then
         SPAWN_RESULT=$(printf '{"tool_name": "Skill", "tool_input": {"skill": "handoff", "project": "%s"}}' "$PROJECT" | python3 "$HERCULES_ROOT/.claude/hooks/spawn-claude-window.py" 2>&1) || true
         # Match only the python script's success systemMessage: "Spawned Claude window: ..."
         # Previously matched "success" which false-positives on {"success": false} error payloads.
-        if echo "$SPAWN_RESULT" | grep -q 'Spawned Claude window'; then
+        if grep -q 'Spawned Claude window' <<<"$SPAWN_RESULT"; then
             echo -e "\n--- Zeus window spawned ---"
             date +%s > "$_SPAWN_LATCH" 2>/dev/null || true   # V11.28.2: stamp for the idempotency latch
         else

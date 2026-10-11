@@ -12,6 +12,16 @@
 #
 # Env:
 #   V11_REVIEW_CADENCE=off   Kill switch — exit 0 immediately, no work done.
+#   V11_REVIEW_DAEMON_PARK=off
+#                            Leave a refused fold pending (pre-fix behavior).
+#                            Default on: when mark-done exits 2 (the task_id
+#                            names several tasks, so the verdict cannot bind,
+#                            or an identity the ledger does not know),
+#                            the entry is parked (review-queue ev:"parked") with
+#                            the kept verdict's path, so later runs stop paying
+#                            for a review that can never bind. `review-queue
+#                            dashboard` lists parked entries; `review-queue
+#                            unpark PROJECT TASK_ID` makes one drainable again.
 #
 # Identity: uses a stable synthetic session uuid "review-daemon@$(hostname)"
 # for all claim/ownership calls, so drain-review-queue --safe semantics
@@ -37,7 +47,7 @@ if [ "${1:-}" = "--test" ]; then
 fi
 
 if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
-    sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,33p' "$0" | sed 's/^# \{0,1\}//'
     exit 0
 fi
 
@@ -122,12 +132,21 @@ mkdir -p "$METRICS_DIR" 2>/dev/null || true
 
 PROCESSED=0
 FAILED=0
+PARKED=0
 
 # Iterate entries one-by-one (jq -c '.[]' + a subshell-free while-read to keep
 # PROCESSED/FAILED counters visible outside the loop).
 while IFS= read -r ENTRY; do
     [ -z "$ENTRY" ] && continue
     TID=$(printf '%s' "$ENTRY" | jq -r '.task_id')
+    # The pending row's session is the PARENT task's session; mark-done binds
+    # the verdict by (session, task_id) since S1-P3, so pass it, never
+    # DAEMON_SESSION (review #61: that wrote every verdict identity_unresolved).
+    PARENT_SESSION=$(printf '%s' "$ENTRY" | jq -r '.session_uuid // ""')
+    # S2-T0b-3 (#113): no --identity. mark-done reads the pending row's
+    # parent_identity itself and, when the ledger does not know it, binds by
+    # the row's TaskList epoch and position; an explicit --identity would be
+    # refused instead (review #23).
     AGENT=$(printf '%s' "$ENTRY" | jq -r '.agent_id // "unknown"')
     PROMPT=$(printf '%s' "$ENTRY" | jq -r '.prompt // empty')
 
@@ -258,25 +277,67 @@ print(json.dumps(best))
         ) 210>"$ERR_LOCK" 2>/dev/null || true
     fi
 
-    # Fold into the review queue's done event, attributed to this daemon session.
+    # Fold into the review queue's done event. The claim (claimed_by) and the
+    # log line carry this daemon's identity; the done event carries the parent's.
     # B5 (improvements/09, W5-T16): write the full verdict to a temp file and
     # pass --verdict-file so mark-done can fold it into a durable verdict
     # store + ev:"review" ledger event (B1/B2) instead of evaporating to just
     # MAX_SEV. Best-effort: a write failure just falls back to severity-only.
     VERDICT_TMP=$(mktemp "${METRICS_DIR}/review-daemon-verdict.XXXXXX" 2>/dev/null || true)
+    MD_RC=0
     if [ -n "$VERDICT_TMP" ] && printf '%s' "$VERDICT_RAW" > "$VERDICT_TMP" 2>/dev/null; then
-        "$V11_HOME/scripts/review-queue" mark-done "$PROJECT" "$TID" "$MAX_SEV" "$DAEMON_SESSION" \
-            --verdict-file "$VERDICT_TMP" >/dev/null 2>>"$LOG_FILE" || true
+        MD_ERR=$("$V11_HOME/scripts/review-queue" mark-done "$PROJECT" "$TID" "$MAX_SEV" "$PARENT_SESSION" \
+            --verdict-file "$VERDICT_TMP" 2>&1 >/dev/null) || MD_RC=$?
+        [ -n "$MD_ERR" ] && _log "$MD_ERR"
+        if [ "$MD_RC" -ne 0 ]; then
+            # mark-done refused (e.g. exit 2: a task_id reused across sessions and a
+            # pending row without a session). Keep the verdict for the operator.
+            # An AMBIGUOUS refusal repeats on every run (the ledger does not change
+            # under it), so park the entry: the nightly cadence would otherwise pay
+            # for a fresh review of it each time. Exit 2 is also review-queue's
+            # usage-error code, so park only when stderr carries the AMBIGUOUS text
+            # (v11_ledger_resolve_by_task_id, review #15), or mark-done's refusal of
+            # an identity the ledger does not know (just as deterministic, review
+            # #23). Anything else may be transient: stays pending.
+            PARK="skip"
+            _md_ambiguous=0
+            case "$MD_ERR" in
+                *" names more than one task "*|*" tasks under task_id "*) _md_ambiguous=1 ;;
+                *" is not in the $PROJECT ledger. Nothing was written."*) _md_ambiguous=1 ;;
+            esac
+            if [ "$MD_RC" -eq 2 ] && [ "$_md_ambiguous" -eq 1 ]; then
+                if [ "${V11_REVIEW_DAEMON_PARK:-on}" = "off" ]; then
+                    PARK="off"
+                else
+                    PARK=$(v11_review_queue_park "$PROJECT" "$TID" \
+                        "mark-done refused (rc=2): ${MD_ERR:0:500}" "$VERDICT_TMP" "$MD_RC" \
+                        "$DAEMON_SESSION" 2>>"$LOG_FILE" || true)
+                    PARK="${PARK:-failed}"
+                    [ "$PARK" = "parked" ] && PARKED=$((PARKED + 1))
+                fi
+            fi
+            _log "$RUN_TS project=$PROJECT task=$TID error=mark-done-refused rc=$MD_RC session=${PARENT_SESSION:-none} verdict_kept=$VERDICT_TMP park=$PARK"
+            FAILED=$((FAILED + 1))
+            continue
+        fi
         rm -f "$VERDICT_TMP" 2>/dev/null || true
     else
         rm -f "$VERDICT_TMP" 2>/dev/null || true
-        "$V11_HOME/scripts/review-queue" mark-done "$PROJECT" "$TID" "$MAX_SEV" "$DAEMON_SESSION" \
-            >/dev/null 2>>"$LOG_FILE" || true
+        "$V11_HOME/scripts/review-queue" mark-done "$PROJECT" "$TID" "$MAX_SEV" "$PARENT_SESSION" \
+            >/dev/null 2>>"$LOG_FILE" || MD_RC=$?
+        if [ "$MD_RC" -ne 0 ]; then
+            _log "$RUN_TS project=$PROJECT task=$TID error=mark-done-failed rc=$MD_RC"
+            FAILED=$((FAILED + 1))
+            continue
+        fi
     fi
 
     _log "$RUN_TS project=$PROJECT task=$TID verdict=$(printf '%s' "$VERDICT_RAW" | jq -r '.verdict // "unknown"') severity=$MAX_SEV claimed_by=$DAEMON_SESSION"
     PROCESSED=$((PROCESSED + 1))
 done < <(printf '%s' "$DRAIN_JSON" | jq -c '.[]')
 
-_log "$RUN_TS project=$PROJECT drained=$COUNT processed=$PROCESSED failed=$FAILED dry_run=false"
+_log "$RUN_TS project=$PROJECT drained=$COUNT processed=$PROCESSED failed=$FAILED parked=$PARKED dry_run=false"
 echo "review-daemon: processed $PROCESSED/$COUNT review(s) for '$PROJECT' ($FAILED failed)."
+if [ "$PARKED" -gt 0 ]; then
+    echo "review-daemon: parked $PARKED review(s) whose verdict mark-done refused — see: scripts/review-queue dashboard $PROJECT"
+fi

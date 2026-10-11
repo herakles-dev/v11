@@ -1,0 +1,272 @@
+#!/bin/bash
+# V11 Script: backup-surface
+# Point-in-time backup/restore for non-git V11 "surfaces" — files or dirs
+# that live outside any git work tree (runtime state, hook scripts, config
+# that was never checked in). Ticket #89 governance (S0-T10): gives
+# "back this up before I touch it" a single, auditable primitive instead of
+# ad-hoc cp/tar one-liners scattered across sessions.
+#
+# Usage:
+#   backup-surface [--force] <path>            Back up a file or directory
+#   backup-surface --list [path]               List backups (optionally
+#                                               filtered to one original path)
+#   backup-surface --restore <backup-path> [--to <dest>] [--force]
+#                                               Restore a backup
+#   backup-surface --help                      Show this usage
+#
+# Storage layout:
+#   ${V11_SURFACE_BACKUP_ROOT:-$HOME/.v11-backups/surfaces}/<YYYYmmdd-HHMMSS>/<absolute path mirrored>
+#
+# A backup mirrors the source's absolute path under the timestamped backup
+# dir, so `--restore` can recover the original destination from the backup
+# path alone. Mode, mtime, and symlinks (kept as symlinks, never followed)
+# are preserved via `cp -a`.
+#
+# A path already inside a git work tree is refused — commit it there
+# instead — unless --force is given. This applies to the backup source and
+# to the restore destination.
+#
+# Exit codes:
+#   0  success
+#   2  usage error (bad args, path not found, not a backup-surface path)
+#   3  refusal (path is under git and --force was not given)
+
+set -euo pipefail
+
+BACKUP_ROOT="${V11_SURFACE_BACKUP_ROOT:-$HOME/.v11-backups/surfaces}"
+FORCE=false
+
+usage() {
+    cat <<'EOF'
+Usage:
+  backup-surface [--force] <path>            Back up a file or directory
+  backup-surface --list [path]               List backups (optionally
+                                              filtered to one original path)
+  backup-surface --restore <backup-path> [--to <dest>] [--force]
+                                              Restore a backup
+  backup-surface --help                      Show this usage
+
+Storage:
+  ${V11_SURFACE_BACKUP_ROOT:-$HOME/.v11-backups/surfaces}/<YYYYmmdd-HHMMSS>/<absolute path mirrored>
+EOF
+}
+
+# Resolve to an absolute path without following/expanding symlinks and
+# without requiring the path to exist (needed for restore destinations that
+# may not exist yet).
+abspath() {
+    realpath -sm -- "$1"
+}
+
+# Nearest existing ancestor of a (possibly nonexistent) path.
+nearest_existing_dir() {
+    local p
+    p="$(abspath "$1")"
+    while [[ ! -d "$p" ]]; do
+        p="$(dirname "$p")"
+    done
+    echo "$p"
+}
+
+# Refuse to touch a path that is already inside a git work tree AND not
+# git-ignored there, unless --force was given. A git-ignored path (e.g. an
+# allowlisted-.gitignore skill dir) is exactly the kind of non-git surface
+# this tool exists for, so it is allowed through even though it resolves to
+# a path under a work tree.
+check_not_git() {
+    local target="$1"
+    local check_dir toplevel
+    check_dir="$(nearest_existing_dir "$target")"
+    if toplevel="$(git -C "$check_dir" rev-parse --show-toplevel 2>/dev/null)"; then
+        if git -C "$check_dir" check-ignore -q -- "$target" 2>/dev/null; then
+            return 0
+        fi
+        if [[ "$FORCE" != true ]]; then
+            echo "already under git: $toplevel; commit instead" >&2
+            exit 3
+        fi
+    fi
+}
+
+do_backup() {
+    local src="$1"
+    if [[ ! -e "$src" && ! -L "$src" ]]; then
+        echo "ERROR: path not found: $src" >&2
+        exit 2
+    fi
+    check_not_git "$src"
+
+    local abs_src ts tsdir dest n
+    abs_src="$(abspath "$src")"
+    ts="$(date +%Y%m%d-%H%M%S)"
+    tsdir="$ts"
+    dest="$BACKUP_ROOT/$tsdir$abs_src"
+    n=2
+    # Collision guard: two backups of the same path within the same second
+    # would otherwise map to the same dest, and cp -a would nest the second
+    # copy inside the first. Never write into an existing dest — bump to a
+    # suffixed timestamp dir instead.
+    while [[ -e "$dest" || -L "$dest" ]]; do
+        tsdir="$ts-$n"
+        dest="$BACKUP_ROOT/$tsdir$abs_src"
+        n=$((n + 1))
+    done
+
+    mkdir -p "$(dirname "$dest")"
+    cp -a -- "$src" "$dest"
+
+    echo "$dest"
+}
+
+do_list() {
+    local filter="${1:-}"
+    [[ -d "$BACKUP_ROOT" ]] || return 0
+
+    local abs_filter=""
+    [[ -n "$filter" ]] && abs_filter="$(abspath "$filter")"
+
+    local ts_dir
+    for ts_dir in "$BACKUP_ROOT"/*/; do
+        [[ -d "$ts_dir" ]] || continue
+        ts_dir="${ts_dir%/}"
+        if [[ -n "$abs_filter" ]]; then
+            local candidate="$ts_dir$abs_filter"
+            [[ -e "$candidate" || -L "$candidate" ]] && echo "$candidate"
+        else
+            echo "$ts_dir"
+        fi
+    done
+}
+
+do_restore() {
+    local backup_path="$1"
+    local dest="$2"
+
+    if [[ ! -e "$backup_path" && ! -L "$backup_path" ]]; then
+        echo "ERROR: backup path not found: $backup_path" >&2
+        exit 2
+    fi
+
+    local abs_backup abs_root orig_abs canon_backup canon_root
+    abs_backup="$(abspath "$backup_path")"
+    abs_root="$(abspath "$BACKUP_ROOT")"
+
+    # Containment check uses canonical (symlink-resolved) paths — a lexical
+    # prefix match on the non-canonicalized (-s) path can be fooled by ".."
+    # components or a symlink that escapes $BACKUP_ROOT. The rest of restore
+    # still uses abs_backup/abs_root (above) to derive the original path.
+    canon_backup="$(realpath -m -- "$backup_path")"
+    canon_root="$(realpath -m -- "$BACKUP_ROOT")"
+
+    case "$canon_backup" in
+        "$canon_root"/*) ;;
+        *)
+            echo "ERROR: not a backup-surface path (outside $abs_root): $backup_path" >&2
+            exit 2
+            ;;
+    esac
+
+    # Strip "<root>/<timestamp>" to recover the original absolute path.
+    local rel="${abs_backup#"$abs_root"/}"   # <ts>/<absolute path, minus leading />
+    orig_abs="/${rel#*/}"
+
+    if [[ -z "$dest" ]]; then
+        dest="$orig_abs"
+    fi
+
+    check_not_git "$dest"
+
+    if [[ -e "$dest" || -L "$dest" ]]; then
+        local aside
+        aside="$dest.pre-restore.$(date +%Y%m%d-%H%M%S)"
+        mv -- "$dest" "$aside"
+        echo "moved aside existing: $aside" >&2
+    fi
+
+    mkdir -p "$(dirname "$dest")"
+    cp -a -- "$backup_path" "$dest"
+
+    echo "$dest"
+}
+
+# --- Arg parsing ------------------------------------------------------------
+
+if [[ $# -eq 0 ]]; then
+    usage >&2
+    exit 2
+fi
+
+# Allow --force as a leading flag ahead of the subcommand/path too.
+if [[ "${1:-}" == "--force" ]]; then
+    FORCE=true
+    shift
+fi
+
+if [[ $# -eq 0 ]]; then
+    usage >&2
+    exit 2
+fi
+
+case "$1" in
+    -h|--help)
+        usage
+        exit 0
+        ;;
+    --list)
+        shift
+        do_list "${1:-}"
+        exit 0
+        ;;
+    --restore)
+        shift
+        if [[ $# -eq 0 ]]; then
+            echo "Usage: backup-surface --restore <backup-path> [--to <dest>]" >&2
+            exit 2
+        fi
+        BACKUP_PATH="$1"
+        shift
+        DEST=""
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                --to)
+                    if [[ $# -lt 2 ]]; then
+                        echo "ERROR: --to requires an argument" >&2
+                        exit 2
+                    fi
+                    DEST="$2"
+                    shift 2
+                    ;;
+                --force)
+                    FORCE=true
+                    shift
+                    ;;
+                *)
+                    echo "Unknown option: $1" >&2
+                    exit 2
+                    ;;
+            esac
+        done
+        do_restore "$BACKUP_PATH" "$DEST"
+        ;;
+    --*)
+        echo "Unknown option: $1" >&2
+        exit 2
+        ;;
+    *)
+        SRC="$1"
+        shift
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                --force)
+                    FORCE=true
+                    shift
+                    ;;
+                *)
+                    echo "Unknown option: $1" >&2
+                    exit 2
+                    ;;
+            esac
+        done
+        do_backup "$SRC"
+        ;;
+esac

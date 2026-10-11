@@ -61,10 +61,12 @@ _THRESHOLDS = [
     (0.00, "ok"),
 ]
 
-_METRICS_DIR = os.path.expanduser("~/.agent-metrics")
+# Explicit module-level override (tests monkeypatch it). None = resolve from the
+# environment on every call, see _metrics_dir().
+_METRICS_DIR: Optional[str] = None
 # Same well-formedness check hooks/lib/common.sh applies to V11_SESSION_ID
 # before trusting it as a path component.
-_SESSION_ID_RE = re.compile(r"^[a-zA-Z0-9._-]{1,64}$")
+_SESSION_ID_RE = re.compile(r"\A[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}\Z")  # S2-R5: no ".", "..", ".x"
 _STALE_AFTER_SECONDS = 6 * 3600  # belt-and-suspenders: force-reset a bucket idle this long
 
 
@@ -75,6 +77,29 @@ def _percent_to_threshold(percent: float) -> str:
     return "ok"
 
 
+def _metrics_dir() -> str:
+    """Resolve the metrics root the way the hooks do (improvements/94).
+
+    hooks/lib/common.sh derives METRICS_DIR="$HERCULES_ROOT/.agent-metrics",
+    and hooks/sync-tasks reads it as ${METRICS_DIR:-$HERCULES_ROOT/.agent-metrics}.
+    Same order here: $METRICS_DIR, else $HERCULES_ROOT/.agent-metrics, else
+    ~/.agent-metrics (the old hardcoded path, so nothing changes when neither
+    is set). Empty values count as unset, like bash's :- expansion. Resolved
+    per call, not at import, so an env set after import still takes effect.
+    Hardcoding ~ made tests that isolate METRICS_DIR/HERCULES_ROOT (but not
+    HOME) write their session dirs into the real ~/.agent-metrics/sessions.
+    """
+    if _METRICS_DIR:
+        return _METRICS_DIR
+    env_metrics = os.environ.get("METRICS_DIR")
+    if env_metrics:
+        return env_metrics
+    hercules_root = os.environ.get("HERCULES_ROOT")
+    if hercules_root:
+        return os.path.join(hercules_root, ".agent-metrics")
+    return os.path.expanduser("~/.agent-metrics")
+
+
 def _default_context_file(session_id: Optional[str]) -> str:
     """Resolve the state file path for a given session_id.
 
@@ -82,12 +107,13 @@ def _default_context_file(session_id: Optional[str]) -> str:
     fresh session naturally starts at zero instead of inheriting whatever
     total every other session on the host has already accumulated.
     """
+    metrics_dir = _metrics_dir()
     if session_id:
         safe = session_id if _SESSION_ID_RE.match(session_id) else "legacy-cli"
-        return os.path.join(_METRICS_DIR, "sessions", safe, "context-estimate.json")
+        return os.path.join(metrics_dir, "sessions", safe, "context-estimate.json")
     # No session_id given at all (e.g. manual `context-status` inspection) —
     # fall back to the pre-fix global path for backward compatibility.
-    return os.path.join(_METRICS_DIR, "context-estimate.json")
+    return os.path.join(metrics_dir, "context-estimate.json")
 
 
 def _fresh_state(session_id: Optional[str]) -> Dict[str, Any]:

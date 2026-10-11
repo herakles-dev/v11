@@ -1,7 +1,67 @@
 #!/bin/bash
-# V8 Metrics Rotation Script
-# Rotates JSONL metrics files when they exceed size threshold
+# V8/V11 Metrics Rotation Script
+# Rotates JSONL metrics files when they exceed size threshold, and (S0-T9,
+# #89) applies a SAFE per-subdirectory policy to ledger/, review-queue/ and
+# outbox/ under METRICS_DIR.
+#
 # Usage: ./scripts/rotate-metrics [--dry-run] [--threshold MB]
+#                                  [--sessions] [--sessions-ttl N]
+#                                  [--ledger-bak-ttl-days N] [--outbox-ttl-days N]
+#                                  [--tasklist-epoch-ttl-days N]
+#
+# ─────────────────────────────────────────────────────────────────────────
+# SUBDIRECTORY POLICY (S0-T9, #89) — orchestrator-verified safety boundary.
+#
+#   subdir         | what rotates                        | what NEVER rotates                       | why
+#   ---------------|--------------------------------------|-------------------------------------------|----
+#   ledger/        | *.bak*, *.stale* files, once older    | <project>.jsonl, <project>.seq,            | <project>.jsonl is the durable,
+#                  | than LEDGER_BAK_TTL_DAYS (default 14) | <project>.jsonl.lock, ledger/.migrated/,   | append-only task-state event log
+#                  | day — moved + gzipped into            | ledger/.legacy-pinned/, ledger/archive/    | ("event log (append-only, never
+#                  | archive/ledger/                       |                                             | deleted)", hooks/lib/common.sh
+#                  |                                        |                                             | ~:2304). Replay reads it directly.
+#                  |                                        |                                             | Only scripts/ledger-archive may
+#                  |                                        |                                             | compact it (sprint_archived events,
+#                  |                                        |                                             | common.sh ~:3464) — rotate-metrics
+#                  |                                        |                                             | never touches jsonl/seq/lock, full
+#                  |                                        |                                             | stop, regardless of size or age.
+#   review-queue/  | nothing — report-only                 | everything: *.jsonl, *.lock, *.bak-*,      | <project>.jsonl files are LIVE
+#                  |                                        | *.ack.json                                 | event-sourced queues (pending/
+#                  |                                        |                                             | claimed/done events). `review-queue
+#                  |                                        |                                             | gc` (scripts/review-queue ~:294)
+#                  |                                        |                                             | only clears stale claim locks — it
+#                  |                                        |                                             | does not compact or shrink the
+#                  |                                        |                                             | file — so there is nothing safe
+#                  |                                        |                                             | for rotate-metrics to do here
+#                  |                                        |                                             | beyond reporting counts. Unbounded
+#                  |                                        |                                             | queue growth is already handled
+#                  |                                        |                                             | separately by the daily
+#                  |                                        |                                             | review-queue-maintenance --normalize
+#                  |                                        |                                             | --gc --apply cadence wired by
+#                  |                                        |                                             | scripts/install-review-cadence.
+#   outbox/        | <project>/<agent>.md files older than | files newer than the TTL                   | outbox files are static, already-
+#                  | OUTBOX_TTL_DAYS (default 30) — moved  |                                             | delivered agent reports; archiving
+#                  | into archive/outbox/<project>/         |                                             | old ones is uncontroversial.
+#   tasklist-      | <session> epoch records not written  | records written within the TTL             | S2-T0b-2 (#113, D6): one small
+#   epochs/        | for TASKLIST_EPOCH_TTL_DAYS (default  |                                             | append-only file per session
+#                  | 30) — deleted                         |                                             | (hooks/sync-tasks). A session idle
+#                  |                                        |                                             | that long gets a fresh epoch on
+#                  |                                        |                                             | its next TaskCreate.
+#   top-level      | any *.jsonl directly under METRICS_DIR over THRESHOLD_MB — moved + gzipped into archive/ (unchanged
+#                  | original behavior). With --sessions: one run of the hooks/session-end GC (UUID-named sessions/{id}/
+#                  | dirs with no live signal for SESSIONS_TTL_DAYS are quarantined, not removed — S1-R1 review #58).
+#
+# TOP-LEVEL CONCURRENCY (review #20 E1) — install-rotate-cadence now runs this
+# weekly against a directory with live concurrent appenders (e.g.
+# dispatch-trace.jsonl). rotate_file() only fences a given "<file>" against a
+# racing writer if that writer maintains a "<file>.lock" sibling and holds it
+# around its append: rotate_file takes the same flock (-w 10s) before mv, and
+# SKIPS that file on timeout rather than blocking forever or rotating out from
+# under a live write. RESIDUAL RISK: a writer that appends without ever
+# creating/holding a ".lock" sibling is not fenced at all — the mv+settle
+# delay (V11_ROTATE_SETTLE_SECS, default 1s) narrows but does not eliminate
+# that race. Give any writer expected to survive weekly rotation a lock
+# sibling.
+# ─────────────────────────────────────────────────────────────────────────
 
 set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -13,37 +73,70 @@ DRY_RUN=false
 SESSIONS_TTL_DAYS="${SESSIONS_TTL_DAYS:-7}"
 DO_SESSIONS=false
 
+# S0-T9 (#89): per-subdir policy knobs
+LEDGER_DIR="$METRICS_DIR/ledger"
+LEDGER_ARCHIVE_DIR="$ARCHIVE_DIR/ledger"
+LEDGER_BAK_TTL_DAYS="${LEDGER_BAK_TTL_DAYS:-14}"
+REVIEW_QUEUE_DIR="$METRICS_DIR/review-queue"
+OUTBOX_DIR="$METRICS_DIR/outbox"
+OUTBOX_ARCHIVE_DIR="$ARCHIVE_DIR/outbox"
+OUTBOX_TTL_DAYS="${OUTBOX_TTL_DAYS:-30}"
+# S2-T0b-2 (#113, D6): TaskList epoch records
+TASKLIST_EPOCH_DIR="$METRICS_DIR/tasklist-epochs"
+TASKLIST_EPOCH_TTL_DAYS="${TASKLIST_EPOCH_TTL_DAYS:-30}"
+
 # Help
 if [ "$1" == "--help" ] || [ "$1" == "-h" ]; then
     cat << 'HELP'
-V8 Metrics Rotation - Rotate JSONL files when they exceed threshold
+V11 Metrics Rotation - Rotate JSONL files when they exceed threshold, plus
+per-subdirectory handling for ledger/, review-queue/ and outbox/.
 
 USAGE:
     ./scripts/rotate-metrics
     ./scripts/rotate-metrics --dry-run
     ./scripts/rotate-metrics --threshold 5
+    ./scripts/rotate-metrics --ledger-bak-ttl-days 3
+    ./scripts/rotate-metrics --outbox-ttl-days 14
     ./scripts/rotate-metrics --help
 
 OPTIONS:
-    --dry-run        Show what would be rotated without acting
-    --threshold MB   Size threshold in MB (default: 10)
-    --sessions       Also clean orphan session-scoped active-project dirs
-                     (older than $SESSIONS_TTL_DAYS days)
-    --sessions-ttl N  Override session TTL in days (default: 7)
+    --dry-run             Show what would be rotated without acting (writes nothing)
+    --threshold MB        Size threshold in MB for top-level *.jsonl (default: 10)
+    --sessions            Also run the session-dir GC (hooks/session-end --gc-run;
+                           with --dry-run, --gc-preview) with a TTL of
+                           $SESSIONS_TTL_DAYS days
+    --sessions-ttl N       Override session TTL in days (default: 7)
+    --ledger-bak-ttl-days N   Override ledger/ backup-debris TTL in days (default: 14)
+    --outbox-ttl-days N       Override outbox/ report TTL in days (default: 30)
+    --tasklist-epoch-ttl-days N  Override tasklist-epochs/ record TTL in days (default: 30; N >= 1)
 
-FILES MANAGED:
+FILES MANAGED (top-level, unchanged):
     ~/.agent-metrics/usage.jsonl
     ~/.agent-metrics/autonomy-audit.jsonl
     ~/.agent-metrics/model-escalation.jsonl
     ~/.agent-metrics/dispatch-trace.jsonl   (V11.21 — orchestrator Phase 4 spawn record)
-    All *.jsonl in ~/.agent-metrics/ (rotate-metrics globs the directory)
+    All *.jsonl directly in ~/.agent-metrics/ (rotate-metrics globs the directory; does NOT recurse)
 
-SESSIONS CLEANUP (--sessions):
-    ~/.agent-metrics/sessions/{session-id}/active-project
-    (P4: per-session active-project scoping introduced 2026-05-14)
+SUBDIRECTORY POLICY (see header comment for the full table + rationale):
+    ledger/         *.bak*/*.stale* debris only, once older than LEDGER_BAK_TTL_DAYS.
+                    <project>.jsonl/.seq/.jsonl.lock, .migrated/, .legacy-pinned/,
+                    archive/ are NEVER touched.
+    review-queue/   report-only. Nothing is ever moved.
+    outbox/         <project>/<agent>.md older than OUTBOX_TTL_DAYS archived.
+    tasklist-epochs/  <session> records not written for TASKLIST_EPOCH_TTL_DAYS deleted.
+
+SESSIONS GC (--sessions):
+    ~/.agent-metrics/sessions/{session-uuid}/ — the SessionEnd GC's rules: UUID
+    names only, live sessions kept (running claude process, recent files),
+    expired dirs moved to sessions/.gc-quarantine/<utc-ts>/ per
+    V11_SESSION_GC_MODE and purged after V11_SESSION_GC_QUARANTINE_HOURS.
+    Needs METRICS_DIR to end in /.agent-metrics (the GC resolves sessions/
+    from HERCULES_ROOT).
 
 ARCHIVE FORMAT:
     ~/.agent-metrics/archive/{filename}.{YYYYMMDD-HHMMSS}.jsonl.gz
+    ~/.agent-metrics/archive/ledger/{filename}.gz
+    ~/.agent-metrics/archive/outbox/{project}/{agent}.md
 HELP
     exit 0
 fi
@@ -67,45 +160,93 @@ while [[ $# -gt 0 ]]; do
             SESSIONS_TTL_DAYS="$2"
             shift 2
             ;;
+        --ledger-bak-ttl-days)
+            LEDGER_BAK_TTL_DAYS="$2"
+            shift 2
+            ;;
+        --outbox-ttl-days)
+            OUTBOX_TTL_DAYS="$2"
+            shift 2
+            ;;
+        --tasklist-epoch-ttl-days)
+            TASKLIST_EPOCH_TTL_DAYS="$2"
+            shift 2
+            ;;
         *)
             shift
             ;;
     esac
 done
 
+# Review #26: a TTL of 0 or less would delete every tasklist-epochs record,
+# the live sessions' included, and each would reopen a `fresh` epoch. Refuse
+# before touching anything.
+if ! [[ $TASKLIST_EPOCH_TTL_DAYS =~ ^[0-9]{1,5}$ ]] || [ "$((10#$TASKLIST_EPOCH_TTL_DAYS))" -le 0 ]; then
+    echo "rotate-metrics: refusing --tasklist-epoch-ttl-days '$TASKLIST_EPOCH_TTL_DAYS': it must be a whole number of days >= 1 (live records would be deleted)" >&2
+    exit 2
+fi
+TASKLIST_EPOCH_TTL_DAYS=$((10#$TASKLIST_EPOCH_TTL_DAYS))
+# "would " in the per-subdir summaries on a dry run only (DRY_RUN is always
+# set, so ${DRY_RUN:+would } said it on real runs too; review #26).
+WOULD=""; [ "$DRY_RUN" = true ] && WOULD="would "
+
 # Convert MB to bytes
 THRESHOLD_BYTES=$((THRESHOLD_MB * 1024 * 1024))
 
-# Create archive directory
-mkdir -p "$ARCHIVE_DIR"
+# V11_ROTATE_SETTLE_SECS: pause between mv and gzip so an in-flight append to
+# the just-renamed inode completes before compression (review #20 E1). 0 in
+# tests.
+V11_ROTATE_SETTLE_SECS="${V11_ROTATE_SETTLE_SECS:-1}"
 
-# Rotate function
+# Rotate function (top-level *.jsonl only — unchanged original behavior).
+# Returns 1 (without rotating) if a "$file.lock" sibling exists and stays
+# held past the 10s wait — see TOP-LEVEL CONCURRENCY note in the header.
 rotate_file() {
     local file="$1"
     local basename=$(basename "$file" .jsonl)
     local timestamp=$(date +%Y%m%d-%H%M%S)
     local archive_name="${basename}.${timestamp}.jsonl"
+    local lock_file="${file}.lock"
 
     if [ "$DRY_RUN" = true ]; then
         echo "  [DRY-RUN] Would rotate: $file -> $ARCHIVE_DIR/$archive_name.gz"
-    else
-        # Move and compress
-        mv "$file" "$ARCHIVE_DIR/$archive_name"
-        gzip "$ARCHIVE_DIR/$archive_name"
-
-        # Create fresh empty file
-        touch "$file"
-
-        echo "  ✅ Rotated: $file -> $ARCHIVE_DIR/$archive_name.gz"
+        return 0
     fi
+
+    mkdir -p "$ARCHIVE_DIR"
+
+    if [ -e "$lock_file" ]; then
+        # A writer sibling holds this lock around its append. Wait briefly
+        # rather than blocking forever; on timeout skip ONLY this file so a
+        # stuck writer never starves rotation of every other file.
+        if ! (
+            flock -w 10 9 || exit 1
+            mv "$file" "$ARCHIVE_DIR/$archive_name"
+        ) 9>"$lock_file"; then
+            echo "  ⚠️  Skipped (lock busy after 10s): $file" >&2
+            return 1
+        fi
+    else
+        mv "$file" "$ARCHIVE_DIR/$archive_name"
+    fi
+
+    # Give an in-flight append to the (now-renamed) inode a moment to land —
+    # mv doesn't fence a writer that already had the old path open.
+    sleep "$V11_ROTATE_SETTLE_SECS"
+    gzip "$ARCHIVE_DIR/$archive_name"
+
+    # Create fresh empty file
+    touch "$file"
+
+    echo "  ✅ Rotated: $file -> $ARCHIVE_DIR/$archive_name.gz"
 }
 
-echo "=== V8 Metrics Rotation ==="
+echo "=== V11 Metrics Rotation ==="
 echo "Threshold: ${THRESHOLD_MB}MB (${THRESHOLD_BYTES} bytes)"
 echo "Directory: $METRICS_DIR"
 echo ""
 
-# Check each metrics file
+# Check each top-level metrics file
 ROTATED=0
 for jsonl_file in "$METRICS_DIR"/*.jsonl; do
     [ -f "$jsonl_file" ] || continue
@@ -118,8 +259,9 @@ for jsonl_file in "$METRICS_DIR"/*.jsonl; do
 
     if [ "$size" -gt "$THRESHOLD_BYTES" ]; then
         echo "  ⚠️  Exceeds threshold"
-        rotate_file "$jsonl_file"
-        ROTATED=$((ROTATED + 1))
+        if rotate_file "$jsonl_file"; then
+            ROTATED=$((ROTATED + 1))
+        fi
     else
         echo "  ✓ Within threshold"
     fi
@@ -139,31 +281,145 @@ fi
 
 echo ""
 
-# P4: optional orphan session-scoped active-project cleanup
-if $DO_SESSIONS; then
-    SESSIONS_DIR="$METRICS_DIR/sessions"
-    if [ -d "$SESSIONS_DIR" ]; then
-        echo "=== Session cleanup (TTL: ${SESSIONS_TTL_DAYS} days) ==="
-        cleaned=0
-        # Find directories older than TTL; -mindepth 1 -maxdepth 1 = direct children only
-        while IFS= read -r dir; do
-            [ -z "$dir" ] && continue
-            if $DRY_RUN; then
-                echo "  [DRY-RUN] Would remove: $dir"
-            else
-                rm -rf "$dir" && echo "  Removed: $dir"
-            fi
-            cleaned=$((cleaned + 1))
-        done < <(find "$SESSIONS_DIR" -mindepth 1 -maxdepth 1 -type d -mtime "+${SESSIONS_TTL_DAYS}" 2>/dev/null)
+# ─────────────────────────────────────────────────────────────────────────
+# S0-T9 (#89): subdirectory policy — ledger/, review-queue/, outbox/
+# ─────────────────────────────────────────────────────────────────────────
 
-        if [ "$cleaned" -eq 0 ]; then
-            echo "  No orphan session dirs older than ${SESSIONS_TTL_DAYS} days"
-        else
-            echo "  Total session dirs ${DRY_RUN:+would be }cleaned: $cleaned"
-        fi
-        echo ""
+echo "=== Subdirectory rotation (ledger / review-queue / outbox) ==="
+
+# --- ledger/: archive ONLY aged backup debris (*.bak*, *.stale*). Never
+#     touches <project>.jsonl, <project>.seq, <project>.jsonl.lock, or the
+#     protected .migrated/, .legacy-pinned/, archive/ subdirs (find is
+#     -maxdepth 1 so it never descends into them; the case exclusion below
+#     is defense-in-depth on top of that).
+echo ""
+echo "--- ledger/ ---"
+if [ -d "$LEDGER_DIR" ]; then
+    LEDGER_CHECKED=0
+    LEDGER_ARCHIVED=0
+    if [ "$LEDGER_BAK_TTL_DAYS" -le 0 ] 2>/dev/null; then
+        LEDGER_MTIME_ARG=()
+    else
+        LEDGER_MTIME_ARG=(-mtime "+$((LEDGER_BAK_TTL_DAYS - 1))")
     fi
+    while IFS= read -r -d '' f; do
+        LEDGER_CHECKED=$((LEDGER_CHECKED + 1))
+        base=$(basename "$f")
+        # Belt-and-braces: never archive anything that looks like a live
+        # ledger artifact, even if it somehow matched the find pattern.
+        case "$base" in
+            *.jsonl|*.seq|*.jsonl.lock) continue ;;
+        esac
+        if [ "$DRY_RUN" = true ]; then
+            echo "  [DRY-RUN] Would archive ledger debris: $f -> $LEDGER_ARCHIVE_DIR/${base}.gz"
+        else
+            mkdir -p "$LEDGER_ARCHIVE_DIR"
+            dest="$LEDGER_ARCHIVE_DIR/$base"
+            if [ -e "$dest" ] || [ -e "${dest}.gz" ]; then
+                dest="${dest}.$(date +%Y%m%d-%H%M%S)"
+            fi
+            mv "$f" "$dest"
+            gzip -f "$dest"
+            echo "  ✅ Archived ledger debris: $f -> ${dest}.gz"
+        fi
+        LEDGER_ARCHIVED=$((LEDGER_ARCHIVED + 1))
+    done < <(find "$LEDGER_DIR" -maxdepth 1 -type f \( -name '*.bak*' -o -name '*.stale*' \) "${LEDGER_MTIME_ARG[@]}" -print0 2>/dev/null)
+    echo "  ledger/: checked $LEDGER_CHECKED debris file(s), ${WOULD}archived $LEDGER_ARCHIVED (TTL ${LEDGER_BAK_TTL_DAYS}d) — *.jsonl/*.seq/*.jsonl.lock/.migrated//.legacy-pinned//archive/ never touched"
+else
+    echo "  (no ledger/ dir)"
+fi
+
+# --- review-queue/: report-only. Nothing is ever moved — see policy table.
+echo ""
+echo "--- review-queue/ ---"
+if [ -d "$REVIEW_QUEUE_DIR" ]; then
+    RQ_FILES=$(find "$REVIEW_QUEUE_DIR" -maxdepth 1 -type f -name '*.jsonl' 2>/dev/null | wc -l | tr -d ' ')
+    echo "  review-queue/: $RQ_FILES live project queue file(s) — report-only, rotate-metrics never moves these"
+    echo "  ('review-queue gc' only clears stale claim locks, it does not compact the file;"
+    echo "   unbounded growth is bounded separately by the daily review-queue-maintenance"
+    echo "   --normalize --gc --apply cadence installed by scripts/install-review-cadence)"
+else
+    echo "  (no review-queue/ dir)"
+fi
+
+# --- outbox/: archive <project>/<agent>.md reports older than the TTL.
+echo ""
+echo "--- outbox/ ---"
+if [ -d "$OUTBOX_DIR" ]; then
+    OUTBOX_CHECKED=0
+    OUTBOX_ARCHIVED=0
+    if [ "$OUTBOX_TTL_DAYS" -le 0 ] 2>/dev/null; then
+        OUTBOX_MTIME_ARG=()
+    else
+        OUTBOX_MTIME_ARG=(-mtime "+$((OUTBOX_TTL_DAYS - 1))")
+    fi
+    while IFS= read -r -d '' f; do
+        OUTBOX_CHECKED=$((OUTBOX_CHECKED + 1))
+        rel="${f#"$OUTBOX_DIR"/}"
+        dest="$OUTBOX_ARCHIVE_DIR/$rel"
+        if [ "$DRY_RUN" = true ]; then
+            echo "  [DRY-RUN] Would archive outbox report: $f -> $dest"
+        else
+            mkdir -p "$(dirname "$dest")"
+            mv "$f" "$dest"
+            echo "  ✅ Archived outbox report: $f -> $dest"
+        fi
+        OUTBOX_ARCHIVED=$((OUTBOX_ARCHIVED + 1))
+    done < <(find "$OUTBOX_DIR" -mindepth 2 -maxdepth 2 -type f -name '*.md' "${OUTBOX_MTIME_ARG[@]}" -print0 2>/dev/null)
+    echo "  outbox/: checked $OUTBOX_CHECKED report(s), ${WOULD}archived $OUTBOX_ARCHIVED (TTL ${OUTBOX_TTL_DAYS}d)"
+else
+    echo "  (no outbox/ dir)"
+fi
+
+# --- tasklist-epochs/: delete <session> records not written for the TTL
+#     (S2-T0b-2, #113, decision D6). Regular files directly in the dir only.
+echo ""
+echo "--- tasklist-epochs/ ---"
+if [ -d "$TASKLIST_EPOCH_DIR" ]; then
+    TLE_REMOVED=0
+    TLE_MTIME_ARG=(-mtime "+$((TASKLIST_EPOCH_TTL_DAYS - 1))")
+    while IFS= read -r -d '' f; do
+        if [ "$DRY_RUN" = true ]; then
+            echo "  [DRY-RUN] Would delete epoch record: $f"
+        else
+            rm -f -- "$f"
+            echo "  ✅ Deleted epoch record: $f"
+        fi
+        TLE_REMOVED=$((TLE_REMOVED + 1))
+    done < <(find "$TASKLIST_EPOCH_DIR" -mindepth 1 -maxdepth 1 -type f "${TLE_MTIME_ARG[@]}" -print0 2>/dev/null)
+    echo "  tasklist-epochs/: ${WOULD}deleted $TLE_REMOVED record(s) not written for ${TASKLIST_EPOCH_TTL_DAYS}d"
+else
+    echo "  (no tasklist-epochs/ dir)"
+fi
+
+echo ""
+
+# P4 + S1-R1 review #58: --sessions used to rm -rf every sessions/* child whose
+# dir mtime was older than SESSIONS_TTL_DAYS: shared identities (legacy-cli,
+# legacy-bootstrap-*), live idle sessions and the only copy of dropped review
+# verdicts (#102) alike. It now runs the hooks/session-end GC once, with its
+# UUID filter, liveness checks and quarantine. The GC derives METRICS_DIR from
+# HERCULES_ROOT, so it runs only when METRICS_DIR ends in /.agent-metrics.
+if $DO_SESSIONS; then
+    echo "=== Session GC (TTL: ${SESSIONS_TTL_DAYS} days, hooks/session-end) ==="
+    GC_HOOK="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/hooks/session-end"
+    GC_METRICS="${METRICS_DIR%/}"
+    TTL_ERE='^[0-9]+$'
+    if [ "${GC_METRICS##*/}" != ".agent-metrics" ]; then
+        echo "  skipped: METRICS_DIR ($GC_METRICS) does not end in /.agent-metrics"
+    elif ! [[ "$SESSIONS_TTL_DAYS" =~ $TTL_ERE ]]; then
+        echo "  skipped: --sessions-ttl must be a whole number of days"
+    elif [ ! -x "$GC_HOOK" ]; then
+        echo "  skipped: $GC_HOOK not found"
+    else
+        GC_ARG="--gc-run"
+        $DRY_RUN && GC_ARG="--gc-preview"
+        HERCULES_ROOT="${GC_METRICS%/*}" V11_SESSION_GC_TTL_HOURS=$(( SESSIONS_TTL_DAYS * 24 )) \
+            "$GC_HOOK" "$GC_ARG" < /dev/null 2>&1 | sed 's/^/  /'
+    fi
+    echo ""
 fi
 
 echo "Tip: Add to crontab for automatic rotation:"
-echo "  0 0 * * * $HERCULES_ROOT/v11/scripts/rotate-metrics --sessions"
+echo "  ./scripts/install-rotate-cadence"
+echo "  (mirrors install-review-cadence; installs a weekly 'v11-rotate-metrics' crontab entry)"

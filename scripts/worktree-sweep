@@ -76,8 +76,11 @@ fi
 
 # Returns 0 (match) if $1 (relative path) matches any glob in GENERATED_GLOBS.
 _is_generated_path() {
-    local path="$1" glob
-    for glob in $GENERATED_GLOBS; do
+    local path="$1" glob globs
+    # read -a splits without pathname expansion: an unquoted
+    # `for glob in $GENERATED_GLOBS` expanded tests/.reports/* against the cwd.
+    read -ra globs <<<"$GENERATED_GLOBS"
+    for glob in "${globs[@]}"; do
         # shellcheck disable=SC2254
         case "$path" in
             $glob) return 0 ;;

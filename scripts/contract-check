@@ -1,0 +1,241 @@
+#!/usr/bin/env python3
+# V11 contract-check — mechanical pre-spawn check of a contract file (zero model tokens).
+#
+# Usage: scripts/contract-check CONTRACT.md [--wave OTHER.md ...] [--repo DIR]
+#
+# Sections (label line through the line before the next label): WRITE SET,
+# PINPOINTS, VERIFY. Problems, one line each: "<id> | <field> | <command or path> | <why>"
+#   dead pinpoint   a backticked grep/rg in PINPOINTS that exits non-zero in the repo
+#   vacuous verify  a [pre:fail] VERIFY line that would pass on today's tree
+#   overlap         one WRITE SET path in two contracts (main + --wave files)
+# A WRITE SET label may declare roots ("S = /abs, R = /abs"); "NAME/rel" resolves
+# against them, R/ falls back to --repo, other undeclared NAME/ is a problem.
+# Commands run via bash -c, cwd = repo, 60 s timeout (--timeout N), stdin closed.
+# Commands run as `set -o pipefail; CMD`. A PINPOINTS or [pre:fail] command with
+# `;`, `&&`, `||` or a `>` redirect outside quotes is not run ("not a single
+# read-only command"); a [pre:fail] command that exits 126/127 or is a bash
+# syntax error is "command not runnable". WRITE SET paths may be backticked or
+# quoted; repo-relative paths resolve against --repo; a directory entry (ends
+# "/") overlaps every path below it.
+# The tree must not change. Limit: that check compares whole-repo
+# `git status --porcelain` plus a hash of `git diff`, so a concurrent writer (a
+# test run rewriting tests/.last-run-metrics.json) can cause a false positive.
+# Exit 0 prints "contract-check: OK (<id>)"; exit 1 lists the problems.
+import os
+import hashlib
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+DEFAULT_REPO = "/path/to/v11"
+LABELS = ("GOAL|MODEL|WRITE SET|READ FIRST|PINPOINTS|CHANGE SPEC|ACCEPTANCE|"
+          "INVARIANTS|VERIFY|BUDGET|FORBIDDEN|REPORT")
+LABEL_RE = re.compile(r"^(%s)\b(\s*\([^)]*\))?\s*:" % LABELS)
+TICK_RE = re.compile(r"`([^`]+)`")
+PATH_RE = re.compile(r"(?<![\w/.\-])(/?[\w.\-]+(?:/[\w.\-]*)+|/[\w.\-]+/?)")
+ROOT_NAME_RE = re.compile(r"[A-Z][A-Z0-9_]*$")
+PROSE = {"and/or", "either/or", "input/output"}
+ROOT_DECL_RE = re.compile(r"\b([A-Z][A-Z0-9_]*)\s*=\s*(/[\w.\-/]+)")
+TIMEOUT = 60
+
+
+def sections(text):
+    """{label: [lines]} — label line included, up to the next label."""
+    out, cur = {}, None
+    for line in text.splitlines():
+        m = LABEL_RE.match(line)
+        if m:
+            cur = m.group(1)
+            out.setdefault(cur, [])
+        if cur:
+            out[cur].append(line)
+    return out
+
+
+def declared_roots(sec):
+    if not sec:
+        return {}
+    return dict(ROOT_DECL_RE.findall(sec[0].split(":", 1)[0]))
+
+
+def write_set(text, repo):
+    """([(path, is_dir)], unresolved root names)."""
+    sec = sections(text).get("WRITE SET")
+    if not sec:
+        return [], []
+    roots = declared_roots(sec)
+    roots.setdefault("R", repo)
+    body = "\n".join([sec[0].split(":", 1)[1]] + sec[1:])
+    paths, bad = [], []
+    for m in PATH_RE.finditer(body):
+        p = m.group(1).rstrip(".,;:)")
+        if not p or p.lower() in PROSE:
+            continue
+        if not p.startswith("/"):
+            name, rel = p.split("/", 1)
+            if ROOT_NAME_RE.match(name):
+                if name not in roots:
+                    if ("." in rel or "/" in rel) and name not in bad:
+                        bad.append(name)
+                    continue
+                p = os.path.join(roots[name], rel)
+            else:
+                p = os.path.join(repo, p)
+        paths.append((os.path.normpath(p), p.endswith("/")))
+    return paths, bad
+
+
+def overlaps(a, b):
+    """True if write-set entries a, b (path, is_dir) are equal or nested via a dir entry."""
+    (pa, da), (pb, db) = a, b
+    return (pa == pb or (da and pb.startswith(pa.rstrip("/") + "/"))
+            or (db and pa.startswith(pb.rstrip("/") + "/")))
+
+
+def not_single_command(cmd):
+    """True if cmd has ;, &&, || or a > redirect outside quotes."""
+    quote, i = None, 0
+    while i < len(cmd):
+        c = cmd[i]
+        if quote:
+            if c == "\\" and quote == '"':
+                i += 1
+            elif c == quote:
+                quote = None
+        elif c == "\\":
+            i += 1
+        elif c in "'\"":
+            quote = c
+        elif c in ";>" or cmd[i:i + 2] in ("&&", "||"):
+            return True
+        i += 1
+    return False
+
+
+def run(cmd, repo):
+    """(rc, stdout, stderr) or (None, why, "") on timeout."""
+    try:
+        r = subprocess.run(["bash", "-c", "set -o pipefail; " + cmd], cwd=repo,
+                           capture_output=True, text=True, errors="replace",
+                           timeout=TIMEOUT, stdin=subprocess.DEVNULL)
+    except subprocess.TimeoutExpired:
+        return None, "timeout after %ss" % TIMEOUT, ""
+    return r.returncode, r.stdout, r.stderr
+
+
+def tree_state(repo):
+    st = subprocess.run(["git", "-C", repo, "status", "--porcelain"], capture_output=True)
+    df = subprocess.run(["git", "-C", repo, "diff"], capture_output=True)
+    return st.stdout, hashlib.sha256(df.stdout).hexdigest()
+
+
+def check(path, waves, repo):
+    cid = Path(path).stem
+    problems = []
+
+    def add(field, what, why):
+        problems.append("%s | %s | %s | %s" % (cid, field, what, why))
+
+    for f in [path] + list(waves):
+        if not Path(f).is_file():
+            add("file", f, "not found")
+    if problems:
+        return cid, problems
+    text = Path(path).read_text(errors="replace")
+    secs = sections(text)
+
+    before = tree_state(repo)
+    for line in secs.get("PINPOINTS", []):
+        for cmd in TICK_RE.findall(line):
+            if not re.match(r"(grep|rg)\b", cmd.strip()):
+                continue
+            if not_single_command(cmd):
+                add("PINPOINTS", cmd, "not a single read-only command")
+                continue
+            rc, out, _ = run(cmd, repo)
+            if rc is None:
+                add("PINPOINTS", cmd, out)
+            elif rc != 0:
+                add("PINPOINTS", cmd, "dead pinpoint: matched nothing (rc=%d)" % rc)
+    for line in secs.get("VERIFY", []):
+        if "[pre:fail]" not in line:
+            continue
+        m = TICK_RE.search(line)
+        if not m:
+            add("VERIFY", line.strip(), "[pre:fail] line has no backticked command")
+            continue
+        cmd = m.group(1)
+        tail = line[m.end():]
+        want = tail.split("=>", 1)[1].strip() if "=>" in tail else None
+        if not_single_command(cmd):
+            add("VERIFY", cmd, "not a single read-only command")
+            continue
+        rc, out, err = run(cmd, repo)
+        if rc is None:
+            add("VERIFY", cmd, out)
+        elif rc in (126, 127) or (rc == 2 and "syntax error" in err):
+            add("VERIFY", cmd, "command not runnable (rc=%d)" % rc)
+        elif want is None:
+            if rc == 0:
+                add("VERIFY", cmd, "vacuous verify: exits 0 on today's tree")
+        elif rc == 0 and out.strip() != want:
+            # "=> VALUE" is the failing value produced today; sound = equals it or exits non-zero
+            add("VERIFY", cmd, "vacuous verify: exits 0 and output %r differs from failing value %r"
+                % (out.strip(), want))
+    if tree_state(repo) != before:
+        add("TREE", repo, "check modified the tree")
+
+    mine_paths, bad = write_set(text, repo)
+    for name in bad:
+        add("WRITE SET", name, "unresolved root %s" % name)
+    seen = set()
+    for other in waves:
+        theirs = write_set(Path(other).read_text(errors="replace"), repo)[0]
+        for a in mine_paths:
+            for b in theirs:
+                if overlaps(a, b) and (a[0], b[0], other) not in seen:
+                    seen.add((a[0], b[0], other))
+                    why = "overlap with %s" % Path(other).stem
+                    if a[0] != b[0]:
+                        why += " (%s vs %s)" % (a[0], b[0])
+                    add("WRITE SET", a[0], why)
+    return cid, problems
+
+
+def main(argv):
+    global TIMEOUT
+    contract, waves, repo = None, [], DEFAULT_REPO
+    if argv and argv[0] in ("--help", "-h"):
+        print(__doc__ or "usage: contract-check CONTRACT.md [--wave OTHER.md ...] [--repo DIR]")
+        return 0
+    it = iter(argv)
+    for a in it:
+        if a == "--repo":
+            repo = next(it, None)
+        elif a == "--timeout":
+            try:
+                TIMEOUT = int(next(it, None))
+            except (TypeError, ValueError):
+                print("contract-check: --timeout needs an integer", file=sys.stderr)
+                return 2
+        elif a == "--wave":
+            waves.append(next(it, None))
+        elif contract is None:
+            contract = a
+        else:
+            waves.append(a)  # tolerate "--wave A B" style
+    if not contract or not repo or None in waves:
+        print(__doc__ or "usage: contract-check CONTRACT.md [--wave OTHER.md ...] [--repo DIR]",
+              file=sys.stderr)
+        return 2
+    cid, problems = check(contract, waves, repo)
+    if problems:
+        print("\n".join(problems))
+        return 1
+    print("contract-check: OK (%s)" % cid)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

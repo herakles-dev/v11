@@ -65,8 +65,24 @@ CANONICAL = {
     "EXECUTED": "SHIPPED",
     "APPROVED": "SHIPPED",
 }
-# Case-insensitive match on word-boundary tokens.
+# Case-insensitive match on word-boundary tokens — used for the ticket BODY's
+# own **Status:** line, which is short, controlled, single-purpose text (the
+# author is declaring the ticket's state, nothing else lives on that line).
 TOKEN_RE = re.compile(r"\b(" + "|".join(STATUS_TOKENS) + r")\b", re.IGNORECASE)
+# README status-column prose is free-text narrative and can mention a status
+# WORD while describing something other than the ticket's own state (#73's
+# false WARN: "...partial PASS looked full — open;" — "partial" describes
+# what the REVIEW covered, not ticket #73's state). Corpus convention
+# (README-wide, verified 2026-09-25): every GENUINE per-ticket status
+# declaration in this column is spelled ALL-CAPS; every lowercase occurrence
+# of the same words is narrative color. The sole exception is "open", which
+# is conventionally lowercase even when declarative ("— open;" — 32 rows use
+# this exact form, and OPEN never appears uppercase in the corpus). So the
+# README matcher is case-SENSITIVE for the all-caps tokens and matches only
+# the lowercase spelling of "open".
+README_TOKEN_RE = re.compile(
+    r"\b(SHIPPED|EXECUTED|APPROVED|PARTIAL|PROPOSED|DEFERRED|HISTORICAL|open)\b"
+)
 # Ticket-file basename pattern
 TICKET_FILE_RE = re.compile(r"^(\d+)-[a-z0-9-]+\.md$")
 # **Status:** line pattern (allow leading `- ` list marker, allow trailing text)
@@ -87,24 +103,17 @@ def debug(msg: str) -> None:
         sys.stderr.write(f"[debug] {msg}\n")
 
 
-def find_primary_token(text: str) -> str | None:
-    """Return the primary status token in text.
-
-    Contract: multi-token prose (typical in README rows describing a ticket's
-    history — "was PROPOSED... now SHIPPED... overall SHIPPED") is resolved
-    to a single umbrella token:
-      - if BOTH strict-SHIPPED and strict-PROPOSED appear → PARTIAL (some
+def _combine_tokens(tokens_found: list[str]) -> str | None:
+    """Resolve a list of found status tokens (already upper-cased + legacy-
+    canonicalized) to a single umbrella token:
+      - if BOTH strict-SHIPPED and strict-PROPOSED/OPEN appear → PARTIAL (some
         of the work still open even though other parts shipped)
       - if only SHIPPED (or synonyms EXECUTED/APPROVED) → SHIPPED
       - if only PROPOSED / OPEN → PROPOSED
       - if only DEFERRED or HISTORICAL → that token
       - if PARTIAL explicitly present → PARTIAL
-    Case-normalized. Legacy tokens canonicalized. Returns None if no token.
+    Returns None if the list is empty.
     """
-    tokens_found: list[str] = []
-    for m in TOKEN_RE.finditer(text):
-        tok = m.group(1).upper()
-        tokens_found.append(CANONICAL.get(tok, tok))
     if not tokens_found:
         return None
     unique = set(tokens_found)
@@ -123,6 +132,33 @@ def find_primary_token(text: str) -> str | None:
         if tok in ("DEFERRED", "HISTORICAL"):
             return tok
     return tokens_found[0]
+
+
+def find_primary_token(text: str) -> str | None:
+    """Return the primary status token in ticket-BODY text (the isolated
+    **Status:** line — see extract_body_status). Case-normalized. Legacy
+    tokens canonicalized. Returns None if no token. See _combine_tokens for
+    the multi-token resolution contract.
+    """
+    tokens_found: list[str] = []
+    for m in TOKEN_RE.finditer(text):
+        tok = m.group(1).upper()
+        tokens_found.append(CANONICAL.get(tok, tok))
+    return _combine_tokens(tokens_found)
+
+
+def find_readme_status_token(text: str) -> str | None:
+    """Return the primary status token in README status-column prose, using
+    README_TOKEN_RE's case-sensitive-except-"open" matching (see its comment)
+    so narrative color like "partial PASS looked full" can't be mistaken for
+    a genuine status declaration. Same multi-token resolution contract as
+    find_primary_token (_combine_tokens) once candidate tokens are found.
+    """
+    tokens_found: list[str] = []
+    for m in README_TOKEN_RE.finditer(text):
+        tok = m.group(1).upper()
+        tokens_found.append(CANONICAL.get(tok, tok))
+    return _combine_tokens(tokens_found)
 
 
 def extract_body_status(ticket_path: Path) -> tuple[str | None, int, str]:
@@ -219,14 +255,35 @@ def diff_ticket(
             )
         )
         return findings
-    readme_token = find_primary_token(readme_status_prose)
+    readme_token = find_readme_status_token(readme_status_prose)
     if readme_token is None:
-        findings.append(
-            (
-                "WARN",
-                f"#{n}: README status column has no recognizable status token",
+        # README_TOKEN_RE is deliberately case-sensitive (except "open" — see
+        # its comment) so narrative prose can't masquerade as a declaration.
+        # That makes a genuinely-declared-but-lowercase status word
+        # indistinguishable from "no status word here at all" without a
+        # second look. Case-insensitive TOKEN_RE tells them apart (review
+        # #19 E1) so the WARN can point at the actual problem instead of
+        # reading as a parse gap.
+        lowercase_hits = sorted({
+            m.group(1).lower()
+            for m in TOKEN_RE.finditer(readme_status_prose)
+            if not m.group(1).isupper()
+        })
+        if lowercase_hits:
+            findings.append(
+                (
+                    "WARN",
+                    f"#{n}: README status column has no ALL-CAPS status token; saw "
+                    f"lowercase: {', '.join(lowercase_hits)} (declare status in ALL-CAPS)",
+                )
             )
-        )
+        else:
+            findings.append(
+                (
+                    "WARN",
+                    f"#{n}: README status column has no recognizable status token",
+                )
+            )
         return findings
     debug(f"#{n}: body={body_token} readme={readme_token}")
     if body_token == readme_token:

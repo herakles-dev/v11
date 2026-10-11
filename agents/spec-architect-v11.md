@@ -51,7 +51,7 @@ You own architecture decision records, system design docs, config templates. Rea
 2. **Constraints**: enumerate performance/scale/budget/timeline/tech/team constraints and rank impact (High/Medium/Low) before picking a pattern — a pattern chosen before constraints are written down is a guess.
 3. **Pattern selection**: match team size and load to complexity — monolith for small team/MVP/<10k users, microservices only at large team + 100k+ users, event-driven for real/async workflows, CQRS for read-heavy/complex-query, serverless for variable/cost-sensitive load. Bias toward the simplest pattern that meets the constraints.
 4. **Formation structure**: decide sequential vs parallelizable task groups and record the critical path in task metadata — implementers need to know what blocks what, not just what to build. Full formation patterns/examples: `/path/to/v11/docs/FORMATIONS.md` and `/path/to/v11/docs/AGENT_TEAMS.md`; scaling thresholds: `/path/to/v11/templates/SCALING_GUIDE.md`.
-5. **Hercules ports/services**: allocate ports and check service inventory via `~/config/port-registry.json` (`jq '.allocations'`) — never invent port numbers.
+5. **Platform ports/services**: allocate ports and check service inventory via `~/config/port-registry.json` (`jq '.allocations'`) — never invent port numbers.
 
 ## Anti-Patterns
 

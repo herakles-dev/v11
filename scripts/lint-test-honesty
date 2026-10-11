@@ -26,6 +26,11 @@ Patterns:
      of test_handoff_hygiene.py, fixed V11.25.2 (commit 5d3492d, T7-E4).
      A bare `_run()` followed by ANY positive assertion is allowed — the
      positive assert fails naturally if the script crashed.
+     A file is exempt when its last module-level `_run` helper has a
+     direct-body `assert <rc> == 0`, rc from a call's first return value
+     or `.returncode`; a named rc must be bound exactly once in the whole
+     helper (any nested/walrus/param/global rebind disqualifies). Residual:
+     callee not checked; asserts inside `with`/`try` are not considered.
 
   P4 bash-case-without-default — `case ... in` block in scripts/handoff
      or hooks/session-end without a `*)` default arm. Was the root cause
@@ -133,6 +138,83 @@ def _check_bare_run_calls(func: ast.FunctionDef, path: Path, violations: list) -
             ))
 
 
+def _eq_zero_operand(test: ast.expr):
+    """The non-zero side of `<x> == 0` / `0 == <x>` (single Eq op), else None."""
+    if not (isinstance(test, ast.Compare) and len(test.ops) == 1
+            and isinstance(test.ops[0], ast.Eq)):
+        return None
+    sides = (test.left, test.comparators[0])
+    for i, side in enumerate(sides):
+        if isinstance(side, ast.Constant) and side.value == 0 \
+                and not isinstance(side.value, bool):
+            return sides[1 - i]
+    return None
+
+
+def _is_returncode_attr(node: ast.expr) -> bool:
+    return isinstance(node, ast.Attribute) and node.attr == "returncode"
+
+
+def _binds_rc(stmt: ast.stmt, name: str) -> bool:
+    """`name, ... = call(...)` or `name = <x>.returncode`."""
+    if not isinstance(stmt, ast.Assign) or len(stmt.targets) != 1:
+        return False
+    tgt = stmt.targets[0]
+    if isinstance(tgt, ast.Tuple):
+        return (bool(tgt.elts) and isinstance(tgt.elts[0], ast.Name)
+                and tgt.elts[0].id == name and isinstance(stmt.value, ast.Call))
+    return (isinstance(tgt, ast.Name) and tgt.id == name
+            and _is_returncode_attr(stmt.value))
+
+
+def _binding_count(func: ast.FunctionDef, name: str) -> int:
+    """Binding sites of `name` anywhere in `func`; a global/nonlocal decl -> 2."""
+    n = sum(a.arg == name for a in ast.walk(func.args) if isinstance(a, ast.arg))
+    for node in (m for stmt in func.body for m in ast.walk(stmt)):
+        if isinstance(node, ast.Name) and node.id == name \
+                and isinstance(node.ctx, ast.Store):
+            n += 1
+        elif isinstance(node, (ast.Global, ast.Nonlocal)) and name in node.names:
+            n += 2
+        elif isinstance(node, ast.ExceptHandler) and node.name == name:
+            n += 1
+        elif isinstance(node, ast.alias) \
+                and (node.asname or node.name.split(".")[0]) == name:
+            n += 1
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef,
+                               ast.ClassDef)) and node.name == name:
+            n += 1
+        elif isinstance(node, (ast.MatchAs, ast.MatchStar)) and node.name == name:
+            n += 1
+        elif isinstance(node, ast.MatchMapping) and node.rest == name:
+            n += 1
+    return n
+
+
+def _has_rc_asserting_run_helper(tree: ast.Module) -> bool:
+    """True iff the last module-level `_run` directly asserts `<rc> == 0`."""
+    helpers = [n for n in tree.body
+               if isinstance(n, ast.FunctionDef) and n.name == "_run"]
+    if not helpers:
+        return False
+    func = helpers[-1]
+    for i, stmt in enumerate(func.body):
+        if isinstance(stmt, ast.Return):
+            return False
+        if not isinstance(stmt, ast.Assert):
+            continue
+        operand = _eq_zero_operand(stmt.test)
+        if operand is None:
+            continue
+        if _is_returncode_attr(operand):
+            return True
+        if isinstance(operand, ast.Name) \
+                and _binding_count(func, operand.id) == 1 \
+                and any(_binds_rc(s, operand.id) for s in func.body[:i]):
+            return True
+    return False
+
+
 def _lint_python_test(path: Path, violations: list) -> None:
     """Apply P1/P2 line-wise, P3 via AST walk over test function bodies."""
     try:
@@ -167,6 +249,8 @@ def _lint_python_test(path: Path, violations: list) -> None:
     try:
         tree = ast.parse(text, filename=str(path))
     except SyntaxError:
+        return
+    if _has_rc_asserting_run_helper(tree):
         return
     for node in ast.walk(tree):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and \

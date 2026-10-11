@@ -1,0 +1,141 @@
+#!/usr/bin/env python3
+# agent-cards — turn the agent registry into compact routing cards (JSONL) for a Choice judgment.
+#
+# Usage: scripts/agent-cards [--registry FILE] [--overrides FILE] [--out FILE] [--stats] [--json]
+#         defaults: ~/.agent-registry/agents.json, config/agent-card-overrides.json
+#
+# Card: {"name","group","pick_when","not_for","model"}, one per active agent, sorted by name.
+#   group      registry category, unless that category holds more than 12 agents; then derived
+#              from name/description with GROUP_RULES (first match wins, else "other")
+#   pick_when  first sentence of the description (<= 160 chars); an override replaces it
+#   not_for    only from the overrides file, "" when absent
+# Overrides: JSON {"<agent>": {"pick_when": "...", "not_for": "..."}}; a name missing from the
+# registry is warned about on stderr.
+# --stats prints count, per-group counts, token estimate (chars/4), roster hash and the number of
+# cards without not_for to stderr; --json prints that block on stdout instead of cards.
+# Offline, read-only (only --out is written), stdlib only, deterministic. Exit 0 on success.
+import argparse
+import hashlib
+import json
+import os
+import re
+import sys
+
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DEFAULT_REGISTRY = os.path.expanduser("~/.agent-registry/agents.json")
+DEFAULT_OVERRIDES = os.path.join(REPO, "config", "agent-card-overrides.json")
+MAX_CATEGORY = 12
+PICK_WHEN_MAX = 160
+
+# (group, keywords) checked in order against "name description" lowercased.
+GROUP_RULES = (
+    ("reviewer", ("review", "adversarial", "audit", "code-quality", "refactor")),
+    ("tester", ("test", "qa-", "tdd")),
+    ("security", ("security", "owasp", "vulnerab")),
+    ("architect", ("architect", "system design", "planner")),
+    ("database", ("database", "sql", "postgres", "schema")),
+    ("frontend", ("frontend", "react", "ui-", "css", "web design")),
+    ("devops", ("devops", "docker", "deploy", "container", "nginx", "service", "ci/cd")),
+    ("docs", ("docs", "documentation", "readme")),
+    ("prompt", ("prompt",)),
+    ("mcp", ("mcp",)),
+)
+
+
+def derive_group(name, description):
+    text = (name + " " + description).lower()
+    for group, words in GROUP_RULES:
+        if any(w in text for w in words):
+            return group
+    return "other"
+
+
+def first_sentence(text):
+    text = " ".join(text.split())
+    s = re.split(r"(?<=[.!?])\s", text, maxsplit=1)[0]
+    if len(s) > PICK_WHEN_MAX:
+        s = s[: PICK_WHEN_MAX - 3].rstrip() + "..."
+    return s
+
+
+def load_json(path, what):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError) as e:
+        sys.exit("agent-cards: cannot read %s %s: %s" % (what, path, e))
+
+
+def build(registry, overrides):
+    agents = {n: a for n, a in registry.get("agents", {}).items()
+              if isinstance(a, dict) and a.get("status") == "active"}
+    per_cat = {}
+    for a in agents.values():
+        per_cat[a.get("category", "")] = per_cat.get(a.get("category", ""), 0) + 1
+    cards = []
+    for name in sorted(agents):
+        a = agents[name]
+        desc = a.get("description", "") or ""
+        cat = a.get("category") or ""
+        group = derive_group(name, desc) if (per_cat[a.get("category", "")] > MAX_CATEGORY or not cat) else cat
+        ov = overrides.get(name, {})
+        cards.append({
+            "name": name,
+            "group": group,
+            "pick_when": ov.get("pick_when") or first_sentence(desc),
+            "not_for": ov.get("not_for", ""),
+            "model": a.get("model", ""),
+        })
+    warnings = ["override for unknown agent: %s" % n for n in sorted(overrides) if n not in agents]
+    pairs = sorted((n, agents[n].get("description", "") or "") for n in agents)
+    roster = hashlib.sha256(json.dumps(pairs).encode()).hexdigest()[:12]
+    return cards, warnings, roster
+
+
+def stats_block(cards, lines, roster):
+    groups = {}
+    for c in cards:
+        groups[c["group"]] = groups.get(c["group"], 0) + 1
+    return {
+        "cards": len(cards),
+        "groups": dict(sorted(groups.items())),
+        "tokens_est": sum(len(l) + 1 for l in lines) // 4,
+        "roster_hash": roster,
+        "no_not_for": sum(1 for c in cards if not c["not_for"]),
+    }
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Generate routing cards (JSONL) from the agent registry. Offline, read-only.")
+    ap.add_argument("--registry", default=DEFAULT_REGISTRY)
+    ap.add_argument("--overrides", default=DEFAULT_OVERRIDES)
+    ap.add_argument("--out")
+    ap.add_argument("--stats", action="store_true")
+    ap.add_argument("--json", action="store_true")
+    args = ap.parse_args()
+
+    registry = load_json(args.registry, "registry")
+    overrides = load_json(args.overrides, "overrides") if os.path.exists(args.overrides) else {}
+    cards, warnings, roster = build(registry, overrides)
+    for w in warnings:
+        print("agent-cards: warning: " + w, file=sys.stderr)
+    lines = [json.dumps(c, sort_keys=True, ensure_ascii=False) for c in cards]
+    stats = stats_block(cards, lines, roster)
+
+    if args.json:
+        print(json.dumps(stats, sort_keys=True))
+    text = "".join(l + "\n" for l in lines)
+    if args.out:
+        with open(args.out, "w") as f:
+            f.write(text)
+    elif not args.json:
+        sys.stdout.write(text)
+    if args.stats:
+        print("cards=%d tokens_est=%d roster_hash=%s no_not_for=%d" % (
+            stats["cards"], stats["tokens_est"], roster, stats["no_not_for"]), file=sys.stderr)
+        for g, n in stats["groups"].items():
+            print("  group %s: %d" % (g, n), file=sys.stderr)
+
+
+if __name__ == "__main__":
+    main()

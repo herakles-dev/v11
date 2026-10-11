@@ -161,6 +161,95 @@ if [ -f "$TASK_STATE" ]; then
     [ "$in_progress" -gt 0 ] && echo "In Progress: $in_progress"
     [ "$pending" -gt 0 ] && echo "Pending: $pending"
     [ "$blocked" -gt 0 ] && echo "Blocked: $blocked"
+
+    # S1-T10 (#72, M6): one cost line from scripts/cost-ledger (S1-T9). A copy
+    # at $METRICS_DIR/cost-ledger/$PROJECT.status.json younger than
+    # V11_COST_STATUS_FRESH seconds (default 300) is used as is. Otherwise one `cost-ledger --by sprint --json` refresh runs at a time
+    # per project: it is started only when the lock is free, else the call joins
+    # the run in flight. Either way the wait is at most V11_COST_STATUS_TIMEOUT
+    # seconds (1-3, default 3). The run is setsid-detached, so a late or
+    # interrupted status call never kills it; it replaces the copy when it
+    # finishes. An older copy is shown with its age and ignored once a day old.
+    # Fail-open: no usable result reads "Cost: unavailable" and nothing else here
+    # changes. The sprint is --sprint, else active_task_sprint, else the
+    # commonest sprint among open tasks (in_progress first). The $ caveat is the
+    # JSON's pricing.basis/scope. Honors V11_COST_STATUS=off.
+    if [ "${V11_COST_STATUS:-on}" != "off" ]; then
+        _CL_LINE=""
+        if [[ "$PROJECT" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+            _CL_BIN="${V11_COST_LEDGER:-$SCRIPT_DIR/cost-ledger}"
+            _CL_DIR="${METRICS_DIR:-$HOME/.agent-metrics}/cost-ledger"
+            _CL_CACHE="$_CL_DIR/${PROJECT}.status.json"
+            _CL_LOCK="$_CL_DIR/.${PROJECT}.lock"
+            _CL_WAIT="${V11_COST_STATUS_TIMEOUT:-3}"
+            case "$_CL_WAIT" in [1-3]) ;; *) _CL_WAIT=3 ;; esac
+            _CL_FRESH="${V11_COST_STATUS_FRESH:-300}"
+            case "$_CL_FRESH" in ''|*[!0-9]*) _CL_FRESH=300 ;; esac
+            _cl_age=$(( $(date +%s) - $(stat -c %Y "$_CL_CACHE" 2>/dev/null || echo 0) ))
+            if [ "$_cl_age" -ge "$_CL_FRESH" ] && [ -x "$_CL_BIN" ] && mkdir -p "$_CL_DIR" 2>/dev/null; then
+                # The lock is taken here, before the fork, and fd 9 is inherited
+                # by the run, so it stays held until the run exits and the wait
+                # below cannot miss it.
+                { if flock -n 9; then
+                    setsid bash -c 'tmp=$(mktemp "$3/.$2.XXXXXX") || exit 0
+                        if timeout 300 "$1" "$2" --by sprint --json > "$tmp"; then mv -f "$tmp" "$4"; else rm -f "$tmp"; fi' \
+                        _ "$_CL_BIN" "$PROJECT" "$_CL_DIR" "$_CL_CACHE" </dev/null >/dev/null 2>&1 &
+                  fi; } 2>/dev/null 9>>"$_CL_LOCK" || true
+                flock -w "$_CL_WAIT" "$_CL_LOCK" true 2>/dev/null || true
+            fi
+            if [ -f "$_CL_CACHE" ]; then
+                _CL_LINE=$(CL_JSON="$_CL_CACHE" TASK_STATE_PATH="$TASK_STATE" CL_SPRINT="$SPRINT_FILTER" python3 - <<'PYEOF' 2>/dev/null || true
+import json, os, time
+from collections import Counter
+from datetime import datetime
+
+with open(os.environ["CL_JSON"], encoding="utf-8") as f:
+    doc = json.load(f)
+age = time.time() - datetime.fromisoformat(doc["generated_at"].replace("Z", "+00:00")).timestamp()
+if doc.get("schema") != "cost-ledger/v1" or doc["filters"]["by"] != "sprint" or age > 86400:
+    raise SystemExit(1)
+
+sprint = os.environ.get("CL_SPRINT") or ""
+if not sprint:
+    try:
+        with open(os.environ["TASK_STATE_PATH"], encoding="utf-8") as f:
+            state = json.load(f)
+    except Exception:
+        state = {}
+    sprint = state.get("active_task_sprint") or ""
+    if sprint in ("null", "unknown"):
+        sprint = ""
+    tasks = [t for t in state.get("open_tasks") or [] if isinstance(t, dict)]
+    for pool in ([t for t in tasks if t.get("status") == "in_progress"], tasks):
+        if sprint:
+            break
+        counts = Counter((t.get("metadata") or {}).get("sprint") for t in pool)
+        for bad in (None, "", "null", "unknown"):
+            counts.pop(bad, None)
+        if counts:
+            sprint = counts.most_common(1)[0][0]
+
+cap = doc["capture"]
+line = f"Cost: ${doc['totals']['usd']:,.2f}"
+if sprint:
+    usd = [g["usd"] for g in doc["groups"] if g["key"] == sprint]
+    line += f" (sprint {sprint}: ${sum(usd):,.2f})" if usd else f" (sprint {sprint}: n/a)"
+line += f" · capture {cap['rate_str']}"
+if cap["priced"] < cap["with_tokens"]:
+    line += f" (priced {cap['priced']})"
+pricing = doc.get("pricing") or {}
+labels = {"api_list_price_equivalent": "API list-price equiv", "subagents_only": "subagents only"}
+caveat = [labels.get(v, str(v).replace("_", " ")) for v in (pricing.get("basis"), pricing.get("scope")) if v]
+line += " · " + (", ".join(caveat) if pricing.get("basis") else "basis unknown")
+if age >= 60:
+    line += f" · as of {int(age // 60)}m ago" if age < 3600 else f" · as of {age / 3600:.1f}h ago"
+print(line)
+PYEOF
+)
+            fi
+        fi
+        echo "${_CL_LINE:-Cost: unavailable}"
+    fi
     echo ""
 
     # V11.21: Review-sibling grouping + plain-language summary line.
@@ -216,13 +305,15 @@ if [ -f "$TASK_STATE" ]; then
     # V11.28.1 (loop-audit): surface the DURABLE review-queue depth. The V11.21 "Reviews:"
     # line above reads in-band task-state siblings; the durable queue at
     # ~/.agent-metrics/review-queue/$PROJECT.jsonl is a separate ledger that silently piled
-    # to 100s of undrained entries because drainage is a manual step nobody ran. Show net-open
-    # (pending minus done) so it can't grow invisibly. Drain: ./scripts/drain-review-queue $PROJECT.
+    # to 100s of undrained entries because drainage is a manual step nobody ran. Show the
+    # open count so it can't grow invisibly. Drain: ./scripts/drain-review-queue $PROJECT.
+    # S2-R4: the latest event per task_id wins (review-queue's own replay), and a parked
+    # entry is counted apart: a drain never clears it, only `review-queue unpark` re-queues it.
     _RQ_FILE="${METRICS_DIR:-$HOME/.agent-metrics}/review-queue/${PROJECT}.jsonl"
     if [ -f "$_RQ_FILE" ]; then
-        _RQ_OPEN=$(V11_RQ="$_RQ_FILE" python3 - <<'PYEOF' 2>/dev/null || echo "0 0"
+        _RQ_OPEN=$(V11_RQ="$_RQ_FILE" python3 - <<'PYEOF' 2>/dev/null || echo "0 0 0"
 import json, os
-pend = {}
+latest = {}
 for line in open(os.environ["V11_RQ"], encoding="utf-8"):
     line = line.strip()
     if not line:
@@ -234,19 +325,17 @@ for line in open(os.environ["V11_RQ"], encoding="utf-8"):
     tid = r.get("task_id")
     if not tid:
         continue
-    if r.get("ev") == "pending":
-        pend.setdefault(tid, True)
-    elif r.get("ev") == "done":
-        pend[tid] = False
-o = sum(1 for v in pend.values() if v); d = sum(1 for v in pend.values() if not v)
-print(f"{o} {d}")
+    latest[str(tid)] = r.get("ev")
+s = list(latest.values())
+print(s.count("pending"), s.count("done"), s.count("parked"))
 PYEOF
 )
-        read -r _rq_open _rq_done <<< "$_RQ_OPEN"
-        if [ "${_rq_open:-0}" -gt 0 ]; then
+        read -r _rq_open _rq_done _rq_parked <<< "$_RQ_OPEN"
+        if [ "${_rq_open:-0}" -gt 0 ] || [ "${_rq_parked:-0}" -gt 0 ]; then
             _rq_warn=""
-            [ "$_rq_open" -ge 20 ] && _rq_warn="  ⚠ drain: ./scripts/drain-review-queue $PROJECT"
-            echo "Review queue (durable): ${_rq_open} open, ${_rq_done} resolved${_rq_warn}"
+            [ "${_rq_open:-0}" -ge 20 ] && _rq_warn="  ⚠ drain: ./scripts/drain-review-queue $PROJECT"
+            echo "Review queue (durable): ${_rq_open:-0} open, ${_rq_parked:-0} parked, ${_rq_done:-0} resolved${_rq_warn}"
+            [ "${_rq_parked:-0}" -gt 0 ] && echo "  Parked entries are not drained: see scripts/review-queue dashboard $PROJECT; re-queue one with scripts/review-queue unpark $PROJECT TASK_ID"
             echo ""
         fi
     fi
@@ -263,8 +352,9 @@ PYEOF
     # than printing a misleading number. Honors V11_PRESCOPE_STATUS=off.
     if [ "${V11_PRESCOPE_STATUS:-on}" != "off" ]; then
         _PRESCOPE_LEDGER_FILE="${METRICS_DIR:-$HOME/.agent-metrics}/ledger/${PROJECT}.jsonl"
-        _PRESCOPE_OUT=$(TASK_STATE_PATH="$TASK_STATE" LEDGER_PATH="$_PRESCOPE_LEDGER_FILE" python3 - <<'PYEOF' 2>/dev/null || echo ""
-import json, os
+        _PRESCOPE_OUT=$(TASK_STATE_PATH="$TASK_STATE" LEDGER_PATH="$_PRESCOPE_LEDGER_FILE" \
+            PRESCOPE_PROJECT="$PROJECT" PRESCOPE_LIB="$SCRIPT_DIR/lib" python3 - <<'PYEOF' 2>/dev/null || echo ""
+import json, os, sys
 
 state_path = os.environ["TASK_STATE_PATH"]
 ledger_path = os.environ.get("LEDGER_PATH", "")
@@ -291,6 +381,57 @@ else:
 
     open_ids = {t.get("task_id") for t in open_tasks if isinstance(t, dict)}
     n = 0
+    # S2-T0b-3 (#113, review #19 C10): a prescope row counts when the task it
+    # was written for is still open, keyed by identity, not by the bare id
+    # (every TaskList of a resumed session reuses ids 1..N). A prescope row
+    # fires inside its TaskCreate, before that task's `created`, so its task
+    # is the first create of (session, id) at or after it (in its TaskList
+    # epoch when stamped). An open record binds by the identity it carries,
+    # its epoch (R1), else the latest create (scripts/lib/task_epoch.py).
+    # Rollback: V11_TASK_RESOLVER=legacy (the bare-id count).
+    tix = None
+    if os.environ.get("V11_TASK_RESOLVER", "shared") != "legacy" and ledger_path and os.path.isfile(ledger_path):
+        sys.dont_write_bytecode = True
+        sys.path.insert(0, os.environ.get("PRESCOPE_LIB", ""))
+        try:
+            import task_epoch as te
+            tix = te.TaskIndex.from_ledger(os.environ.get("PRESCOPE_PROJECT", ""), identities=[],
+                                           metrics_dir=os.path.dirname(os.path.dirname(ledger_path)))
+        except Exception:
+            tix = None
+    if tix is not None:
+        open_idents, open_unbound = set(), set()
+        for t in open_tasks:
+            if not isinstance(t, dict):
+                continue
+            sess, tid = str(t.get("session_uuid") or ""), str(t.get("task_id") or "")
+            ident, cl = None, tix.claims(sess, tid)
+            ti = t.get("identity") if isinstance(t.get("identity"), dict) else {}
+            if te.valid_identity(ti.get("subject_norm"), ti.get("create_seq")):
+                ident = tix.alias((ti["subject_norm"], ti["create_seq"]))
+            elif te.tl_epoch_of(t) is not None and cl:
+                res = tix.resolve(sess, tid, epoch=te.tl_epoch_of(t))
+                ident = res.identity if res.status == te.BOUND else None
+            elif cl:
+                ident = cl[-1].identity
+            if ident is not None:
+                open_idents.add(ident)
+            else:
+                open_unbound.add((sess, tid))
+        for row in te.read_ledger(os.environ.get("PRESCOPE_PROJECT", ""),
+                                  os.path.dirname(os.path.dirname(ledger_path))):
+            if row.get("ev") != "prescope":
+                continue
+            sess, tle, tid = te.claim_key(row)
+            pos = te.position(row)
+            after = [c for c in tix.claims(sess, tid) if c.ev == "created" and c.pos >= pos]
+            if tle is not None and any(c.tl_epoch == tle for c in after):
+                after = [c for c in after if c.tl_epoch == tle]
+            ident = after[0].identity if after else None
+            if ident in open_idents or (ident is None and (sess, tid) in open_unbound):
+                n += 1
+        print(f"{pct} {n}")
+        raise SystemExit(0)
     if ledger_path and os.path.isfile(ledger_path):
         try:
             with open(ledger_path, encoding="utf-8") as f:

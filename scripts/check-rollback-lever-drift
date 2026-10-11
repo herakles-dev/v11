@@ -4,6 +4,11 @@ check-rollback-lever-drift — drift guard: V11_* rollback env-var reads in
 scripts/+hooks/ vs documented rows in docs/ROLLBACK_REFERENCE.md
 (improvements/44-check-rollback-lever-drift.md).
 
+Reader dirs (--reader-dir, default ~/.claude/skills): code outside v11 that a
+doc row names as the reader of a lever (e.g. the /align-aggregate skill).
+Only .py/.sh files are scanned, and a reader-dir hit ONLY clears a doc-lie —
+it never produces a silent-lever WARN (improvements/61).
+
 ROOT CAUSE this defends: adding or renaming a runtime lever touches N surfaces
 (code where it's read, docs/ROLLBACK_REFERENCE.md, sometimes the ticket file's
 "Rollback" section) and nothing enforces that a lever declared in one is
@@ -35,6 +40,7 @@ V11_HOME = Path(os.environ.get("V11_HOME", "/path/to/v11"))
 DEFAULT_ROLLBACK_DOC = V11_HOME / "docs" / "ROLLBACK_REFERENCE.md"
 DEFAULT_SCRIPTS_DIR = V11_HOME / "scripts"
 DEFAULT_HOOKS_DIR = V11_HOME / "hooks"
+DEFAULT_READER_DIR = Path.home() / ".claude" / "skills"
 
 # Vars that are NOT rollback levers — inter-hook state channels, test seams,
 # and internal command-carrying vars. These must not be flagged as silent
@@ -45,6 +51,7 @@ EXCLUSIONS = {
     "V11_CALLER_KIND",
     "V11_CALLER_KIND_INFERENCE",
     "V11_SESSION_ID",
+    "V11_SESSION_ID_SOURCE",  # hooks/session-end → scripts/handoff (S1-T1 review #69)
     "V11_PROJECT",
     "V11_ACTIVE_PROJECT_OWNER",
     "V11_ERROR",
@@ -58,6 +65,8 @@ EXCLUSIONS = {
     "V11_DETECTION_METHOD",
     "V11_DURATION_MS",
     "V11_DISPATCH_TRACE",
+    "V11_TOOL_NAME",  # v11_parse_input -> hooks (S2-T1 profiler reads it)
+    "V11_SITTING",    # v11_sitting -> sync-tasks / self-nudge check (S2-T0b-2/4)
     # environment vars, not levers
     "V11_HOME",
     "V11_SCHEMA_DIR",
@@ -72,9 +81,19 @@ EXCLUDED_PREFIXES = ("V11_TEST_",)
 
 # bash: ${V11_FOO:-...} or ${V11_FOO:default} — captures FOO in group 1
 BASH_LEVER_RE = re.compile(r"\$\{V11_([A-Z0-9_]+)\s*:?-")
-# python: os.environ.get('V11_FOO', ...) or os.environ["V11_FOO"]
-PY_LEVER_RE = re.compile(
-    r"""os\.environ(?:\.get|\[)\s*[('"]V11_([A-Z0-9_]+)['"\)]"""
+# python subscript read: os.environ["V11_FOO"]. Feeds the silent-lever WARN.
+# Deliberately NOT widened to .get("V11_FOO"): here that form is mostly
+# bash->embedded-python data channels (V11_BF_*, V11_FILES_JSON, *_LIBDIR) and
+# widening it adds ~95 false silent-lever WARNs. (The previous pattern claimed
+# to match .get too, but its single char class [('"] never could.)
+PY_LEVER_RE = re.compile(r"""os\.environ\[\s*['"]V11_([A-Z0-9_]+)['"]""")
+# Any read, any form: bash $V11_FOO / ${V11_FOO...}, python os.environ[...] /
+# os.environ.get(...) / os.getenv(...). Used ONLY for the doc-lie direction:
+# a documented lever is real if anything reads it. The narrow test above called
+# common.sh's embedded os.environ.get("V11_CANCELLED_COUNTER") a doc-lie, which
+# kept run-tests --regression permanently red (improvements/61).
+ANY_READ_RE = re.compile(
+    r"""(?:\$\{?|os\.environ(?:\.get\(|\[)\s*['"]|getenv\(\s*['"])V11_([A-Z0-9_]+)"""
 )
 # python: helper-function call with literal env-name argument, e.g.
 # _env_off("V11_FOO") — the helper indirection hides the direct env read.
@@ -122,9 +141,13 @@ def is_excluded(name: str) -> bool:
     return False
 
 
-def enumerate_code_levers(*roots: Path) -> dict[str, list[str]]:
-    """{var_name: [example_files]} for every V11_* read in code."""
+def enumerate_code_levers(
+    *roots: Path, suffixes: set[str] | None = None
+) -> tuple[dict[str, list[str]], set[str]]:
+    """Return ({var: [example_files]} for lever-shaped reads,
+    {every V11_* name read in any form})."""
     result: dict[str, set[str]] = {}
+    any_read: set[str] = set()
     # Files that reference V11_* names in documentation strings, not as
     # actual reads. Empty by default now — placeholder names (V11_X/V11_FOO/
     # V11_BAR) are handled via EXCLUSIONS, and the check's OWN env read
@@ -135,6 +158,8 @@ def enumerate_code_levers(*roots: Path) -> dict[str, list[str]]:
             continue
         for path in root.rglob("*"):
             if not path.is_file():
+                continue
+            if suffixes is not None and path.suffix not in suffixes:
                 continue
             # skip non-text
             if path.suffix in {".pyc", ".jsonl", ".json", ".bak"}:
@@ -149,16 +174,17 @@ def enumerate_code_levers(*roots: Path) -> dict[str, list[str]]:
                 text = path.read_text(encoding="utf-8", errors="replace")
             except OSError:
                 continue
+            any_read.update("V11_" + m.group(1) for m in ANY_READ_RE.finditer(text))
             for m in BASH_LEVER_RE.finditer(text):
                 name = "V11_" + m.group(1)
                 if is_excluded(name):
                     continue
-                result.setdefault(name, set()).add(str(path.relative_to(V11_HOME)))
+                result.setdefault(name, set()).add(rel)
             for m in PY_LEVER_RE.finditer(text):
                 name = "V11_" + m.group(1)
                 if is_excluded(name):
                     continue
-                result.setdefault(name, set()).add(str(path.relative_to(V11_HOME)))
+                result.setdefault(name, set()).add(rel)
             # Helper-function indirection: python scripts commonly wrap env
             # reads in a helper (`_env_off("V11_X")`) which the direct regex
             # above misses. Widen to any "V11_*" literal appearing in a call
@@ -171,10 +197,8 @@ def enumerate_code_levers(*roots: Path) -> dict[str, list[str]]:
                     name = "V11_" + m.group(1)
                     if is_excluded(name):
                         continue
-                    result.setdefault(name, set()).add(
-                        str(path.relative_to(V11_HOME))
-                    )
-    return {k: sorted(v)[:3] for k, v in result.items()}
+                    result.setdefault(name, set()).add(rel)
+    return {k: sorted(v)[:3] for k, v in result.items()}, any_read | set(result)
 
 
 def _looks_like_python(path: Path) -> bool:
@@ -183,7 +207,9 @@ def _looks_like_python(path: Path) -> bool:
     try:
         with path.open("rb") as f:
             first = f.read(80)
-        return b"python" in first[:40]
+        # Require an actual shebang: a bash file whose first line merely runs
+        # `python3 - <<'PY'` is not python (improvements/61 test fixture).
+        return first.startswith(b"#!") and b"python" in first.split(b"\n", 1)[0]
     except OSError:
         return False
 
@@ -236,14 +262,21 @@ def main() -> int:
     parser.add_argument(
         "--hooks-dir", type=Path, default=DEFAULT_HOOKS_DIR
     )
+    parser.add_argument(
+        "--reader-dir", type=Path, action="append", default=None,
+        help=f"extra code dir that may read a documented lever (repeatable; "
+        f"default {DEFAULT_READER_DIR}). Clears doc-lies only; never adds WARNs.",
+    )
     args = parser.parse_args()
 
-    code = enumerate_code_levers(args.scripts_dir, args.hooks_dir)
+    code, read_anywhere = enumerate_code_levers(args.scripts_dir, args.hooks_dir)
     docs = enumerate_doc_levers(args.rollback_doc)
 
     code_names = set(code.keys())
     silent = sorted(code_names - docs)  # in code, not in docs
-    doc_lies = sorted(docs - code_names)  # in docs, not in code
+    reader_dirs = args.reader_dir if args.reader_dir is not None else [DEFAULT_READER_DIR]
+    _, reader_reads = enumerate_code_levers(*reader_dirs, suffixes={".py", ".sh"})
+    doc_lies = sorted(docs - read_anywhere - reader_reads)  # documented, read by nothing
 
     if not silent and not doc_lies:
         debug(f"in sync: {len(code_names)} levers documented + implemented")

@@ -25,23 +25,54 @@
 # this by adding one.
 #
 # Usage:
-#   task-cancel PROJECT TASK_ID SESSION_UUID [--reason "..."] [--dry-run]
+#   task-cancel PROJECT TASK_ID SESSION_UUID [--created-seqno N] [--identity SN:CS] [--epoch E]
+#               [--create-seq N] [--reason "..."] [--dry-run]
 #
 #   PROJECT      Project name (^[a-zA-Z0-9._-]{1,64}$)
 #   TASK_ID      Session-local task id (as recorded on the `created` event)
 #   SESSION_UUID Session UUID that created the task (exact match required —
 #                task_id alone is reused across sessions and is not a
 #                stable identity)
+#   --created-seqno N
+#                Pin ONE exact `created` event by its ledger seqno (unique).
+#                Required whenever (task_id, session_uuid) owns more than one
+#                identity — which happens in migration/fold pseudo-sessions
+#                that merged older sessions' numbering. Canonical identity is
+#                (project, subject_norm, create_seq) and create_seq is assigned
+#                PER subject_norm, so two identities can share task_id AND
+#                create_seq with different subjects; only the seqno is unique.
+#                (free-llm alignment 2026-09-18: one session carried 2-3
+#                identities for 15 ids; the old latest-in-file pick mis-
+#                targeted 2 already-completed records.)
+#   --identity SN:CS
+#                Pin the task by its identity, subject_norm:create_seq (split on
+#                the last ':'), as the AMBIGUOUS listing prints it (S2-T0b-3).
+#   --epoch E    Narrow to the `created` events stamped with TaskList epoch E
+#                (tl_epoch); still refuses if that epoch holds several.
+#   --create-seq N
+#                Optional narrowing filter on create_seq (NOT sufficient on its
+#                own — see above; the script still refuses if ambiguous).
 #   --reason     Cancellation reason (default: "task-cancel script")
 #   --dry-run    Print the event that WOULD be appended; do not write
 #
-# Finds the most recent `created` event for (task_id, session_uuid) in the
-# project's ledger, copies its v/subject_norm/create_seq, and appends a
+# Finds the `created` event for (task_id, session_uuid[, create_seq][, seqno])
+# in the project's ledger, copies its v/subject_norm/create_seq, and appends a
 # cancelled event via v11_ledger_append. If no matching `created` event is
 # found, prints near-miss candidates (same task_id, other sessions) and
-# exits 1.
+# exits 1. If the match is AMBIGUOUS (more than one distinct
+# (subject_norm, create_seq) identity) it REFUSES, lists every candidate with
+# its `--created-seqno`, and exits 2 — it never guesses which record to close.
+# S2-T0b-3 (#113, review #19 C10): a session that resumed reuses task ids, one
+# per TaskList epoch, and the zombies this script exists to close are mostly
+# older epochs' tasks under a reused id. So several identities still refuse,
+# never defaulting to the current epoch's (review #23). The listing gives each
+# candidate's --identity, --created-seqno, TaskList epoch and last status (a
+# completed or cancelled task needs no cancel), the session's current epoch's
+# create first (scripts/lib/task_epoch.py resolve). V11_TASK_RESOLVER=legacy
+# prints the v11.46 listing.
 #
-# Exit codes: 0 success (dry-run print or real append), 1 no match / usage error.
+# Exit codes: 0 success (dry-run print or real append), 1 no match / usage
+# error, 2 ambiguous identity (re-run with --created-seqno N).
 
 set -euo pipefail
 
@@ -62,12 +93,48 @@ fi
 # --- Arg parsing: 3 required positionals + optional flags ---
 REASON="task-cancel script"
 DRY_RUN=false
+CREATE_SEQ_SEL=""
+CREATED_SEQNO_SEL=""
+IDENTITY_SEL=""
+EPOCH_SEL=""
 POSITIONAL=()
 
 while [ $# -gt 0 ]; do
     case "$1" in
         --reason)
             REASON="${2:-}"
+            shift 2
+            ;;
+        --create-seq)
+            CREATE_SEQ_SEL="${2:-}"
+            if ! printf '%s' "$CREATE_SEQ_SEL" | grep -qE '^-?[0-9]+$'; then
+                echo "task-cancel: --create-seq expects an integer, got '${CREATE_SEQ_SEL}'" >&2
+                exit 1
+            fi
+            shift 2
+            ;;
+        --created-seqno)
+            CREATED_SEQNO_SEL="${2:-}"
+            if ! printf '%s' "$CREATED_SEQNO_SEL" | grep -qE '^[0-9]+$'; then
+                echo "task-cancel: --created-seqno expects a non-negative integer, got '${CREATED_SEQNO_SEL}'" >&2
+                exit 1
+            fi
+            shift 2
+            ;;
+        --identity)
+            IDENTITY_SEL="${2:-}"
+            if ! [[ "$IDENTITY_SEL" =~ ^.+:[0-9]+$ ]]; then
+                echo "task-cancel: --identity expects SUBJECT_NORM:CREATE_SEQ, got '${IDENTITY_SEL}'" >&2
+                exit 1
+            fi
+            shift 2
+            ;;
+        --epoch)
+            EPOCH_SEL="${2:-}"
+            if ! [[ "$EPOCH_SEL" =~ ^[1-9][0-9]*$ ]]; then
+                echo "task-cancel: --epoch expects a TaskList epoch (a positive integer), got '${EPOCH_SEL}'" >&2
+                exit 1
+            fi
             shift 2
             ;;
         --dry-run)
@@ -120,10 +187,90 @@ if [ ! -f "$LEDGER_FILE" ]; then
     exit 1
 fi
 
-# --- Find the most recent `created` event for this exact (task_id, session_uuid) ---
-MATCHES=$(jq -c --arg tid "$TASK_ID" --arg sid "$SESSION_UUID" \
-    'select(.ev == "created" and .task_id == $tid and .session_uuid == $sid)' \
+# --- Find the `created` event(s) for this exact (task_id, session_uuid) ---
+# The fold keys records by (project, subject_norm, create_seq); one
+# (task_id, session_uuid) pair can legitimately own several identities when a
+# migration/fold pseudo-session merged older numbering. Narrow by --create-seq
+# when given; otherwise refuse below if more than one distinct create_seq.
+MATCHES=$(jq -c --arg tid "$TASK_ID" --arg sid "$SESSION_UUID" --arg cs "$CREATE_SEQ_SEL" \
+    'select(.ev == "created" and .task_id == $tid and .session_uuid == $sid)
+     | select($cs == "" or ((.create_seq|tostring) == $cs))' \
     "$LEDGER_FILE" 2>/dev/null || true)
+
+if [ -z "$MATCHES" ] && [ -n "$CREATE_SEQ_SEL" ]; then
+    echo "task-cancel: no 'created' event found for task_id='$TASK_ID' session_uuid='$SESSION_UUID' create_seq=$CREATE_SEQ_SEL" >&2
+    OTHER_SEQS=$(jq -c --arg tid "$TASK_ID" --arg sid "$SESSION_UUID" \
+        'select(.ev == "created" and .task_id == $tid and .session_uuid == $sid) | {create_seq, ts, subject: (.subject // .subject_norm)}' \
+        "$LEDGER_FILE" 2>/dev/null || true)
+    if [ -n "$OTHER_SEQS" ]; then
+        echo "Identities that DO exist for this (task_id, session_uuid):" >&2
+        printf '%s\n' "$OTHER_SEQS" | jq -r '"  create_seq=\(.create_seq)  ts=\(.ts)  subject=\"\(.subject)\""' >&2
+    fi
+    exit 1
+fi
+
+# --created-seqno pins ONE exact `created` event by its ledger seqno (unique).
+if [ -n "$MATCHES" ] && [ -n "$CREATED_SEQNO_SEL" ]; then
+    MATCHES=$(printf '%s\n' "$MATCHES" | jq -c --arg sq "$CREATED_SEQNO_SEL" 'select((.seqno|tostring) == $sq)')
+    if [ -z "$MATCHES" ]; then
+        echo "task-cancel: no 'created' event with seqno=$CREATED_SEQNO_SEL for task_id='$TASK_ID' session_uuid='$SESSION_UUID'" >&2
+        exit 1
+    fi
+fi
+
+# --identity / --epoch narrow the same way (S2-T0b-3).
+if [ -n "$MATCHES" ] && { [ -n "$IDENTITY_SEL" ] || [ -n "$EPOCH_SEL" ]; }; then
+    NARROWED=$(printf '%s\n' "$MATCHES" | jq -c --arg sn "${IDENTITY_SEL%:*}" --arg cs "${IDENTITY_SEL##*:}" \
+        --arg id "$IDENTITY_SEL" --arg ep "$EPOCH_SEL" '
+        select($id == "" or ((.subject_norm // "") == $sn and (.create_seq|tostring) == $cs))
+        | select($ep == "" or ((.tl_epoch // "")|tostring) == $ep)')
+    if [ -z "$NARROWED" ]; then
+        echo "task-cancel: no 'created' event for task_id='$TASK_ID' session_uuid='$SESSION_UUID' matches${IDENTITY_SEL:+ --identity '$IDENTITY_SEL'}${EPOCH_SEL:+ --epoch $EPOCH_SEL}. Identities that DO exist:" >&2
+        printf '%s\n' "$MATCHES" | jq -r '"  --identity \u0027\(.subject_norm // ""):\(.create_seq)\u0027  --created-seqno \(.seqno)  epoch=\(.tl_epoch // "-")  ts=\(.ts)  subject=\"\(.subject // .subject_norm)\""' >&2
+        exit 1
+    fi
+    MATCHES="$NARROWED"
+fi
+
+# Canonical identity is (project, subject_norm, create_seq) — and create_seq is
+# assigned PER subject_norm, so two identities can share task_id AND create_seq
+# with different subjects. Ambiguity is therefore judged on distinct
+# (subject_norm, create_seq) pairs, never on create_seq alone.
+if [ -n "$MATCHES" ]; then
+    DISTINCT_IDS=$(printf '%s\n' "$MATCHES" | jq -r '"\(.subject_norm // "")|\(.create_seq)"' | sort -u | wc -l)
+    if [ "$DISTINCT_IDS" -gt 1 ] && [ "${V11_TASK_RESOLVER:-shared}" = "legacy" ]; then
+        echo "task-cancel: AMBIGUOUS — task_id='$TASK_ID' session_uuid='$SESSION_UUID' matches $DISTINCT_IDS distinct identities (subject_norm, create_seq). Refusing to guess; re-run with --created-seqno N:" >&2
+        printf '%s\n' "$MATCHES" | jq -r '"  --created-seqno \(.seqno)   create_seq=\(.create_seq)  ts=\(.ts)  subject=\"\(.subject // .subject_norm)\""' >&2
+        exit 2
+    fi
+    if [ "$DISTINCT_IDS" -gt 1 ]; then
+        # The session's current TaskList epoch binds which create? Listed
+        # first, as a suggestion only: an older epoch's zombie is the usual
+        # target of a cancel (review #23).
+        RESOLVED=$(python3 "$V11_HOME/scripts/lib/task_epoch.py" resolve "--session=$SESSION_UUID" \
+            "--metrics-dir=$METRICS_DIR" --format=json -- "$PROJECT" "$TASK_ID" 2>/dev/null || true)
+        EPOCH_SEQNO=$(printf '%s' "$RESOLVED" | jq -r '
+            select(.status == "bound" and .basis == "current_epoch" and .claim.ev == "created"
+                   and .claim.session_uuid == $sid) | .claim.seqno // empty' --arg sid "$SESSION_UUID" 2>/dev/null || true)
+        IDS_JSON=$(printf '%s\n' "$MATCHES" | jq -sc '[.[] | [(.subject_norm // ""), .create_seq]] | unique')
+        # Each identity's last status event (created, in_progress, blocked,
+        # completed, cancelled), in ledger order.
+        STATUS_MAP=$(jq -cn --argjson want "$IDS_JSON" '
+            reduce (inputs | select(.ev as $e | ["created","in_progress","blocked","completed","cancelled"]
+                                    | index([$e]) != null)
+                    | select([(.subject_norm // ""), .create_seq] as $k | $want | index([$k]) != null)) as $r
+                ({}; .["\($r.subject_norm // "")|\($r.create_seq)"] = $r.ev)' "$LEDGER_FILE" 2>/dev/null || true)
+        [ -n "$STATUS_MAP" ] || STATUS_MAP='{}'
+        echo "task-cancel: AMBIGUOUS — task_id='$TASK_ID' session_uuid='$SESSION_UUID' matches $DISTINCT_IDS distinct identities (subject_norm, create_seq). Refusing to guess; re-run with --identity SN:CS (or --created-seqno N, or --epoch E):" >&2
+        printf '%s\n' "$MATCHES" | jq -rs --arg cur "$EPOCH_SEQNO" --argjson st "$STATUS_MAP" '
+            (map(select((.seqno|tostring) == $cur)) + map(select((.seqno|tostring) != $cur)))[]
+            | "  --identity \u0027\(.subject_norm // ""):\(.create_seq)\u0027  --created-seqno \(.seqno)"
+              + "  epoch=\(.tl_epoch // "-")\(if (.seqno|tostring) == $cur then " (current)" else "" end)"
+              + "  status=\($st["\(.subject_norm // "")|\(.create_seq)"] // "?")"
+              + "  ts=\(.ts)  subject=\"\(.subject // .subject_norm)\""' >&2
+        exit 2
+    fi
+fi
 
 if [ -z "$MATCHES" ]; then
     echo "task-cancel: no 'created' event found in $LEDGER_FILE for task_id='$TASK_ID' session_uuid='$SESSION_UUID'" >&2

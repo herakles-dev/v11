@@ -252,6 +252,21 @@ if [ "${V11_DISPATCH_TRACE:-on}" != "off" ] \
             # sprint is required by the schema — fall back to "unknown" if absent
             # so the trace line still writes (orchestrator-spawned ad-hoc agents).
             [ -z "$_DT_SPRINT" ] && _DT_SPRINT="unknown"
+            # S2-T0b-2 (#113): name the spawning session and its TaskList
+            # epoch (the record, read with builtins), since a task id is only
+            # unique within one; a task carried into the current epoch keeps
+            # the one it was created in (review #26). V11_TASKLIST_EPOCH=off
+            # leaves both out. _V11_TL_EPOCH is restored after the read, so no
+            # event this hook appends later is stamped (v11_ledger_append).
+            _DT_EPOCH_ARGS=()
+            _DT_TLE_SAVED="${_V11_TL_EPOCH:-}"
+            v11_tl_epoch_read "${V11_SESSION_ID:-}" "$_DT_TID"
+            _DT_TLE="$_V11_TL_EPOCH"
+            _V11_TL_EPOCH="$_DT_TLE_SAVED"
+            if [ "$_V11_TLR_STATE" != "off" ]; then
+                _DT_EPOCH_ARGS=(--session-uuid "$V11_SESSION_ID")
+                [ -n "$_DT_TLE" ] && _DT_EPOCH_ARGS+=(--tl-epoch "$_DT_TLE")
+            fi
             "$V11_HOME/scripts/dispatch-trace-append" \
                 --task-id "$_DT_TID" \
                 --project "$V11_PROJECT" \
@@ -265,6 +280,7 @@ if [ "${V11_DISPATCH_TRACE:-on}" != "off" ] \
                 ${V11_TOKENS:+--tokens "$V11_TOKENS"} \
                 ${V11_TOOL_USES:+--tool-uses "$V11_TOOL_USES"} \
                 ${V11_DURATION_MS:+--duration-ms "$V11_DURATION_MS"} \
+                "${_DT_EPOCH_ARGS[@]}" \
                 --event completion 2>/dev/null || true
         fi
     fi

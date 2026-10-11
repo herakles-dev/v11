@@ -320,7 +320,7 @@ if missing_dependency:
 ```python
 TaskCreate(
     subject="BREAKING: Docker network configuration changed",
-    description="All services now use project-internal network in addition to hercules-network. Update your service configs.\n\nAffected: implementers, integrator, tester",
+    description="All services now use project-internal network in addition to app-network. Update your service configs.\n\nAffected: implementers, integrator, tester",
     metadata={
         "broadcast": True,
         "affected_agents": ["implementer", "integrator", "tester"]

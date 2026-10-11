@@ -197,14 +197,39 @@ fi
 # If a non-empty handoff-tasks.json exists, surface it as one line. Don't dump
 # the full <v11-resume> block — that would auto-recreate tasks already loaded.
 # Opt-out: V11_COMPACT_HANDOFF_LINE=off.
+# S1-T3 (#75c): not for the session that wrote the file. Compaction happens
+# mid-session; when handoff-tasks.json's live_session_uuid (S1-T1) is THIS
+# session, its open tasks are this session's own TaskList, and "Run /v11 to
+# rehydrate" would duplicate them. The session id comes from the hook's stdin
+# JSON (.session_id), else V11_SESSION_ID. No id or no stamp → the line prints
+# as before (fail toward nudging). S2-T0b-4: and only in the sitting that wrote
+# the file, with no TaskList epoch opened since (v11_handoff_self_sitting;
+# compaction never changes the sitting, a #26 wipe opens an epoch).
+# Rollback: V11_HANDOFF_SELF_NUDGE_SUPPRESS=off (never suppress), =session (S1).
 if [ "${V11_COMPACT_HANDOFF_LINE:-}" != "off" ]; then
     HO_TASKS_FILE="$PROJECT_DIR/handoff-tasks.json"
-    if [ -f "$HO_TASKS_FILE" ] && [ -s "$HO_TASKS_FILE" ]; then
+    HO_SELF=0
+    if [ "${V11_HANDOFF_SELF_NUDGE_SUPPRESS:-on}" != "off" ] && [ -f "$HO_TASKS_FILE" ]; then
+        HO_SID=""
+        if [ ! -t 0 ]; then
+            HO_SID=$(timeout 2 cat 2>/dev/null | jq -r '.session_id // "" | tostring' 2>/dev/null || echo "")
+        fi
+        [ -n "$HO_SID" ] || HO_SID="${V11_SESSION_ID:-}"
+        HO_LIVE_SID="" HO_SITTING="" HO_TLE=""
+        IFS='|' read -r HO_LIVE_SID HO_SITTING HO_TLE < <(jq -r \
+            '[.live_session_uuid, .live_sitting, .live_tl_epoch] | map(. // "" | tostring) | join("|")' \
+            "$HO_TASKS_FILE" 2>/dev/null) || true
+        if [ -n "$HO_SID" ] && [ -n "$HO_LIVE_SID" ] && [ "$HO_SID" = "$HO_LIVE_SID" ] \
+           && v11_handoff_self_sitting "$HO_SID" "$HO_SITTING" "$HO_TLE"; then
+            HO_SELF=1
+        fi
+    fi
+    if [ "$HO_SELF" -eq 0 ] && [ -f "$HO_TASKS_FILE" ] && [ -s "$HO_TASKS_FILE" ]; then
         HO_OPEN_COUNT=$(jq -r '(.open_tasks // []) | length' "$HO_TASKS_FILE" 2>/dev/null || echo 0)
         [[ "$HO_OPEN_COUNT" =~ ^[0-9]+$ ]] || HO_OPEN_COUNT=0
         if [ "$HO_OPEN_COUNT" -gt 0 ]; then
             echo ""
-            echo "Handoff waiting: $HO_OPEN_COUNT open task(s). Run /v11 to rehydrate."
+            echo "Handoff waiting: $HO_OPEN_COUNT open task(s). Run /v11 to rehydrate — if TaskList already lists them, ignore this."
         fi
     fi
 fi

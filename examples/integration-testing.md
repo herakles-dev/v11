@@ -19,8 +19,8 @@ jq '.allocations' ~/config/port-registry.json
 # Check active containers
 docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
 
-# Check hercules-network
-docker network inspect hercules-network | jq '.[].Containers | keys'
+# Check app-network
+docker network inspect app-network | jq '.[].Containers | keys'
 ```
 
 ---
@@ -35,11 +35,11 @@ docker network inspect hercules-network | jq '.[].Containers | keys'
 ### Services Involved
 | Service | Role | Port | Network |
 |---------|------|------|---------|
-| api-gateway | Entry point, routing | 8090 | hercules-network |
-| auth-service | Authentication | 8091 | hercules-network |
-| user-service | User management | 8092 | hercules-network |
-| postgres | Shared database | internal | hercules-network |
-| redis | Session storage | internal | hercules-network |
+| api-gateway | Entry point, routing | 8090 | app-network |
+| auth-service | Authentication | 8091 | app-network |
+| user-service | User management | 8092 | app-network |
+| postgres | Shared database | internal | app-network |
+| redis | Session storage | internal | app-network |
 
 ### Integration Points
 1. api-gateway -> auth-service (JWT validation)
@@ -88,7 +88,7 @@ services:
       timeout: 5s
       retries: 5
     networks:
-      - hercules-network
+      - app-network
 
   redis:
     image: redis:7-alpine
@@ -99,7 +99,7 @@ services:
       timeout: 5s
       retries: 5
     networks:
-      - hercules-network
+      - app-network
 
   # Layer 2: Core service (auth)
   auth-service:
@@ -124,7 +124,7 @@ services:
       retries: 3
       start_period: 10s
     networks:
-      - hercules-network
+      - app-network
 
   # Layer 3: Business service (depends on auth)
   user-service:
@@ -151,7 +151,7 @@ services:
       retries: 3
       start_period: 10s
     networks:
-      - hercules-network
+      - app-network
 
   # Layer 4: Gateway (depends on all)
   api-gateway:
@@ -175,10 +175,10 @@ services:
       retries: 3
       start_period: 10s
     networks:
-      - hercules-network
+      - app-network
 
 networks:
-  hercules-network:
+  app-network:
     external: true
 
 volumes:
@@ -345,7 +345,7 @@ curl -sf http://localhost:8092/health/ready | jq .
 ### Health Checks
 - All services: healthy ✓
 - Dependencies: connected ✓
-- Network: hercules-network ✓
+- Network: app-network ✓
 
 ### Files Created
 - docker-compose.yml (120 lines)
@@ -374,7 +374,7 @@ HANDOFF: spec-tester-v10 for L3 integration tests
 
   "integration": {
     "services_configured": 5,
-    "networks": ["hercules-network"],
+    "networks": ["app-network"],
     "ports_allocated": [8090, 8091, 8092],
     "health_checks": "all_passing"
   },
@@ -412,7 +412,7 @@ HANDOFF: spec-tester-v10 for L3 integration tests
 
 ```bash
 # Check network membership
-docker network inspect hercules-network | jq '.[].Containers'
+docker network inspect app-network | jq '.[].Containers'
 
 # Test DNS resolution
 docker exec api-gateway nslookup auth-service

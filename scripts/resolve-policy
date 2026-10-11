@@ -123,7 +123,7 @@ v11_resolve_tool_policy "$TOOL_NAME" "$REGISTRY_PATH" > "$POLICY_OUT" 2>/dev/nul
 EXIT_CODE=${PIPESTATUS[0]:-$?}
 
 # Re-check: if V11_POLICY_REASON indicates denial, exit code is 1
-if [ -n "$V11_POLICY_REASON" ] && echo "$V11_POLICY_REASON" | grep -qE "denied|not in profile"; then
+if [ -n "$V11_POLICY_REASON" ] && grep -qE "denied|not in profile" <<<"$V11_POLICY_REASON"; then
     RESULT_MSG=$(cat "$POLICY_OUT")
     echo "  RESULT: ✗ DENIED"
     echo "  Reason: ${RESULT_MSG:-$V11_POLICY_REASON}"

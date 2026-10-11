@@ -142,8 +142,8 @@ For every technology, assumption, and unknown in VISION.md:
    ```bash
    curl -s -X POST "http://localhost:8140/api/libraries" \
      -H "Content-Type: application/json" \
-     -H "Remote-User: hercules@herakles.dev" \
-     -d '{"name": "Project Research", "slug": "project-slug", "description": "...", "owner": "hercules", "visibility": "public"}'
+     -H "Remote-User: you@example.com" \
+     -d '{"name": "Project Research", "slug": "project-slug", "description": "...", "owner": "you", "visibility": "public"}'
    ```
 
 2. **Write research documents** — one per topic
@@ -154,7 +154,7 @@ For every technology, assumption, and unknown in VISION.md:
    ```bash
    for f in research/*.md; do
      curl -s -X POST "http://localhost:8140/api/libraries/ID/upload" \
-       -H "Remote-User: hercules@herakles.dev" -F "file=@$f"
+       -H "Remote-User: you@example.com" -F "file=@$f"
    done
    ```
 

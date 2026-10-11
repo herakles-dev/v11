@@ -148,15 +148,21 @@ def brief_key(subject_norm, create_seq):
     return hashlib.sha256(f"{project}|{subject_norm}|{create_seq}|brief".encode()).hexdigest()
 
 briefs = []
+skipped_reconstructed = 0
 for row in read_jsonl(ledger):
     if row.get("ev") != "created":
-        continue
-    if row.get("source") == "migration":   # pre-V11 imports — not the current orchestrator's authoring
         continue
     if since_dt is not None:
         ts = parse_ts(row.get("ts"))
         if ts is not None and ts < since_dt:
             continue
+    # migration: pre-V11 imports, not the current orchestrator's authoring.
+    # backfill-* (#99): end-state metadata, not the brief as written.
+    # Findings an earlier --apply wrote for such rows stay in agent-errors.jsonl.
+    _src = str(row.get("source") or "")
+    if _src == "migration" or _src.startswith("backfill-"):
+        skipped_reconstructed += 1
+        continue
     subject   = row.get("subject") or ""
     subj_norm = row.get("subject_norm") or ""
     create_seq = row.get("create_seq")
@@ -212,14 +218,21 @@ try:
     ov = json.loads(env("V11_GB_OVERRIDE_JSON") or "{}")
 except Exception:
     ov = {}
-orch_row = next((r for r in ov.get("agents", []) if r.get("recommended_agent") == "orchestrator"), None)
-override_rate = (orch_row or {}).get("rate_pct", ov.get("overall", {}).get("rate_pct"))
+# S1-T11 (#56): the orchestrator routes every spawn, so its override rate is the
+# project's diverged share of DECIDED routing rows (agent-scorecard --routing
+# overall.decided_rate_pct), shown with the coverage it rests on. It is no longer
+# the rate_pct of the "orchestrator" recommendation row, which is ~0 by
+# construction (orchestrator-recommended tasks land in companion/self_executed).
+_ov_all = ov.get("overall", {})
+override_rate = _ov_all.get("decided_rate_pct")
+override_coverage = _ov_all.get("coverage_pct")
 
 summary = {
-    "project": project, "since": since_raw, "briefs_graded": n,
+    "project": project, "since": since_raw, "briefs_graded": n, "skipped_reconstructed": skipped_reconstructed,
     "pct_scoped": pct("scoped"), "pct_right_agent": pct("right_agent"),
     "briefing_defect": len(defects), "briefing_risk": len(risks),
     "orchestrator_override_rate_pct": override_rate,
+    "override_rate_coverage_pct": override_coverage,
     "advisory_only": True,
 }
 
@@ -274,8 +287,10 @@ if as_json:
 print(f"v11.44 Brief Quality — {project}   (ADVISORY ONLY — orchestrator authoring signal)")
 if since_raw: print(f"  since={since_raw}")
 print("=" * 88)
-print(f"  briefs graded: {n}   scoped: {summary['pct_scoped']}%   right-agent: {summary['pct_right_agent']}%")
-print(f"  briefing_defect: {len(defects)}   briefing_risk: {len(risks)}   override-rate: {override_rate}")
+print(f"  briefs graded: {n}   scoped: {summary['pct_scoped']}%   right-agent: {summary['pct_right_agent']}%"
+      f"   skipped (migration/backfill): {skipped_reconstructed}")
+_ovr = "n/a" if override_rate is None else f"{override_rate}% of decided routing rows (coverage {override_coverage}%)"
+print(f"  briefing_defect: {len(defects)}   briefing_risk: {len(risks)}   override-rate: {_ovr}")
 print("  " + "-" * 84)
 for b in sorted(briefs, key=lambda x: {"briefing_defect":0,"briefing_risk":1,"ok":2}[x["verdict"]]):
     if b["verdict"] == "ok":

@@ -9,7 +9,7 @@
 **Service Discovery**:
 ```json
 {
-  "tool": "hercules_port_registry_query",
+  "tool": "platform_port_registry_query",
   "args": {
     "query_type": "by_service",
     "value": "ice-rights-api"
@@ -20,7 +20,7 @@
 **Check Observability Health**:
 ```json
 {
-  "tool": "hercules_observability_status",
+  "tool": "platform_observability_status",
   "args": {
     "component": "all",
     "include_coverage": true
@@ -31,7 +31,7 @@
 **Query Recent Errors**:
 ```json
 {
-  "tool": "hercules_query_logs",
+  "tool": "platform_query_logs",
   "args": {
     "service": "ice-rights-api",
     "level": "error",
@@ -44,7 +44,7 @@
 **Safe Deployment with Dry Run**:
 ```json
 {
-  "tool": "hercules_deployment_trigger",
+  "tool": "platform_deployment_trigger",
   "args": {
     "operation": "restart",
     "service": "moody-time-machine",
@@ -96,12 +96,12 @@ MCP server configured in `/path/to/operator-home/.config/.mcp.json`:
 ```json
 {
   "mcpServers": {
-    "hercules-platform": {
+    "platform-mcp": {
       "command": "node",
-      "args": ["/path/to/operator-home/.mcp-servers/hercules-platform/dist/index.js"]
+      "args": ["/path/to/operator-home/.mcp-servers/platform-mcp/dist/index.js"]
     }
   }
 }
 ```
 
-**Source**: `/path/to/operator-home/.mcp-servers/hercules-platform/`
+**Source**: `/path/to/operator-home/.mcp-servers/platform-mcp/`

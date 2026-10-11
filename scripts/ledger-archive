@@ -136,7 +136,8 @@ if [ -n "$SPRINT" ] && [ -n "$BEFORE_DATE" ]; then
     exit 1
 fi
 
-if [ -n "$BEFORE_DATE" ] && ! printf '%s' "$BEFORE_DATE" | grep -qE '^[0-9]{4}-[0-9]{2}-[0-9]{2}'; then
+# Whole-value match: BEFORE_DATE lands in the archive file name.
+if [ -n "$BEFORE_DATE" ] && ! [[ $BEFORE_DATE =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
     echo "ledger-archive: --before DATE must be YYYY-MM-DD" >&2
     exit 1
 fi
@@ -598,6 +599,20 @@ PYEOF
         rm -f "$_TMP_LEDGER" 2>/dev/null
         exit 1
     fi
+
+    # S2-T5 (v11-leverage-program) staleness fix: this rewrite bypasses
+    # hooks/lib/common.sh v11_ledger_append, the only writer that keeps the
+    # per-identity status map (<project>.seq `status`/`status_version`) used
+    # by TaskCreate continuation decisions in sync with the ledger. Delete
+    # the staleness marker (<project>.status-sync) so the next
+    # continuation-needing v11_ledger_append call rebuilds the map from the
+    # ledger instead of trusting one that may now be stale — belt-and-
+    # suspenders alongside v11_ledger_append's own general guard (any write
+    # to the ledger moves its mtime past an unrefreshed marker). Archived
+    # rows are always already-terminal (the archivability rule above), so
+    # their status-map entries were correct before this rewrite too; this
+    # is precautionary, not a known-wrong-state fix.
+    rm -f "${LEDGER_DIR}/${PROJECT}.status-sync" 2>/dev/null || true
 
     # --- Direct summary append, SAME locked step as the mv above -----------
     # No v11_ledger_append call here (self-deadlock risk); bump the shared

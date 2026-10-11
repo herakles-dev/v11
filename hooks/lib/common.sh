@@ -22,16 +22,43 @@ ACTIVE_PROJECT_FILE="$METRICS_DIR/active-project"
 # P4 (2026-05-14): two-tier read for session-scoped isolation.
 #   Tier 1: $METRICS_DIR/sessions/$V11_SESSION_ID/active-project (preferred when session_id present)
 #   Tier 2: $ACTIVE_PROJECT_FILE (legacy global, CLI scripts and fallback)
+# One project-name rule (improvements/59): a leading letter or digit, then
+# letters/digits/._- , 64 chars max. Rejects "." and ".." (which collapse
+# $SESSIONS_ROOT/$PROJECT onto the sessions root), dot-dirs (.gemini, .forge)
+# and shell debris captured from raw command text (example-project;  $P;  *).
+# The EREs live in variables: an inline ERE in [[ =~ ]] in this file once
+# bricked every hook (v11.35.3). Rollback: V11_PROJECT_SLUG_GUARD=off.
+V11_PROJECT_SLUG_ERE='^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$'
+V11_PROJECT_SLUG_ERE_LEGACY='^[a-zA-Z0-9._-]{1,64}$'
+v11_valid_project_slug() {
+    if [ "${V11_PROJECT_SLUG_GUARD:-on}" = "off" ]; then
+        [[ "$1" =~ $V11_PROJECT_SLUG_ERE_LEGACY ]]
+    else
+        [[ "$1" =~ $V11_PROJECT_SLUG_ERE ]]
+    fi
+}
+
+# One session-id rule (S2-R5): a leading letter or digit, then letters/digits/
+# ._- , 64 chars max, so $METRICS_DIR/sessions/<id> is always a child of
+# sessions/. The old '^[a-zA-Z0-9._-]{1,64}$' let "." and ".." through
+# (sessions/.. is the metrics dir itself, which SessionEnd's scratch retirement
+# would delete under V11_SESSION_GC_MODE=remove) and dot-names (.gc-quarantine).
+# Builtins only. v11_parse_input drops an id that fails it (V11_SESSION_ID=""),
+# so an invalid id reads as no id downstream. No lever: revert the commit.
+V11_SESSION_ID_ERE='^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$'
+v11_valid_session_id() {
+    [[ "$1" =~ $V11_SESSION_ID_ERE ]]
+}
+
 v11_read_active_project() {
     local raw candidate
 
     # Tier 1: session-scoped (only if V11_SESSION_ID available and well-formed)
-    if [ -n "${V11_SESSION_ID:-}" ] \
-       && printf '%s' "$V11_SESSION_ID" | grep -qE '^[a-zA-Z0-9._-]{1,64}$'; then
+    if v11_valid_session_id "${V11_SESSION_ID:-}"; then
         candidate="$METRICS_DIR/sessions/$V11_SESSION_ID/active-project"
         if [ -f "$candidate" ] && [ -s "$candidate" ]; then
             raw=$(head -n 1 "$candidate" 2>/dev/null | tr -d '[:space:]')
-            if printf '%s' "$raw" | grep -qE '^[a-zA-Z0-9._-]{1,64}$'; then
+            if v11_valid_project_slug "$raw"; then
                 printf '%s' "$raw"
                 return 0
             fi
@@ -47,7 +74,7 @@ v11_read_active_project() {
     [ -f "$ACTIVE_PROJECT_FILE" ] || return 0
     [ -s "$ACTIVE_PROJECT_FILE" ] || return 0
     raw=$(head -n 1 "$ACTIVE_PROJECT_FILE" 2>/dev/null | tr -d '[:space:]')
-    if ! printf '%s' "$raw" | grep -qE '^[a-zA-Z0-9._-]{1,64}$'; then
+    if ! v11_valid_project_slug "$raw"; then
         echo "v11_read_active_project: rejected invalid content in $ACTIVE_PROJECT_FILE" >&2
         return 0
     fi
@@ -84,11 +111,11 @@ v11_write_active_project() {
     # Format: line 1 = project name, line 2 = owning session UUID (or empty)
     mkdir -p "$(dirname "$ACTIVE_PROJECT_FILE")"
     local owner="${V11_SESSION_ID:-}"
+    v11_valid_session_id "$owner" || owner=""
     printf '%s\n%s\n' "$project" "$owner" > "$ACTIVE_PROJECT_FILE"
 
     # Additionally update session-scoped file when V11_SESSION_ID is well-formed
-    if [ -n "$owner" ] \
-       && printf '%s' "$owner" | grep -qE '^[a-zA-Z0-9._-]{1,64}$'; then
+    if [ -n "$owner" ]; then
         local scoped_dir="$METRICS_DIR/sessions/$owner"
         mkdir -p "$scoped_dir" 2>/dev/null
         printf '%s\n' "$project" > "$scoped_dir/active-project"
@@ -127,7 +154,7 @@ v11_session_uuid() {
     if [ -z "$sid" ]; then
         sid="${CLAUDE_CODE_SESSION_ID:-}"
     fi
-    if [ -n "$sid" ] && printf '%s' "$sid" | grep -qE '^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$'; then
+    if v11_valid_session_id "$sid"; then
         printf '%s' "$sid"
     else
         printf '%s' "legacy-cli"
@@ -205,12 +232,20 @@ v11_rebuild_project_aggregate() {
     # what a consumer saw a moment ago — independent of whichever source
     # (legacy fold or a prior ledger cutover) produced it. Never regress a
     # visible count, full stop.
-    local _prior_total=0 _prior_completed=0
-    if [ -s "$aggregate_file" ] && jq empty "$aggregate_file" 2>/dev/null; then
-        _prior_total=$(jq -r '.total // 0' "$aggregate_file" 2>/dev/null || echo 0)
-        _prior_completed=$(jq -r '.completed // 0' "$aggregate_file" 2>/dev/null || echo 0)
+    # _prior_alias_count / _prior_ageout_count: a prior cutover's aggregate is
+    # the folded replay, so its total already nets out the aliases and age-out
+    # cancellations it reports (review #15, S2-R4).
+    # One jq for all four (review #20): this runs on every Task* call. Invalid
+    # JSON prints nothing, so all four stay 0; a non-number field reads as 0.
+    local _prior_total=0 _prior_completed=0 _prior_alias_count=0 _prior_ageout_count=0
+    if [ -s "$aggregate_file" ]; then
+        IFS=$'\t' read -r _prior_total _prior_completed _prior_alias_count _prior_ageout_count \
+            < <(jq -r '[.total, .completed, .alias_count, .ageout_count] | map(numbers // 0) | @tsv' \
+                    "$aggregate_file" 2>/dev/null) || true
         case "$_prior_total" in ''|*[!0-9]*) _prior_total=0 ;; esac
         case "$_prior_completed" in ''|*[!0-9]*) _prior_completed=0 ;; esac
+        case "$_prior_alias_count" in ''|*[!0-9]*) _prior_alias_count=0 ;; esac
+        case "$_prior_ageout_count" in ''|*[!0-9]*) _prior_ageout_count=0 ;; esac
     fi
 
     # Collect matching session files
@@ -603,6 +638,12 @@ v11_rebuild_project_aggregate() {
                     end
                 ),
                 last_updated:    (map(.last_updated // $now) | max),
+                # #87: fold the per-session progress clock the same way as
+                # last_updated (max across contributing sessions). A session
+                # scratch written before #87 has no last_progress_at, so it
+                # falls back to that session own last_updated field instead of
+                # dragging the aggregate max down to null.
+                last_progress_at: (map(.last_progress_at // .last_updated // $now) | max),
                 aggregate_built_at: $now
             }
             | .findings_summary = (
@@ -811,31 +852,82 @@ v11_rebuild_project_aggregate() {
             # regression. Prior events without this reason (pre-Wave-2 manual
             # cancellations) are NOT counted, so this never retroactively
             # bypasses the guard for other correction paths.
-            local _ageout_count=0
-            if [ "${V11_AGEOUT_GUARD_CARVEOUT:-on}" != "off" ] && [ -f "$_ledger_file" ]; then
-                # grep -c prints the count to stdout even on 0 matches (exit 1);
-                # do NOT chain || echo 0 (would concatenate two zeros → "00").
-                _ageout_count=$(grep -c '"reason":"review_sibling_ageout"' "$_ledger_file" 2>/dev/null || true)
-                _ageout_count="${_ageout_count//[^0-9]/}"
-                [ -z "$_ageout_count" ] && _ageout_count=0
+            # S2-R4: the count is the replay's .ageout_count (parsed events, so
+            # a non-compact `"reason": "..."` line counts too; a grep missed
+            # it). Against the PRIOR, add back only age-outs the prior did not
+            # already reflect (max(0, ageout_count - prior ageout_count)): the
+            # whole-ledger count re-added on every rebuild let a real loss of
+            # up to that many tasks pass the guard once an aggregate carried
+            # them (review #15's alias pattern). The legacy session-fold never
+            # sees a ledger-only cancellation, so the ledger-vs-legacy check
+            # below still adds the full ageout_count.
+            local _ageout_count=0 _ageout_carveout=0
+            if [ "${V11_AGEOUT_GUARD_CARVEOUT:-on}" != "off" ]; then
+                _ageout_count=$(printf '%s' "$_replay" | jq -r '.ageout_count // 0' 2>/dev/null || echo 0)
+                case "$_ageout_count" in ''|*[!0-9]*) _ageout_count=0 ;; esac
+                _ageout_carveout=$((_ageout_count - _prior_ageout_count))
+                [ "$_ageout_carveout" -lt 0 ] && _ageout_carveout=0
             fi
-            local _rt_adj="$_rt"
+            # review #3 (S1-T2c): rehydrate-alias carve-out. v11_replay_ledger
+            # folds each rehydrate alias into its original identity, so total
+            # drops by one against a prior that counted both identities (live:
+            # v11-leverage-program prior 178 vs ledger 177, blocked). The
+            # replay reports how many it folded (.alias_count); add it back,
+            # like the age-out carve-out. V11_REPLAY_REHYDRATE_ALIAS=off folds
+            # none, so this is 0.
+            # review #15: against the PRIOR, add back only aliases the prior did
+            # not already fold (max(0, alias_count - prior alias_count)); an
+            # unconditional add-back let a real loss of up to alias_count tasks
+            # pass the guard on every rebuild after the first cutover. The
+            # legacy session-fold always counts both identities, so the
+            # ledger-vs-legacy check below still adds the full alias_count.
+            local _alias_count _alias_carveout
+            _alias_count=$(printf '%s' "$_replay" | jq -r '.alias_count // 0' 2>/dev/null || echo 0)
+            case "$_alias_count" in ''|*[!0-9]*) _alias_count=0 ;; esac
+            _alias_carveout=$((_alias_count - _prior_alias_count))
+            [ "$_alias_carveout" -lt 0 ] && _alias_carveout=0
+            # cancelled events don't affect .completed; _rc_adj unchanged.
             local _rc_adj="$_rc"
-            if [ "$_ageout_count" -gt 0 ] 2>/dev/null; then
-                _rt_adj=$((_rt + _ageout_count))
-                # cancelled events don't affect .completed; _rc_adj unchanged.
-            fi
+            local _rt_adj_legacy=$((_rt + _ageout_count + _alias_count))
+            local _rt_adj=$((_rt + _ageout_carveout + _alias_carveout))
             if [ "$_accept_correction" != "1" ] && { [ "$_rt_adj" -lt "$_prior_total" ] 2>/dev/null || [ "$_rc_adj" -lt "$_prior_completed" ] 2>/dev/null; }; then
-                echo "v11_rebuild_project_aggregate: REGRESSION-GUARD for '$project' — ledger replay (total=$_rt completed=$_rc; +ageout_carveout=$_ageout_count → adjusted total=$_rt_adj) would regress below the currently-displayed aggregate (total=$_prior_total completed=$_prior_completed); cutover skipped, prior aggregate preserved." >&2
-                printf '{"ts":"%s","project":"%s","decision":"regression-guard-blocked","prior_total":%s,"prior_completed":%s,"ledger_total":%s,"ledger_completed":%s,"ageout_carveout":%s}\n' \
-                    "$now" "$project" "$_prior_total" "$_prior_completed" "$_rt" "$_rc" "$_ageout_count" >> "$_cutover_log" 2>/dev/null || true
-            elif [ "$_accept_correction" = "1" ] || { [ "$_rt_adj" -ge "$_lt" ] 2>/dev/null && [ "$_rc_adj" -ge "$_lc" ] 2>/dev/null; }; then
+                echo "v11_rebuild_project_aggregate: REGRESSION-GUARD for '$project' — ledger replay (total=$_rt completed=$_rc; +ageout_carveout=$_ageout_carveout +alias_carveout=$_alias_carveout → adjusted total=$_rt_adj) would regress below the currently-displayed aggregate (total=$_prior_total completed=$_prior_completed); cutover skipped, prior aggregate preserved." >&2
+                printf '{"ts":"%s","project":"%s","decision":"regression-guard-blocked","prior_total":%s,"prior_completed":%s,"ledger_total":%s,"ledger_completed":%s,"ageout_carveout":%s,"alias_carveout":%s}\n' \
+                    "$now" "$project" "$_prior_total" "$_prior_completed" "$_rt" "$_rc" "$_ageout_carveout" "$_alias_carveout" >> "$_cutover_log" 2>/dev/null || true
+            elif [ "$_accept_correction" = "1" ] || { [ "$_rt_adj_legacy" -ge "$_lt" ] 2>/dev/null && [ "$_rc_adj" -ge "$_lc" ] 2>/dev/null; }; then
                 # CUTOVER: ledger is equal-or-superset of legacy on total AND
                 # completed — replay is authoritative and never regresses.
+                # #87: v11_replay_ledger itself never computes last_progress_at
+                # (left out of its ADR-governed determinism contract on purpose,
+                # see WALLCLOCK above). Without this, a cutover project would
+                # silently lose the progress clock to the // last_updated
+                # fallback on every rebuild, since cutover overwrites the
+                # legacy-fold aggregate (which DOES carry it) with $_replay
+                # (which does not). Derive it here, max ts across every
+                # status-changing ledger event (created/in_progress/completed/
+                # blocked/cancelled), and merge it in. --rawfile + a per-line
+                # try/catch reads $_ledger_file inside the SAME jq process that
+                # already writes $_ctmp below (0 new forks: M2 gate, tests/
+                # test_sync_tasks_fork_budget.py) and skips a malformed line
+                # instead of aborting the whole parse, matching v11_replay_
+                # ledger own per-line tolerance (a plain --slurpfile does not:
+                # one bad line would fail the entire jq call). Never fails the
+                # cutover: no matching event leaves $lpa null and the merge is
+                # skipped.
                 (
                     flock -w 5 202 || { echo "v11_rebuild_project_aggregate: cutover flock timeout for $project" >&2; exit 1; }
                     local _ctmp="$aggregate_file.tmp.$$"
-                    printf '%s' "$_replay" | jq '.' > "$_ctmp" 2>/dev/null
+                    printf '%s' "$_replay" | jq --rawfile ledger_raw "$_ledger_file" '
+                        (
+                            [$ledger_raw | split("\n")[] | select(. != "")
+                                | (try fromjson catch null) | select(. != null)
+                                | select((.ev // "") as $e
+                                    | ["created","in_progress","completed","blocked","cancelled"] | index($e))
+                                | (.ts // empty)]
+                            | if length == 0 then null else max end
+                        ) as $lpa
+                        | if $lpa != null then .last_progress_at = $lpa else . end
+                    ' > "$_ctmp" 2>/dev/null
                     if [ -s "$_ctmp" ] && jq empty "$_ctmp" 2>/dev/null; then
                         mv "$_ctmp" "$aggregate_file"
                     else
@@ -853,9 +945,9 @@ v11_rebuild_project_aggregate() {
                     fi
                     local _cutover_reason="guard-pass"
                     [ "$_accept_correction" = "1" ] && _cutover_reason="correction-authorized"
-                    [ "$_ageout_count" -gt 0 ] 2>/dev/null && [ "$_cutover_reason" = "guard-pass" ] && _cutover_reason="ageout-carveout-material"
-                    printf '{"ts":"%s","project":"%s","decision":"cutover","reason":"%s","prior_total":%s,"prior_completed":%s,"legacy_total":%s,"legacy_completed":%s,"ledger_total":%s,"ledger_completed":%s,"ageout_carveout":%s}\n' \
-                        "$now" "$project" "$_cutover_reason" "$_prior_total" "$_prior_completed" "$_lt" "$_lc" "$_rt" "$_rc" "$_ageout_count" >> "$_cutover_log" 2>/dev/null || true
+                    [ "$_ageout_carveout" -gt 0 ] 2>/dev/null && [ "$_cutover_reason" = "guard-pass" ] && _cutover_reason="ageout-carveout-material"
+                    printf '{"ts":"%s","project":"%s","decision":"cutover","reason":"%s","prior_total":%s,"prior_completed":%s,"legacy_total":%s,"legacy_completed":%s,"ledger_total":%s,"ledger_completed":%s,"ageout_carveout":%s,"alias_carveout":%s}\n' \
+                        "$now" "$project" "$_cutover_reason" "$_prior_total" "$_prior_completed" "$_lt" "$_lc" "$_rt" "$_rc" "$_ageout_carveout" "$_alias_carveout" >> "$_cutover_log" 2>/dev/null || true
                 }
             else
                 # LEDGER BEHIND LEGACY -> keep legacy (NEVER regress a visible
@@ -902,9 +994,12 @@ v11_rebuild_project_aggregate() {
 #   synchronous but time-bounded (timeout 10): v11_replay_ledger is ~100ms
 #   for any realistic ledger, so this adds negligible latency to the rebuild.
 #
-#   Wall-clock fields (aggregate_built_at, last_updated) are excluded from
-#   the comparison — same exclusion the determinism tests use (§3.2 / test
-#   _WALLCLOCK_FIELDS).
+#   Wall-clock fields (aggregate_built_at, last_updated, last_progress_at)
+#   are excluded from the comparison — same exclusion the determinism tests
+#   use (§3.2 / test _WALLCLOCK_FIELDS). last_progress_at (#87) is a hook-only
+#   stall-clock aid, not reconstructed by v11_replay_ledger, so leaving it
+#   unexcluded would flag every project with a status-changed task as
+#   diverged on every rebuild.
 #
 #   Divergence log schema per line:
 #   {
@@ -956,7 +1051,7 @@ v11_shadow_reconciliation_diff() {
     [ -n "$replay_output" ] || return 0
 
     # Delegate the structural diff + JSONL append to Python.
-    # Wall-clock exclusions: aggregate_built_at, last_updated (ADR §6, test _WALLCLOCK_FIELDS).
+    # Wall-clock exclusions: aggregate_built_at, last_updated, last_progress_at (ADR §6, test _WALLCLOCK_FIELDS; #87).
     local divergence_file="${METRICS_DIR}/ledger-shadow-divergence.jsonl"
     local now
     now=$(date -Iseconds 2>/dev/null || date -u +"%Y-%m-%dT%H:%M:%S+00:00")
@@ -976,7 +1071,7 @@ divfile       = os.environ.get("V11_SHADOW_DIVERGENCE_FILE", "")
 now           = os.environ.get("V11_SHADOW_NOW") or datetime.datetime.now().isoformat()
 
 # Wall-clock fields excluded from the comparison (same set as test _WALLCLOCK_FIELDS).
-WALLCLOCK = frozenset({"aggregate_built_at", "last_updated"})
+WALLCLOCK = frozenset({"aggregate_built_at", "last_updated", "last_progress_at"})
 
 try:
     live   = json.loads(live_json)
@@ -1024,46 +1119,80 @@ NON_PROJECTS="v11 v10 v9 v8 v7 v6_Ultra sessions scripts system-apps-config port
 .ssh snap node_modules deploy.sh"
 
 # Parse hook stdin JSON once into global vars.
+# S2-T4: single jq pass (was 7-9 separate jq forks: tool_name, file_path,
+# command, session_id, tool_response, tool_output fallback, tool_response
+# string-unwrap, error, cwd — TaskGet alone forked ~25 of these). Fields are
+# emitted as a NUL-delimited raw-string stream (jq -j, explicit "\u0000"
+# separators) and read back with one `read -r -d ''` per field.
+# Deliberately NOT @tsv: @tsv escapes embedded tabs/newlines/CR *within* a
+# field's own text (task descriptions, multi-line tool output) into literal
+# two-char "\t"/"\n"/"\r" sequences on the way out, and plain `read` cannot
+# losslessly un-escape those back into real control characters on the way in.
+# NUL cannot appear in a JSON text payload, so it needs no escaping and is
+# unambiguous as a field terminator — ordinary field values pass through
+# byte-for-byte.
 v11_parse_input() {
   V11_RAW_INPUT="$(cat)"
-  V11_TOOL_NAME="$(printf '%s' "$V11_RAW_INPUT"  | jq -r '.tool_name // empty')"
-  V11_FILE_PATH="$(printf '%s' "$V11_RAW_INPUT"  | jq -r '.tool_input.file_path // .tool_input.path // empty')"
-  V11_COMMAND="$(printf '%s' "$V11_RAW_INPUT"     | jq -r '.tool_input.command // empty')"
-  V11_SESSION_ID="$(printf '%s' "$V11_RAW_INPUT"  | jq -r '.session_id // empty')"
-  # V11_TOOL_OUTPUT: Claude Code emits the tool result at .tool_response (object).
-  # Pre-V11.13 tests synthesise .tool_output (raw text). Prefer the object as
-  # compact JSON so downstream jq paths work; fall back to legacy text when
-  # only .tool_output is present. Both consumers (jq path queries AND grep over
-  # embedded text) keep working because compact JSON still contains the literal
-  # words/IDs they search for.
-  _V11_TR_JSON="$(printf '%s' "$V11_RAW_INPUT" | jq -c '.tool_response // empty' 2>/dev/null)"
-  if [ -n "$_V11_TR_JSON" ] && [ "$_V11_TR_JSON" != "null" ]; then
-      V11_TOOL_OUTPUT="$_V11_TR_JSON"
-      _V11_TR_FROM_RESPONSE=1
-  else
-      V11_TOOL_OUTPUT="$(printf '%s' "$V11_RAW_INPUT" | jq -r '.tool_output // empty')"
-      _V11_TR_FROM_RESPONSE=0
-  fi
-  unset _V11_TR_JSON
-  # S81-W0-2 (U-new-1): dsh-hooks-claude-code flattens .tool_response into a
-  # JSON-encoded STRING before delivering the hook payload. Downstream jq paths
-  # like .task.id / .taskId then error with "Cannot index string with X".
-  # Unwrap once here so every consumer sees the object shape.
-  #
-  # GATE (v11-test-debt): only the .tool_response path can be a JSON-encoded
-  # string wrapper. The legacy .tool_output fallback is already RAW TEXT and must
-  # NOT be re-parsed as JSON — jq reads a value like "1. Fix bug [completed]\n2…"
-  # as a JSON stream, greedily emits the leading number 1, and silently truncates
-  # the entire TaskList text to "1" (breaking counter + active_task_ids
-  # reconciliation). Skipping the unwrap for legacy text leaves it untouched.
-  if [ "${_V11_TR_FROM_RESPONSE:-0}" = "1" ]; then
-      _V11_TR_UW="$(printf '%s' "${V11_TOOL_OUTPUT:-}" | jq -c 'if type == "string" then (fromjson? // .) else . end' 2>/dev/null)"
-      [ -n "$_V11_TR_UW" ] && [ "$_V11_TR_UW" != "null" ] && V11_TOOL_OUTPUT="$_V11_TR_UW"
-      unset _V11_TR_UW
-  fi
-  unset _V11_TR_FROM_RESPONSE
-  V11_ERROR="$(printf '%s' "$V11_RAW_INPUT"       | jq -r '.error // empty')"
-  V11_CWD="$(printf '%s' "$V11_RAW_INPUT"         | jq -r '.working_directory // empty')"
+  # Defensive defaults: if V11_RAW_INPUT is empty/invalid JSON, the jq call
+  # below produces no output and every `read` hits EOF without touching its
+  # variable. Pre-seed empty strings so behavior matches the old per-field
+  # jq calls (an errored call left its var unset/empty either way) even
+  # under `set -u`.
+  V11_TOOL_NAME="" V11_FILE_PATH="" V11_COMMAND="" V11_SESSION_ID=""
+  V11_ERROR="" V11_CWD="" V11_TOOL_OUTPUT=""
+  {
+    IFS= read -r -d '' V11_TOOL_NAME
+    IFS= read -r -d '' V11_FILE_PATH
+    IFS= read -r -d '' V11_COMMAND
+    IFS= read -r -d '' V11_SESSION_ID
+    IFS= read -r -d '' V11_ERROR
+    IFS= read -r -d '' V11_CWD
+    IFS= read -r -d '' V11_TOOL_OUTPUT
+  } < <(printf '%s' "$V11_RAW_INPUT" | jq -j '
+    def strize: if type == "string" then . else tojson end;
+    (.tool_name // ""), "\u0000",
+    ((.tool_input.file_path // .tool_input.path) // ""), "\u0000",
+    (.tool_input.command // ""), "\u0000",
+    (.session_id // ""), "\u0000",
+    (.error // ""), "\u0000",
+    ((.cwd // .working_directory) // ""), "\u0000",
+    (
+      # V11_TOOL_OUTPUT: Claude Code emits the tool result at .tool_response
+      # (object). Pre-V11.13 tests synthesise .tool_output (raw text). Prefer
+      # the object, as compact JSON text, so downstream jq path queries work;
+      # fall back to legacy .tool_output text when .tool_response is
+      # absent/null/false. Both consumers (jq path queries AND grep over
+      # embedded text) keep working because compact JSON still contains the
+      # literal words/IDs they search for.
+      #
+      # S81-W0-2 (U-new-1): dsh-hooks-claude-code flattens .tool_response into
+      # a JSON-encoded STRING before delivering the hook payload. Downstream
+      # jq paths like .task.id / .taskId then error with "Cannot index string
+      # with X". Unwrap once here so every consumer sees the object shape.
+      #
+      # GATE (v11-test-debt): only the .tool_response path can be a
+      # JSON-encoded string wrapper. The legacy .tool_output fallback is
+      # already RAW TEXT and must NOT be re-parsed as JSON — a value like
+      # "1. Fix bug [completed]\n2…" read as a JSON stream greedily emits the
+      # leading number 1, silently truncating the entire TaskList text to "1"
+      # (breaking counter + active_task_ids reconciliation). Only the
+      # .tool_response branch below ever calls fromjson.
+      #
+      # review-#14 HIGH fix: the .tool_response branch always applies tojson
+      # to its result (never strize) so a bare non-JSON string ("hello")
+      # round-trips as valid quoted JSON ("hello"), matching the pre-S2-T4
+      # jq -c dot-tool_response-or-empty behavior byte-for-byte. strize is
+      # reserved for the legacy .tool_output fallback below, where the
+      # value is raw text and must stay unquoted.
+      (.tool_response // null) as $tr
+      | if ($tr != null and $tr != false) then
+          ($tr | if type == "string" then (fromjson? // .) else . end | tojson)
+        else
+          (.tool_output // "" | strize)
+        end
+    ), "\u0000"
+  ')
+  v11_valid_session_id "$V11_SESSION_ID" || V11_SESSION_ID=""  # S2-R5: "..", ".x", "a/b" = no id
 
   # V9_ aliases removed in V11.7 — no hooks reference them (verified 2026-03-28)
 }
@@ -1156,7 +1285,7 @@ v11_risk_classification_text() {
   masked=$(printf '%s' "$masked" | sed "s/'[^']*'/MASKED/g")
 
   # (4) double-quoted spans — refuse on \" or $' (mispairing hazard)
-  if printf '%s' "$masked" | grep -qF '\"' || printf '%s' "$masked" | grep -qF "\$'"; then
+  if grep -qF '\"' <<<"$masked" || grep -qF "\$'" <<<"$masked"; then
     printf '%s' "$masked"; return
   fi
   local _dq_count
@@ -1222,24 +1351,36 @@ v11_detect_project() {
   # V9_ aliases removed in V11.7
 }
 
-# Internal: extract project name from a path string (pure regex, no I/O).
+# Internal: extract project name from a path string (regex, plus one -d stat
+# for Convention 3).
+# improvements/59: every capture must pass v11_valid_project_slug. Callers feed
+# this raw, UNEVALUATED command text (track-autonomy, guard-enforcement,
+# v11_check_risk/autonomy), so a capture can be `example-project;`, `$P;` or `*`.
+# BASH_REMATCH is copied first: the slug check runs its own [[ =~ ]].
 _v11_detect_project_from_path() {
-  local filepath="$1"
+  local filepath="$1" candidate
   [ -z "$filepath" ] && return
   # Convention 1: sessions/{name}/
   if [[ "$filepath" =~ ^$SESSIONS_ROOT/([^/]+) ]]; then
-    V11_PROJECT="${BASH_REMATCH[1]}" V11_DETECTION_METHOD="sessions"; return
+    candidate="${BASH_REMATCH[1]}"
+    v11_valid_project_slug "$candidate" || return
+    V11_PROJECT="$candidate" V11_DETECTION_METHOD="sessions"; return
   fi
   # Convention 2: portfolio-platform/apps/{name}/
   if [[ "$filepath" =~ ^$HERCULES_ROOT/portfolio-platform/apps/([^/]+) ]]; then
-    V11_PROJECT="${BASH_REMATCH[1]}" V11_DETECTION_METHOD="portfolio-app"; return
+    candidate="${BASH_REMATCH[1]}"
+    v11_valid_project_slug "$candidate" || return
+    V11_PROJECT="$candidate" V11_DETECTION_METHOD="portfolio-app"; return
   fi
-  # Convention 3: $HERCULES_ROOT/{name}/ (excluding infra dirs)
+  # Convention 3: $HERCULES_ROOT/{name}/ (excluding infra dirs). Must be an
+  # existing directory: a top-level FILE ($HERCULES_ROOT/CLAUDE.md) is not a project.
   if [[ "$filepath" =~ ^$HERCULES_ROOT/([^/]+) ]]; then
-    local candidate="${BASH_REMATCH[1]}"
+    candidate="${BASH_REMATCH[1]}"
     for np in $NON_PROJECTS; do
       [[ "$candidate" == "$np" ]] && return
     done
+    v11_valid_project_slug "$candidate" || return
+    [ "${V11_PROJECT_SLUG_GUARD:-on}" = "off" ] || [ -d "$HERCULES_ROOT/$candidate" ] || return
     V11_PROJECT="$candidate" V11_DETECTION_METHOD="hercules-root"
   fi
 }
@@ -1357,6 +1498,9 @@ v11_autonomy_level() {
 #     paths.
 # Sets V11_RISK_PATH_CONTEXT_RESOLVED to the space-joined resolved paths on
 # success. Returns 0 (downgrade OK) or 1 (stay HIGH).
+# The harness session scratchpad, shared with v11_is_write_gate_exempt
+# (improvements/76). EREs live in variables (v11.35.3).
+V11_SCRATCHPAD_ERE='^/tmp/claude-[0-9]+/[^/]*/[^/]*/scratchpad/.+$'
 v11_rm_is_scratchpad_only_delete() {
   local cmd="$1"
   V11_RISK_PATH_CONTEXT_RESOLVED=""
@@ -1401,11 +1545,50 @@ v11_rm_is_scratchpad_only_delete() {
 
   local p
   for p in "${paths[@]}"; do
-    [[ "$p" =~ ^/tmp/claude-[0-9]+/[^/]*/[^/]*/scratchpad/.+$ ]] || return 1
+    [[ "$p" =~ $V11_SCRATCHPAD_ERE ]] || return 1
   done
 
   V11_RISK_PATH_CONTEXT_RESOLVED="${paths[*]}"
   return 0
+}
+
+# improvements/76: may guard-write-gates let this Write/Edit through with no
+# task in_progress? True (0) for the harness scratchpad, and for the /handoff
+# skill's own files directly under $SESSIONS_ROOT/<project>/ (exact basenames:
+# a nested dir or handoff.md.bak stays gated). Scoped to the write gate only:
+# v11_is_metadata_file is also the early exit in detect-project, verify-syntax
+# and guard-enforcement, and widening it would stop a handoff.md read binding
+# the project and skip JSON validation of a hand-written handoff-tasks.json.
+# The path is canonicalized first (realpath -m resolves relative paths, `..`
+# and symlinks), so sessions/x/../../src/foo.py never matches; any resolution
+# failure gates. Rollback: V11_WRITE_GATE_SCRATCH_EXEMPT=off.
+v11_is_write_gate_exempt() {
+  local path="$1" resolved root rest project base
+  [ "${V11_WRITE_GATE_SCRATCH_EXEMPT:-on}" = "off" ] && return 1
+  [ -z "$path" ] && return 1
+  resolved=$(realpath -m -- "$path" 2>/dev/null) || return 1
+  [ -n "$resolved" ] || return 1
+
+  [[ "$resolved" =~ $V11_SCRATCHPAD_ERE ]] && return 0
+
+  root=$(realpath -m -- "$SESSIONS_ROOT" 2>/dev/null) || return 1
+  [ -n "$root" ] || return 1
+  case "$resolved" in
+    "$root"/*/*) ;;
+    *) return 1 ;;
+  esac
+  rest="${resolved#"$root"/}"
+  project="${rest%%/*}"
+  base="${rest#*/}"
+  case "$base" in
+    */*) return 1 ;;
+    *) ;;
+  esac
+  v11_valid_project_slug "$project" || return 1
+  case "$base" in
+    .session-summary.md|.handoff-steer.md|.handoff-addendum.md|handoff.md|handoff-tasks.json|peers.json) return 0 ;;
+    *) return 1 ;;
+  esac
 }
 
 v11_check_risk() {
@@ -1445,7 +1628,7 @@ v11_check_risk() {
   )
 
   for PATTERN in "${!PATTERNS[@]}"; do
-    if printf '%s' "$V11_COMMAND" | grep -qiF "$PATTERN"; then
+    if grep -qiF "$PATTERN" <<<"$V11_COMMAND"; then
       MATCHED_PATTERN="$PATTERN"
       RISK_DESCRIPTION="${PATTERNS[$PATTERN]}"
       break
@@ -1633,11 +1816,11 @@ v11_check_autonomy() {
             continue
           fi
           # Detect nested quantifiers like (x+)+, (x*)*, (x+)*, (x*)+ — classic ReDoS
-          if printf '%s' "$PATTERN" | grep -qE '\([^)]*[+*][^)]*\)[+*]'; then
+          if grep -qE '\([^)]*[+*][^)]*\)[+*]' <<<"$PATTERN"; then
             echo "Autonomy: regex grant rejected (nested quantifier / ReDoS shape)" >&2
             continue
           fi
-          if printf '%s' "$V11_FILE_PATH" | grep -qE -- "$PATTERN" 2>/dev/null; then
+          if grep -qE -- "$PATTERN" <<<"$V11_FILE_PATH" 2>/dev/null; then
             echo "Autonomy A2: grant matched regex $PATTERN"
             return 0
           fi
@@ -2355,30 +2538,41 @@ v11_normalize_subject() {
 #   "null" (no artifacts persistence) — 5-arg callers keep the pre-E2 behavior.
 v11_reapply_terminal_fold() {
     local id="$1" status="$2" subject="$3" sid="$4" now="$5"
-    local rid="${6:-}" arts="${7:-null}"
+    local rid="${6:-}" arts="${7:-null}" prior="${8:-}"
     # Defensive: an empty ARTIFACTS_JSON would make --argjson fail; coerce to null.
     [ -n "$arts" ] || arts="null"
     printf '%s' "$arts" | jq empty 2>/dev/null || arts="null"
     local state; state="$(cat)"
     case "$status" in
         completed)
+            # F36: counter fold mirrors the canonical TaskUpdate(completed) branch
+            # in hooks/sync-tasks — drop only the bucket the task was actually in.
+            # $prior empty (older marker lines predate this field, or the caller
+            # never resolved it) falls back to the original unconditional
+            # in_progress decrement, preserving exact pre-fix behavior.
             printf '%s' "$state" | jq \
                 --arg id "$id" --arg subject "$subject" --arg sid "$sid" --arg now "$now" \
-                --arg rid "$rid" --argjson arts "$arts" '
+                --arg rid "$rid" --argjson arts "$arts" --arg prior "$prior" '
                 if ($id != "" and (.open_tasks[$id] != null)) then
-                    .in_progress = ([.in_progress - 1, 0] | max)
-                    | .completed += 1
+                    (if $prior == "in_progress" or $prior == "" then .in_progress = ([.in_progress - 1, 0] | max) | .completed += 1
+                     elif $prior == "pending" then .pending = ([.pending - 1, 0] | max) | .completed += 1
+                     elif $prior == "blocked" then .blocked = ([.blocked - 1, 0] | max) | .completed += 1
+                     elif $prior == "completed" then .
+                     else .completed += 1
+                     end)
                     | .recent_completed = ([{id: $id, subject: $subject, at: $now, session_uuid: $sid}] + (.recent_completed // []))[:10]
                     | .active_task = null
                     | .active_task_ids = ((.active_task_ids // []) | map(select(. != $id)))
                     | .active_agent_id = null
                     | .last_updated = $now
+                    | .last_progress_at = $now  # #87: a recovered status change is real progress
                     | if (.open_tasks[$id]._idk) != null then
                         ._terminal_idk = (._terminal_idk // {})
                         | ._terminal_idk[$id] = (
                             .open_tasks[$id]._idk
                             + {terminal_status: "completed", tombstoned_at: $now}
                             + (if .open_tasks[$id].subject != null then {subject: .open_tasks[$id].subject} else {} end)
+                            + (if .open_tasks[$id]._tl_epoch != null then {_tl_epoch: .open_tasks[$id]._tl_epoch} else {} end)
                           )
                       else . end
                     # E2a — V11.21 sibling pending_parent→pending (verbatim, gated on $rid)
@@ -2397,21 +2591,28 @@ v11_reapply_terminal_fold() {
             ;;
         blocked)
             printf '%s' "$state" | jq \
-                --arg id "$id" --arg subject "$subject" --arg sid "$sid" --arg now "$now" '
+                --arg id "$id" --arg subject "$subject" --arg sid "$sid" --arg now "$now" \
+                --arg prior "$prior" '
                 if ($id != "" and (.open_tasks[$id] != null)) then
-                    .in_progress = ([.in_progress - 1, 0] | max)
-                    | .blocked += 1
+                    (if $prior == "in_progress" or $prior == "" then .in_progress = ([.in_progress - 1, 0] | max) | .blocked += 1
+                     elif $prior == "pending" then .pending = ([.pending - 1, 0] | max) | .blocked += 1
+                     elif $prior == "completed" then .completed = ([.completed - 1, 0] | max) | .blocked += 1
+                     elif $prior == "blocked" then .
+                     else .blocked += 1
+                     end)
                     | .active_task = null
                     | .active_task_ids = ((.active_task_ids // []) | map(select(. != $id)))
                     | .active_agent_id = null
                     | .blocked_tasks = ([{id: $id, subject: $subject, reason: "unspecified", at: $now, session_uuid: $sid}] + (.blocked_tasks // []))[:5]
                     | .last_updated = $now
+                    | .last_progress_at = $now  # #87: a recovered status change is real progress
                     | if (.open_tasks[$id]._idk) != null then
                         ._terminal_idk = (._terminal_idk // {})
                         | ._terminal_idk[$id] = (
                             .open_tasks[$id]._idk
                             + {terminal_status: "blocked", tombstoned_at: $now}
                             + (if .open_tasks[$id].subject != null then {subject: .open_tasks[$id].subject} else {} end)
+                            + (if .open_tasks[$id]._tl_epoch != null then {_tl_epoch: .open_tasks[$id]._tl_epoch} else {} end)
                           )
                       else . end
                     | .open_tasks = ((.open_tasks // {}) | del(.[$id]))
@@ -2438,7 +2639,7 @@ v11_apply_reconcile_markers() {
     local marker="$1" sid="$2" now="$3"
     local state; state="$(cat)"
     [ -n "$marker" ] && [ -s "$marker" ] || { printf '%s' "$state"; return 0; }
-    local line tid st subj rtid arts_file arts new
+    local line tid st subj rtid pst arts_file arts new
     while IFS= read -r line; do
         [ -n "$line" ] || continue
         tid=$(printf '%s' "$line" | jq -r '.task_id // ""' 2>/dev/null)
@@ -2447,6 +2648,10 @@ v11_apply_reconcile_markers() {
         subj=$(printf '%s' "$line" | jq -r '.subject // "unknown"' 2>/dev/null)
         rtid=$(printf '%s' "$line" | jq -r '.review_task_id // ""' 2>/dev/null)
         [ "$rtid" = "null" ] && rtid=""
+        # F36: the recorded prior status (absent on marker lines written before
+        # this field existed — v11_reapply_terminal_fold treats "" as "in_progress",
+        # the original unconditional-decrement behavior).
+        pst=$(printf '%s' "$line" | jq -r '.prior_status // ""' 2>/dev/null)
         arts="null"
         # Only look for a sidecar under a filesystem-safe task id (no traversal).
         case "$tid" in
@@ -2458,13 +2663,612 @@ v11_apply_reconcile_markers() {
                 fi
                 ;;
         esac
-        new=$(printf '%s' "$state" | v11_reapply_terminal_fold "$tid" "$st" "$subj" "$sid" "$now" "$rtid" "$arts")
+        new=$(printf '%s' "$state" | v11_reapply_terminal_fold "$tid" "$st" "$subj" "$sid" "$now" "$rtid" "$arts" "$pst")
         if [ -n "$new" ] && printf '%s' "$new" | jq empty 2>/dev/null; then
             state="$new"
         fi
     done < "$marker"
     printf '%s' "$state"
 }
+
+# --- S2-T0b-2 (#113): TaskList epochs, write side ---
+# A task id is local to one Claude Code TaskList, and a resumed conversation
+# can get a new TaskList that numbers from 1 again under the same hook session.
+# hooks/sync-tasks opens an epoch at the first TaskCreate of a session (`fresh`)
+# and when a TaskCreate shows the TaskList changed (`reuse`): the id is already
+# in the current epoch (with a different tool_use_id), or the claude process
+# changed (the sitting) and the id is not above the epoch's max id (review #19
+# C1). Each event sync-tasks appends carries the epoch as `tl_epoch` (an int,
+# only ever matched); the opening create also carries `tl_open`.
+#
+# The record $METRICS_DIR/tasklist-epochs/<session> is append-only (C3): every
+# TaskCreate appends one snapshot line, and readers take the LAST complete line:
+#   v1 <tl_epoch> <fresh|reuse|seed> <pid:starttime|-> <last tool_use_id|->
+#      <,id:tu8,id:tu8,...,> <max id|-> <,sitting,...,> <,id,...,> <-|from:,id,...,>
+# tu8 is the last 8 characters of the create's tool_use_id, so a re-fired
+# PostToolUse for any create of the epoch is recognised (C2). The last three
+# fields (review #26; a line without them is read as sittings {its sitting},
+# nothing pending, no carry):
+#   sittings  the claude processes that created in this epoch (at most 8, oldest
+#             first). C1 opens only for a sitting not in it, so two processes
+#             sharing one session id (a tmux teammate, a nested
+#             `claude -p --resume`) never open an epoch by interleaving.
+#   pending   the ids created by the newest sitting since it joined (empty while
+#             only the opener created). After a resume, a parallel batch of the
+#             new TaskList can deliver an id above the old max first: it joins
+#             the old epoch. When an id reuse then opens an epoch in that same
+#             sitting, those ids belong to the new TaskList and are CARRIED.
+#   carry     the ids carried into this epoch and the epoch they were created in
+#             (`from`). Their ledger lines are already written with `from`, and
+#             since `from`'s id set never held them before, (session, from, id)
+#             still names each one task: they keep `from` as their stamp.
+#             v11_tl_epoch_read SESSION TASK_ID sets _V11_TL_EPOCH to `from` for
+#             a carried TASK_ID, so C7, Strategy 1.6, C8 and every event of that
+#             task agree with its create, and readers need no rewrite.
+#             task_epoch.epoch_for_task is the Python side.
+# tl_epoch 0 is a `seed` line, written by scripts/task-epoch-seed for a session
+# that was live at rollout, and by the first create after an empty or garbled
+# last line (which reads as unknown: nothing opens, nothing is stamped, C3; the
+# seed line lets tracking resume). A seed epoch's events stay unstamped until the
+# next epoch opens. A torn tail (a writer killed mid-line) is skipped, and the
+# next writer starts its line on a new one. Only sync-tasks writes, under FD-201;
+# past ~64 KB the writer rewrites the record to its last line (tmp + rename).
+# scripts/rotate-metrics removes records 30 days after the last write.
+# scripts/lib/task_epoch.py read_epoch_record is the Python reader.
+# Everything here is bash builtins: no forks on the TaskCreate/TaskUpdate/TaskList
+# path (design §7). The helpers set globals and must never be called as $(...).
+# Rollback: V11_TASKLIST_EPOCH=off (no record, no stamps: v11.46 line shapes).
+_V11_TLR_LINE_ERE='^v1 (0|[1-9][0-9]{0,15}) (fresh|reuse|seed) ([0-9]{1,10}:[0-9]{1,20}|-) ([A-Za-z0-9_-]{1,128}|-) (,([A-Za-z0-9_-]{1,32}:[A-Za-z0-9_-]{1,8},)*) ([0-9]{1,12}|-)( (,([0-9]{1,10}:[0-9]{1,20},){0,8}) (,([A-Za-z0-9_-]{1,32},)*) (-|(0|[1-9][0-9]{0,15}):(,([A-Za-z0-9_-]{1,32},)*)))?$'
+_V11_TLR_ID_ERE='^[A-Za-z0-9_-]{1,32}$'
+_V11_TLR_NUM_ERE='^[0-9]{1,12}$'
+_V11_TLR_PID_ERE='^[0-9]{1,10}$'
+_V11_TLR_TICKS_ERE='^[0-9]{1,20}$'
+_V11_TLR_EPOCH_ERE='^[1-9][0-9]{9,15}$'
+
+# v11_sitting — V11_SITTING="<CLAUDE_PID>:<starttime>" (field 22 of
+#   /proc/<pid>/stat), or "" when CLAUDE_PID is unset or unreadable. A new
+#   claude process (a resume) is a new sitting even with the same session id.
+v11_sitting() {
+    V11_SITTING=""
+    local pid="${CLAUDE_PID:-}" stat rest
+    local -a f
+    [[ $pid =~ $_V11_TLR_PID_ERE ]] || return 0
+    [ -r "/proc/$pid/stat" ] || return 0
+    IFS= read -r stat 2>/dev/null < "/proc/$pid/stat" || [ -n "$stat" ] || return 0
+    rest="${stat##*) }"
+    read -r -a f <<< "$rest"
+    [[ ${f[19]:-} =~ $_V11_TLR_TICKS_ERE ]] || return 0
+    V11_SITTING="$pid:${f[19]}"
+}
+
+# v11_tl_epoch_read SESSION [TASK_ID] — read the session's epoch record. Sets
+#   _V11_TLR_STATE  off (lever off / no real session) | none (no record) |
+#                   unknown (empty or garbled) | ok
+#   _V11_TL_EPOCH   the epoch to stamp: its tl_epoch, "" when none/unknown/seed.
+#                   For a TASK_ID the epoch carried (review #26), the epoch
+#                   that task was created in ("" when that was a seed epoch).
+#   _V11_TLR_EPOCH _V11_TLR_REASON _V11_TLR_SITTING _V11_TLR_TUID _V11_TLR_IDS
+#   _V11_TLR_MAX _V11_TLR_SITS _V11_TLR_PEND
+#                   the last line's fields; _V11_TLR_CFROM/_V11_TLR_CARRY its
+#                   carry ("" and "," when none); _V11_TLR_BYTES the record's
+#                   size; _V11_TLR_TORN=1 when a torn tail follows the line.
+v11_tl_epoch_read() {
+    local sid="$1" tid="${2:-}" f line n IFS=
+    local -a lines
+    _V11_TL_EPOCH=""; _V11_TLR_STATE="off"; _V11_TLR_EPOCH=""; _V11_TLR_REASON=""
+    _V11_TLR_SITTING=""; _V11_TLR_TUID=""; _V11_TLR_IDS=""; _V11_TLR_MAX=""; _V11_TLR_TORN=0
+    _V11_TLR_SITS=","; _V11_TLR_PEND=","; _V11_TLR_CFROM=""; _V11_TLR_CARRY=","; _V11_TLR_BYTES=0
+    [ "${V11_TASKLIST_EPOCH:-on}" != "off" ] || return 0
+    v11_valid_session_id "$sid" && [ "$sid" != "legacy-cli" ] || return 0
+    _V11_TLR_STATE="none"
+    f="$METRICS_DIR/tasklist-epochs/$sid"
+    [ -e "$f" ] || return 0
+    _V11_TLR_STATE="unknown"
+    # mapfile keeps each line's newline, so the last element lacks one only
+    # when it is a torn tail. (It reads a 580 KB record in ~2.5 ms; a
+    # ${var##*$'\n'} over the whole file took seconds.)
+    mapfile lines 2>/dev/null < "$f"
+    n=${#lines[@]}
+    [ "$n" -gt 0 ] || return 0
+    line="${lines[*]}"; _V11_TLR_BYTES=${#line}
+    line="${lines[n-1]}"
+    if [[ $line != *$'\n' ]]; then
+        _V11_TLR_TORN=1
+        [ "$n" -gt 1 ] || return 0
+        line="${lines[n-2]}"
+    fi
+    line="${line%$'\n'}"
+    [[ $line =~ $_V11_TLR_LINE_ERE ]] || return 0
+    _V11_TLR_STATE="ok"
+    _V11_TLR_EPOCH="${BASH_REMATCH[1]}"; _V11_TLR_REASON="${BASH_REMATCH[2]}"
+    _V11_TLR_SITTING="${BASH_REMATCH[3]}"; _V11_TLR_TUID="${BASH_REMATCH[4]}"
+    _V11_TLR_IDS="${BASH_REMATCH[5]}"; _V11_TLR_MAX="${BASH_REMATCH[7]}"
+    if [ -n "${BASH_REMATCH[8]}" ]; then
+        _V11_TLR_SITS="${BASH_REMATCH[9]}"; _V11_TLR_PEND="${BASH_REMATCH[11]}"
+        if [ "${BASH_REMATCH[13]}" != "-" ]; then
+            _V11_TLR_CFROM="${BASH_REMATCH[14]}"; _V11_TLR_CARRY="${BASH_REMATCH[15]}"
+        fi
+    elif [ "$_V11_TLR_SITTING" != "-" ]; then
+        _V11_TLR_SITS=",$_V11_TLR_SITTING,"
+    fi
+    [ "$_V11_TLR_EPOCH" != "0" ] && _V11_TL_EPOCH="$_V11_TLR_EPOCH"
+    if [ -n "$tid" ] && [ -n "$_V11_TLR_CFROM" ] && [[ $_V11_TLR_CARRY == *",$tid,"* ]]; then
+        _V11_TL_EPOCH=""; [ "$_V11_TLR_CFROM" != "0" ] && _V11_TL_EPOCH="$_V11_TLR_CFROM"
+    fi
+    return 0
+}
+
+# v11_tl_epoch_on_create SESSION TASK_ID TOOL_USE_ID [RACED]
+#   A TaskCreate returned TASK_ID: decide whether it opens an epoch, append the
+#   record line and set _V11_TL_EPOCH (the epoch to stamp) and _V11_TL_OPEN
+#   (fresh|reuse when this create opened it, else ""). Re-reads the record, so
+#   call it under FD-201. RACED=1 (FD-201 timed out): nothing is written, and a
+#   create that would open an epoch is left unstamped rather than stamped with
+#   the epoch it leaves. On an unknown record it appends an epoch-0 seed line
+#   holding this id (review #26): nothing opens or is stamped, and the next
+#   create is judged against a readable line again.
+v11_tl_epoch_on_create() {
+    local sid="$1" tid="$2" tuid="$3" raced="${4:-0}"
+    local tu8="-" open="" reuse=0 sit epoch reason ids max sits pend carry="-" nl="" dir f line rest x
+    _V11_TL_OPEN=""
+    v11_tl_epoch_read "$sid"
+    [ "$_V11_TLR_STATE" = "off" ] && return 0
+    [[ $tid =~ $_V11_TLR_ID_ERE ]] || return 0
+    tuid="${tuid//[!A-Za-z0-9_-]/}"; tuid="${tuid:0:128}"
+    if [ ${#tuid} -gt 8 ]; then tu8="${tuid: -8}"; elif [ -n "$tuid" ]; then tu8="$tuid"; fi
+    v11_sitting
+    sit="${V11_SITTING:--}"
+    if [ "$_V11_TLR_STATE" = "none" ]; then
+        open="fresh"
+    elif [ "$_V11_TLR_STATE" = "ok" ]; then
+        # C2: a re-fired PostToolUse for a create this epoch already recorded.
+        if [ "$tu8" != "-" ] && [[ $_V11_TLR_IDS == *",$tid:$tu8,"* ]]; then
+            return 0
+        fi
+        if [[ $_V11_TLR_IDS == *",$tid:"* ]]; then
+            open="reuse"; reuse=1
+        elif [ "$sit" != "-" ] && [ "$_V11_TLR_SITS" != "," ] && [[ $_V11_TLR_SITS != *",$sit,"* ]] \
+             && [[ $tid =~ $_V11_TLR_NUM_ERE ]] && [[ $_V11_TLR_MAX =~ $_V11_TLR_NUM_ERE ]] \
+             && (( 10#$tid <= 10#$_V11_TLR_MAX )); then
+            # C1: a new claude process whose TaskList numbers from 1 again. Only
+            # for a sitting this epoch has not seen (review #26): processes that
+            # share the session id interleave their creates without opening one.
+            open="reuse"
+        fi
+    fi
+    if [ "$raced" = "1" ]; then
+        [ -n "$open" ] && _V11_TL_EPOCH=""
+        return 0
+    fi
+    max="-"; [[ $tid =~ $_V11_TLR_NUM_ERE ]] && max="$((10#$tid))"
+    if [ -n "$open" ]; then
+        epoch="${EPOCHREALTIME//[!0-9]/}"
+        [[ $epoch =~ $_V11_TLR_EPOCH_ERE ]] || { _V11_TL_EPOCH=""; return 0; }
+        reason="$open"; ids=",$tid:$tu8,"; sits=","; pend=","
+        [ "$sit" != "-" ] && sits=",$sit,"
+        # review #26: an id reuse by the sitting that joined the old epoch last,
+        # after it created ids there: those ids are this new TaskList's (a
+        # parallel batch delivered them first), so they are carried. A reuse of
+        # an id that sitting created itself carries nothing.
+        if [ "$reuse" = "1" ] && [ "$sit" != "-" ] && [ "$_V11_TLR_PEND" != "," ] \
+           && [[ $_V11_TLR_SITS == *",$sit," ]] && [[ $_V11_TLR_PEND != *",$tid,"* ]]; then
+            carry="$_V11_TLR_EPOCH:$_V11_TLR_PEND"
+            rest="${_V11_TLR_PEND#,}"
+            while [ -n "$rest" ]; do
+                x="${rest%%,*}"; rest="${rest#*,}"
+                line="${_V11_TLR_IDS#*,$x:}"
+                ids="$ids$x:${line%%,*},"
+                if [[ $x =~ $_V11_TLR_NUM_ERE ]] && { [ "$max" = "-" ] || (( 10#$x > 10#$max )); }; then
+                    max="$((10#$x))"
+                fi
+            done
+        fi
+    elif [ "$_V11_TLR_STATE" = "unknown" ]; then
+        epoch=0; reason="seed"; ids=",$tid:$tu8,"; sits=","; pend=","
+        [ "$sit" != "-" ] && sits=",$sit,"
+    else
+        epoch="$_V11_TLR_EPOCH"; reason="$_V11_TLR_REASON"; ids="$_V11_TLR_IDS$tid:$tu8,"
+        if [[ $_V11_TLR_MAX =~ $_V11_TLR_NUM_ERE ]] && { [ "$max" = "-" ] || (( 10#$_V11_TLR_MAX > 10#$max )); }; then
+            max="$_V11_TLR_MAX"
+        fi
+        sits="$_V11_TLR_SITS"; pend="$_V11_TLR_PEND"
+        [ -n "$_V11_TLR_CFROM" ] && carry="$_V11_TLR_CFROM:$_V11_TLR_CARRY"
+        if [ "$sit" = "-" ]; then
+            sit="$_V11_TLR_SITTING"
+        elif [[ $sits != *",$sit,"* ]]; then
+            # a sitting joins (at most 8 are kept): its ids are pending until it
+            # reuses an id (a carry) or another sitting joins. The first known
+            # sitting counts as the opener, whose ids never are.
+            pend=","; [ "$sits" != "," ] && pend=",$tid,"
+            sits="$sits$sit,"
+            x="${sits//[!,]/}"
+            (( ${#x} > 9 )) && sits=",${sits#,*,}"
+        elif [ -n "${sits#,*,}" ] && [[ $sits == *",$sit," ]]; then
+            pend="$pend$tid,"
+        fi
+    fi
+    dir="$METRICS_DIR/tasklist-epochs"; f="$dir/$sid"
+    [ -d "$dir" ] || mkdir -p "$dir" 2>/dev/null
+    [ "$_V11_TLR_TORN" = "1" ] && nl=$'\n'
+    line="v1 $epoch $reason $sit ${tuid:--} $ids $max $sits $pend $carry"
+    if ! printf '%s%s\n' "$nl" "$line" 2>/dev/null >> "$f"; then
+        [ -n "$open" ] && _V11_TL_EPOCH=""
+        return 0
+    fi
+    # review #26: only the last line is ever read, so past ~64 KB the record is
+    # rewritten to it (tmp + rename: a reader outside FD-201 sees the old file
+    # or the new one). The rename is the one fork on this path, once per ~64 KB.
+    if (( _V11_TLR_BYTES + ${#line} >= 65536 )); then
+        { printf '%s\n' "$line" > "$dir/.$sid.compact" && mv -f -- "$dir/.$sid.compact" "$f"; } 2>/dev/null \
+            || rm -f -- "$dir/.$sid.compact" 2>/dev/null
+    fi
+    _V11_TLR_STATE="ok"; _V11_TLR_EPOCH="$epoch"; _V11_TLR_REASON="$reason"; _V11_TLR_SITTING="$sit"
+    _V11_TLR_TUID="${tuid:--}"; _V11_TLR_IDS="$ids"; _V11_TLR_MAX="$max"; _V11_TLR_TORN=0
+    _V11_TLR_SITS="$sits"; _V11_TLR_PEND="$pend"; _V11_TLR_CFROM=""; _V11_TLR_CARRY=","
+    [ "$carry" != "-" ] && { _V11_TLR_CFROM="${carry%%:*}"; _V11_TLR_CARRY="${carry#*:}"; }
+    _V11_TL_EPOCH=""; [ "$epoch" != "0" ] && _V11_TL_EPOCH="$epoch"
+    _V11_TL_OPEN="$open"
+    return 0
+}
+
+# v11_tl_entry_current ENTRY_TL_EPOCH — C7: may a per-session STATE entry
+#   (open_tasks[id], recent_completed/blocked_tasks, _terminal_idk[id]) stamped
+#   with ENTRY_TL_EPOCH ("" = unstamped) stand for the task this call names?
+#   Yes with no current epoch, for the current epoch (a carried task's: the
+#   epoch it was created in, see v11_tl_epoch_read), and for any entry when the
+#   current epoch opened `fresh`: no reuse was seen, so the TaskList before it
+#   continues, including one whose record was lost while STATE survived (review
+#   #26). Otherwise the entry names an older TaskList's task.
+v11_tl_entry_current() {
+    [ -z "${_V11_TL_EPOCH:-}" ] && return 0
+    [ "$1" = "$_V11_TL_EPOCH" ] && return 0
+    [ "${_V11_TLR_REASON:-}" = "fresh" ] && return 0
+    return 1
+}
+
+# v11_handoff_self_sitting SESSION LIVE_SITTING LIVE_TL_EPOCH — S2-T0b-4 (the
+#   S1-T3 condition, design §5). The caller has already matched SESSION to the
+#   handoff-tasks.json live_session_uuid; LIVE_SITTING and LIVE_TL_EPOCH are
+#   that file's live_sitting and live_tl_epoch (scripts/handoff stamps them).
+#   True when this claude process wrote the file and the session's TaskList is
+#   still the one it described:
+#     - LIVE_SITTING equals v11_sitting's value. A resume is a new claude
+#       process, so it is nudged and L2.3 runs. A file without live_sitting
+#       (S1 format, or V11_TASKLIST_EPOCH=off at the writer) never matches:
+#       fail toward nudging.
+#     - when the file names an epoch and the epoch record is readable, the
+#       record's epoch (0 = seed) is still that one. An id reuse within the
+#       sitting (a #26 wipe) opens a new epoch, so it is nudged.
+#   V11_HANDOFF_SELF_NUDGE_SUPPRESS=session: the session match alone (S1).
+#   Builtins only; sets V11_SITTING and the _V11_TLR_* globals, so it must
+#   never be called as $(...).
+v11_handoff_self_sitting() {
+    [ "${V11_HANDOFF_SELF_NUDGE_SUPPRESS:-on}" = "session" ] && return 0
+    [ -n "$2" ] || return 1
+    v11_sitting
+    [ -n "$V11_SITTING" ] && [ "$2" = "$V11_SITTING" ] || return 1
+    [ -n "$3" ] || return 0
+    v11_tl_epoch_read "$1"
+    [ "$_V11_TLR_STATE" = "ok" ] || return 0
+    [ "$3" = "$_V11_TLR_EPOCH" ]
+}
+
+# S2-T0b-2 (#111, review #19 C5/C6): the identity-status predicates
+# v11_ledger_append's continuation pass uses, kept apart so the jq/Python parity
+# test (tests/test_ledger_rehydrate_identity.py) runs the same code.
+#   v11_last_map($status_only): ledger rows -> {key: {ev, seqno}}, each
+#     identity's last event; its last STATUS event (created, in_progress,
+#     blocked, completed, cancelled) when $status_only (C5: review, prescope and
+#     field_update rows never decide). scripts/lib/task_epoch.py last_status()
+#     is the Python reference.
+#   v11_alias_pairs: the alias sidecar object -> [{a, t, an, tn}].
+#   v11_folded($last; $al; $k): the latest of $k's last event and its aliases'
+#     (alias-folded, like TaskIndex.last_status), or null.
+#   v11_closed($f): that event is completed or cancelled.
+_V11_JQ_IDSTATUS_DEFS='
+def v11_st_evs: ["created", "in_progress", "blocked", "completed", "cancelled"];
+def v11_key($sn; $cs): $sn + "\u0000" + ($cs | tostring);
+def v11_last_map($status_only):
+    [ .[] | select(type == "object" and (.subject_norm | type) == "string" and .subject_norm != ""
+                   and (.create_seq | type) == "number" and .create_seq >= 0)
+          | if $status_only then select(.ev as $e | any(v11_st_evs[]; . == $e)) else . end ]
+    | sort_by(.seqno // 0)
+    | reduce .[] as $r ({}; .[v11_key($r.subject_norm; $r.create_seq)] = {ev: $r.ev, seqno: ($r.seqno // 0)});
+def v11_alias_pairs:
+    (.aliases // []) | map(select(type == "object" and (.alias | type) == "object"
+            and (.target | type) == "object"
+            and (.alias.subject_norm | type) == "string" and (.target.subject_norm | type) == "string"
+            and (.alias.create_seq | type) == "number" and (.target.create_seq | type) == "number")
+        | {a: v11_key(.alias.subject_norm; .alias.create_seq),
+           t: v11_key(.target.subject_norm; .target.create_seq),
+           an: .alias.subject_norm, tn: .target.subject_norm});
+def v11_folded($last; $al; $k):
+    [$last[$k]] + [$al[] | select(.t == $k) | $last[.a]] | map(select(. != null)) | max_by(.seqno);
+def v11_closed($f): $f != null and ($f.ev == "completed" or $f.ev == "cancelled");
+'
+
+# S2-T5 (#58a): v11_ledger_append trim.
+#
+# Historically this call site cost ~42 forks / ~12 jq (04ea283 measurement,
+# recon/S2-baseline.md): most of it was 7-8 separate `$(printf X | jq Y)`
+# pipeline forks for validation/extraction, plus the continuation pass
+# (below) re-slurping the WHOLE project ledger via `jq -rs` on every single
+# `created` event to answer "is this subject_norm's identity still open".
+# That is correct but O(ledger): example-project's ledger alone is 1.68 MB.
+#
+# The T0b-2 review (#111/#19 C5/C6) comment on the old continuation pass
+# said the trim should keep the contract with "a per-identity last-STATUS
+# map maintained under FD-207 ... plus this sidecar: the target's and each
+# candidate's alias-folded status are then map lookups" instead of the
+# jq -rs slurp. That is what this does:
+#
+#   - `.seq` gains two additive fields: `status` (a map keyed by
+#     v11_key(subject_norm, create_seq) -> {ev, seqno, origins}, "origins"
+#     being every (session_uuid, task_id) that ever wrote a `created` row
+#     for that identity — needed to answer the review #26 "did the handoff-
+#     named session+id actually create this" mismatch check without a
+#     ledger scan) and `status_version` (0 until bootstrapped, 1 once the
+#     map covers the whole ledger).
+#   - Every append that resolves a status-type event (v11_st_evs: created,
+#     in_progress, blocked, completed, cancelled) upserts its own key into
+#     `status` as part of the SAME jq call that already rewrites `.seq`
+#     (`_V11_JQ_LA_WRITE` below) — no extra fork. review/prescope/
+#     field_update never touch it (C5).
+#   - A `created` event's continuation decision reads that map directly
+#     (`_V11_JQ_LA_CONT_FAST`, O(#identities-in-this-subject-family), not
+#     O(ledger)) whenever `status_version == 1`.
+#   - The FIRST `created` call a project ever makes after this ships (or
+#     any call that needs a continuation decision before the map has ever
+#     been built) still pays one `jq -rs` full-ledger slurp
+#     (`_V11_JQ_LA_CONT_COLD`, structurally the same decision the old
+#     `_V11_JQ_CONTINUATION` made) — but that SAME call also builds the
+#     complete map from the rows it already slurped and hands it to
+#     `_V11_JQ_LA_WRITE`, which persists it and sets `status_version = 1`.
+#     Every later call is the fast, O(1)-ish path. This makes the warm-up
+#     self-paying (it costs exactly what today's call already costs, once,
+#     per project) rather than a separate migration step.
+#   - `test_ledger_rehydrate_identity.py`'s `_write_ledger()` fixture writes
+#     a bare `{"__seqno__":.., "subjects":{...}}` `.seq` (no `status`/
+#     `status_version`) to simulate a ledger that predates this change —
+#     exactly the case the cold path exists for.
+#
+# `_V11_JQ_IDSTATUS_DEFS` above (v11_key/v11_last_map/v11_alias_pairs/
+# v11_folded/v11_closed) is untouched: tests/test_ledger_rehydrate_identity.py
+# ::test_last_status_parity_with_task_epoch sources common.sh and calls it
+# directly by name, so its signatures and behavior are a hard contract.
+# `v11_folded`/`v11_closed`/`v11_key`/`v11_alias_pairs` are pure functions
+# of their arguments and are reused as-is by the fast path (it just passes
+# the persisted `status` map in place of a freshly-computed `v11_last_map`
+# result — identical shape, `{ev, seqno}` — plus each entry's `origins`).
+
+# _V11_JQ_LA_HEADER: envelope validation + version check + ev/subject_norm/
+# task_id/rehydrate_target extraction, ALL in one jq call (was 3: the
+# has()-chain validate, the .v read, and the ev_type/subject_norm/
+# rehydrate_target extract). Output is "\u001f"-joined so the caller splits
+# it with plain bash substring ops (0 forks) exactly as the old single
+# extraction did. "MALFORMED" / "BADVER\u001f<v>" are sentinels the caller
+# checks first. `task_id` (review fix, S2 T2/T3/R2 batch MEDIUM #2) rides
+# along for the pair_activate dedupe check below — 0 extra forks for every
+# other event type, which is the overwhelming majority of calls.
+_V11_JQ_LA_HEADER='
+if (type != "object") then "MALFORMED"
+elif ((["v","ev","ts","project","subject_norm","task_id","session_uuid"] - keys) | length) > 0 then "MALFORMED"
+elif (.v != 1) then "BADVER\u001f\(.v // 0)"
+else
+  [(.ev | tostring), (.subject_norm | tostring), (.task_id | tostring),
+   (.rehydrate_target
+    | if type == "object" and (.subject_norm | type) == "string" and .subject_norm != ""
+         and (.subject_norm | test("[[:cntrl:]]") | not)
+         and (.create_seq | type) == "number" and .create_seq >= 0
+         and .create_seq == (.create_seq | floor) and .create_seq < 1000000000
+      then .subject_norm, (.create_seq | tostring),
+           (.session | if type == "string" and test("^[A-Za-z0-9._-]{1,128}$") then . else "" end),
+           (.id | if type == "number" then tostring else . end
+                | if type == "string" and test("^[A-Za-z0-9._-]{1,64}$") then . else "" end)
+      else "", "", "", "" end)]
+  | join("\u001f")
+end
+'
+
+# _V11_JQ_LA_SEQLOAD: read+validate+default .seq AND bump __seqno__, in one
+# call (was: `jq empty` existence probe + `cat` + a separate structure-
+# validate jq — 4 forks/2 jq). A missing/unreadable/invalid file falls back
+# to the bash-side default below via the empty-output check (jq's own parse
+# error means the filter never runs, so this handles "doesn't exist" and
+# "not JSON" the same way `[ -f ] && [ -s ] && jq empty` used to). `status`/
+# `status_version` are additive (absent on a pre-S2-T5 `.seq`) and default
+# to `{}`/0 the same way `subjects` already defaulted. NUL-delimited output
+# (seq_json, status_version) via process substitution + `read -r -d ""`
+# (the codebase's existing multi-field pattern, e.g. the TaskCreate
+# metadata pass) — NOT `$(...)`, which would silently truncate at the first
+# embedded NUL.
+_V11_JQ_LA_SEQLOAD='
+(if type == "object" and (.["__seqno__"] | type) == "number" and (.subjects | type) == "object" then {
+    "__seqno__": (.["__seqno__"] + 1),
+    subjects: .subjects,
+    status: (if (.status | type) == "object" then .status else {} end),
+    status_version: (if (.status_version | type) == "number" then .status_version else 0 end)
+ } else {"__seqno__": 1, subjects: {}, status: {}, status_version: 0} end) as $sq
+| ($sq | tostring), "\u0000", ($sq.status_version | tostring), "\u0000"
+'
+
+# _V11_JQ_LA_CONT_FAST: the warm-path continuation decision. Same contract
+# as the old `_V11_JQ_CONTINUATION` (below-cold) — a rehydrate_target
+# continues while its alias-folded last STATUS event is non-terminal AND a
+# `created` row naming rehydrate_target's session+id exists for it or a
+# sidecar alias of it (C5/C6, review #26 mismatch check); otherwise a plain
+# create_seq for `$norm` continues if it has one still open — but it reads
+# the persisted `status` map (O(#identities sharing this subject/alias
+# family)) instead of re-slurping the ledger (O(#events ever)). `origins`
+# (this identity's own `created` rows' (session_uuid, task_id) pairs, folded
+# across aliases the same way status is) stands in for the old mismatch
+# check's ledger scan for `.ev == "created" and .session_uuid == $tss and
+# .task_id == $tsi`.
+_V11_JQ_LA_CONT_FAST="$_V11_JQ_IDSTATUS_DEFS"'
+. as $sq
+| ($sq.status // {}) as $S
+| (if $rh then ($al | if type == "array" then (.[0] // {}) else {} end
+              | if type == "object" then v11_alias_pairs else [] end)
+   else [] end) as $AL
+| def entries($k): [$S[$k]] + [$AL[] | select(.t == $k) | $S[.a]] | map(select(. != null));
+  def origins_of($k): [entries($k)[] | (.origins // [])[]];
+  (if $rh and $tsn != "" then
+      v11_key($tsn; ($tcs | tonumber)) as $tk
+      | v11_folded($S; $AL; $tk) as $f
+      | if $f == null then {refused: "unknown"}
+        elif ($tss == "" or $tsi == ""
+              or ([origins_of($tk)[] | select(.s == $tss and .t == $tsi)] | length) == 0)
+        then {refused: "mismatch"}
+        elif v11_closed($f) then {refused: "terminal"}
+        else {seq: ($tcs | tonumber), norm: $tsn} end
+   else {} end) as $t
+| (if $t.seq != null then $t
+   elif $cont_on and $norm != "" and $norm != "__empty__" then
+       (($sq.subjects[$norm] // 0) | floor) as $maxseq
+       | ([range(1; $maxseq + 1)]
+          | map(select(v11_closed(v11_folded($S; $AL; v11_key($norm; .))) | not))
+          | max) as $s
+       | if $s == null then {} else {seq: $s, norm: $norm} end
+   else {} end) as $c
+| ($c.seq // "" | tostring), "\u0000", ($c.norm // ""), "\u0000", ($t.refused // ""), "\u0000"
+'
+
+# _V11_JQ_LA_CONT_COLD: the cold/bootstrap path — structurally the same
+# slurp-based decision the old `_V11_JQ_CONTINUATION` made (kept verbatim;
+# only `. as $all` up front and the bootstrap-map build at the end are new),
+# used while `status_version != 1` for this project OR the map has gone
+# stale (`v11_ledger_append`'s `_status_sync_file` check, below) since it
+# was last built. It ALSO builds the complete origins-aware status map from
+# the rows it already slurped (`v11_last_map(true)` + `v11_origins_map`, one
+# extra reduce over data already in memory — no extra fork), so this is a
+# one-time cost per warm-up (or per staleness event): `_V11_JQ_LA_WRITE`
+# persists the map and flips `status_version`, and every later `created`
+# call — until something touches the ledger outside this function — takes
+# the fast path above.
+#
+# Staleness: the map is maintained ONLY by v11_ledger_append. A writer that
+# appends or rewrites this project's ledger directly — confirmed:
+# ~/.claude/skills/align-aggregate/align_aggregate.py's write_cancellations()
+# (direct `cancelled` events), scripts/ledger-archive's filtered rewrite,
+# scripts/backfill-ledger-attribution's tmp+os.replace rewrite — leaves the
+# map holding a status the ledger no longer agrees with. All three are
+# patched to delete `_status_sync_file` after writing, which is belt-and-
+# suspenders: the general guard (`[[ jsonl -nt _status_sync_file ]]`, a
+# stat()-only builtin test) already catches ANY writer, known or not, since
+# writing a file always moves its mtime forward. scripts/migrate-ledger and
+# scripts/task-cancel already go through v11_ledger_append (no bypass);
+# scripts/rotate-metrics explicitly never touches `*.jsonl`/`*.seq`;
+# scripts/task-epoch-seed only writes `tasklist-epochs/<sid>` records and
+# the `.aliases.json` sidecar, never the ledger itself.
+_V11_JQ_LA_CONT_COLD="$_V11_JQ_IDSTATUS_DEFS"'
+def v11_origins_map:
+    [ .[] | select(type == "object" and .ev == "created"
+                   and (.subject_norm | type) == "string" and .subject_norm != ""
+                   and (.create_seq | type) == "number" and .create_seq >= 0) ]
+    | sort_by(.seqno // 0)
+    | reduce .[] as $r ({}; .[v11_key($r.subject_norm; $r.create_seq)] =
+        ((.[v11_key($r.subject_norm; $r.create_seq)] // []) +
+         [{s: ($r.session_uuid // "" | tostring), t: ($r.task_id // "" | tostring)}]));
+. as $all
+| (if $rh then ($al | if type == "array" then (.[0] // {}) else {} end
+              | if type == "object" then v11_alias_pairs else [] end)
+ else [] end) as $al
+| ([$norm] + (if $tsn != "" then [$tsn] else [] end)) as $n0
+| ($n0 + [$al[] | select(.tn as $x | any($n0[]; . == $x)) | .an]) as $norms
+| ($all | [.[] | select(type == "object" and (.subject_norm as $s | any($norms[]; . == $s)))]) as $rows
+| ($rows | v11_last_map($rh)) as $last
+| (if $rh and $tsn != "" then
+       v11_folded($last; $al; v11_key($tsn; ($tcs | tonumber))) as $f
+       | v11_key($tsn; ($tcs | tonumber)) as $tk
+       | if $f == null then {refused: "unknown"}
+         elif ($tss == "" or $tsi == ""
+               or ([$rows[] | select(.ev == "created" and .session_uuid == $tss
+                                     and ((.task_id // "") | tostring) == $tsi
+                                     and (.create_seq | type) == "number")
+                            | v11_key(.subject_norm; .create_seq)
+                            | select(. == $tk or (. as $k | any($al[]; .a == $k and .t == $tk)))]
+                   | length) == 0) then {refused: "mismatch"}
+         elif v11_closed($f) then {refused: "terminal"}
+         else {seq: ($tcs | tonumber), norm: $tsn} end
+   else {} end) as $t
+| (if $t.seq != null then $t
+   elif $cont_on and $norm != "" and $norm != "__empty__" then
+       ([$rows[] | select(.subject_norm == $norm and (.create_seq | type) == "number"
+                          and .create_seq >= 0) | .create_seq]
+        | unique | map(select(v11_closed(v11_folded($last; $al; v11_key($norm; .))) | not)) | max) as $s
+       | if $s == null then {} else {seq: $s, norm: $norm} end
+   else {} end) as $c
+| ($all | v11_last_map(true)) as $bmap_status
+| ($all | v11_origins_map) as $bmap_origins
+| (reduce ($bmap_status | keys[]) as $k ({}; .[$k] = ($bmap_status[$k] + {origins: ($bmap_origins[$k] // [])})))
+  as $bootstrap_map
+| ($c.seq // "" | tostring), "\u0000", ($c.norm // ""), "\u0000", ($t.refused // ""), "\u0000",
+  ($bootstrap_map | tostring), "\u0000"
+'
+
+# _V11_JQ_LA_WRITE: the write. Given the caller's resolved continuation
+# decision (cont_seq/cont_norm/refused — empty when none applies) and an
+# optional freshly-bootstrapped map, this single call:
+#   - mints a fresh create_seq (bumping `subjects[orig_norm]`) when this is
+#     a `created` event with no continuation, or uses the caller-provided
+#     create_seq for a non-`created` event (or the identity_unresolved:true
+#     sentinel -1, or signals "SKIP" — LEDGER-IDENTITY-MISS — when neither
+#     is available, mirroring the old bash-side branch exactly);
+#   - merges in `$bootstrap_map` (setting `status_version = 1`) when the
+#     cold path ran this call;
+#   - upserts `status[key]` for status-type events only (C5), appending
+#     this row's (session_uuid, task_id) to `origins` on a `created` row;
+#   - builds the complete ledger line (seqno/create_seq injection,
+#     `continues`, `subject_norm` override, `rehydrate_target_refused`,
+#     `tl_epoch` — byte-for-byte the same fields the old inline jq built).
+# Output: "OK\0<seq_json>\0<line>\0<resolved_create_seq>\0" or "SKIP\0".
+# The PIPE_BUF (4096-byte) truncation cap and the embedded-newline check
+# stay bash-side (below) so the identity fields this jq call has ALREADY
+# committed to `status_version`/`subjects` can never be reverted by a
+# too-late truncation decision.
+_V11_JQ_LA_WRITE='
+def v11_key($sn; $cs): $sn + "\u0000" + ($cs | tostring);
+def v11_st_evs: ["created", "in_progress", "blocked", "completed", "cancelled"];
+. as $sq
+| ($event.subject_norm // "" | tostring) as $orig_norm
+| ($cont_seq != "") as $continues
+| (if $ev_type == "created" then
+     (if $continues then ($cont_seq | tonumber) else (($sq.subjects[$orig_norm] // 0) + 1) end)
+   elif ($event.create_seq | type) == "number" then $event.create_seq
+   elif ($event.identity_unresolved // false) then -1
+   else null
+   end) as $resolved_seq
+| if $resolved_seq == null then "SKIP", "\u0000"
+  else
+    (if $continues then $cont_norm else $orig_norm end) as $winning_norm
+    | ($sq
+       | (if $bootstrap_map != null then (.status = $bootstrap_map | .status_version = 1) else . end)
+       | .subjects = (if $ev_type == "created" and ($continues | not)
+                      then (.subjects + {($orig_norm): $resolved_seq}) else .subjects end)
+       | (if (v11_st_evs | any(. == $ev_type)) then
+            .status[v11_key($winning_norm; $resolved_seq)] = {
+              ev: $ev_type, seqno: .["__seqno__"],
+              origins: (((.status[v11_key($winning_norm; $resolved_seq)].origins) // [])
+                        + (if $ev_type == "created" then
+                             [{s: ($event.session_uuid // "" | tostring),
+                               t: ($event.task_id // "" | tostring)}]
+                           else [] end))
+            }
+          else . end)
+      ) as $sq2
+    | ($event
+       | del(.rehydrate_target)
+       + {seqno: $sq2["__seqno__"], create_seq: $resolved_seq}
+       + (if $continues then {continues: true} else {} end)
+       + (if $continues and $winning_norm != $orig_norm then {subject_norm: $winning_norm} else {} end)
+       + (if $refused != "" then {rehydrate_target_refused: $refused} else {} end)
+       + (if $tle != null and .tl_epoch == null and .ev != "review" then {tl_epoch: $tle} else {} end)
+       | with_entries(select(.value != null))
+      ) as $line
+    | "OK", "\u0000", ($sq2 | tostring), "\u0000", ($line | tostring), "\u0000",
+      ($resolved_seq | tostring), "\u0000"
+  end
+'
 
 # v11_ledger_append PROJECT EVENT_JSON
 #   Append one event line to the project ledger.
@@ -2497,84 +3301,120 @@ v11_apply_reconcile_markers() {
 #     and the .jsonl file (O_APPEND write). It never calls anything that takes
 #     FD 201/202/203 — no deadlock possible even when nested inside the FD-201
 #     per-session STATE lock that sync-tasks holds for its entire run.
+#
+#   S2-T5: ~7-8 forks / 3-4 jq per call (down from ~42/12) — see the
+#   _V11_JQ_LA_* comments above. `.seq` on disk is now written compact (was
+#   pretty-printed via a second `jq '.'` pass this trim folds away); nothing
+#   reads it expecting a particular byte layout (grep confirmed — only
+#   __seqno__/subjects are read elsewhere, e.g. scripts/ledger-archive,
+#   and both survive through unrelated-key-preserving `.foo = x` updates).
 v11_ledger_append() {
     local project="$1"
     local event_json="$2"
 
-    # SEC-C-02: validate project name before any filesystem path construction
-    if [ -z "$project" ] || ! printf '%s' "$project" | grep -qE '^[a-zA-Z0-9._-]{1,64}$'; then
+    # SEC-C-02: validate project name before any filesystem path construction.
+    # Builtin regex (0 forks, was `printf | grep -qE` — 2 forks): the ERE
+    # lives in the existing shared variable (never inline in `[[ =~ ]]` —
+    # v11.35.3 bricked every hook that way), same pattern this file already
+    # ships at :3820 and the exact charset `printf | grep` enforced here.
+    if [ -z "$project" ] || ! [[ "$project" =~ $V11_PROJECT_SLUG_ERE_LEGACY ]]; then
         echo "v11_ledger_append: invalid project name '$project' — skipping (SEC-C-02)" >&2
         return 0
     fi
 
-    # Validate event_json is non-empty JSON object with required envelope fields
-    if [ -z "$event_json" ] || ! printf '%s' "$event_json" | jq -e 'type == "object" and has("v") and has("ev") and has("ts") and has("project") and has("subject_norm") and has("task_id") and has("session_uuid")' >/dev/null 2>&1; then
+    if [ -z "$event_json" ]; then
         echo "v11_ledger_append: malformed event_json (missing required envelope fields) — skipping" >&2
         return 0
     fi
 
-    # Verify v==1 (replay rejects unknown major version)
-    local ev_version
-    ev_version=$(printf '%s' "$event_json" | jq -r '.v // 0' 2>/dev/null)
-    if [ "$ev_version" != "1" ]; then
-        echo "v11_ledger_append: unknown ledger version '$ev_version' — skipping" >&2
-        return 0
-    fi
+    # One jq call: envelope validate + version check + ev_type/subject_norm/
+    # rehydrate_target extract (was 3 calls — see _V11_JQ_LA_HEADER above).
+    local _hdr
+    _hdr=$(jq -r "$_V11_JQ_LA_HEADER" <<<"$event_json" 2>/dev/null)
+    case "$_hdr" in
+        ''|MALFORMED)
+            echo "v11_ledger_append: malformed event_json (missing required envelope fields) — skipping" >&2
+            return 0
+            ;;
+        BADVER*)
+            echo "v11_ledger_append: unknown ledger version '${_hdr#BADVER$'\x1f'}' — skipping" >&2
+            return 0
+            ;;
+    esac
+    # review fix (S2 T2/T3/R2 batch, MEDIUM #2): _ev_task_id rides along in
+    # the SAME _V11_JQ_LA_HEADER call above (0 new forks) so the
+    # pair_activate dedupe check below has the task_id without a second jq.
+    local ev_type subject_norm _ev_task_id="" _rt_sn="" _rt_cs="" _rt_ss="" _rt_id=""
+    ev_type="${_hdr%%$'\x1f'*}"; _hdr="${_hdr#*$'\x1f'}"
+    subject_norm="${_hdr%%$'\x1f'*}"; _hdr="${_hdr#*$'\x1f'}"
+    _ev_task_id="${_hdr%%$'\x1f'*}"; _hdr="${_hdr#*$'\x1f'}"
+    _rt_sn="${_hdr%%$'\x1f'*}"; _hdr="${_hdr#*$'\x1f'}"
+    _rt_cs="${_hdr%%$'\x1f'*}"; _hdr="${_hdr#*$'\x1f'}"
+    _rt_ss="${_hdr%%$'\x1f'*}"; _rt_id="${_hdr#*$'\x1f'}"
 
     local ledger_dir="${METRICS_DIR}/ledger"
     local jsonl_file="${ledger_dir}/${project}.jsonl"
     local lock_file="${ledger_dir}/${project}.jsonl.lock"
     local seq_file="${ledger_dir}/${project}.seq"
+    # Staleness marker for the `status` map (review finding: the map is only
+    # kept in sync BY v11_ledger_append — an out-of-band writer that appends
+    # or rewrites this project's .jsonl directly (confirmed: align-aggregate's
+    # write_cancellations(), ledger-archive's filtered rewrite,
+    # backfill-ledger-attribution's tmp+os.replace rewrite) leaves the map
+    # holding a status the live ledger no longer agrees with — e.g. an
+    # externally-cancelled identity still reading "open", so the next
+    # `created` on that subject would wrongly CONTINUE it instead of minting
+    # fresh. See _status_sync_file's use in Step 2 and after the append below.
+    # fix review #16 (S2-T5 MEDIUM): the marker's CONTENT, not just its
+    # existence/mtime, is now part of the contract — see the "PENDING" write
+    # ahead of the .seq write in Step 4 below (crash-safety for the window
+    # between that write and the jsonl append).
+    local _status_sync_file="${ledger_dir}/${project}.status-sync"
 
-    # Ensure ledger directory exists (mirrors agent-errors.jsonl pattern)
     mkdir -p "$ledger_dir" 2>/dev/null || {
         echo "v11_ledger_append: failed to create ledger dir '$ledger_dir' — skipping" >&2
         return 0
     }
 
-    # Extract event type — drives create_seq assignment
-    local ev_type
-    ev_type=$(printf '%s' "$event_json" | jq -r '.ev // ""' 2>/dev/null)
-
-    local subject_norm
-    subject_norm=$(printf '%s' "$event_json" | jq -r '.subject_norm // ""' 2>/dev/null)
+    # Rollback: V11_REHYDRATE_IDENTITY_WRITE=off keys every create on its own
+    # subject, and continuation decides "open" on the last event of any kind
+    # with no alias awareness (v11.46).
+    local _rh_on=true
+    [ "${V11_REHYDRATE_IDENTITY_WRITE:-on}" = "off" ] && _rh_on=false
+    [ "$_rh_on" = true ] || { _rt_sn=""; _rt_cs=""; }
+    [ -n "$_rt_sn" ] && [ -n "$_rt_cs" ] || { _rt_sn=""; _rt_cs=""; }
 
     # v11.37 W1-T2 (ticket #38 amplification): attribution-normalization gate.
+    # Off by default (V11_LEDGER_STRICT_ATTRIBUTION=off) — unchanged behavior
+    # and unchanged fork cost (0) on the default path; only herestring'd in
+    # place of `printf | jq` (saves 1 fork each when an operator opts in).
     # Agent-authored events (created / review / artifact_warn) should
     # carry an actor field (owner || metadata.agent || recommended_agent). State
     # transitions (in_progress / completed / cancelled / field_update) inherit
     # attribution from the create row of the same task_id; system events
     # (prescope / reconcile) are inherently no-actor.
-    # (Post-CLOSE review-w1-t2 E1 fix: comment previously miscategorized
-    # `cancelled` as agent-authored — case statement + CLAUDE.md §14.1 +
-    # audit-ledger-attribution script all correctly treat it as state-transition;
-    # only this comment was wrong. Corrected inline.)
-    # When strict mode is on and an agent-authored event
-    # lacks attribution, we mirror to a side-file for later analysis — the primary
-    # ledger write ALWAYS proceeds (never silently drop data). Lever tri-state:
+    # Lever tri-state:
     #   off (default)  — no observability, no side-file (pre-v11.37 behavior)
     #   advisory       — STDERR WARN + side-file mirror
     #   on             — same as advisory (kept as separate token for future
     #                    "hard refuse" semantics if the operator ever needs it)
-    # Rollback: V11_LEDGER_STRICT_ATTRIBUTION=off (default).
     local _v11_lsa="${V11_LEDGER_STRICT_ATTRIBUTION:-off}"
     if [ "$_v11_lsa" != "off" ]; then
         case "$ev_type" in
             created|review|artifact_warn)
                 local _owner _agent _rec
-                _owner=$(printf '%s' "$event_json" | jq -r '.owner // ""' 2>/dev/null)
-                _agent=$(printf '%s' "$event_json" | jq -r '.metadata.agent // ""' 2>/dev/null)
-                _rec=$(printf '%s' "$event_json" | jq -r '.recommended_agent // ""' 2>/dev/null)
+                _owner=$(jq -r '.owner // ""' <<<"$event_json" 2>/dev/null)
+                _agent=$(jq -r '.metadata.agent // ""' <<<"$event_json" 2>/dev/null)
+                _rec=$(jq -r '.recommended_agent // ""' <<<"$event_json" 2>/dev/null)
                 if [ -z "$_owner" ] && [ -z "$_agent" ] && [ -z "$_rec" ]; then
-                    echo "v11_ledger_append: attribution missing on '$ev_type' event (project=$project task_id=$(printf '%s' "$event_json" | jq -r '.task_id // "?"'))" >&2
+                    echo "v11_ledger_append: attribution missing on '$ev_type' event (project=$project task_id=$(jq -r '.task_id // "?"' <<<"$event_json"))" >&2
                     local _unattr_file="${METRICS_DIR}/unattributed-events.jsonl"
                     local _unattr_lock="${METRICS_DIR}/.unattributed-events.lock"
                     mkdir -p "$METRICS_DIR" 2>/dev/null || true
                     # v11.38 W1-T2 (#52 fix): dedicated flock (FD 209, 2s timeout)
-                    # + best-effort truncation cap at 4000B (jq del artifacts/metadata/
-                    # description if line too big for atomic O_APPEND on Linux).
-                    # Primary FD-207 critical section is unaffected. All best-effort;
-                    # never fail the caller.
+                    # + best-effort truncation cap at 4000B. Primary FD-207
+                    # critical section is unaffected. All best-effort; never
+                    # fail the caller.
                     (
                         exec 209>"$_unattr_lock"
                         flock -w 2 209 || {
@@ -2585,7 +3425,7 @@ v11_ledger_append() {
                         _line="$event_json"
                         if [ "${#_line}" -gt 4000 ]; then
                             local _reduced
-                            _reduced=$(printf '%s' "$_line" | jq -c 'del(.description,.metadata,.artifacts)' 2>/dev/null)
+                            _reduced=$(jq -c 'del(.description,.metadata,.artifacts)' <<<"$_line" 2>/dev/null)
                             if [ -n "$_reduced" ] && [ "${#_reduced}" -le 4000 ]; then
                                 _line="$_reduced"
                             fi
@@ -2597,99 +3437,177 @@ v11_ledger_append() {
         esac
     fi
 
-    # --- FD-207 critical section: read .seq → bump → atomic-write .seq → append ---
-    # flock -w 5: on timeout skip the ledger write and log (side-effect-never-fails).
-    # The subshell exits non-zero on any internal failure; the outer || true ensures
-    # the caller is never failed. All four steps (read, bump, write, append) happen
-    # inside the single FD-207 hold window.
+    # --- FD-207 critical section: read .seq → bump → decide identity →
+    #     write .seq → append. flock -w 5: on timeout skip the ledger write
+    #     and log (side-effect-never-fails). The subshell exits non-zero on
+    #     any internal failure; the outer || true ensures the caller is
+    #     never failed.
     (
-        # Acquire FD 207 on the dedicated lock file
         exec 207>"$lock_file"
         flock -w 5 207 || {
             echo "v11_ledger_append: FD-207 flock timeout for project=$project — skipping ledger write" >&2
             exit 1
         }
+        # Byte-accurate `${#var}` for the PIPE_BUF check further down (jq's
+        # own JSON handling is UTF-8-always and unaffected by LC_ALL — this
+        # only changes what bash's `${#}` counts). Scoped to this subshell.
+        local LC_ALL=C
 
-        # Step 1: Read .seq or initialize
-        local seq_json
-        if [ -f "$seq_file" ] && [ -s "$seq_file" ] && jq empty "$seq_file" 2>/dev/null; then
-            seq_json=$(cat "$seq_file" 2>/dev/null)
-            # Validate expected structure: must have __seqno__ int and subjects object
-            if ! printf '%s' "$seq_json" | jq -e 'type == "object" and (.["__seqno__"] | type) == "number" and (.subjects | type) == "object"' >/dev/null 2>&1; then
-                seq_json='{"__seqno__":0,"subjects":{}}'
-            fi
-        else
-            seq_json='{"__seqno__":0,"subjects":{}}'
+        # review fix (S2 T2/T3/R2 batch, MEDIUM #2): pair_activate dedupe at
+        # append time. Under a flock-timeout on STATE_FILE.lock (_V11_SYNC_RACED=1,
+        # sync-tasks proceeds unserialized), two racing TaskUpdate(completed)
+        # calls on the same paired parent can each read shadow
+        # metadata.parent_status=="pending_parent" before either write lands, so
+        # both build a pair_activate event for the same shadow task_id. This
+        # FD-207 critical section IS the one place both calls serialize (each
+        # v11_ledger_append acquires it in turn), so check-then-append here is
+        # atomic: skip the append (no seqno burned, no duplicate row) if a
+        # pair_activate for this task_id is already on the ledger.
+        if [ "$ev_type" = "pair_activate" ] && [ -n "$_ev_task_id" ] && [ -s "$jsonl_file" ] \
+           && jq -e --arg tid "$_ev_task_id" 'select(.ev == "pair_activate" and .task_id == $tid)' \
+                "$jsonl_file" >/dev/null 2>&1; then
+            echo "v11_ledger_append: duplicate pair_activate for task_id=$_ev_task_id project=$project — skipping (already ledgered)" >&2
+            exit 0
         fi
 
-        # Step 2: Bump __seqno__ (every event)
-        local new_seqno
-        new_seqno=$(printf '%s' "$seq_json" | jq '.__seqno__ + 1' 2>/dev/null)
-        if [ -z "$new_seqno" ] || [ "$new_seqno" = "null" ]; then
-            echo "v11_ledger_append: failed to compute new seqno for project=$project — skipping" >&2
+        # Step 1: load .seq, defaulting/normalizing it, with __seqno__
+        # already bumped (1 fork, 1 jq — was 4 forks/2 jq: a `jq empty`
+        # probe, a `cat`, a separate structure-validate, then a bump).
+        local seq_json="" _sv=""
+        { IFS= read -r -d '' seq_json; IFS= read -r -d '' _sv; } \
+            < <(jq -j "$_V11_JQ_LA_SEQLOAD" "$seq_file" 2>/dev/null)
+        if [ -z "$seq_json" ]; then
+            seq_json='{"__seqno__":1,"subjects":{},"status":{},"status_version":0}'
+            _sv="0"
+        fi
+
+        # Step 2: for a `created` event that needs a continuation decision
+        # (a rehydrate target was named, or the continuation lever is on and
+        # this event carries a real subject) — same gate the old code used
+        # (`[ -s "$jsonl_file" ] && { target-named || plain-continuation-
+        # eligible }`) — resolve it via the warm map (fast) or, the first
+        # time this project needs one since the map gained a `status_version`
+        # field, via one ledger slurp that also builds that map (cold; see
+        # _V11_JQ_LA_CONT_COLD above). Every other event type, and a
+        # `created` with nothing to check, skips this step entirely (0
+        # forks): $cont_seq/$cont_norm/$refused stay empty and $bootstrap_map
+        # stays null, so Step 3 mints.
+        #
+        # The map is trusted (fast path) only when, IN ADDITION to
+        # status_version==1, `_status_sync_file` exists, is not older than
+        # `$jsonl_file` (`[[ -nt ]]`, a stat()-only builtin test — 0 forks),
+        # AND its CONTENT is the empty "confirmed" sentinel (a builtin `read`
+        # — 0 forks). v11_ledger_append itself always re-touches
+        # `_status_sync_file` AFTER the jsonl append below (never before —
+        # HIGH-A already forces the .seq write, which the map lives in, to
+        # happen BEFORE the jsonl append, so a same-call self-comparison
+        # would otherwise always look stale), so its own successful appends
+        # never trip this. An out-of-band writer that touches the jsonl file
+        # without knowing about the marker — any writer, not just the three
+        # known ones patched to delete it explicitly — leaves the marker
+        # exactly as old as it was, so the jsonl's newer mtime is caught
+        # here and forces the cold rebuild.
+        # fix review #16 (S2-T5 MEDIUM): the content check closes a second
+        # crash window the mtime check alone cannot: Step 4 below writes the
+        # PENDING sentinel (marking the .seq write about to happen as
+        # unconfirmed) immediately before the .seq write, and only writes
+        # the confirmed "" sentinel after the jsonl append succeeds. A crash
+        # between the PENDING write and the append leaves `.seq`'s `status`
+        # map possibly describing an event the jsonl never durably got —
+        # but the marker still reads PENDING (jsonl's mtime never moved, so
+        # the mtime check alone would miss this), so the content check
+        # forces the cold rebuild instead of trusting it.
+        local _cont_seq="" _cont_norm="" _refused="" _bootstrap_map="null"
+        if [ "$ev_type" = "created" ] && [ -s "$jsonl_file" ] \
+           && { [ -n "$_rt_sn" ] || { [ "${V11_IDENTITY_CONTINUATION:-on}" != "off" ] \
+                  && [ -n "$subject_norm" ] && [ "$subject_norm" != "__empty__" ]; }; }; then
+            local _cont_on=true
+            [ "${V11_IDENTITY_CONTINUATION:-on}" = "off" ] && _cont_on=false
+            local _al_file="${ledger_dir}/${project}.aliases.json"
+            local -a _al_arg=(--argjson al '[]')
+            [ "$_rh_on" = true ] && [ -s "$_al_file" ] && _al_arg=(--slurpfile al "$_al_file")
+            local _cont=""
+            local _map_fresh=0
+            if [ "$_sv" = "1" ] && [[ -e "$_status_sync_file" && ! "$jsonl_file" -nt "$_status_sync_file" ]]; then
+                # fix review #16 (S2-T5 MEDIUM): mtime alone isn't enough — a
+                # PENDING marker (see Step 4) can be mtime-fresh (just
+                # written) yet still mean "a .seq write is/was in flight,
+                # not yet confirmed by the append". Builtin `read`, 0 forks.
+                local _sync_content=""
+                IFS= read -r _sync_content < "$_status_sync_file" 2>/dev/null || true
+                [ -z "$_sync_content" ] && _map_fresh=1
+            fi
+            if [ "$_map_fresh" = "1" ]; then
+                { IFS= read -r -d '' _cont_seq; IFS= read -r -d '' _cont_norm; IFS= read -r -d '' _refused; } \
+                    < <(jq -j --arg norm "$subject_norm" --arg tsn "$_rt_sn" --arg tcs "$_rt_cs" \
+                            --arg tss "$_rt_ss" --arg tsi "$_rt_id" \
+                            --argjson cont_on "$_cont_on" --argjson rh "$_rh_on" "${_al_arg[@]}" \
+                            "$_V11_JQ_LA_CONT_FAST" <<<"$seq_json" 2>/dev/null) \
+                    || { [ "${_al_arg[0]}" = "--slurpfile" ] && \
+                         { IFS= read -r -d '' _cont_seq; IFS= read -r -d '' _cont_norm; IFS= read -r -d '' _refused; } \
+                             < <(jq -j --arg norm "$subject_norm" --arg tsn "$_rt_sn" --arg tcs "$_rt_cs" \
+                                     --arg tss "$_rt_ss" --arg tsi "$_rt_id" \
+                                     --argjson cont_on "$_cont_on" --argjson rh "$_rh_on" --argjson al '[]' \
+                                     "$_V11_JQ_LA_CONT_FAST" <<<"$seq_json" 2>/dev/null); }
+            else
+                { IFS= read -r -d '' _cont_seq; IFS= read -r -d '' _cont_norm; IFS= read -r -d '' _refused; \
+                  IFS= read -r -d '' _bootstrap_map; } \
+                    < <(jq -j -s --arg norm "$subject_norm" --arg tsn "$_rt_sn" --arg tcs "$_rt_cs" \
+                            --arg tss "$_rt_ss" --arg tsi "$_rt_id" \
+                            --argjson cont_on "$_cont_on" --argjson rh "$_rh_on" "${_al_arg[@]}" \
+                            "$_V11_JQ_LA_CONT_COLD" "$jsonl_file" 2>/dev/null) \
+                    || { [ "${_al_arg[0]}" = "--slurpfile" ] && \
+                         { IFS= read -r -d '' _cont_seq; IFS= read -r -d '' _cont_norm; IFS= read -r -d '' _refused; \
+                           IFS= read -r -d '' _bootstrap_map; } \
+                             < <(jq -j -s --arg norm "$subject_norm" --arg tsn "$_rt_sn" --arg tcs "$_rt_cs" \
+                                     --arg tss "$_rt_ss" --arg tsi "$_rt_id" \
+                                     --argjson cont_on "$_cont_on" --argjson rh "$_rh_on" --argjson al '[]' \
+                                     "$_V11_JQ_LA_CONT_COLD" "$jsonl_file" 2>/dev/null); }
+            fi
+            [ -n "$_bootstrap_map" ] || _bootstrap_map="null"
+        elif [ -n "$_rt_sn" ]; then
+            _refused="unknown"
+        fi
+
+        # Step 3: mint-or-confirm + status-map upsert + complete_line, in
+        # one call (1 fork, 1 jq — see _V11_JQ_LA_WRITE above).
+        local _tle_json="null"
+        [[ ${_V11_TL_EPOCH:-} =~ $_V11_TLR_EPOCH_ERE ]] && _tle_json="$_V11_TL_EPOCH"
+        local _wr_status="" seq_json2="" complete_line="" this_create_seq=""
+        { IFS= read -r -d '' _wr_status; IFS= read -r -d '' seq_json2; \
+          IFS= read -r -d '' complete_line; IFS= read -r -d '' this_create_seq; } \
+            < <(jq -j --argjson event "$event_json" --arg ev_type "$ev_type" \
+                    --arg cont_seq "$_cont_seq" --arg cont_norm "$_cont_norm" --arg refused "$_refused" \
+                    --argjson bootstrap_map "$_bootstrap_map" --argjson tle "$_tle_json" \
+                    "$_V11_JQ_LA_WRITE" <<<"$seq_json" 2>/dev/null)
+
+        if [ "$_wr_status" = "SKIP" ]; then
+            echo "sync-tasks: LEDGER-IDENTITY-MISS task=$(jq -r '.task_id // "?"' <<<"$event_json" 2>/dev/null) project=$project — no _idk on STATE record; ledger line SKIPPED (run scripts/migrate-ledger / verify backfill)" >&2
+            exit 1
+        elif [ "$_wr_status" != "OK" ] || [ -z "$seq_json2" ] || [ -z "$complete_line" ]; then
+            echo "v11_ledger_append: jq failed to build complete line for project=$project — skipping" >&2
             exit 1
         fi
 
-        # Step 3: Compute create_seq (only for 'created' events; others use caller-provided value)
-        local this_create_seq
-        if [ "$ev_type" = "created" ]; then
-            # Bump subjects[subject_norm] counter
-            local escaped_norm
-            escaped_norm=$(printf '%s' "$subject_norm" | jq -Rs '.')
-            this_create_seq=$(printf '%s' "$seq_json" | jq --argjson norm "$escaped_norm" '
-                ((.subjects[$norm] // 0) + 1)
-            ' 2>/dev/null)
-            if [ -z "$this_create_seq" ] || [ "$this_create_seq" = "null" ]; then
-                echo "v11_ledger_append: failed to compute create_seq for project=$project subject_norm=$subject_norm — skipping" >&2
-                exit 1
-            fi
-            # Write new subjects counter into seq_json
-            seq_json=$(printf '%s' "$seq_json" | jq \
-                --argjson seqno "$new_seqno" \
-                --argjson norm "$escaped_norm" \
-                --argjson cs "$this_create_seq" '
-                .["__seqno__"] = $seqno
-                | .subjects[$norm] = $cs
-            ' 2>/dev/null)
-        else
-            # Non-created: create_seq must already be in event_json (from _idk),
-            # UNLESS the caller explicitly flags identity_unresolved:true (W5-T16
-            # verdict fold-back, improvements/09) — a flagged event with a
-            # sentinel create_seq beats a dropped verdict (unattributed-never-
-            # dropped doctrine). Sentinel create_seq=-1 mirrors the existing
-            # MED-B project-scope reconcile sentinel (subject_norm=="" &&
-            # create_seq==-1) so it never collides with a real identity.
-            local _identity_unresolved
-            _identity_unresolved=$(printf '%s' "$event_json" | jq -r '.identity_unresolved // false' 2>/dev/null)
-            this_create_seq=$(printf '%s' "$event_json" | jq -r '.create_seq // empty' 2>/dev/null)
-            if [ -z "$this_create_seq" ] || [ "$this_create_seq" = "null" ] || [ "$this_create_seq" = "" ]; then
-                if [ "$_identity_unresolved" = "true" ]; then
-                    this_create_seq="-1"
-                else
-                    echo "sync-tasks: LEDGER-IDENTITY-MISS task=$(printf '%s' "$event_json" | jq -r '.task_id // "?"') project=$project — no _idk on STATE record; ledger line SKIPPED (run scripts/migrate-ledger / verify backfill)" >&2
-                    exit 1
-                fi
-            fi
-            # Only update __seqno__ (no subjects bump for non-created)
-            seq_json=$(printf '%s' "$seq_json" | jq \
-                --argjson seqno "$new_seqno" '
-                .["__seqno__"] = $seqno
-            ' 2>/dev/null)
-        fi
+        # fix review #16 (S2-T5 MEDIUM): mark the status-sync marker PENDING
+        # BEFORE the .seq write below (builtin printf, 0 forks). `.seq`'s
+        # `status` map is about to be updated for THIS event, but the jsonl
+        # append that makes it real hasn't happened yet (HIGH-A requires the
+        # .seq write to stay before the append). A crash anywhere from here
+        # through the append leaves this marker on disk reading "PENDING"
+        # (only the OK-confirmed write below, after the append, ever clears
+        # it back to empty) — Step 2's freshness check above now checks this
+        # marker's CONTENT, not just its mtime, so the next call correctly
+        # refuses to trust a `status` map whose confirming append may never
+        # have landed, instead of silently reading a phantom status.
+        printf 'PENDING\n' > "$_status_sync_file" 2>/dev/null || true
 
-        if [ -z "$seq_json" ] || [ "$seq_json" = "null" ]; then
-            echo "v11_ledger_append: jq produced empty/null seq_json for project=$project — skipping" >&2
-            exit 1
-        fi
-
-        # Step 4: Atomic write .seq (tmp in same dir + rename).
+        # Step 4: atomic write .seq (tmp in same dir + rename). Written
+        # directly (builtin printf, 0 forks — was a second `jq '.'` pass,
+        # 2 forks): $seq_json2 is already-validated compact JSON from Step 3.
         # HIGH-A: if this write FAILS, log and exit WITHOUT appending.
-        # A failed write means __seqno__ was NOT durably advanced; the next acquirer
-        # would compute the same ordinal → duplicate seqno → corruption (ADR §4.4).
-        # We MUST NOT append the line in that case. A gap is harmless; a duplicate is not.
-        local seq_tmp
-        seq_tmp="${seq_file}.tmp.$$"
-        if ! printf '%s' "$seq_json" | jq '.' > "$seq_tmp" 2>/dev/null || ! [ -s "$seq_tmp" ]; then
+        local seq_tmp="${seq_file}.tmp.$$"
+        if ! printf '%s\n' "$seq_json2" > "$seq_tmp" 2>/dev/null || ! [ -s "$seq_tmp" ]; then
             rm -f "$seq_tmp" 2>/dev/null
             echo "LEDGER-SEQ-WRITE-FAIL: aborting ledger line (seqno gaps; no duplicate) project=$project" >&2
             exit 1
@@ -2700,24 +3618,9 @@ v11_ledger_append() {
             exit 1
         fi
 
-        # Step 5: Build the complete line and append (O_APPEND).
-        # seqno and create_seq are injected now that both are durably committed.
-        local complete_line
-        complete_line=$(printf '%s' "$event_json" | jq -c \
-            --argjson seqno "$new_seqno" \
-            --argjson create_seq "$this_create_seq" '
-            . + {seqno: $seqno, create_seq: ($create_seq | tonumber)}
-        ' 2>/dev/null)
-
-        if [ -z "$complete_line" ] || [ "$complete_line" = "null" ]; then
-            echo "v11_ledger_append: jq failed to build complete line for project=$project — skipping" >&2
-            exit 1
-        fi
-
-        # Validate no embedded newline (ADR §1.1: one compact JSON object per line).
-        # Use `case` pattern matching — `grep -q $'\n'` produces false positives on
-        # some systems because grep treats the newline pattern as "end of line"
-        # and matches the implicit line-end of a trailing-newline-less input.
+        # Validate no embedded newline (ADR §1.1: one compact JSON object per
+        # line). `case` pattern matching, not `grep -q $'\n'` (false
+        # positives on some systems on the implicit line-end match).
         case "$complete_line" in
             *$'\n'*)
                 echo "v11_ledger_append: line contains embedded newline — skipping (malformed event)" >&2
@@ -2725,38 +3628,32 @@ v11_ledger_append() {
                 ;;
         esac
 
-        # ADR §4.1 MED-2: ≤PIPE_BUF (4096 byte) line-size invariant.
-        # A line exceeding 4096 bytes cannot be atomically written by O_APPEND on
-        # Linux (PIPE_BUF = 4096); the write() may be torn across concurrent appends,
-        # breaking the §4.3 "only the tail fragment may be torn" safety guarantee.
-        # Truncate lowest-priority optional fields in priority order:
-        #   1. description  2. metadata  3. artifacts
-        # Identity fields (project, subject_norm, create_seq, seqno, ev, ts, task_id)
-        # and counters_delta are NEVER truncated.
-        # If the line is still >4096 after truncating all three → log + skip (never append).
-        local line_bytes
-        line_bytes=$(printf '%s\n' "$complete_line" | wc -c 2>/dev/null || echo 9999)
-        if [ "${line_bytes:-9999}" -gt 4096 ]; then
-            # Try truncating description first
-            local reduced
-            reduced=$(printf '%s' "$complete_line" | jq -c 'del(.description)' 2>/dev/null)
-            local rb
-            rb=$(printf '%s\n' "${reduced:-}" | wc -c 2>/dev/null || echo 9999)
-            if [ "${rb:-9999}" -le 4096 ] && [ -n "$reduced" ]; then
+        # ADR §4.1 MED-2: ≤PIPE_BUF (4096 byte) line-size invariant — O_APPEND
+        # cannot atomically write a line bigger than PIPE_BUF on Linux, and a
+        # torn write breaks the §4.3 "only the tail fragment may be torn"
+        # guarantee. Truncate lowest-priority optional fields in priority
+        # order: description, metadata, artifacts. Identity fields and
+        # counters_delta are NEVER truncated. `${#complete_line}` is exact
+        # bytes here (LC_ALL=C, set above) — 0 forks in the common case
+        # (was a `wc -c` fork every call); the rare re-jq fallbacks below are
+        # unchanged (only triggered when actually over budget).
+        if [ "${#complete_line}" -gt 4096 ]; then
+            local reduced rb
+            reduced=$(jq -c 'del(.description)' <<<"$complete_line" 2>/dev/null)
+            rb=${#reduced}
+            if [ -n "$reduced" ] && [ "$rb" -le 4096 ]; then
                 complete_line="$reduced"
                 echo "v11_ledger_append: truncated description to fit PIPE_BUF for project=$project" >&2
             else
-                # Also truncate metadata
-                reduced=$(printf '%s' "$complete_line" | jq -c 'del(.description,.metadata)' 2>/dev/null)
-                rb=$(printf '%s\n' "${reduced:-}" | wc -c 2>/dev/null || echo 9999)
-                if [ "${rb:-9999}" -le 4096 ] && [ -n "$reduced" ]; then
+                reduced=$(jq -c 'del(.description,.metadata)' <<<"$complete_line" 2>/dev/null)
+                rb=${#reduced}
+                if [ -n "$reduced" ] && [ "$rb" -le 4096 ]; then
                     complete_line="$reduced"
                     echo "v11_ledger_append: truncated description+metadata to fit PIPE_BUF for project=$project" >&2
                 else
-                    # Also truncate artifacts
-                    reduced=$(printf '%s' "$complete_line" | jq -c 'del(.description,.metadata,.artifacts)' 2>/dev/null)
-                    rb=$(printf '%s\n' "${reduced:-}" | wc -c 2>/dev/null || echo 9999)
-                    if [ "${rb:-9999}" -le 4096 ] && [ -n "$reduced" ]; then
+                    reduced=$(jq -c 'del(.description,.metadata,.artifacts)' <<<"$complete_line" 2>/dev/null)
+                    rb=${#reduced}
+                    if [ -n "$reduced" ] && [ "$rb" -le 4096 ]; then
                         complete_line="$reduced"
                         echo "v11_ledger_append: truncated description+metadata+artifacts to fit PIPE_BUF for project=$project" >&2
                     else
@@ -2767,15 +3664,40 @@ v11_ledger_append() {
             fi
         fi
 
-        # O_APPEND write: each printf >> on a POSIX system issues a single write(2)
-        # that the kernel appends atomically (for lines <= PIPE_BUF ~4096 bytes).
+        # O_APPEND write: builtin printf + redirect (0 forks — was also a
+        # builtin, unchanged) issues a single write(2) the kernel appends
+        # atomically for lines <= PIPE_BUF.
         printf '%s\n' "$complete_line" >> "$jsonl_file"
 
-        # ADR §2.3 (LOW): for `created` events, print the FD-207-confirmed create_seq
-        # to stdout so the caller can stamp the authoritative value into _idk.
-        # (Non-created events already resolved create_seq from _idk before this call.)
+        # Re-stamp the status-map staleness marker AFTER the jsonl append
+        # (builtin printf + redirect, 0 forks) — this specific ordering is
+        # what keeps v11_ledger_append's OWN appends from tripping the
+        # `[[ jsonl -nt marker ]]` staleness check on the very next call: the
+        # marker is now at least as new as the line this call just wrote,
+        # whether or not this event was status-type (a non-status append,
+        # e.g. review/prescope, still moves the jsonl's mtime forward and
+        # would otherwise falsely read as "changed since sync" next time).
+        # fix review #16 (S2-T5 MEDIUM): also the ONLY place the PENDING
+        # sentinel written above is ever cleared back to "confirmed" (empty)
+        # — reached only once the append this .seq write described has
+        # actually landed. Any exit before this line (crash or an early
+        # `exit 1` above) leaves PENDING on disk, which Step 2's content
+        # check now treats as unconditionally stale.
+        printf '' > "$_status_sync_file" 2>/dev/null || true
+
+        # ADR §2.3 (LOW): for `created` events, print the FD-207-confirmed
+        # create_seq on stdout (builtin printf, 0 forks) so the caller can
+        # stamp it into _idk. #111: a create that carried rehydrate_target
+        # prints "create_seq<TAB>subject_norm" — the identity actually used
+        # (the target's when accepted, else its own) — every other create
+        # prints create_seq alone. Matches
+        # tests/test_ledger_rehydrate_identity.py's stdout contract exactly.
         if [ "$ev_type" = "created" ]; then
-            printf '%s' "$this_create_seq"
+            if [ -n "$_rt_sn" ]; then
+                printf '%s\t%s' "$this_create_seq" "${_cont_norm:-$subject_norm}"
+            else
+                printf '%s' "$this_create_seq"
+            fi
         fi
 
     ) || true
@@ -2784,6 +3706,7 @@ v11_ledger_append() {
     # this call; the ledger is durable enrichment, not a replacement for STATE.
     return 0
 }
+
 
 # v11_ledger_identity_fallback PROJECT SUBJECT [SCAN_CAP]
 #   ADR Addendum A §A.2 — Phase-1 lock-free reverse-scan fallback.
@@ -2901,19 +3824,53 @@ print("MISS", end=""); sys.exit(0)
 FALLBACK_PYEOF
 }
 
-# v11_ledger_resolve_by_task_id PROJECT TASK_ID [SCAN_CAP]
+# v11_ledger_resolve_by_task_id PROJECT TASK_ID [SESSION_UUID] [SCAN_CAP]
 #   W5-T16 (improvements/09) — bounded reverse-scan identity recovery keyed
 #   by task_id rather than subject text. The CLI `review-queue mark-done
 #   --verdict-file` path only has a task_id in hand (no subject string to
 #   normalize), so v11_ledger_identity_fallback (subject-keyed) doesn't fit;
 #   this mirrors the fold-reconcile create_seq scan (scripts/fold-reconcile:
 #   141-214) as a live lock-free lookup instead of an offline batch pass.
-#   Returns "SUBJECT_NORM\tCREATE_SEQ" (tab-separated) on stdout, or "MISS".
+#   S1-P3 (#97): task_ids are session-local and reused across sessions, so a
+#   bare id can name several parents. The latest event carrying the id used
+#   to win, which bound S1-T8's verdict to the planning session's task 10.
+#     - SESSION_UUID given and it holds one task under TASK_ID: that task.
+#       If it holds several (the id reused after the first closed), the one
+#       that has completed; none or several completed → AMBIGUOUS.
+#     - SESSION_UUID that is not a UUID (review #61: review-daemon passed its
+#       own id), or that holds no task under TASK_ID: treated as no session,
+#       with a NOTE when that still binds.
+#     - no SESSION_UUID: binds only when every identity-bearing event for
+#       TASK_ID names one identity; otherwise prints "AMBIGUOUS\t<detail>"
+#       and the caller must refuse rather than guess.
+#   ev:"review"/"prescope" rows are never candidates: a review row names the
+#   identity it was (possibly wrongly) bound to, and prescope rows carry the
+#   subject_norm=""/create_seq=-1 sentinel.
+#   Returns "SUBJECT_NORM\tCREATE_SEQ" (tab-separated) on stdout, optionally
+#   followed by a second line "NOTE\t<text>", or "MISS", or "AMBIGUOUS\t<detail>".
 #   Side-effect-never-fails: returns "MISS" on any internal error.
+#   S2-T0b-3 (#113): the rules above are the v11.46 path, kept under
+#   V11_TASK_RESOLVER=legacy. By default this delegates to v11_resolve_identity
+#   (scripts/lib/task_epoch.py, rules R0-R4) with the same signature and TSV
+#   contract; SCAN_CAP is ignored (the index reads the whole ledger). A task_id
+#   one session reused (a TaskList that restarted at 1) binds the claim at the
+#   row's position, not "the completed one"; AMBIGUOUS is left for a real tie.
+#   Extra arguments after SCAN_CAP pass through to the resolver:
+#   --identity SN:CS (R0), --epoch E (R1), --at TS [--seqno N], --subject TEXT.
 v11_ledger_resolve_by_task_id() {
+    if [ "${V11_TASK_RESOLVER:-shared}" = "legacy" ]; then
+        _v11_ledger_resolve_by_task_id_legacy "$@"
+        return 0
+    fi
+    local project="$1" task_id="$2" session_uuid="${3:-}"
+    [ $# -gt 4 ] && shift 4 || set --
+    V11_IDENTITY_HELPER=on v11_resolve_identity "$project" "$task_id" "$session_uuid" "" --format tsv "$@"
+}
+_v11_ledger_resolve_by_task_id_legacy() {
     local project="$1"
     local task_id="$2"
-    local scan_cap="${3:-50000}"
+    local session_uuid="${3:-}"
+    local scan_cap="${4:-50000}"
 
     if [ -z "$project" ] || ! printf '%s' "$project" | grep -qE '^[a-zA-Z0-9._-]{1,64}$'; then
         printf 'MISS'
@@ -2932,13 +3889,15 @@ v11_ledger_resolve_by_task_id() {
 
     V11_LRT_FILE="$ledger_file" \
     V11_LRT_TASK="$task_id" \
+    V11_LRT_SESSION="$session_uuid" \
     V11_LRT_PROJECT="$project" \
     V11_LRT_CAP="$scan_cap" \
     python3 - <<'RESOLVE_PYEOF' 2>/dev/null
-import os, sys, json
+import os, re, sys, json
 
 ledger_path = os.environ.get("V11_LRT_FILE", "")
 target_task = os.environ.get("V11_LRT_TASK", "")
+target_sess = os.environ.get("V11_LRT_SESSION", "")
 project     = os.environ.get("V11_LRT_PROJECT", "")
 scan_cap    = int(os.environ.get("V11_LRT_CAP", "50000"))
 
@@ -2947,13 +3906,10 @@ if not ledger_path or not target_task or not project:
 
 try:
     with open(ledger_path, "rb") as fh:
-        fh.seek(0, 2)
-        scan_end_off = fh.tell()
-        if scan_end_off == 0:
-            print("MISS", end=""); sys.exit(0)
-        fh.seek(0)
-        raw_bytes = fh.read(scan_end_off)
+        raw_bytes = fh.read()
 except OSError:
+    print("MISS", end=""); sys.exit(0)
+if not raw_bytes:
     print("MISS", end=""); sys.exit(0)
 
 try:
@@ -2964,15 +3920,15 @@ except Exception:
 lines = raw_text.split("\n")
 if lines and lines[-1] != "":
     lines = lines[:-1]  # drop torn tail (§4.3)
+lines = [ln for ln in lines if ln != ""]
+if len(lines) > scan_cap:
+    print(f"LEDGER-IDENTITY-SCAN-CAP: scan_cap={scan_cap} project={project} — "
+          f"only the newest {scan_cap} lines were considered", file=sys.stderr)
+    lines = lines[-scan_cap:]
 
-lines_scanned = 0
+candidates = []  # every identity-bearing event for TASK_ID: (identity, session_uuid, ev), newest first
+completed = set()  # identities with a `completed` event
 for raw in reversed(lines):
-    if raw == "":
-        continue
-    lines_scanned += 1
-    if lines_scanned > scan_cap:
-        print(f"LEDGER-IDENTITY-MISS-SCAN-CAP: scan_cap={scan_cap} project={project}", file=sys.stderr)
-        print("MISS", end=""); sys.exit(0)
     try:
         ev = json.loads(raw)
     except json.JSONDecodeError:
@@ -2983,12 +3939,71 @@ for raw in reversed(lines):
         continue
     if str(ev.get("task_id", "")) != str(target_task):
         continue
+    if ev.get("ev") in ("review", "prescope"):
+        continue
+    sn = ev.get("subject_norm") or ""
     cs = ev.get("create_seq")
-    sn = ev.get("subject_norm", "")
-    if cs is not None:
-        print(f"{sn}\t{cs}", end=""); sys.exit(0)
+    if not sn or not isinstance(cs, int) or isinstance(cs, bool) or cs < 0:
+        continue
+    if ev.get("ev") == "completed":
+        completed.add((sn, cs))
+    candidates.append(((sn, cs), str(ev.get("session_uuid") or ""), ev.get("ev")))
 
-print("MISS", end=""); sys.exit(0)
+
+def distinct(cands):
+    out = {}  # identity -> sessions that carry it (newest identity first)
+    for ident, sess, _ev in cands:
+        out.setdefault(ident, set()).add(sess)
+    return out
+
+
+def describe(idents):
+    return "; ".join(
+        f"session {','.join(sorted(s[:8] for s in sessions if s)) or '?'}: "
+        f"\"{sn[:60]}\" (create_seq {cs})"
+        for (sn, cs), sessions in idents.items())
+
+
+def bind(ident, note=""):
+    print(f"{ident[0]}\t{ident[1]}" + (f"\nNOTE\t{note}" if note else ""), end="")
+    sys.exit(0)
+
+
+is_uuid = bool(re.fullmatch(
+    r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}", target_sess))
+if is_uuid:
+    mine = distinct([c for c in candidates if c[1] == target_sess])
+    if len(mine) == 1:
+        bind(next(iter(mine)))
+    if len(mine) > 1:
+        done = [i for i in mine if i in completed]
+        if len(done) == 1:
+            bind(done[0])
+        print(f"AMBIGUOUS\tsession {target_sess} holds {len(mine)} tasks under task_id "
+              f"{target_task} and {len(done) or 'none'} of them completed — {describe(mine)}",
+              end="")
+        sys.exit(0)
+
+identities = distinct(candidates)
+if not identities:
+    print("MISS", end=""); sys.exit(0)
+if len(identities) == 1:
+    only = next(iter(identities))
+    note = ""
+    if target_sess:
+        owners = ",".join(sorted(s[:8] for s in identities[only] if s)) or "?"
+        why = (f"session {target_sess} holds no task {target_task}" if is_uuid
+               else f"'{target_sess}' is not a session UUID")
+        note = f"{why}; bound to the only task carrying that id (session {owners})"
+    bind(only, note)
+why = ""
+if target_sess:
+    why = (f" (session {target_sess} holds none of them)" if is_uuid
+           else f" ('{target_sess}' is not a session UUID)")
+print(f"AMBIGUOUS\ttask_id {target_task} names more than one task in the {project} ledger — "
+      f"{describe(identities)}. Pass the parent's session UUID as SESSION_UUID{why} "
+      f"(4th argument; `review-queue pending {project} --json` lists it)", end="")
+sys.exit(0)
 RESOLVE_PYEOF
 }
 
@@ -3015,7 +4030,74 @@ RESOLVE_PYEOF
 #     {"create_seq": null, "subject_norm": null, "found": false}
 #
 #   Rollback: V11_IDENTITY_HELPER=off emits the not-found shape unconditionally.
+#
+#   S2-T0b-3 (#113): the scan above is the v11.46 path, kept under
+#   V11_TASK_RESOLVER=legacy. By default this is the bash wrapper on
+#   scripts/lib/task_epoch.py resolve, the resolver every reader shares (rules
+#   R0-R4 in its docstring):
+#     v11_resolve_identity PROJECT TASK_ID SESSION_UUID [SUBJECT]
+#         [--identity SN:CS] [--epoch E] [--at TS [--seqno N]] [--format json|tsv]
+#   SESSION_UUID may be empty (R3). SUBJECT no longer filters: R2/R3 prefer
+#   the claim whose norms hold it, and R4 on a stamped current TaskList epoch
+#   binds that epoch's claim whatever it says. The JSON keeps the three fields above and
+#   adds status (bound|unresolved|ambiguous), basis, note and candidates;
+#   found is true only when bound. --format tsv prints the
+#   v11_ledger_resolve_by_task_id contract (SN\tCS[\nNOTE\t..] | MISS |
+#   AMBIGUOUS\t..). V11_IDENTITY_HELPER=off applies to the JSON form only.
+#   One python3 run plus a ledger replay: never call it on a hook hot path.
+#   Values reach task_epoch.py as --opt=VALUE and the positionals after --, so
+#   a subject, norm or id starting with '-' is data, never an option (review
+#   #23). task_epoch.py's stderr (notes, warnings, usage errors) passes through
+#   to the caller's stderr; a non-zero exit adds a line and reads as MISS.
 v11_resolve_identity() {
+    if [ "${V11_TASK_RESOLVER:-shared}" = "legacy" ]; then
+        _v11_resolve_identity_legacy "$@"
+        return 0
+    fi
+    local project="${1:-}" task_id="${2:-}" session_uuid="${3:-}" subject="${4:-}" fmt="json"
+    local _not_found='{"create_seq":null,"subject_norm":null,"found":false}'
+    [ $# -gt 4 ] && shift 4 || set --
+    local _ri_args=()
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --format) fmt="${2:-json}"; shift; [ $# -gt 0 ] && shift ;;
+            --format=*) fmt="${1#--format=}"; shift ;;
+            --identity|--epoch|--at|--seqno|--subject) _ri_args+=("$1=${2:-}"); shift; [ $# -gt 0 ] && shift ;;
+            *) _ri_args+=("$1"); shift ;;
+        esac
+    done
+    [ "$fmt" = "tsv" ] || fmt="json"
+    local _miss="MISS"
+    if [ "$fmt" = "json" ]; then
+        _miss="$_not_found"
+        if [ "${V11_IDENTITY_HELPER:-on}" = "off" ]; then
+            printf '%s' "$_not_found"
+            return 0
+        fi
+    fi
+    if [ -z "$project" ] || [ -z "$task_id" ] || ! [[ "$project" =~ ^[a-zA-Z0-9._-]{1,64}$ ]] \
+       || [ ! -s "${METRICS_DIR}/ledger/${project}.jsonl" ]; then
+        printf '%s' "$_miss"
+        return 0
+    fi
+    [ -n "$subject" ] && _ri_args+=("--subject=$subject")
+    local _out="" _rc=0
+    _out=$(python3 "$V11_HOME/scripts/lib/task_epoch.py" resolve \
+        "--session=$session_uuid" "--metrics-dir=$METRICS_DIR" "--format=$fmt" \
+        "${_ri_args[@]+"${_ri_args[@]}"}" -- "$project" "$task_id") || { _rc=$?; _out=""; }
+    [ "$_rc" -eq 0 ] || echo "v11_resolve_identity: task_epoch.py resolve exited $_rc for task $task_id; read as unresolved" >&2
+    if [ "$fmt" = "tsv" ]; then
+        printf '%s' "${_out:-MISS}"
+        return 0
+    fi
+    _out=$(printf '%s' "$_out" | jq -c '
+        {create_seq: (.identity.create_seq // null), subject_norm: (.identity.subject_norm // null),
+         found: (.status == "bound"), status: (.status // "unresolved"), basis: (.basis // null),
+         note: (.note // ""), candidates: (.candidates // [])}' 2>/dev/null) || _out=""
+    printf '%s' "${_out:-$_not_found}"
+    return 0
+}
+_v11_resolve_identity_legacy() {
     local project="$1"
     local task_id="$2"
     local session_uuid="$3"
@@ -3226,6 +4308,39 @@ except ImportError:
         s = s[:200]
         return s or "__empty__"
 
+# S1-P3 (review #61): the one waived/void correction rule, shared with
+# agent-scorecard (scripts/lib/review_corrections.py).
+try:
+    from review_corrections import correction_outcomes
+except ImportError:
+    def correction_outcomes(rows):  # test-isolation stub; void rows are still skipped
+        return {}
+
+# S2-T0b-1 (#113): the (session_uuid, tl_epoch, task_id) keying rule, shared
+# with scripts/lib/task_epoch.py. tl_epoch is None on an unstamped event, so an
+# unstamped ledger keys exactly as the v11.46 (session_uuid, task_id) index did.
+# Review #20: imported from the import-free task_key.py (not task_epoch.py) and
+# computed once per event (memo on id(ev); `events` outlives every call).
+# Rollback: V11_TASK_RESOLVER=legacy (v11.46 keying, alias-only sibling norms,
+# no tl_epoch/identity fields).
+_RESOLVER_LEGACY = os.environ.get("V11_TASK_RESOLVER", "shared") == "legacy"
+try:
+    from task_key import claim_key as _claim_key
+except ImportError:
+    def _claim_key(ev):  # test-isolation stub: every event reads as unstamped
+        _t = ev.get("task_id")
+        return (str(ev.get("session_uuid") or ""), None, "" if _t is None else str(_t))
+_ck_memo = {}
+
+def claim_key(ev):
+    _ck = _ck_memo.get(id(ev))
+    if _ck is None:
+        _ck = _claim_key(ev)
+        if _RESOLVER_LEGACY:
+            _ck = (_ck[0], None, _ck[2])
+        _ck_memo[id(ev)] = _ck
+    return _ck
+
 
 # ---------------------------------------------------------------------------
 # §4.3  Parse ledger — skip malformed/truncated lines safely
@@ -3276,8 +4391,26 @@ def parse_ledger(path, project_name):
 # ---------------------------------------------------------------------------
 # §3.2  Sort: (ts, seqno) ascending — strict total order
 # ---------------------------------------------------------------------------
+_UTC = datetime.timezone.utc
+_TS_MIN = datetime.datetime.min.replace(tzinfo=_UTC)
+
 def sort_key(ev):
-    return (ev.get("ts", ""), int(ev.get("seqno", 0)))
+    # improvements/60: order by the parsed UTC instant, seqno as tiebreak.
+    # The ts STRING is not an order (the ledger mixes +02:00 and +00:00),
+    # and seqno alone is not either (hand-appended events carry none).
+    # Rollback: V11_REPLAY_ORDER=ts-string.
+    if _REPLAY_ORDER_LEGACY:
+        return (ev.get("ts", ""), int(ev.get("seqno", 0) or 0))
+    d = _v11_parse_iso(ev.get("ts", ""))
+    if d is None:
+        d = _TS_MIN
+    elif d.tzinfo is None:
+        d = d.replace(tzinfo=_UTC)
+    else:
+        d = d.astimezone(_UTC)
+    return (d, int(ev.get("seqno", 0) or 0))
+
+_REPLAY_ORDER_LEGACY = os.environ.get("V11_REPLAY_ORDER", "") == "ts-string"
 
 
 # ---------------------------------------------------------------------------
@@ -3332,6 +4465,8 @@ def deep_merge(base, overlay):
 # §3.3 / §3.4  Single-pass fold
 # ---------------------------------------------------------------------------
 events = parse_ledger(ledger_path, project)
+# {(seqno, ts): "waived"|"void"} — computed in file order, before the sort.
+review_corrected = correction_outcomes(events)
 events.sort(key=sort_key)
 
 counters = {"total": 0, "pending": 0, "in_progress": 0, "completed": 0, "blocked": 0, "cancelled": 0}
@@ -3354,31 +4489,165 @@ by_id = {}
 # than phantom-keying. The pair goes permanently AMBIGUOUS and lookups
 # refuse (legacy phantom fallthrough). Resolution before the second claim
 # still lands on the then-only claimant (closest-preceding semantics).
+# S2-T0b-1 (#113): the index is keyed on claim_key(ev) = (session_uuid,
+# tl_epoch, task_id). A resumed conversation keeps its hook session but gets a
+# new TaskList that reuses ids 1..N, and hooks/sync-tasks stamps each event
+# with the TaskList epoch it ran in (tl_epoch). A stamped pair is exact per
+# epoch; every claim is also noted under the unstamped (session, None, id)
+# key, which unstamped events look up with the sticky rule above, unchanged.
 sess_task_index = {}
+sess_task_claims = {}  # every identity that ever claimed a claim_key
+sess_task_last = {}    # (session, None, task_id) -> the latest claimant noted
+epoch_open = {}        # (session, tl_epoch) -> tl_open of the create that opened it
+# Per project (review #20): epoch_open sees only this project's ledger, so the
+# replay stays one incremental file read. TaskIndex.epochs() reads every
+# ledger (C13). When a create in ANOTHER project opened the epoch `fresh`, a
+# stamped subject_norm-less row here stays unresolved (a phantom key) where
+# TaskIndex binds it by inference_cross_epoch. It fails safe: no wrong bind.
+_stamped_fb = {}       # id(ev) -> the fold's answer for a stamped event
 _IDK_AMBIGUOUS = object()
+# Every stamped claim_key a claim holds, anywhere in the ledger (review #19
+# C11): a stamped row whose epoch claims its id only later names an older
+# task. A claim is what task_epoch.py R1 counts (review #20): an
+# identity-bearing `created`; other identity-bearing rows only for a
+# (session, task_id) with no `created` at all (a task older than the ledger).
+# A later status row in a reuse epoch whose create was dropped is no claim, so
+# an earlier subject_norm-less row there stays unresolved. Empty for an
+# unstamped ledger.
+_stamped_claims, _created_pairs, _stamped_other = set(), set(), []
+for _e in events:
+    if not _e.get("subject_norm") or _e.get("ev") in ("review", "prescope"):
+        continue
+    _ck = claim_key(_e)
+    if _e.get("ev") == "created":
+        _created_pairs.add((_ck[0], _ck[2]))
+        if _ck[1] is not None:
+            _stamped_claims.add(_ck)
+    elif _ck[1] is not None:
+        _stamped_other.append(_ck)
+_stamped_claims.update(_ck for _ck in _stamped_other if (_ck[0], _ck[2]) not in _created_pairs)
 
 def sess_index_note(ev, key):
-    """Record `key` as a claimant of this event's (session_uuid, task_id).
+    """Record `key` as a claimant of this event's claim_key.
     Call ONLY for identity-bearing (subject_norm-carrying) events."""
     _s = ev.get("session_uuid")
     _t = ev.get("task_id")
     if not _s or _t is None:
         return
-    _k = (str(_s), str(_t))
-    _prev = sess_task_index.get(_k)
-    if _prev is None or _prev == key:
-        sess_task_index[_k] = key
-    else:
-        sess_task_index[_k] = _IDK_AMBIGUOUS  # sticky — never resolves again
+    _ck = claim_key(ev)
+    _keys = (_ck,) if _ck[1] is None else (_ck, (_ck[0], None, _ck[2]))
+    for _k in _keys:
+        sess_task_claims.setdefault(_k, set()).add(key)
+        _prev = sess_task_index.get(_k)
+        if _prev is None or _prev == key:
+            sess_task_index[_k] = key
+        else:
+            sess_task_index[_k] = _IDK_AMBIGUOUS  # sticky — never resolves again
+    sess_task_last[_keys[-1]] = key
+
+def _stamped_resolve(ck):
+    _fb = sess_task_index.get(ck)
+    if _fb is not None:
+        return None if _fb is _IDK_AMBIGUOUS else _fb
+    # No claim in the event's own epoch so far (task_epoch.py rule R1). When
+    # the epoch claims the id later (C11: the row predates that create, so it
+    # names an older task), or the epoch opened `fresh` (first create of the
+    # session, or the epoch record was lost) and continues the TaskList before
+    # it, the latest earlier claimant binds. A `reuse` epoch, or one whose
+    # opening create is not in the ledger, never binds into an older epoch:
+    # its create was never ledgered.
+    if ck not in _stamped_claims and epoch_open.get((ck[0], ck[1])) != "fresh":
+        return None
+    return sess_task_last.get((ck[0], None, ck[2]))
 
 def sess_index_resolve(ev):
     """Fallback idk key for a subject_norm-less event, or None when there is
-    no unambiguous well-formed precedent for its (session_uuid, task_id)."""
-    _fb = sess_task_index.get(
-        (str(ev.get("session_uuid") or ""), str(ev.get("task_id") or "")))
+    no unambiguous well-formed precedent for its claim_key."""
+    _ck = claim_key(ev)
+    if _ck[1] is not None:
+        # Resolved once, at the event's place in the fold; the walks after
+        # the fold reuse that answer instead of the index's final state.
+        if id(ev) not in _stamped_fb:
+            _stamped_fb[id(ev)] = _stamped_resolve(_ck)
+        return _stamped_fb[id(ev)]
+    _fb = sess_task_index.get(_ck)
     if _fb is None or _fb is _IDK_AMBIGUOUS:
         return None
     return _fb
+
+# S1-T2c: rehydrate aliases. v11-resume-tasks stamps a rehydrated task's source
+# identity into metadata.rehydrated_from.identity. For a task renamed before the
+# restart, the rehydrated `created` carries the NEW subject_norm, so
+# v11_ledger_append's continuation (keyed on subject_norm) mints a fresh
+# identity and the original stays open forever (v11-leverage-program #71 ->
+# #1). A `created` whose rehydrated_from.identity names a different identity
+# already in by_id is an ALIAS: every event of its own identity folds into the
+# original. Only an identity's first event can alias it (one with history is a
+# separate task, never merged); a malformed rehydrated_from, or a target never
+# seen, is ignored. Targets are always by_id keys and aliases never enter
+# by_id, so chains stay one hop; alias_resolve still refuses a loop.
+# A target already completed or cancelled is never aliased (review #3): the
+# alias heals originals left OPEN, and a stale handoff (v11-resume-tasks does
+# no ledger check) that rehydrates a finished task would otherwise reopen it.
+# The fold runs in (ts, seqno) order, so this is the target's status as of the
+# alias's own `created`.
+# Read-side, so existing ledgers heal without a rewrite.
+# Rollback: V11_REPLAY_REHYDRATE_ALIAS=off.
+_REHYDRATE_ALIAS = os.environ.get("V11_REPLAY_REHYDRATE_ALIAS", "on") != "off"
+alias_of = {}     # alias idk key -> the identity key it folds into
+alias_norms = {}  # target key -> subject_norms of its aliases (sibling link)
+alias_src = {}    # alias idk key -> the `created` that made it (identity view)
+
+def alias_resolve(key):
+    _seen = set()
+    while key in alias_of and key not in _seen:
+        _seen.add(key)
+        key = alias_of[key]
+    return key
+
+def alias_note(ev, key):
+    """Register `key`, a created event's own identity, as an alias of the
+    identity its metadata.rehydrated_from.identity names, when valid."""
+    if not _REHYDRATE_ALIAS or key in by_id or key in alias_of:
+        return
+    md = ev.get("metadata")
+    rf = md.get("rehydrated_from") if isinstance(md, dict) else None
+    ident = rf.get("identity") if isinstance(rf, dict) else None
+    if not isinstance(ident, dict):
+        return
+    sn, cs = ident.get("subject_norm"), ident.get("create_seq")
+    if (not isinstance(sn, str) or not sn or isinstance(cs, bool)
+            or not isinstance(cs, int) or cs < 0):
+        return
+    target = alias_resolve(ev.get("project", "") + "\x00" + sn + "\x00" + str(cs))
+    if (target == key or target not in by_id or by_id[target].get("review_only")
+            or by_id[target]["status"] in ("completed", "cancelled")):
+        return
+    alias_of[key] = target
+    alias_norms.setdefault(target, set()).add(ev.get("subject_norm"))
+    alias_src[key] = ev
+
+# S2-T0b-1 (design §6.6): every subject an identity went by, for the
+# sibling-follows-parent link. key_norms(key) = its own norm, its aliases'
+# norms, and the normalized subject of each `created` and renaming
+# field_update folded into it: a renamed or rehydrated parent keeps its first
+# norm while its review sibling says "Review: <new subject>". Subjects are
+# normalized only when a sibling asks. task_epoch.py builds the same set.
+key_subjects = {}     # identity key -> raw subjects (created / field_update)
+tl_epoch_by_key = {}  # identity key -> {session_uuid: last tl_epoch stamped on it}
+_key_norms_memo = {}
+
+def key_norms(key):
+    if key not in _key_norms_memo:
+        _n = {key.split("\x00")[1]} | alias_norms.get(key, set())
+        if not _RESOLVER_LEGACY:
+            _n |= {normalize_subject(_s) for _s in key_subjects.get(key, ())}
+        _key_norms_memo[key] = _n
+    return _key_norms_memo[key]
+
+# S1-T2c: every `created` folded into an identity, for the identity view
+# (scripts/wave-check binds review_of by task-id epoch from these).
+created_claims = {}
 project_pinned_at = None
 last_ts = ""
 phase = "discovery"
@@ -3450,7 +4719,8 @@ for ev in events:
 
         elif scope == "identity":
             # identity-scope reconcile IS permitted to key by_id
-            rec = by_id.setdefault(idk(ev), fresh())
+            _rkey = alias_resolve(idk(ev))
+            rec = by_id.setdefault(_rkey, fresh())
             # improvements/24 (adversarial finding #2): an identity-bearing
             # reconcile also registers its claim so a later subject_norm-less
             # status event can heal through it — relevant post-archive, where
@@ -3459,7 +4729,7 @@ for ev in events:
             # fallback (out of scope — reconcile emitters are our own
             # tooling and always stamp identity).
             if ev.get("subject_norm"):
-                sess_index_note(ev, idk(ev))
+                sess_index_note(ev, _rkey)
             forced = ev.get("identity_status")
             if forced in ("pending", "in_progress", "completed", "blocked"):
                 rec["status"] = forced
@@ -3479,6 +4749,12 @@ for ev in events:
     # verdict_ref/verdict_sha when present) for downstream lookups.
     # ------------------------------------------------------------------
     if ev_type == "review":
+        # S1-P3 (review #61): a void row is no review, and neither is the row it
+        # voids. last_review_* reaches only the identity view, so the default
+        # aggregate is byte-identical either way.
+        if (str(ev.get("outcome") or "").lower() == "void"
+                or review_corrected.get((ev.get("seqno"), ev.get("ts"))) == "void"):
+            continue
         # E1 fix (adversarial-lite): identity-unresolved review events share
         # the sentinel subject_norm=="" / create_seq==-1 key, which collapses
         # ALL unresolved reviews for a project onto one by_id record and lets
@@ -3488,7 +4764,7 @@ for ev in events:
         if ev.get("identity_unresolved") or ev.get("create_seq") in (None, -1):
             _key = (ev.get("project", ""), "__unresolved__", ev.get("task_id", ""))
         else:
-            _key = idk(ev)
+            _key = alias_resolve(idk(ev))
         _review_new = _key not in by_id
         rec = by_id.setdefault(_key, fresh())
         if _review_new:
@@ -3533,6 +4809,10 @@ for ev in events:
     # Per-identity state machine — last-event-wins (ADR §3.3/§3.4)
     # ------------------------------------------------------------------
     _key = idk(ev)
+    if ev_type == "created" and ev.get("tl_open") in ("fresh", "reuse"):
+        _ck = claim_key(ev)
+        if _ck[1] is not None:
+            epoch_open.setdefault((_ck[0], _ck[1]), ev["tl_open"])
     if not ev.get("subject_norm"):
         # improvements/24 fallback: no identity fields on this event —
         # resolve through the (session_uuid, task_id) index so the status
@@ -3546,7 +4826,18 @@ for ev in events:
         if _fb is not None:
             _key = _fb
     else:
+        if ev_type == "created":
+            alias_note(ev, _key)
+        _key = alias_resolve(_key)
         sess_index_note(ev, _key)
+    # improvements/60: a non-status event (artifact_warn, field_update, ...)
+    # updates an existing task; it never creates one. Without this an
+    # identity-less artifact_warn became a blank pending task (6 projects).
+    # Rollback: V11_NONSTATUS_CREATES_TASK=on.
+    if (ev_type not in ("created", "in_progress", "completed", "blocked", "cancelled")
+            and _key not in by_id
+            and os.environ.get("V11_NONSTATUS_CREATES_TASK", "off") != "on"):
+        continue
     rec = by_id.setdefault(_key, fresh())
     # F3 fix: a real (non-review, non-reconcile) event landing on this
     # identity proves it corresponds to an actual task — clear any
@@ -3556,6 +4847,21 @@ for ev in events:
     if ev_type == "created":
         rec["status"] = "pending"
         rec["created_ts"] = ev.get("ts")
+        _cmd = ev.get("metadata") if isinstance(ev.get("metadata"), dict) else {}
+        _claim = {
+            "session_uuid": ev.get("session_uuid"),
+            "task_id":      ev.get("task_id"),
+            "seqno":        ev.get("seqno"),
+            "ts":           ev.get("ts"),
+            "review_of":    _cmd.get("review_of"),
+        }
+        if not _RESOLVER_LEGACY:
+            # S2-T0b-1: the TaskList epoch of this create, and the identity it
+            # carried (differs from the record's own only for a rehydrate alias).
+            _claim["tl_epoch"] = claim_key(ev)[1]
+            _claim["identity"] = {"subject_norm": ev.get("subject_norm"),
+                                  "create_seq": ev.get("create_seq")}
+        created_claims.setdefault(_key, []).append(_claim)
     elif ev_type == "in_progress":
         rec["status"] = "in_progress"
     elif ev_type == "completed":
@@ -3575,6 +4881,9 @@ for ev in events:
         rec["status"] = "cancelled"
         rec["cancelled_reason"] = ev.get("reason")
         rec["cancelled_at"] = ev.get("at") or ev.get("ts")
+
+    if ev_type in ("created", "field_update") and isinstance(ev.get("subject"), str) and ev["subject"]:
+        key_subjects.setdefault(_key, set()).add(ev["subject"])
 
     # field updates — any event type may carry these; None/"" means no change
     for fld in ("subject", "description", "owner", "sprint", "gate", "recommended_agent"):
@@ -3603,6 +4912,9 @@ for ev in events:
     tid  = ev.get("task_id")
     if sess and tid:
         rec["task_id_by_session"][sess] = tid
+        _tle = claim_key(ev)[1]
+        if _tle is not None:
+            tl_epoch_by_key.setdefault(_key, {})[sess] = _tle
 
 
 # ---------------------------------------------------------------------------
@@ -3617,6 +4929,49 @@ for k in list(counters.keys()):
 # add them back once here so `counters` matches `derived` below.
 counters["total"] += archived_total
 counters["completed"] += archived_completed
+
+# improvements/58 item 3: a V11.21 review sibling follows its parent into
+# cancellation. The sibling is its own identity (metadata.review_of = the
+# parent's session-local task_id), so the parent's `cancelled` event never
+# reached it and it stayed open forever. task_id alone is not a link:
+# sessions reuse ids across subjects, so an unrelated task can be the only
+# claimant of (session_uuid, review_of). A parent counts only if it claimed
+# that pair in a session the sibling lived in AND its subject_norm equals
+# the sibling's "Review: <parent subject>" remainder, normalized. No such
+# parent → stay open (never guess). Follow only when every matching parent
+# is cancelled; completed parents keep their sibling (the pending review).
+# Rollback: V11_SIBLING_FOLLOWS_PARENT=off.
+if os.environ.get("V11_SIBLING_FOLLOWS_PARENT", "on") != "off":
+    for rec in by_id.values():
+        if rec["status"] not in ("pending", "in_progress", "blocked"):
+            continue
+        _ro = (rec.get("metadata") or {}).get("review_of")
+        if _ro in (None, ""):
+            continue
+        _subj = rec.get("subject") or ""
+        if not _subj.startswith("Review: "):
+            continue
+        _want = normalize_subject(_subj[len("Review: "):])
+        _parents = []
+        for _s in rec["task_id_by_session"]:
+            for _pk in sess_task_claims.get((str(_s), None, str(_ro)), ()):
+                _parts = _pk.split("\x00")
+                # S1-T2c: an aliased parent also answers to its aliases' norms;
+                # S2-T0b-1: and to every subject it went by (key_norms).
+                if len(_parts) == 3 and _pk in by_id and _want in key_norms(_pk):
+                    _parents.append(by_id[_pk])
+        if _parents and all(p["status"] == "cancelled" for p in _parents):
+            rec["status"] = "cancelled"
+            rec["cancelled_reason"] = "parent_cancelled"
+            # Latest by parsed instant, not string order: offsets are mixed
+            # (+02:00 / +00:00), and the cancelled-unfold path parses this.
+            def _utc(s):
+                d = _v11_parse_iso(s)
+                if d is None:
+                    return None
+                return d.astimezone(datetime.timezone.utc) if d.tzinfo else d.replace(tzinfo=datetime.timezone.utc)
+            _cas = [p.get("cancelled_at") for p in _parents if _utc(p.get("cancelled_at"))]
+            rec["cancelled_at"] = max(_cas, key=_utc) if _cas else None
 
 derived = {
     "pending":     sum(1 for r in by_id.values() if r["status"] == "pending" and not r.get("review_only")),
@@ -3655,7 +5010,7 @@ for ev in reversed(events):
     # through the same fallback the main fold used, so this walk agrees with
     # by_id instead of relying on the by-reference invariant. Ambiguous or
     # precedent-less events keep raw idk(ev) — same as the fold did.
-    k = idk(ev)
+    k = alias_resolve(idk(ev))
     if not ev.get("subject_norm"):
         _fbk = sess_index_resolve(ev)
         if _fbk is not None:
@@ -3699,6 +5054,7 @@ active_task_ids    = sorted([
 # means changing this dict's shape — a consumer-breaking change deliberately
 # NOT bundled into the #24 remediation.
 open_tasks_by_session = {}
+_open_key = {}  # (session_uuid, t_id) -> the by_id key its entry shows (last wins, as above)
 for _k, rec in by_id.items():
     if rec["status"] in ("completed", "blocked"):
         continue
@@ -3734,6 +5090,7 @@ for _k, rec in by_id.items():
             "status":      rec["status"],
             "metadata":    rec["metadata"],
         }
+        _open_key[(sess_uuid, t_id)] = _k
 
 # active_task_ids_by_session (diagnostic parity, §3.5)
 active_task_ids_by_session = {}
@@ -3768,6 +5125,26 @@ open_tasks = [
     for sess_uuid, sess_tasks in open_tasks_by_session.items()
     for t_id, task_rec in sess_tasks.items()
 ]
+# S2-T0b-1 (#113): an entry whose task was stamped with a TaskList epoch in
+# that session also carries the epoch and its identity, so a reader binds it
+# exactly (task_epoch.py R0/R1) instead of by the reused id. Unstamped entries
+# are unchanged, so the aggregate of an unstamped ledger is byte-identical,
+# except the §6.6 key_norms sibling link on renamed/rehydrated parents: a
+# review sibling also matches every subject its parent went by, so it can now
+# follow a cancelled parent (review #20).
+if not _RESOLVER_LEGACY:
+    for _e in open_tasks:
+        _ok = _open_key.get((_e["session_uuid"], _e["task_id"]))
+        _tle = tl_epoch_by_key.get(_ok, {}).get(_e["session_uuid"]) if _ok else None
+        if _tle is None:
+            continue
+        _p = _ok.split("\x00")
+        try:
+            _pcs = int(_p[2])
+        except ValueError:
+            _pcs = None
+        _e["tl_epoch"] = _tle
+        _e["identity"] = {"subject_norm": _p[1], "create_seq": _pcs}
 
 # recent_completed — top 10 by completed_at desc (§3.5)
 completed_recs = [
@@ -3916,6 +5293,131 @@ aggregate = {
     "aggregate_built_at":         now,
     "ledger_source":              "ledger",
 }
+# review #3 (S1-T2c): each rehydrate alias folds a second identity into its
+# original, so total is one lower than a replay without aliases counted. The
+# cutover REGRESSION-GUARD adds this back (alias_carveout). Only emitted when
+# an alias fired, so the aggregate stays byte-identical without one.
+if alias_of:
+    aggregate["alias_count"] = len(alias_of)
+# S2-R4: the review-sibling age-out cancellations this replay folded (the
+# align-aggregate sweep writes them with reason "review_sibling_ageout"). The
+# cutover REGRESSION-GUARD adds back only those a prior aggregate did not
+# already reflect (ageout_carveout). Only emitted when one exists, like
+# alias_count.
+_ageout_n = sum(1 for ev in events
+                if ev.get("ev") == "cancelled" and ev.get("reason") == "review_sibling_ageout")
+if _ageout_n:
+    aggregate["ageout_count"] = _ageout_n
+
+# improvements/96 (S1-T16): opt-in per-identity view. The aggregate keeps
+# closed tasks only as counts (recent_completed is a top-10 display list), so
+# a consumer that must see a whole sprint, completed and cancelled included
+# (scripts/wave-check), reads this instead of re-folding the ledger itself.
+# Off by default, so the aggregate every other caller writes is unchanged.
+if os.environ.get("V11_REPLAY_EMIT_IDENTITIES", "off") == "on":
+    # Review fields for this view come from a second walk, so the fold above
+    # (and the aggregate every default caller gets) is untouched:
+    #   - the latest valid ev:"review" per identity (the fold's review-branch
+    #     key) with its severity, outcome, verdict_ref and verdict_sha.
+    #     Corrections follow scripts/lib/review_corrections.py (review_corrected,
+    #     the same rule agent-scorecard uses): outcome=void (S1-P3: e.g. a
+    #     verdict the resolver misattributed) erases the original, and the void
+    #     row is no review either; outcome=waived marks the original waived, and
+    #     the correction row is itself a waived review;
+    #   - the last review_summary_delta a completion carried: the severity
+    #     counts survive the PIPE_BUF cap that drops a large verdict (#102);
+    #   - the outcome / waiver_reason of the last cancellation.
+    # created_claims lists every `created` folded into the identity (session,
+    # task_id, seqno, ts, review_of), rehydrate aliases included (S1-T2c);
+    # S2-T0b-1 adds each create's tl_epoch and the identity it carried, and
+    # the record's norms (key_norms). scripts/lib/task_epoch.py reads its
+    # aliases from here.
+    _last_rev, _last_rsd, _last_cancel = {}, {}, {}
+
+    def _correction(ev):
+        """"void" / "waived" when a later row corrects this review, else None."""
+        return review_corrected.get((ev.get("seqno"), ev.get("ts")))
+
+    for ev in events:
+        _t = ev.get("ev")
+        if _t == "review":
+            if str(ev.get("outcome") or "").lower() == "void" or _correction(ev) == "void":
+                continue
+            if ev.get("identity_unresolved") or ev.get("create_seq") in (None, -1):
+                continue
+            _last_rev[alias_resolve(idk(ev))] = ev
+        elif _t in ("completed", "cancelled"):
+            _ek = alias_resolve(idk(ev))
+            if not ev.get("subject_norm"):
+                _fb = sess_index_resolve(ev)
+                if _fb is not None:
+                    _ek = _fb
+            if _t == "cancelled":
+                _last_cancel[_ek] = ev
+            elif isinstance(ev.get("review_summary_delta"), dict):
+                _last_rsd[_ek] = ev["review_summary_delta"]
+    identities = []
+    for _k, rec in by_id.items():
+        # review_only records are orphaned verdict pointers, not tasks; their
+        # unresolved-review keys are tuples, never idk() strings.
+        if rec.get("review_only") or not isinstance(_k, str):
+            continue
+        _parts = _k.split("\x00")
+        if len(_parts) != 3:
+            continue
+        try:
+            _cs = int(_parts[2])
+        except ValueError:
+            _cs = None
+        _rev = _last_rev.get(_k) or {}
+        _outcome = _rev.get("outcome")
+        if _rev and _correction(_rev) == "waived":
+            _outcome = "waived"
+        _cev = _last_cancel.get(_k) or {}
+        identities.append({
+            "subject_norm":         _parts[1],
+            "create_seq":           _cs,
+            "task_id":              rec["task_id"],
+            "session_uuid":         rec["session_uuid"],
+            "task_id_by_session":   rec["task_id_by_session"],
+            "status":               rec["status"],
+            "subject":              rec["subject"],
+            "sprint":               rec["sprint"],
+            "metadata":             rec["metadata"],
+            "artifacts":            rec["artifacts"],
+            # From the void-aware walk, not the fold's raw last review.
+            "last_review_severity": _rev.get("review_severity") if _rev else None,
+            "last_review_outcome":  _outcome,
+            "last_review_verdict_ref": _rev.get("verdict_ref"),
+            "last_review_verdict_sha": _rev.get("verdict_sha"),
+            "review_summary_delta": _last_rsd.get(_k),
+            "cancelled_outcome":    _cev.get("outcome"),
+            "cancelled_waiver_reason": _cev.get("waiver_reason"),
+            "completed_at":         rec["completed_at"],
+            "cancelled_at":         rec["cancelled_at"],
+            "cancelled_reason":     rec["cancelled_reason"],
+            "created_claims":       created_claims.get(_k, []),
+        })
+        if not _RESOLVER_LEGACY:
+            identities[-1]["norms"] = sorted(key_norms(_k))
+    aggregate["identities"] = identities
+    if not _RESOLVER_LEGACY:
+        # S2-T0b-1 (review #19 C6): the alias map itself, so a writer can
+        # materialise legacy aliases once (a sidecar) instead of scanning
+        # the ledger on every append.
+        def _ident_obj(k):
+            _p = k.split("\x00")
+            try:
+                return {"subject_norm": _p[1], "create_seq": int(_p[2])}
+            except (IndexError, ValueError):
+                return {"subject_norm": _p[1] if len(_p) > 1 else "", "create_seq": None}
+        aggregate["aliases"] = [
+            {"alias": _ident_obj(_a), "target": _ident_obj(_t),
+             "session_uuid": alias_src[_a].get("session_uuid"),
+             "task_id": alias_src[_a].get("task_id"),
+             "seqno": alias_src[_a].get("seqno"), "ts": alias_src[_a].get("ts")}
+            for _a, _t in sorted(alias_of.items())
+        ]
 
 print(json.dumps(aggregate, separators=(",", ":")))
 PYEOF
@@ -3967,9 +5469,7 @@ v11_session_is_live() {
     local max_age_min="${2:-${V11_SESSION_LIVENESS_MINUTES:-15}}"
     [ -z "$session_uuid" ] && return 1
     [ "$session_uuid" = "legacy-cli" ] && return 1
-    if ! printf '%s' "$session_uuid" | grep -qE '^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$'; then
-        return 1
-    fi
+    v11_valid_session_id "$session_uuid" || return 1
     local sdir="$METRICS_DIR/sessions/$session_uuid"
     [ -d "$sdir" ] || return 1
     local newest
@@ -4165,8 +5665,14 @@ PYEOF
 }
 
 # v11_review_queue_add PROJECT TASK_ID AGENT_ID SUBJECT [FILES_CHANGED_JSON] [SESSION_UUID]
+#                      [PARENT_SUBJECT_NORM PARENT_CREATE_SEQ [TL_EPOCH]]
 #   Append a pending event IF no current pending entry exists for (project, task_id).
 #   Idempotent: re-calling for an already-pending task is a no-op.
+#   S2-T0b-2 (#113, #97 going forward): with the parent's identity, the row
+#   carries parent_identity {subject_norm, create_seq} (and tl_epoch, the
+#   TaskList epoch it was completed in), and a row that names a DIFFERENT
+#   parent_identity under the same task_id (a reused id) no longer counts as
+#   "already pending". Rows without one keep the bare-task_id rule.
 #   Echoes "added" or "exists" on stdout (advisory). Returns 0 on success or no-op.
 #   Side-effect-never-fails: any internal failure → silent skip.
 #   Returns 0 on enqueue success or silent-skip (legacy never-fails contract).
@@ -4177,6 +5683,10 @@ PYEOF
 v11_review_queue_add() {
     local project="$1" task_id="$2" agent_id="$3" subject="$4"
     local files_json="${5:-[]}" session_uuid="${6:-}"
+    local parent_sn="${7:-}" parent_cs="${8:-}" parent_tle="null"
+    [[ $parent_cs =~ $_V11_TLR_NUM_ERE ]] && [ "$parent_cs" != "0" ] && [ -n "$parent_sn" ] \
+        || { parent_sn=""; parent_cs=""; }
+    [[ ${9:-} =~ $_V11_TLR_EPOCH_ERE ]] && parent_tle="$9"
 
     # SEC-C-02 + arg presence
     if [ -z "$project" ] || ! printf '%s' "$project" | grep -qE '^[a-zA-Z0-9._-]{1,64}$'; then
@@ -4301,10 +5811,13 @@ v11_review_queue_add() {
         --argjson files "$files_json" \
         --arg session_uuid "${session_uuid:-}" \
         --argjson trace "${_rq_trace}" \
+        --arg psn "$parent_sn" --arg pcs "$parent_cs" --argjson ptle "$parent_tle" \
         '({v:1, ev:"pending", ts:$ts, project:$project, task_id:$task_id,
           agent_id:$agent_id, subject:$subject, files_changed:$files,
           session_uuid:$session_uuid, claimed_by:null}) +
-         (if ($trace | type) == "object" then {trace: $trace} else {} end)' \
+         (if ($trace | type) == "object" then {trace: $trace} else {} end) +
+         (if $psn != "" then {parent_identity: {subject_norm: $psn, create_seq: ($pcs | tonumber)}} else {} end) +
+         (if $ptle != null then {tl_epoch: $ptle} else {} end)' \
         2>/dev/null) || {
         echo "v11_review_queue_add: failed to build event JSON — skipping" >&2
         return 0
@@ -4322,10 +5835,16 @@ v11_review_queue_add() {
         # Check current status by replaying the file (latest event per task_id wins)
         local current_status="absent"
         if [ -f "$jsonl_file" ] && [ -s "$jsonl_file" ]; then
-            current_status=$(V11_RQ_FILE="$jsonl_file" V11_RQ_TASK="$task_id" python3 - <<'PYEOF' 2>/dev/null || echo "absent"
+            current_status=$(V11_RQ_FILE="$jsonl_file" V11_RQ_TASK="$task_id" \
+                V11_RQ_PSN="$parent_sn" V11_RQ_PCS="$parent_cs" python3 - <<'PYEOF' 2>/dev/null || echo "absent"
 import os, json
 path = os.environ.get("V11_RQ_FILE", "")
 target = os.environ.get("V11_RQ_TASK", "")
+# S2-T0b-2: with the parent's identity, rows naming another parent_identity
+# under this task_id are another task's (a reused id) and are skipped.
+psn = os.environ.get("V11_RQ_PSN", "")
+pcs = os.environ.get("V11_RQ_PCS", "")
+want = (psn, int(pcs)) if psn and pcs.isdigit() else None
 latest = None
 try:
     with open(path, "r", encoding="utf-8") as f:
@@ -4338,6 +5857,10 @@ try:
             except Exception:
                 continue
             if str(ev.get("task_id", "")) == target:
+                pi = ev.get("parent_identity")
+                if (want is not None and isinstance(pi, dict)
+                        and (pi.get("subject_norm"), pi.get("create_seq")) != want):
+                    continue
                 latest = ev.get("ev", "")
 except Exception:
     pass
@@ -4400,20 +5923,27 @@ _v11_review_verdict_store() {
     return 0
 }
 
-# _v11_review_ledger_event PROJECT TASK_ID SEVERITY VERDICT_FILE VERDICT_REF VERDICT_SHA
+# _v11_review_ledger_event PROJECT TASK_ID SEVERITY VERDICT_FILE VERDICT_REF VERDICT_SHA [OUTCOME] [RESOLVED]
 #   B2 (improvements/09, W5-T16): append the ev:"review" ledger event.
+#   OUTCOME (S1-T11): written as `outcome` only when non-empty (today: "waived"),
+#   so a waiver never lands as a clean NONE review; every other call keeps its bytes.
 #   Status-neutral and counters_delta-free by construction — see the
-#   `ev_type == "review"` branch in v11_replay_ledger. Resolves identity via
-#   v11_ledger_resolve_by_task_id (task_id-keyed reverse scan, prior-session-
-#   safe); on MISS, appends anyway with create_seq:null/identity_unresolved:
+#   `ev_type == "review"` branch in v11_replay_ledger. RESOLVED (S1-P3) is the
+#   caller's v11_ledger_resolve_by_task_id result; without it the bare task_id
+#   is resolved here. An AMBIGUOUS resolution writes nothing and returns 2. On
+#   MISS, appends anyway with create_seq:null/identity_unresolved:
 #   true (a flagged event beats a dropped verdict — unattributed-never-
 #   dropped doctrine). session_uuid is the DRAINER's own session (v11_session_
 #   uuid), distinct from the done-event's owner/session_uuid argument.
 _v11_review_ledger_event() {
     local project="$1" task_id="$2" severity="$3" verdict_file="$4" verdict_ref="$5" verdict_sha="$6"
+    local outcome="${7:-}" resolved="${8:-}"
 
-    local resolved
-    resolved=$(v11_ledger_resolve_by_task_id "$project" "$task_id" 2>/dev/null || echo "MISS")
+    if [ -z "$resolved" ]; then
+        resolved=$(v11_ledger_resolve_by_task_id "$project" "$task_id" 2>/dev/null || echo "MISS")
+    fi
+    resolved="${resolved%%$'\n'*}"  # drop the resolver's NOTE line
+    [ "${resolved%%$'\t'*}" = "AMBIGUOUS" ] && return 2
 
     local subject_norm="" create_seq="" identity_unresolved="false"
     if [ -z "$resolved" ] || [ "$resolved" = "MISS" ]; then
@@ -4446,37 +5976,45 @@ _v11_review_ledger_event() {
             --arg ts "$now" --arg project "$project" --arg task_id "$task_id" \
             --arg session_uuid "$drainer_session" --arg severity "$severity" \
             --arg verdict_sha "$verdict_sha" --arg verdict_ref "$verdict_ref" \
-            --arg owner "$reviewer_identity" \
+            --arg owner "$reviewer_identity" --arg outcome "$outcome" \
             --argjson error_count "${error_count:-0}" \
             '{v:1, ev:"review", ts:$ts, project:$project, subject_norm:"", task_id:$task_id,
               create_seq:null, identity_unresolved:true, session_uuid:$session_uuid,
               review_severity:$severity, reviewer_agent:$owner, owner:$owner,
               error_count:$error_count, verdict_sha:$verdict_sha, verdict_ref:$verdict_ref,
-              source:"cli-drain"}' 2>/dev/null) || return 1
+              source:"cli-drain"}
+             + (if $outcome == "" then {} else {outcome:$outcome} end)' 2>/dev/null) || return 1
     else
         event_json=$(jq -cn \
             --arg ts "$now" --arg project "$project" --arg task_id "$task_id" \
             --arg subject_norm "$subject_norm" --argjson create_seq "$create_seq" \
             --arg session_uuid "$drainer_session" --arg severity "$severity" \
             --arg verdict_sha "$verdict_sha" --arg verdict_ref "$verdict_ref" \
-            --arg owner "$reviewer_identity" \
+            --arg owner "$reviewer_identity" --arg outcome "$outcome" \
             --argjson error_count "${error_count:-0}" \
             '{v:1, ev:"review", ts:$ts, project:$project, subject_norm:$subject_norm, task_id:$task_id,
               create_seq:$create_seq, session_uuid:$session_uuid,
               review_severity:$severity, reviewer_agent:$owner, owner:$owner,
               error_count:$error_count, verdict_sha:$verdict_sha, verdict_ref:$verdict_ref,
-              source:"cli-drain"}' 2>/dev/null) || return 1
+              source:"cli-drain"}
+             + (if $outcome == "" then {} else {outcome:$outcome} end)' 2>/dev/null) || return 1
     fi
 
     v11_ledger_append "$project" "$event_json"
 }
 
-# _v11_prescope_ledger_event PROJECT TASK_ID REASON SESSION_UUID
-#   S1-B2 (improvements/10): append ONE status-neutral ev:"prescope" ledger
-#   event for a single fired TaskCreate advisory (V11_PRESCOPE_ADVISORY /
-#   V11_SCOPE_WARN / V11_PRESCOPE_SMELL — S1-A1/A2/A3/B1). REASON is one of
+# _v11_prescope_ledger_event PROJECT TASK_ID SESSION_UUID REASON...
+#   S1-B2 (improvements/10), S2-T5 (#83): append ONE status-neutral
+#   ev:"prescope" ledger event covering every fired TaskCreate advisory
+#   (V11_PRESCOPE_ADVISORY / V11_SCOPE_WARN / V11_PRESCOPE_SMELL —
+#   S1-A1/A2/A3/B1) in ONE call — was one ~42-fork v11_ledger_append call
+#   PER REASON, so a task that tripped e.g. both scope_large and a smell
+#   check paid for two full appends. REASON... is one or more of
 #   missing_scope|invalid_scope|scope_large|complex_no_deliverable|
-#   smell_conjunction|smell_runbook_steps|smell_length.
+#   smell_conjunction|smell_runbook_steps|smell_length, stamped as the
+#   `reasons` array. Ledgers are append-only: rows written before this
+#   change still carry the old singular `reason:<str>` shape, and readers
+#   (scripts/prescope-check) accept both indefinitely.
 #
 #   Mirrors the ev:"review" pattern above (_v11_review_ledger_event): the
 #   identity_unresolved:true / subject_norm:"" / create_seq:null sentinel is
@@ -4498,7 +6036,9 @@ _v11_review_ledger_event() {
 #
 #   Side-effect-never-fails: v11_ledger_append itself never fails the caller.
 _v11_prescope_ledger_event() {
-    local project="$1" task_id="$2" reason="$3" session_uuid="$4"
+    local project="$1" task_id="$2" session_uuid="$3"
+    shift 3
+    [ "$#" -gt 0 ] || return 0
 
     local now
     now="$(date -u +%Y-%m-%dT%H:%M:%S+00:00)"
@@ -4506,15 +6046,120 @@ _v11_prescope_ledger_event() {
     local event_json
     event_json=$(jq -cn \
         --arg ts "$now" --arg project "$project" --arg task_id "$task_id" \
-        --arg session_uuid "$session_uuid" --arg reason "$reason" \
+        --arg session_uuid "$session_uuid" --args \
         '{v:1, ev:"prescope", ts:$ts, project:$project, subject_norm:"", task_id:$task_id,
           create_seq:null, identity_unresolved:true, session_uuid:$session_uuid,
-          reason:$reason}' 2>/dev/null) || return 1
+          reasons:$ARGS.positional}' "$@" 2>/dev/null) || return 1
 
     v11_ledger_append "$project" "$event_json"
 }
 
-# v11_review_queue_mark_done PROJECT TASK_ID [REVIEW_SEVERITY] [SESSION_UUID] [VERDICT_FILE]
+# _v11_review_queue_rows_py: the python both helpers below share. A queue row
+#   belongs to (session, identity): its session_uuid when that is a UUID (else
+#   none), and its parent_identity "SN:CS" (S2-T0b-2 writes it on pending rows,
+#   mark-done on done rows); a done row without one takes the identity of the
+#   latest pending/parked row before it that its session matches. A missing
+#   session or identity matches any.
+_V11_RQ_ROWS_PY='
+import json, re, sys
+UUID = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+def ident_of(v):
+    if isinstance(v, dict):
+        sn, cs = v.get("subject_norm"), v.get("create_seq")
+        if isinstance(sn, str) and sn and isinstance(cs, int) and not isinstance(cs, bool) and cs >= 0:
+            return f"{sn}:{cs}"
+    return ""
+def same(a, b):
+    return not a or not b or a == b
+def queue_rows(path, tid):
+    out, opened = [], []
+    try:
+        fh = open(path, encoding="utf-8", errors="replace")
+    except OSError:
+        return out
+    with fh:
+        for line in fh:
+            try:
+                ev = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(ev, dict) or str(ev.get("task_id", "")) != tid:
+                continue
+            sess = str(ev.get("session_uuid") or "")
+            sess = sess if UUID.fullmatch(sess) else ""
+            ident = ident_of(ev.get("parent_identity"))
+            kind = ev.get("ev", "")
+            if kind in ("pending", "parked"):
+                opened.append((sess, ident))
+            elif kind == "done" and not ident:
+                ident = next((i for s, i in reversed(opened) if same(s, sess)), "")
+            out.append((kind, sess, ident, ev))
+    return out
+'
+
+# _v11_review_queue_anchor QUEUE_FILE TASK_ID [SESSION_UUID]
+#   S2-T0b-3: the open queue row of TASK_ID (the latest row SESSION_UUID
+#   matches, when it is pending or parked): prints session, parent identity
+#   SN:CS, tl_epoch, ts and subject, each NUL-terminated (all empty when none).
+_v11_review_queue_anchor() {
+    V11_RQ_FILE="$1" V11_RQ_TASK="$2" V11_RQ_SESS="${3:-}" python3 -c "$_V11_RQ_ROWS_PY"'
+import os
+rows = [r for r in queue_rows(os.environ["V11_RQ_FILE"], os.environ["V11_RQ_TASK"])
+        if same(r[1], os.environ.get("V11_RQ_SESS", ""))]
+f = [""] * 5
+if rows and rows[-1][0] in ("pending", "parked"):
+    kind, sess, ident, ev = rows[-1]
+    tle = ev.get("tl_epoch")
+    tle = str(tle) if isinstance(tle, int) and not isinstance(tle, bool) and tle > 0 else (
+        tle if isinstance(tle, str) and tle.isdigit() else "")
+    subj = ev.get("subject")
+    f = [sess, ident, tle, str(ev.get("ts") or ""),
+         " ".join(subj.split()) if isinstance(subj, str) and subj not in ("", "?", "unknown") else ""]
+sys.stdout.write("".join(x.replace("\0", "") + "\0" for x in f))
+' 2>/dev/null || printf '\0\0\0\0\0'
+}
+
+# _v11_review_queue_status QUEUE_FILE TASK_ID SESSION IDENTITY [OPEN_IDENTITY] [IDENTITY_SET]
+#   S2-T0b-3 (#97 F19): mark-done's one read of the queue, under its lock
+#   (review #23: no second python for the anchor on the sync-tasks path). The
+#   open row is the one _v11_review_queue_anchor finds (SESSION counts only
+#   when it is a UUID). The fold matches SESSION when it is a UUID, else the
+#   open row's session; and IDENTITY when IDENTITY_SET is 1 (the caller bound
+#   it, or found it unbound: empty), else the open row's parent_identity.
+#   Prints "<ev><TAB><masks><TAB><identity>": ev of the latest row of TASK_ID
+#   that matches (session, identity), either may be empty ("absent" when none
+#   does); masks 1 when the bare id's latest row is open (pending/parked) for
+#   another task: both identities known and different (OPEN_IDENTITY: the
+#   caller's resolution of that row when it carries no parent_identity), else
+#   0 (a done row appended then would close that entry in every task_id-keyed
+#   queue view); identity: the one the done row carries.
+_v11_review_queue_status() {
+    V11_RQ_FILE="$1" V11_RQ_TASK="$2" V11_RQ_SESS="${3:-}" V11_RQ_IDENT="${4:-}" V11_RQ_OPEN="${5:-}" \
+    V11_RQ_IDENT_SET="${6:-0}" python3 -c "$_V11_RQ_ROWS_PY"'
+import os
+rows = queue_rows(os.environ["V11_RQ_FILE"], os.environ["V11_RQ_TASK"])
+want_s = os.environ.get("V11_RQ_SESS", "")
+want_s = want_s if UUID.fullmatch(want_s) else ""
+mine = [r for r in rows if same(r[1], want_s)]
+open_s, open_i = (mine[-1][1], mine[-1][2]) if mine and mine[-1][0] in ("pending", "parked") else ("", "")
+want_s = want_s or open_s
+want_i = os.environ.get("V11_RQ_IDENT", "") if os.environ.get("V11_RQ_IDENT_SET") == "1" else open_i
+latest, last = "absent", None
+for kind, sess, ident, _ev in rows:
+    last = (kind, sess, ident)
+    if same(sess, want_s) and same(ident, want_i):
+        latest = kind or latest
+masks = False
+if last is not None and last[0] in ("pending", "parked"):
+    kind, sess, ident = last
+    if not ident and same(sess, want_s):
+        ident = os.environ.get("V11_RQ_OPEN", "")
+    masks = not same(ident, want_i)
+sys.stdout.write(f"{latest}\t{int(masks)}\t{want_i}")
+' 2>/dev/null || printf 'absent'
+}
+
+# v11_review_queue_mark_done PROJECT TASK_ID [REVIEW_SEVERITY] [SESSION_UUID] [VERDICT_FILE] [IDENTITY]
 #   Append a done event. Idempotent: if latest is already done, no-op.
 #   REVIEW_SEVERITY is informational (max severity from review.errors[*]) for the queue surface.
 #   VERDICT_FILE (optional, W5-T16/improvements/09): when given and
@@ -4522,10 +6167,30 @@ _v11_prescope_ledger_event() {
 #   (ev:"review" ledger event); the resulting verdict_ref/verdict_sha are
 #   also folded into this done event (B4). Without VERDICT_FILE, behavior
 #   (including the done event's shape) is byte-identical to today.
+#   S1-P3 (#97): with VERDICT_FILE, SESSION_UUID also names the parent task's
+#   session — the verdict binds to the task that session created under
+#   TASK_ID. Without SESSION_UUID a task_id reused across sessions is refused
+#   (stderr message, return 2, nothing written) rather than bound to a guess.
 #   Echoes "marked", "already_done", or "absent" on stdout.
+#   S2-T0b-3 (#113, #97 F19). IDENTITY ("SUBJECT_NORM:CREATE_SEQ", review-queue
+#   mark-done --identity) names the parent exactly. The verdict binds, in order,
+#   to: IDENTITY (R0; one the ledger does not know is refused, return 2); the
+#   open queue row's parent_identity (R0); its tl_epoch (R1); its ts and
+#   subject (R2); else (session, task_id) alone. The open queue row is the
+#   latest pending/parked row for the task_id in SESSION_UUID (any session when
+#   SESSION_UUID is empty or not a UUID, whose session then stands in). The
+#   done row carries the bound identity as parent_identity (the open row's own
+#   when its parent_identity is not in the ledger and the fold fell back to the
+#   row's epoch/position: it closes that row, review #23), and already_done
+#   matches (session, task_id, identity) instead of the bare task_id: a row
+#   without a session or identity matches any, and a done row without
+#   parent_identity takes the one of the row it closed. V11_TASK_RESOLVER=legacy
+#   keeps the v11.46 behaviour and bytes.
 v11_review_queue_mark_done() {
     local project="$1" task_id="$2"
-    local severity="${3:-NONE}" session_uuid="${4:-}" verdict_file="${5:-}"
+    local severity="${3:-NONE}" session_uuid="${4:-}" verdict_file="${5:-}" identity_arg="${6:-}"
+    local _rq_shared=1
+    [ "${V11_TASK_RESOLVER:-shared}" = "legacy" ] && _rq_shared=0
 
     # V11.28.1: normalize severity to the canonical enum {NONE,LOW,MEDIUM,HIGH,CRITICAL}
     # at the single write chokepoint. Any non-severity code (no_op, waived, misrouted,
@@ -4544,6 +6209,14 @@ v11_review_queue_mark_done() {
                        severity="NONE" ;;
     esac
 
+    # S1-T11: a verdict file that says WAIVED is a waiver even when the severity
+    # was derived from its (empty) errors[] — `review-queue mark-done --verdict-file`
+    # with no SEV passes NONE, which is how the 19 S0 waivers landed as clean reviews.
+    if [ -z "$_rq_outcome" ] && [ -n "$verdict_file" ] && [ -f "$verdict_file" ] \
+       && [ "$(jq -r '(.verdict // "") | ascii_downcase' "$verdict_file" 2>/dev/null)" = "waived" ]; then
+        _rq_outcome="waived"
+    fi
+
     if [ -z "$project" ] || ! printf '%s' "$project" | grep -qE '^[a-zA-Z0-9._-]{1,64}$'; then
         return 0
     fi
@@ -4558,16 +6231,96 @@ v11_review_queue_mark_done() {
 
     mkdir -p "$queue_dir" 2>/dev/null || return 0
 
+    # S2-T0b-3: the open queue row this fold answers, and the identity it names.
+    # Read here only when a resolver call needs it (a verdict to bind, or
+    # IDENTITY); otherwise the status read under the lock finds it, so the
+    # sync-tasks TaskUpdate fold (no verdict file) forks what v11.46 did.
+    local _rq_sess_ok=0 _rq_target="" _rq_target_set=0 _rq_anchor_sess="" _rq_row_ident=""
+    local _rq_anchor=("" "" "" "" "")  # session, parent identity SN:CS, tl_epoch, ts, subject
+    [[ "$session_uuid" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]] && _rq_sess_ok=1
+    if [ "$_rq_shared" = 1 ]; then
+        if [ -n "$identity_arg" ]; then
+            if ! [[ "$identity_arg" =~ ^.+:[0-9]+$ ]]; then
+                echo "review-queue mark-done: --identity must be SUBJECT_NORM:CREATE_SEQ, got '$identity_arg'. Nothing was written." >&2
+                return 2
+            fi
+            _rq_target="$identity_arg"
+            _rq_target_set=1
+        fi
+        if [ -s "$jsonl_file" ] && { [ -n "$identity_arg" ] || { [ -n "$verdict_file" ] && [ -f "$verdict_file" ] \
+                && [ "${V11_REVIEW_LEDGER:-on}" != "off" ]; }; }; then
+            [ "$_rq_sess_ok" = 1 ] && _rq_anchor_sess="$session_uuid"
+            mapfile -t -d '' _rq_anchor < <(_v11_review_queue_anchor "$jsonl_file" "$task_id" "$_rq_anchor_sess")
+            [ "${#_rq_anchor[@]}" -eq 5 ] || _rq_anchor=("" "" "" "" "")
+            [ -z "$_rq_target" ] && _rq_target="${_rq_anchor[1]}"
+        fi
+    fi
+
     # B1+B2 (improvements/09, W5-T16): verdict fold-back, gated by
     # V11_REVIEW_LEDGER (new lever, default on). Never fails mark-done —
     # a verdict-store/ledger failure just means verdict_ref/verdict_sha
     # stay empty on the done event (falls back to today's severity-only shape).
     local verdict_ref="" verdict_sha=""
     if [ -n "$verdict_file" ] && [ -f "$verdict_file" ] && [ "${V11_REVIEW_LEDGER:-on}" != "off" ]; then
+        # S1-P3: bind the parent before anything is written, so a refusal
+        # leaves no verdict file, ledger row or queue row behind.
+        local resolved _rq_note=""
+        if [ "$_rq_shared" = 1 ]; then
+            local _rq_rsess="$session_uuid" _rq_flags=()
+            if [ "$_rq_sess_ok" = 0 ] \
+               && [[ "${_rq_anchor[0]}" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]; then
+                _rq_rsess="${_rq_anchor[0]}"
+            fi
+            # --opt=VALUE: a subject or norm starting with '-' stays a value (review
+            # #23); the resolver's own stderr notes pass through to the caller.
+            [ -n "${_rq_anchor[2]}" ] && _rq_flags+=("--epoch=${_rq_anchor[2]}")
+            [ -n "${_rq_anchor[3]}" ] && _rq_flags+=("--at=${_rq_anchor[3]}")
+            [ -n "${_rq_anchor[4]}" ] && _rq_flags+=("--subject=${_rq_anchor[4]}")
+            _rq_target_set=1
+            if [ -n "$_rq_target" ]; then
+                resolved=$(v11_ledger_resolve_by_task_id "$project" "$task_id" "$_rq_rsess" "" \
+                    "--identity=$_rq_target" || echo "MISS")
+                # A queue row's parent_identity the ledger does not know falls
+                # back to the row's epoch/position; an explicit IDENTITY never does.
+                if [ -z "$identity_arg" ] && { [ -z "$resolved" ] || [ "$resolved" = "MISS" ]; }; then
+                    echo "review-queue mark-done: note — the queue row's parent_identity '$_rq_target' is not in the $project ledger; binding by the row's TaskList epoch and position" >&2
+                    # The fold still answers that row: the done row carries the
+                    # row's own identity, so it closes the entry (review #23).
+                    _rq_row_ident="$_rq_target"
+                    _rq_target=""
+                fi
+            fi
+            if [ -z "$_rq_target" ]; then
+                resolved=$(v11_ledger_resolve_by_task_id "$project" "$task_id" "$_rq_rsess" "" \
+                    "${_rq_flags[@]+"${_rq_flags[@]}"}" || echo "MISS")
+            fi
+        else
+            resolved=$(v11_ledger_resolve_by_task_id "$project" "$task_id" "$session_uuid" 2>/dev/null || echo "MISS")
+        fi
+        case "$resolved" in *$'\n'*) _rq_note="${resolved#*$'\n'}"; resolved="${resolved%%$'\n'*}" ;; esac
+        if [ "${resolved%%$'\t'*}" = "AMBIGUOUS" ]; then
+            echo "review-queue mark-done: ${resolved#*$'\t'}. Nothing was written." >&2
+            return 2
+        fi
+        if [ -n "$identity_arg" ] && [ "$_rq_shared" = 1 ] && { [ -z "$resolved" ] || [ "$resolved" = "MISS" ]; }; then
+            echo "review-queue mark-done: identity '$identity_arg' is not in the $project ledger. Nothing was written." >&2
+            return 2
+        fi
+        if [ "$_rq_shared" = 1 ] && [ -n "$resolved" ] && [ "$resolved" != "MISS" ]; then
+            _rq_target="${resolved%$'\t'*}:${resolved##*$'\t'}"
+        fi
+        [ -n "$_rq_note" ] && echo "review-queue mark-done: note — ${_rq_note#NOTE$'\t'}" >&2
+        if [ -n "$session_uuid" ] && { [ -z "$resolved" ] || [ "$resolved" = "MISS" ]; }; then
+            echo "review-queue mark-done: session $session_uuid has no task $task_id in the $project ledger — the verdict is recorded with identity_unresolved:true" >&2
+        fi
         verdict_ref=$(_v11_review_verdict_store "$project" "$task_id" "$verdict_file" 2>/dev/null || true)
         if [ -n "$verdict_ref" ] && [ -f "$verdict_ref" ]; then
             verdict_sha=$(sha256sum "$verdict_ref" 2>/dev/null | awk '{print $1}')
-            _v11_review_ledger_event "$project" "$task_id" "$severity" "$verdict_file" "$verdict_ref" "$verdict_sha" 2>/dev/null || true
+            # Only a waiver's outcome reaches the ledger row; other outcome codes
+            # (no_op, misrouted, ...) keep today's bytes until S3-T6 reworks this.
+            local _rl_outcome=""
+            [ "$_rq_outcome" = "waived" ] && _rl_outcome="waived"
+            _v11_review_ledger_event "$project" "$task_id" "$severity" "$verdict_file" "$verdict_ref" "$verdict_sha" "$_rl_outcome" "${resolved:-MISS}" 2>/dev/null || true
         else
             verdict_ref=""
         fi
@@ -4576,28 +6329,48 @@ v11_review_queue_mark_done() {
     local now
     now="$(date -u +%Y-%m-%dT%H:%M:%S+00:00)"
 
-    local event_line
-    event_line=$(jq -cn \
-        --arg ts "$now" \
-        --arg project "$project" \
-        --arg task_id "$task_id" \
-        --arg severity "$severity" \
-        --arg outcome "$_rq_outcome" \
-        --arg session_uuid "${session_uuid:-}" \
-        --arg verdict_ref "${verdict_ref:-}" \
-        --arg verdict_sha "${verdict_sha:-}" \
-        '{v:1, ev:"done", ts:$ts, project:$project, task_id:$task_id,
-          review_severity:$severity, session_uuid:$session_uuid}
-         + (if $outcome == "" then {} else {outcome:$outcome} end)
-         + (if $verdict_ref == "" then {} else {verdict_ref:$verdict_ref} end)
-         + (if $verdict_sha == "" then {} else {verdict_sha:$verdict_sha} end)' 2>/dev/null) || return 0
+    # --identity may name another task than the open queue row does (a verdict
+    # kept from an earlier TaskList): resolve that row's own task, so the done
+    # row never closes it (see _v11_review_queue_status "masks").
+    local _rq_open_ident="${_rq_anchor[1]}"
+    if [ "$_rq_shared" = 1 ] && [ -n "$identity_arg" ] && [ -z "$_rq_open_ident" ] && [ -n "${_rq_anchor[3]}" ]; then
+        local _rq_asess="$session_uuid" _rq_ares="" _rq_aflags=("--at=${_rq_anchor[3]}")
+        [ "$_rq_sess_ok" = 1 ] || _rq_asess="${_rq_anchor[0]}"
+        [ -n "${_rq_anchor[2]}" ] && _rq_aflags+=("--epoch=${_rq_anchor[2]}")
+        [ -n "${_rq_anchor[4]}" ] && _rq_aflags+=("--subject=${_rq_anchor[4]}")
+        _rq_ares=$(v11_ledger_resolve_by_task_id "$project" "$task_id" "$_rq_asess" "" \
+            "${_rq_aflags[@]}" || echo "MISS")
+        _rq_ares="${_rq_ares%%$'\n'*}"
+        case "$_rq_ares" in
+            ""|MISS|AMBIGUOUS*) ;;
+            *) _rq_open_ident="${_rq_ares%$'\t'*}:${_rq_ares##*$'\t'}" ;;
+        esac
+    fi
 
     (
         exec 208>"$lock_file"
         flock -w 5 208 || exit 1
 
-        local current_status="absent"
-        if [ -f "$jsonl_file" ] && [ -s "$jsonl_file" ]; then
+        # The done row's parent_identity: the bound identity, else (shared mode)
+        # the open queue row's, which the status read below finds.
+        local current_status="absent" _rq_pi="$_rq_target" _rq_st=""
+        if [ -f "$jsonl_file" ] && [ -s "$jsonl_file" ] && [ "$_rq_shared" = 1 ]; then
+            _rq_st=$(_v11_review_queue_status "$jsonl_file" "$task_id" "$session_uuid" \
+                "${_rq_row_ident:-$_rq_target}" "$_rq_open_ident" "$_rq_target_set")
+            case "$_rq_st" in
+                *$'\t'*$'\t'*)
+                    current_status="${_rq_st%%$'\t'*}"
+                    _rq_st="${_rq_st#*$'\t'}"
+                    _rq_pi="${_rq_st#*$'\t'}"
+                    if [ "${_rq_st%%$'\t'*}" = 1 ]; then
+                        echo "review-queue mark-done: note — the open queue entry for task_id $task_id names another task; it stays open (the verdict is in the ledger, no done row written)" >&2
+                        case "$current_status" in done) echo "already_done" ;; *) echo "absent" ;; esac
+                        exit 0
+                    fi
+                    ;;
+                *) current_status="${_rq_st:-absent}" ;;
+            esac
+        elif [ -f "$jsonl_file" ] && [ -s "$jsonl_file" ]; then
             current_status=$(V11_RQ_FILE="$jsonl_file" V11_RQ_TASK="$task_id" python3 - <<'PYEOF' 2>/dev/null || echo "absent"
 import os, json
 path = os.environ.get("V11_RQ_FILE", "")
@@ -4622,8 +6395,30 @@ PYEOF
 )
         fi
 
+        [ "$current_status" = done ] && { echo "already_done"; exit 0; }
+
+        local event_line
+        event_line=$(jq -cn \
+            --arg ts "$now" \
+            --arg project "$project" \
+            --arg task_id "$task_id" \
+            --arg severity "$severity" \
+            --arg outcome "$_rq_outcome" \
+            --arg session_uuid "${session_uuid:-}" \
+            --arg verdict_ref "${verdict_ref:-}" \
+            --arg verdict_sha "${verdict_sha:-}" \
+            --arg pi "$_rq_pi" \
+            '{v:1, ev:"done", ts:$ts, project:$project, task_id:$task_id,
+              review_severity:$severity, session_uuid:$session_uuid}
+             + (if $outcome == "" then {} else {outcome:$outcome} end)
+             + (if $verdict_ref == "" then {} else {verdict_ref:$verdict_ref} end)
+             + (if $verdict_sha == "" then {} else {verdict_sha:$verdict_sha} end)
+             + (if ($pi | test("^.+:[0-9]+$")) then
+                  ($pi | capture("^(?<sn>.+):(?<cs>[0-9]+)$")
+                   | {parent_identity: {subject_norm: .sn, create_seq: (.cs | tonumber)}})
+                else {} end)' 2>/dev/null) || exit 0
+
         case "$current_status" in
-            done) echo "already_done"; exit 0 ;;
             absent) echo "absent" ;;  # No prior pending — still record the done for audit trail
             *) echo "marked" ;;
         esac
@@ -4762,6 +6557,112 @@ PYEOF
         fi
         printf '%s\n' "$new_line" >> "$jsonl_file"
         echo "claimed"
+    )
+    return 0
+}
+
+# v11_review_queue_park PROJECT TASK_ID REASON [VERDICT_KEPT] [RC] [BY]
+#   Sprint-close review (S1): parks a pending entry whose verdict cannot be
+#   folded. `mark-done --verdict-file` exits 2 when the S1-P3 resolver finds
+#   the task_id names several tasks (a TaskList restart that reuses ids), and
+#   it will refuse the same way on every later run. Left pending, the nightly
+#   review-daemon cadence re-drains the entry and pays for a new headless
+#   review each time. Append-only, like claim: a copy of the latest pending
+#   event with ev:"parked", the claim cleared, and parked_at, park_reason,
+#   parked_by, plus park_rc/verdict_kept when given. Every drain path selects
+#   ev=="pending" only, so a parked entry is neither drainable nor done.
+#   Echoes one of: parked | already_parked | not_pending | absent | lock_timeout
+v11_review_queue_park() {
+    _v11_review_queue_park_transition park "$@"
+}
+
+# v11_review_queue_unpark PROJECT TASK_ID [BY]
+#   Reverses v11_review_queue_park: appends the parked event back as
+#   ev:"pending" (claim cleared, park fields dropped, unparked_at/unparked_by
+#   added; ts, and so pending_since, kept), so the next drain picks it up.
+#   Echoes one of: unparked | not_parked | absent | lock_timeout
+v11_review_queue_unpark() {
+    local project="$1" task_id="$2" by="${3:-}"
+    _v11_review_queue_park_transition unpark "$project" "$task_id" "" "" "" "$by"
+}
+
+_v11_review_queue_park_transition() {
+    local mode="$1" project="$2" task_id="$3" reason="${4:-}" kept="${5:-}" rc="${6:-}" by="${7:-}"
+    if [ -z "$project" ] || ! printf '%s' "$project" | grep -qE '^[a-zA-Z0-9._-]{1,64}$'; then
+        echo "absent"; return 0
+    fi
+    [ -z "$task_id" ] && { echo "absent"; return 0; }
+    [ -z "$by" ] && by="$(v11_session_uuid 2>/dev/null || echo "legacy-cli")"
+    local jsonl_file lock_file
+    jsonl_file=$(v11_review_queue_path "$project" jsonl 2>/dev/null) || { echo "absent"; return 0; }
+    lock_file=$(v11_review_queue_path "$project" lock 2>/dev/null) || { echo "absent"; return 0; }
+    if [ ! -f "$jsonl_file" ] || [ ! -s "$jsonl_file" ]; then
+        echo "absent"; return 0
+    fi
+
+    (
+        exec 208>"$lock_file"
+        flock -w 5 208 || { echo "lock_timeout"; exit 0; }
+        V11_RQ_FILE="$jsonl_file" V11_RQ_TASK="$task_id" V11_RQ_MODE="$mode" \
+        V11_RQ_REASON="$reason" V11_RQ_KEPT="$kept" V11_RQ_RC="$rc" V11_RQ_BY="$by" \
+        python3 - <<'PYEOF' 2>/dev/null || echo "absent"
+import os, json
+from datetime import datetime, timezone
+
+path = os.environ["V11_RQ_FILE"]
+target = os.environ["V11_RQ_TASK"]
+mode = os.environ.get("V11_RQ_MODE", "")
+latest = None
+with open(path, "r", encoding="utf-8") as f:
+    for line in f:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            ev = json.loads(line)
+        except Exception:
+            continue
+        if str(ev.get("task_id", "")) == target:
+            latest = ev
+if latest is None:
+    print("absent")
+    raise SystemExit(0)
+
+now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S+00:00")
+PARK_FIELDS = ("parked_at", "park_reason", "park_rc", "verdict_kept", "parked_by")
+new = dict(latest)
+new["claimed_by"] = None
+new.pop("claimed_at", None)
+if mode == "park":
+    if latest.get("ev") == "parked":
+        print("already_parked")
+        raise SystemExit(0)
+    if latest.get("ev") != "pending":
+        print("not_pending")
+        raise SystemExit(0)
+    for k in ("unparked_at", "unparked_by"):
+        new.pop(k, None)
+    new.update(ev="parked", parked_at=now, park_reason=os.environ.get("V11_RQ_REASON", ""),
+               parked_by=os.environ.get("V11_RQ_BY", ""))
+    rc = os.environ.get("V11_RQ_RC", "")
+    if rc.isdigit():
+        new["park_rc"] = int(rc)
+    kept = os.environ.get("V11_RQ_KEPT", "")
+    if kept:
+        new["verdict_kept"] = kept
+    result = "parked"
+else:
+    if latest.get("ev") != "parked":
+        print("not_parked")
+        raise SystemExit(0)
+    for k in PARK_FIELDS:
+        new.pop(k, None)
+    new.update(ev="pending", unparked_at=now, unparked_by=os.environ.get("V11_RQ_BY", ""))
+    result = "unparked"
+with open(path, "a", encoding="utf-8") as f:
+    f.write(json.dumps(new, separators=(",", ":")) + "\n")
+print(result)
+PYEOF
     )
     return 0
 }

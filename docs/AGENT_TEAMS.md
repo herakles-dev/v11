@@ -15,6 +15,8 @@
 | **Per-task agent assignment** | Any task — assign `metadata.agent` to route to the right specialist | Main list | Definition model | All coordinated work (V11.11+) |
 | **Agent Team** (deprecated) | Legacy; only when agents need shared task lists + wave dependencies | Team list (separate) | Lead model (Opus) | Avoid — use background agents instead |
 
+**Execution default (Contract mode)**: for 3+ tasks each member gets one contract with an explicit `model` and an in-tree disjoint write set; the worktree-by-default rule is legacy under `V11_CONTRACT_MODE=off`.
+
 **Default for V11.11+**: Assign `metadata.agent` on tasks. Spawn agents as background agents or foreground subagents. Skip TeamCreate unless you have an explicit cross-agent coordination requirement that cannot be met by task metadata.
 
 ---
@@ -61,10 +63,10 @@ Agent(
 For 3-8 independent tasks with no shared state or handoff dependencies, spawn background agents directly — no TeamCreate needed:
 
 ```python
-# Spawn multiple independent agents in one message
-Agent(prompt="...", subagent_type="spec-implementer-v11", run_in_background=True)
-Agent(prompt="...", subagent_type="spec-tester-v11", run_in_background=True)
-Agent(prompt="...", subagent_type="spec-integrator-v11", run_in_background=True)
+# Legacy — under `V11_CONTRACT_MODE=off`
+Agent(prompt="...", subagent_type="spec-implementer-v11", model="sonnet", run_in_background=True)
+Agent(prompt="...", subagent_type="spec-tester-v11", model="sonnet", run_in_background=True)
+Agent(prompt="...", subagent_type="spec-integrator-v11", model="sonnet", run_in_background=True)
 ```
 
 You are notified when each completes. Review results and proceed.

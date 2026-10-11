@@ -284,10 +284,33 @@ that v11.37 W1-T1 reconciler cleaned once (`adversarial-lite-reviewer` and 5 v11
 drift-agent siblings were live but unregistered). Also flags ledger-active labels with no
 `.md` (rename/alias drift) and registered entries with no `.md` (dead registrations).
 
-**Config**: none. Task-like ledger labels (`W1-T*`, `S76-*`, `CLOSE-T*`, `Sprint*`, etc.)
-and composite labels (`foo+bar`) are filtered as attribution-noise, not real agent
-identities. Claude Code built-ins (`Explore`, `general-purpose`) and meta-labels
-(`self`, `main`, `orchestrator`, etc.) are also skipped.
+**Config**: `--human-owner NAME` (repeatable) adds owner labels that name a person;
+`human`, `director` and the git `user.name` always count. `--project-root DIR`
+(repeatable, default `$HOME` and `$SESSIONS_ROOT`) holds `<project>/.claude/agents/` for
+ledger `<project>.jsonl`. `--dispatch-trace PATH` (default
+`~/.agent-metrics/dispatch-trace.jsonl`) supplies spawn-time agent types.
+
+**Ledger label resolution** (S1-T12, #38): each label is normalised first (`X\nX` → `X`,
+`X (note)` → `X`, `X — note` → `X`, `X x3` → `X`). An owner that is still unknown on a
+claim event (not `created`, not `review`) is aliased to the `metadata.agent` of the same
+task's `created` event, joined inside one ledger file on `(subject_norm, create_seq)` or
+`(session_uuid, task_id)` with a real session uuid, never bare task_id; an ambiguous join
+does not alias. This resolves named background spawns (`dx-intake` → `spec-implementer-v11`).
+Only spawn names are aliased. An owner that is itself a plausible agent type (an `.md` in
+any project's `.claude/agents/` or in `~/.claude/agents/archive/`, any ledger's
+`metadata.agent` / `recommended_agent`, or dispatch-trace `spawned_agent` /
+`recommended_agent`) is never aliased: an unregistered one WARNs as a type mismatch
+(`owner type X vs created type Y`).
+The ledger project's own `<root>/<project>/.claude/agents/<name>.md` counts as an `.md`;
+another project's does not. Task-like labels
+(`W1-T*`, `S76-*`, `CLOSE-T*`, `Sprint*`, etc.), composite labels (`foo+bar`) and free text
+(any whitespace) are filtered as attribution-noise. Claude Code built-ins (`Explore`,
+`general-purpose`, `Plan`, `claude-code-guide`, `fork`), meta-labels (`self`, `main`,
+`orchestrator`, `team-lead`, `lead`, `direct`, etc.), model ids (`claude-opus-4-7`,
+`claude-opus-5-5[1m]`, not `haiku-4-5-scout`) and human owners are skipped. Whatever still
+resolves to an unknown type WARNs under that type (with the raw labels and ledgers it came
+from). A `registry-drift summary:` line counts each step; the last line stays
+`check-registry-drift: N WARN.`.
 
 **Lever**: `V11_REGISTRY_CHECK=off` (no-op, exit 0).
 

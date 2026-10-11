@@ -1,0 +1,81 @@
+#!/usr/bin/env python3
+# contract-consumers — list every reader of a file, for pasting into a contract's INVARIANTS.
+#
+# Usage: scripts/contract-consumers PATH... [--json] [--repo DIR]
+#         PATH is repo-relative or absolute; a PATH that does not exist is still searched
+#         by string (the contract may name a file it is about to create).
+#
+# Searches regular text files under tests/, scripts/, hooks/ (skips __pycache__, .git,
+# binaries) for the repo-relative path or the basename. A file is not its own reader.
+#   direct     the file references PATH
+#   via:<s>    a test references script <s> (scripts/<name> or hooks/<name>) that directly
+#              references PATH; one hop only, a direct reader is not re-listed
+#
+# Output: PATH<TAB>KIND<TAB>READER per line, sorted by kind then reader; --json prints a
+# list of {"path","kind","reader"}. Exit 0 always. Read-only, stdlib only.
+import argparse
+import json
+import os
+import sys
+
+SEARCH_DIRS = ("tests", "scripts", "hooks")
+SKIP_DIRS = {"__pycache__", ".git"}
+
+
+def load_files(repo):
+    files = {}
+    for top in SEARCH_DIRS:
+        for root, dirs, names in os.walk(os.path.join(repo, top)):
+            dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
+            for n in names:
+                p = os.path.join(root, n)
+                if os.path.islink(p) or not os.path.isfile(p):
+                    continue
+                try:
+                    with open(p, "rb") as f:
+                        data = f.read()
+                except OSError:
+                    continue
+                if b"\0" in data:
+                    continue
+                files[os.path.relpath(p, repo)] = data.decode("utf-8", "replace")
+    return files
+
+
+def consumers(path, repo, files):
+    rel = os.path.relpath(os.path.abspath(os.path.join(repo, path)), repo)
+    needles = {rel, os.path.basename(rel)}
+    direct = sorted(r for r, t in files.items()
+                    if r != rel and any(n in t for n in needles))
+    hits = {r: "direct" for r in direct}
+    for script in direct:
+        if not script.startswith(("scripts/", "hooks/")):
+            continue
+        for r, t in files.items():
+            if r.startswith("tests/") and r != rel and r not in hits and script in t:
+                hits[r] = "via:" + script
+    return [{"path": path, "kind": k, "reader": r}
+            for r, k in sorted(hits.items(), key=lambda x: (x[1], x[0]))]
+
+
+def main():
+    ap = argparse.ArgumentParser(description="List readers of a file.")
+    ap.add_argument("paths", nargs="+", metavar="PATH")
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument("--repo", default="/path/to/v11")
+    a = ap.parse_args()
+    repo = os.path.abspath(a.repo)
+    files = load_files(repo)
+    out = []
+    for p in a.paths:
+        out.extend(consumers(p, repo, files))
+    if a.json:
+        print(json.dumps(out, indent=2))
+    else:
+        for h in out:
+            print(f"{h['path']}\t{h['kind']}\t{h['reader']}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

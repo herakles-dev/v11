@@ -26,11 +26,11 @@ services:
       retries: 3
       start_period: 10s
     networks:
-      - hercules-network
+      - app-network
     restart: unless-stopped
 
 networks:
-  hercules-network:
+  app-network:
     external: true
 ```
 
@@ -62,11 +62,11 @@ services:
       retries: 3
       start_period: 10s
     networks:
-      - hercules-network
+      - app-network
     restart: unless-stopped
 
 networks:
-  hercules-network:
+  app-network:
     external: true
 ```
 
@@ -93,7 +93,7 @@ services:
       timeout: 5s
       retries: 5
     networks:
-      - hercules-network
+      - app-network
     restart: unless-stopped
 
   # Backend API
@@ -117,7 +117,7 @@ services:
       retries: 3
       start_period: 10s
     networks:
-      - hercules-network
+      - app-network
     restart: unless-stopped
 
   # Frontend
@@ -139,11 +139,11 @@ services:
       retries: 3
       start_period: 10s
     networks:
-      - hercules-network
+      - app-network
     restart: unless-stopped
 
 networks:
-  hercules-network:
+  app-network:
     external: true
 
 volumes:
@@ -173,7 +173,7 @@ services:
       timeout: 5s
       retries: 5
     networks:
-      - hercules-network
+      - app-network
 
   redis:
     image: redis:7-alpine
@@ -184,7 +184,7 @@ services:
       timeout: 5s
       retries: 5
     networks:
-      - hercules-network
+      - app-network
 
   # Core service (Layer 2)
   auth-service:
@@ -209,7 +209,7 @@ services:
       retries: 3
       start_period: 10s
     networks:
-      - hercules-network
+      - app-network
 
   # Business service (Layer 3)
   user-service:
@@ -236,7 +236,7 @@ services:
       retries: 3
       start_period: 10s
     networks:
-      - hercules-network
+      - app-network
 
   # API Gateway (Layer 4)
   api-gateway:
@@ -260,10 +260,10 @@ services:
       retries: 3
       start_period: 10s
     networks:
-      - hercules-network
+      - app-network
 
 networks:
-  hercules-network:
+  app-network:
     external: true
 
 volumes:
@@ -288,7 +288,7 @@ services:
   postgres:
     # No ports section - internal only
     networks:
-      - hercules-network
+      - app-network
 ```
 
 ### 2. Use Environment Variables
@@ -430,7 +430,7 @@ services:
 
 ```yaml
 networks:
-  hercules-network:
+  app-network:
     external: true  # Created separately, shared across all services
 ```
 
@@ -438,7 +438,7 @@ networks:
 
 ```yaml
 networks:
-  hercules-network:
+  app-network:
     external: true
 
   project-internal:
@@ -447,7 +447,7 @@ networks:
 services:
   gateway:
     networks:
-      - hercules-network   # External access
+      - app-network   # External access
       - project-internal   # Internal routing
 
   backend:

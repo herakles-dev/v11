@@ -1,0 +1,256 @@
+#!/usr/bin/env python3
+"""S2-T0b-2 (#113, #111): deploy-time seed for the TaskList epoch write side.
+
+    task-epoch-seed [--records] [--aliases] [--apply]
+                    [--session S ...] [--live-minutes N] [--project P ...]
+                    [--metrics-dir DIR] [--config-dir DIR]
+
+Dry-run by default: prints what it would write, one TSV line per item. --apply
+writes. With neither --records nor --aliases, does both.
+
+Records (review #19 C1). hooks/sync-tasks opens a TaskList epoch when a
+TaskCreate reuses an id of the current epoch, or when the claude process
+changed and the id is not above the epoch's max. It learns the epoch's ids
+from $METRICS_DIR/tasklist-epochs/<session>, which it starts at a session's
+first TaskCreate. A session live at rollout already has creates the record
+never saw, so this writes its record from the ledgers: the session's current
+epoch as scripts/lib/task_epoch.py derives it (TaskIndex.epochs, every ledger).
+    - unstamped history (every session before rollout):
+          v1 0 seed <sitting> - <,id:-,...,> <max>
+      the id set is complete; the session's events stay unstamped until its
+      next epoch opens (stamping an epoch whose opening create is not in the
+      ledger would leave readers unable to bind its older rows);
+    - a stamped epoch whose record is gone: its tl_epoch and open reason.
+The sitting is <pid>:<starttime> of the claude process whose
+<config>/sessions/<pid>.json names the session, else "-". Sessions: --session,
+else every sessions/<id>/ with a top-level file touched in the last
+--live-minutes (default 60) plus the session of every running claude process.
+A session that already has a record, or never created a task, is skipped. The
+record is created with link(2), so a record sync-tasks wrote meanwhile wins.
+
+Aliases (review #19 C6). v11_ledger_append treats a rehydrate target as
+finished when a legacy alias of it (an older rehydrated create keyed on its
+new subject, which v11_replay_ledger folds into the original) finished later.
+Rather than scan every created event on each append, the aliases are
+materialised once, per project, into $METRICS_DIR/ledger/<project>.aliases.json
+from the replay's identity view:
+    {"v": 1, "built_at": ISO, "source": "task-epoch-seed",
+     "aliases": [{"alias": {subject_norm, create_seq},
+                  "target": {subject_norm, create_seq},
+                  "session_uuid", "task_id", "seqno", "ts"}]}
+A project with no aliases gets no file (an old one is removed). With
+V11_REHYDRATE_IDENTITY_WRITE on, new rehydrates are keyed on their target and
+make no new aliases, so this runs once at rollout, and again after any period
+with that lever off.
+"""
+
+import argparse
+import datetime
+import json
+import os
+import re
+import sys
+import time
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "lib"))
+import task_epoch as te  # noqa: E402
+
+_SID_RE = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}")
+_PROJECT_RE = re.compile(r"[a-zA-Z0-9._-]{1,64}")
+_ID_RE = re.compile(r"[0-9]{1,12}")
+
+
+def _starttime(pid):
+    try:
+        with open(f"/proc/{pid}/stat", encoding="utf-8", errors="replace") as fh:
+            stat = fh.read()
+    except OSError:
+        return None
+    f = stat.rpartition(") ")[2].split()
+    return f[19] if len(f) > 19 and f[19].isdigit() else None
+
+
+def claude_processes(config_dir):
+    """{session_id: [(pid, starttime)]} for running claude processes."""
+    out = {}
+    d = os.path.join(config_dir, "sessions")
+    try:
+        names = os.listdir(d)
+    except OSError:
+        return out
+    for name in names:
+        stem = name[:-5] if name.endswith(".json") else None
+        if not stem or not stem.isdigit():
+            continue
+        try:
+            with open(os.path.join(d, name), encoding="utf-8") as fh:
+                doc = json.load(fh)
+        except (OSError, ValueError):
+            continue
+        sid = doc.get("sessionId") if isinstance(doc, dict) else None
+        st = _starttime(stem)
+        if isinstance(sid, str) and st:
+            out.setdefault(sid, []).append((stem, st))
+    return out
+
+
+def live_sessions(metrics_dir, minutes, procs):
+    now = time.time()
+    found = set(procs)
+    root = os.path.join(metrics_dir, "sessions")
+    try:
+        names = os.listdir(root)
+    except OSError:
+        names = []
+    for sid in names:
+        if not _SID_RE.fullmatch(sid) or sid == "legacy-cli":
+            continue
+        d = os.path.join(root, sid)
+        try:
+            newest = max((e.stat().st_mtime for e in os.scandir(d) if e.is_file()), default=0)
+        except OSError:
+            continue
+        if now - newest <= minutes * 60:
+            found.add(sid)
+    return sorted(s for s in found if _SID_RE.fullmatch(s) and s != "legacy-cli")
+
+
+def record_line(idx, sid, sitting):
+    """The seed line for the session's current epoch, or None when it has none."""
+    eps = idx.epochs(sid)
+    if not eps:
+        return None
+    ep = eps[-1]
+    # TaskIndex keeps each epoch's creates in _epoch_creates (filled by epochs()).
+    ids = sorted({int(ev["task_id"]) for _, ev in idx._epoch_creates.get((sid, ep.ordinal), [])
+                  if _ID_RE.fullmatch(str(ev.get("task_id", "")))})
+    if not ids:
+        return None
+    idf = "," + "".join(f"{i}:-," for i in ids)
+    if ep.stamped and ep.tl_epoch:
+        reason = ep.open_reason if ep.open_reason in ("fresh", "reuse") else "reuse"
+        return f"v1 {ep.tl_epoch} {reason} {sitting} - {idf} {max(ids)}\n"
+    return f"v1 0 seed {sitting} - {idf} {max(ids)}\n"
+
+
+def write_record(metrics_dir, sid, line):
+    d = os.path.join(metrics_dir, "tasklist-epochs")
+    os.makedirs(d, exist_ok=True)
+    path = os.path.join(d, sid)
+    tmp = f"{path}.seed.{os.getpid()}"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        fh.write(line)
+    try:
+        os.link(tmp, path)          # never replaces a record sync-tasks wrote
+        return True
+    except FileExistsError:
+        return False
+    finally:
+        os.unlink(tmp)
+
+
+def seed_records(args, out):
+    procs = claude_processes(args.config_dir)
+    sessions = args.session or live_sessions(args.metrics_dir, args.live_minutes, procs)
+    idx = te.TaskIndex("", [], identities=[], metrics_dir=args.metrics_dir)
+    for sid in sessions:
+        if not _SID_RE.fullmatch(sid):
+            out.append(("record", sid, "skip", "not a session id"))
+            continue
+        if os.path.exists(os.path.join(args.metrics_dir, "tasklist-epochs", sid)):
+            out.append(("record", sid, "skip", "has a record"))
+            continue
+        running = procs.get(sid, [])
+        sitting = f"{running[0][0]}:{running[0][1]}" if len(running) == 1 else "-"
+        line = record_line(idx, sid, sitting)
+        if line is None:
+            out.append(("record", sid, "skip", "no task created"))
+            continue
+        if args.apply:
+            ok = write_record(args.metrics_dir, sid, line)
+            out.append(("record", sid, "written" if ok else "skip", line.rstrip("\n") if ok else "has a record"))
+        else:
+            out.append(("record", sid, "would-write", line.rstrip("\n")))
+
+
+def project_aliases(project, metrics_dir):
+    ids = te.replay_identities(project, metrics_dir=metrics_dir)
+    if ids is None:
+        return None
+    out = []
+    for rec in ids:
+        target = (rec.get("subject_norm"), rec.get("create_seq"))
+        if not te.valid_identity(*target):
+            continue
+        for c in rec.get("created_claims") or []:
+            ci = c.get("identity") if isinstance(c, dict) else None
+            own = (ci.get("subject_norm"), ci.get("create_seq")) if isinstance(ci, dict) else None
+            if own and te.valid_identity(*own) and own != target:
+                out.append({"alias": {"subject_norm": own[0], "create_seq": own[1]},
+                            "target": {"subject_norm": target[0], "create_seq": target[1]},
+                            "session_uuid": c.get("session_uuid"), "task_id": c.get("task_id"),
+                            "seqno": c.get("seqno"), "ts": c.get("ts")})
+    return sorted(out, key=lambda a: (a["seqno"] is None, a["seqno"] or 0))
+
+
+def seed_aliases(args, out):
+    ledger = os.path.join(args.metrics_dir, "ledger")
+    if args.project:
+        projects = args.project
+    else:
+        try:
+            projects = sorted(n[:-6] for n in os.listdir(ledger) if n.endswith(".jsonl"))
+        except OSError:
+            projects = []
+    for project in projects:
+        if not _PROJECT_RE.fullmatch(project):
+            out.append(("aliases", project, "skip", "not a project name"))
+            continue
+        aliases = project_aliases(project, args.metrics_dir)
+        path = os.path.join(ledger, f"{project}.aliases.json")
+        if aliases is None:
+            out.append(("aliases", project, "skip", "replay failed"))
+            continue
+        if not aliases:
+            if os.path.exists(path):
+                if args.apply:
+                    os.unlink(path)
+                out.append(("aliases", project, "removed" if args.apply else "would-remove", path))
+            continue
+        doc = {"v": 1, "built_at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+               "source": "task-epoch-seed", "aliases": aliases}
+        if args.apply:
+            tmp = f"{path}.tmp.{os.getpid()}"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(doc, fh, separators=(",", ":"))
+                fh.write("\n")
+            os.replace(tmp, path)
+        out.append(("aliases", project, "written" if args.apply else "would-write",
+                    f"{len(aliases)} alias(es) -> {path}"))
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    ap.add_argument("--records", action="store_true", help="seed epoch records of live sessions")
+    ap.add_argument("--aliases", action="store_true", help="materialise legacy alias sidecars")
+    ap.add_argument("--apply", action="store_true", help="write (default: dry run)")
+    ap.add_argument("--session", action="append", default=[], help="seed only this session (repeatable)")
+    ap.add_argument("--live-minutes", type=int, default=60)
+    ap.add_argument("--project", action="append", default=[], help="aliases for this project only (repeatable)")
+    ap.add_argument("--metrics-dir", default=te.default_metrics_dir())
+    ap.add_argument("--config-dir", default=te.default_config_dir())
+    args = ap.parse_args(argv)
+    if not args.records and not args.aliases:
+        args.records = args.aliases = True
+    out = []
+    if args.records:
+        seed_records(args, out)
+    if args.aliases:
+        seed_aliases(args, out)
+    for row in out:
+        print("\t".join(str(x) for x in row))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

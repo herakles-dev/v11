@@ -1,351 +1,585 @@
-#!/bin/bash
-# V11 Update — Upgrade project V11 hooks to latest version
-# Usage: ./scripts/v11-update PROJECT [--dry-run]
-#        ./scripts/v11-update --scan
-#        ./scripts/v11-update --all [--dry-run]
-#
-# Detects current V11 version from hook wiring, applies incremental upgrades.
-# All changes are backed up before modification.
+#!/usr/bin/env python3
+"""
+V11 Update — reconcile a project's .claude/settings.json hook wiring against
+the canonical template (v11/.claude/settings.json), preserving custom hooks
+and explicit timeouts.
 
-set -euo pipefail
+Rebuilt (S0-T4, ticket #86) on top of scripts/lib/wiring_diff.py. The old
+version-ladder implementation (frozen at v11.11, `--all --dry-run` wrote for
+real, `--all` only walked $SESSIONS_ROOT) is gone. This is now a template
+diff: every command wired anywhere in the template is "managed" and made to
+match the template's (event, matcher) wiring exactly (the project's own extra
+per-hook keys like "async"/"statusMessage" survive); every other command is
+"unmanaged" (custom hooks, opt-in v11 hooks like enforce-subagent / pg-*) and
+preserved byte-for-byte, except a superseded one (guard-teammate-timeout,
+replaced by the template's guard-agent-stall), which is removed.
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-V11_HOME="$(cd "$SCRIPT_DIR/.." && pwd)"
-source "$SCRIPT_DIR/../hooks/lib/common.sh" 2>/dev/null || {
-  HERCULES_ROOT="${HERCULES_ROOT:-$HOME}"
-  SESSIONS_ROOT="${SESSIONS_ROOT:-$HERCULES_ROOT/sessions}"
-}
+Writes keep the file's own indent, trailing newline, permission bits and
+symlink, and only the "hooks" value is re-serialized. In --all mode a file
+that can't be read or reconciled (invalid JSON, wrong shape, OSError) is
+reported as an error and skipped; the run continues and exits 1 at the end.
 
-CURRENT_VERSION="v11.11"
-
-# ── Helpers ───────────────────────────────────────────────────────────────────
-
-err() { echo "ERROR: $*" >&2; exit 1; }
-
-detect_version() {
-  local settings="$1"
-  [ ! -f "$settings" ] && echo "none" && return
-
-  local hook_count
-  hook_count=$(grep -c 'v11/hooks/' "$settings" 2>/dev/null || echo "0")
-  hook_count="${hook_count//[!0-9]/}"; hook_count="${hook_count:-0}"
-  local has_post_compact
-  has_post_compact=$(grep -c 'post-compact' "$settings" 2>/dev/null || echo "0")
-  has_post_compact="${has_post_compact//[!0-9]/}"; has_post_compact="${has_post_compact:-0}"
-  local has_fix_team_pre
-  has_fix_team_pre=$(jq -r '[.hooks.PreToolUse[]? | select(.command? // "" | contains("fix-team-model"))] | length' "$settings" 2>/dev/null || echo "0")
-  has_fix_team_pre="${has_fix_team_pre//[!0-9]/}"; has_fix_team_pre="${has_fix_team_pre:-0}"
-
-  if [ "$hook_count" -eq 0 ]; then echo "none"
-  elif [ "$hook_count" -le 11 ]; then echo "v11.0"
-  elif [ "$hook_count" -le 13 ] && [ "$has_fix_team_pre" -eq 0 ]; then echo "v11.1"
-  elif [ "$has_post_compact" -eq 0 ]; then echo "v11.2"
-  else echo "v11.5"
-  fi
-}
-
-# Check if shared hooks contain current-version (V11.6+) features.
-# V11.7 (tracker system) and V11.8 (formation-select, STR interview, strict
-# Gate 11) are framework-level — they ship via shared scripts/agents, not
-# new per-project settings.json hooks. So a project with full V11.6 wiring
-# running against current shared hooks is effectively at $CURRENT_VERSION.
-detect_current_features() {
-  grep -q 'V11_HOME' "$V11_HOME/hooks/lib/common.sh" 2>/dev/null && \
-  grep -q 'PYEOF\|context_tracker' "$V11_HOME/hooks/sync-tasks" 2>/dev/null
-}
-# Backward-compat alias
-detect_v11_6() { detect_current_features; }
-
-find_settings() {
-  local project="$1"
-  for p in "$HERCULES_ROOT/$project/.claude/settings.json" \
-           "$SESSIONS_ROOT/$project/.claude/settings.json"; do
-    [ -f "$p" ] && echo "$p" && return
-  done
-  echo ""
-}
-
-version_num() {
-  case "$1" in
-    none) echo 0 ;; v11.0) echo 1 ;; v11.1) echo 2 ;;
-    v11.2) echo 3 ;; v11.5) echo 4 ;; v11.6) echo 5 ;;
-    v11.7) echo 6 ;; v11.8) echo 7 ;; v11.9) echo 8 ;;
-    v11.10) echo 9 ;; v11.11) echo 10 ;;
-    *) echo 0 ;;
-  esac
-}
-
-# ── Upgrade Steps ─────────────────────────────────────────────────────────────
-
-upgrade_to_v11_1() {
-  local settings="$1" dry="$2"
-  # V11.11: TeamCreate is deprecated; fix-team-model is a dormant safety net kept for
-  # backwards compatibility. The matcher is still wired so older projects that reference
-  # TeamCreate don't lose the guard entirely.
-  echo "  + Add fix-team-model PostToolUse (TeamCreate|Agent) [V11.11: dormant safety net]"
-  [ "$dry" = "true" ] && return
-  local tmp="${settings}.tmp"
-  jq '.hooks.PostToolUse += [{"matcher": "TeamCreate|Agent", "type": "command", "command": "$HOME/v11/hooks/fix-team-model"}]' \
-    "$settings" > "$tmp" && mv "$tmp" "$settings"
-}
-
-upgrade_to_v11_2() {
-  local settings="$1" dry="$2"
-  # V11.11: TeamCreate is deprecated; fix-team-model is a dormant safety net kept for
-  # backwards compatibility. The PreToolUse trigger fires only if TeamCreate is invoked.
-  echo "  + Add fix-team-model PreToolUse (TeamCreate|Agent) [V11.11: dormant safety net]"
-  [ "$dry" = "true" ] && return
-  local tmp="${settings}.tmp"
-  jq '.hooks.PreToolUse += [{"matcher": "TeamCreate|Agent", "type": "command", "command": "$HOME/v11/hooks/fix-team-model"}]' \
-    "$settings" > "$tmp" && mv "$tmp" "$settings"
-}
-
-upgrade_to_v11_5() {
-  local settings="$1" dry="$2"
-  echo "  + Add post-compact PostToolUse hook"
-  [ "$dry" = "true" ] && return
-  local tmp="${settings}.tmp"
-  jq '.hooks.PostToolUse += [{"type": "command", "command": "$HOME/v11/hooks/post-compact"}]' \
-    "$settings" > "$tmp" && mv "$tmp" "$settings"
-}
-
-upgrade_to_v11_6() {
-  local project="$1" dry="$2"
-  echo "  + V11.6: shared hooks already updated (context tracking, wave review, recovery)"
-  echo "  + Run validate-project-setup for 14-check verification"
-  [ "$dry" = "true" ] && return
-  "$SCRIPT_DIR/validate-project-setup" "$project" 2>/dev/null || true
-}
-
-upgrade_to_v11_7() {
-  local project="$1" dry="$2"
-  echo "  + V11.7: tracker system — shared scripts/agents already updated"
-  echo "  + New: tracker-status, F13 deep-research, F14 pm-audit, adversarial-reviewer"
-  [ "$dry" = "true" ] && return
-  # No per-project settings.json change. Optional: refresh session-manifest.
-  if [ -x "$SCRIPT_DIR/tracker-status" ]; then
-    "$SCRIPT_DIR/tracker-status" "$project" >/dev/null 2>&1 || true
-  fi
-}
-
-upgrade_to_v11_8() {
-  local project="$1" dry="$2"
-  echo "  + V11.8: formation-select + validate-invariants + flywheel taxonomy"
-  echo "  + STR interview hook + strict Gate 11 + verify-gate0 (all framework-level)"
-  [ "$dry" = "true" ] && return
-  # No per-project settings.json change. V11.8 enforcement runs at compliance check.
-}
-
-upgrade_to_v11_11() {
-  local project="$1" dry="$2"
-  echo "  + V11.11: per-task agent assignment via metadata.agent on TaskCreate"
-  echo "  + TeamCreate deprecated; guard-teammate-timeout renamed to guard-agent-stall"
-  echo "  + .formation-registry.json is legacy/optional — no crash if missing"
-  [ "$dry" = "true" ] && return
-  # Framework-level: sync-tasks metadata.agent support + guard-agent-stall hook ship
-  # via shared hooks/scripts. No per-project settings.json hook change required.
-  # Validate compliance to surface any stale guard-teammate-timeout references.
-  if [ -x "$SCRIPT_DIR/v11-compliance-check" ]; then
-    "$SCRIPT_DIR/v11-compliance-check" "$project" 2>/dev/null || true
-  fi
-}
-
-# ── Apply Upgrades ────────────────────────────────────────────────────────────
-
-apply_upgrade() {
-  local project="$1" settings="$2" current="$3" dry="${4:-false}"
-  local cur_num target_num
-  cur_num=$(version_num "$current")
-  target_num=$(version_num "$CURRENT_VERSION")
-
-  if [ "$cur_num" -ge "$target_num" ]; then
-    echo "  Already on $CURRENT_VERSION. Nothing to update."
-    return 0
-  fi
-
-  local steps=$(( target_num - cur_num ))
-  echo "  Upgrading $current -> $CURRENT_VERSION ($steps steps)"
-
-  # Backup
-  if [ "$dry" != "true" ]; then
-    cp "$settings" "${settings}.${current}-backup"
-    echo "  Backup: ${settings}.${current}-backup"
-  fi
-
-  # Apply each step
-  [ "$cur_num" -lt 2 ]  && upgrade_to_v11_1  "$settings" "$dry"
-  [ "$cur_num" -lt 3 ]  && upgrade_to_v11_2  "$settings" "$dry"
-  [ "$cur_num" -lt 4 ]  && upgrade_to_v11_5  "$settings" "$dry"
-  [ "$cur_num" -lt 5 ]  && upgrade_to_v11_6  "$project"  "$dry"
-  [ "$cur_num" -lt 6 ]  && upgrade_to_v11_7  "$project"  "$dry"
-  [ "$cur_num" -lt 7 ]  && upgrade_to_v11_8  "$project"  "$dry"
-  # v11.9 and v11.10 were framework-level releases (no per-project hook changes).
-  # v11.11 covers all three in a single upgrade step.
-  [ "$cur_num" -lt 10 ] && upgrade_to_v11_11 "$project"  "$dry"
-
-  return 0
-}
-
-# ── Commands ──────────────────────────────────────────────────────────────────
-
-cmd_scan() {
-  echo ""
-  echo "V11 Version Survey"
-  echo "==================="
-  echo ""
-
-  local count_current=0 count_v11_5=0 count_v11_2=0 count_v11_1=0 count_v11_0=0 count_none=0
-  local projects_v11_5="" projects_v11_2="" projects_v11_0="" projects_none=""
-
-  for dir in "$SESSIONS_ROOT"/*/; do
-    [ -d "$dir" ] || continue
-    local proj
-    proj=$(basename "$dir")
-    local settings
-    settings=$(find_settings "$proj")
-    local ver
-    if [ -z "$settings" ]; then
-      ver="none"
-    else
-      ver=$(detect_version "$settings")
-    fi
-
-    case "$ver" in
-      v11.5)
-        if detect_current_features; then
-          count_current=$((count_current + 1))
-        else
-          count_v11_5=$((count_v11_5 + 1))
-          projects_v11_5="$projects_v11_5 $proj"
-        fi
-        ;;
-      v11.2) count_v11_2=$((count_v11_2 + 1)); projects_v11_2="$projects_v11_2 $proj" ;;
-      v11.1) count_v11_1=$((count_v11_1 + 1)); projects_v11_0="$projects_v11_0 $proj" ;;
-      v11.0) count_v11_0=$((count_v11_0 + 1)); projects_v11_0="$projects_v11_0 $proj" ;;
-      none)  count_none=$((count_none + 1)); projects_none="$projects_none $proj" ;;
-    esac
-  done
-
-  printf "  %-22s %3d projects\n" "v11.11 (current):" "$count_current"
-  printf "  %-22s %3d projects" "v11.5-10 (1-6 behind):" "$count_v11_5"
-  [ -n "$projects_v11_5" ] && printf "  (%s)" "$(echo $projects_v11_5 | tr ' ' ', ')"
-  echo
-  printf "  %-22s %3d projects" "v11.2-4 (4-6 behind):" "$count_v11_2"
-  [ -n "$projects_v11_2" ] && printf "  (%s)" "$(echo $projects_v11_2 | tr ' ' ', ')"
-  echo
-  printf "  %-22s %3d projects" "v11.0-1 (7+ behind):" "$(( count_v11_0 + count_v11_1 ))"
-  [ -n "$projects_v11_0" ] && printf "  (%s)" "$(echo $projects_v11_0 | tr ' ' ', ')"
-  echo
-  printf "  %-22s %3d sessions" "No V11:" "$count_none"
-  echo
-  echo ""
-
-  local total_outdated=$(( count_v11_5 + count_v11_2 + count_v11_1 + count_v11_0 ))
-  if [ "$total_outdated" -gt 0 ]; then
-    echo "Update all: /v11-update --all"
-  else
-    echo "All V11 projects are current."
-  fi
-  echo ""
-}
-
-cmd_update_all() {
-  local dry="${1:-false}"
-  local updated=0 failed=0 skipped=0
-
-  echo ""
-  echo "V11 Batch Update to $CURRENT_VERSION"
-  echo "======================================"
-  [ "$dry" = "true" ] && echo "(DRY RUN — no changes)"
-  echo ""
-
-  for dir in "$SESSIONS_ROOT"/*/; do
-    [ -d "$dir" ] || continue
-    local proj
-    proj=$(basename "$dir")
-    local settings
-    settings=$(find_settings "$proj")
-    [ -z "$settings" ] && continue
-
-    local ver
-    ver=$(detect_version "$settings")
-    [ "$ver" = "none" ] && continue
-
-    printf "  %-30s %s -> %s  " "$proj" "$ver" "$CURRENT_VERSION"
-
-    if [ "$(version_num "$ver")" -ge "$(version_num "$CURRENT_VERSION")" ]; then
-      echo "[current]"
-      skipped=$((skipped + 1))
-      continue
-    fi
-
-    if apply_upgrade "$proj" "$settings" "$ver" "$dry" > /dev/null 2>&1; then
-      echo "[OK]"
-      updated=$((updated + 1))
-    else
-      echo "[FAIL]"
-      failed=$((failed + 1))
-    fi
-  done
-
-  echo ""
-  echo "$updated updated, $skipped current, $failed failed."
-  echo ""
-}
-
-cmd_update_single() {
-  local project="$1" dry="${2:-false}"
-
-  # Sanitize project name
-  if [[ "$project" == *".."* ]] || [[ "$project" == *"/"* ]] || [[ "$project" =~ [^a-zA-Z0-9._-] ]]; then
-    err "Invalid project name: $project"
-  fi
-
-  local settings
-  settings=$(find_settings "$project")
-  if [ -z "$settings" ]; then
-    echo "No settings.json found for '$project'."
-    echo "Not a V11 project. Use: ./scripts/migrate-to-v11 $project"
-    exit 1
-  fi
-
-  local ver
-  ver=$(detect_version "$settings")
-  echo ""
-  echo "V11 Update: $project"
-  echo "  Settings: $settings"
-  echo "  Current version: $ver"
-  echo "  Target version: $CURRENT_VERSION"
-  [ "$dry" = "true" ] && echo "  (DRY RUN)"
-  echo ""
-
-  apply_upgrade "$project" "$settings" "$ver" "$dry"
-  echo ""
-}
-
-# ── Main ──────────────────────────────────────────────────────────────────────
-
-if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
-  cat << 'HELP'
-V11 Update — Upgrade project V11 hooks to latest version
+--restore STAMP (review #18 E1) is the one-command rollback of an apply:
+every file under BACKUP_ROOT/STAMP/<mirrored absolute path> is put back
+byte-exact at that absolute path, with the backup's mode. It is a dry-run
+listing (backup -> target, sha256 differs?) unless --apply is given. Before
+overwriting, the current target is saved under BACKUP_ROOT/<now>-pre-restore/
+so the restore is itself undoable with --restore <that stamp> --apply.
 
 Usage:
-  ./scripts/v11-update PROJECT [--dry-run]   Update single project
-  ./scripts/v11-update --scan                Show version survey
-  ./scripts/v11-update --all [--dry-run]     Update all V11 projects
+  v11-update PROJECT_OR_PATH [--dry-run] [--json]
+  v11-update --all [--dry-run] [--json]
+  v11-update --restore STAMP [STAMP ...] [--apply] [--json]
+  v11-update --help
+  v11-update --test
 
-HELP
-  exit 0
-fi
+Dropped flags (see report / --help): --scan (superseded by
+scripts/check-wiring-parity, which reports live fleet-wide parity instead of
+a frozen version ladder).
+"""
+from __future__ import annotations
 
-case "${1:-}" in
-  --scan) cmd_scan ;;
-  --all)  cmd_update_all "${2:-false}" ;;
-  --test) echo "v11-update v11.11.0"; exit 0 ;;
-  "")     echo "Usage: ./scripts/v11-update PROJECT [--dry-run] | --scan | --all"; exit 1 ;;
-  *)
-    DRY=false
-    [ "${2:-}" = "--dry-run" ] && DRY=true
-    cmd_update_single "$1" "$DRY"
-    ;;
-esac
+import argparse
+import hashlib
+import json
+import os
+import re
+import stat
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+V11_HOME = Path(os.environ.get("V11_HOME", SCRIPT_DIR.parent))
+sys.path.insert(0, str(SCRIPT_DIR / "lib"))
+import wiring_diff  # noqa: E402
+
+HERCULES_ROOT = Path(os.environ.get("HERCULES_ROOT", "/path/to/operator-home"))
+SESSIONS_ROOT = Path(os.environ.get("SESSIONS_ROOT", str(HERCULES_ROOT / "sessions")))
+TEMPLATE_PATH = Path(os.environ.get("V11_UPDATE_TEMPLATE", str(V11_HOME / ".claude" / "settings.json")))
+SCAN_ROOT = Path(os.environ.get("V11_UPDATE_SCAN_ROOT", str(HERCULES_ROOT)))
+BACKUP_ROOT = Path(os.environ.get("V11_UPDATE_BACKUP_ROOT", str(Path.home() / ".v11-backups" / "v11-update")))
+
+VERSION_STRING = "v11-update (template-diff, S0-T4)"
+
+
+def err(msg: str) -> None:
+    print(f"ERROR: {msg}", file=sys.stderr)
+
+
+def resolve_settings_path(project_or_path: str) -> Path | None:
+    """Accept a bare project name (search HERCULES_ROOT/P and SESSIONS_ROOT/P,
+    old v11-update behavior) or a direct path to a settings.json / a project
+    directory containing .claude/settings.json."""
+    p = Path(project_or_path)
+
+    if p.name == "settings.json" and p.is_file():
+        return p
+    if (p / ".claude" / "settings.json").is_file():
+        return p / ".claude" / "settings.json"
+
+    # Reject path traversal / separators in a bare project name, mirroring
+    # the old script's sanitization.
+    name = project_or_path
+    if ".." in name or "/" in name:
+        return None
+
+    for base in (HERCULES_ROOT, SESSIONS_ROOT):
+        candidate = base / name / ".claude" / "settings.json"
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def error_report(settings_path: Path, error: str) -> dict:
+    return {
+        "path": str(settings_path), "error": error,
+        "at_parity": False, "changes": [], "custom_commands": [],
+        "would_change": False, "wrote": False,
+    }
+
+
+def reconcile_one(settings_path: Path, template: dict, dry_run: bool, timestamp: str) -> dict:
+    """Diff+optionally-apply one settings.json. Returns a report dict."""
+    original_text = settings_path.read_text()
+    try:
+        project_settings = json.loads(original_text)
+    except json.JSONDecodeError as e:
+        return error_report(settings_path, f"invalid JSON: {e}")
+
+    try:
+        new_settings, changes = wiring_diff.diff(project_settings, template.get("hooks", {}))
+    except wiring_diff.SettingsShapeError as e:
+        return error_report(settings_path, f"unexpected shape: {e}")
+    new_text = wiring_diff.dump_settings(new_settings, original_text)
+    at_parity = wiring_diff.is_at_parity(changes)
+    # Only a wiring-level change (added/rematched/removed/superseded) justifies a write:
+    # an at-parity file is never rewritten for formatting alone.
+    would_change = (not at_parity) and new_text != original_text
+
+    wrote = False
+    backup = None
+    if would_change and not dry_run:
+        backup = str(wiring_diff.backup_file(settings_path, BACKUP_ROOT, timestamp))
+        wiring_diff.atomic_write(settings_path, new_text)
+        wrote = True
+
+    return {
+        "path": str(settings_path),
+        "at_parity": at_parity,
+        "would_change": would_change,
+        "wrote": wrote,
+        "backup": backup,
+        "changes": changes,
+        "custom_commands": wiring_diff.custom_commands(changes),
+    }
+
+
+def cmd_single(project_or_path: str, dry_run: bool, as_json: bool) -> int:
+    settings_path = resolve_settings_path(project_or_path)
+    if settings_path is None:
+        if not as_json:
+            print(f"No settings.json found for '{project_or_path}'.")
+            print("Not a V11 project. Use: ./scripts/migrate-to-v11 " + project_or_path)
+        else:
+            print(json.dumps({"error": "not_found", "project": project_or_path}))
+        return 1
+
+    if not TEMPLATE_PATH.is_file():
+        err(f"template not found: {TEMPLATE_PATH}")
+        return 2
+    template = wiring_diff.load_template(TEMPLATE_PATH)
+
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    report = reconcile_one_safe(settings_path, template, dry_run, timestamp)
+
+    if as_json:
+        print(json.dumps(report, indent=2))
+        return 1 if report.get("error") else 0
+    else:
+        print()
+        print(f"V11 Update: {settings_path}")
+        if report.get("error"):
+            print(f"  ERROR: {report['error']}")
+            return 1
+        print(f"  At template parity: {report['at_parity']}")
+        if dry_run:
+            print("  (DRY RUN — no changes written)")
+        _print_changes_table(report["changes"])
+        if report["custom_commands"]:
+            print(f"  Custom hooks preserved: {', '.join(report['custom_commands'])}")
+        if report["wrote"]:
+            print(f"  Written. Backup: {report['backup']}")
+        elif report["would_change"]:
+            print("  Would write (re-run without --dry-run to apply).")
+        else:
+            print("  No changes needed.")
+        print()
+    return 0
+
+
+def _print_changes_table(changes: list[dict]) -> None:
+    by_type: dict[str, int] = {}
+    for c in changes:
+        by_type[c["type"]] = by_type.get(c["type"], 0) + 1
+    if not by_type:
+        return
+    print("  Changes:")
+    for t in ("added", "rematched", "removed", "superseded", "timeout_preserved", "fields_preserved", "custom_preserved"):
+        if t in by_type:
+            print(f"    {t}: {by_type[t]}")
+        for c in changes:
+            if c["type"] != t:
+                continue
+            if t == "added":
+                print(f"      + {c['command']} @ {c['event']} ({c['matcher']})")
+            elif t == "rematched":
+                print(f"      ~ {c['command']} @ {c['event']}: {c['from_matcher']} -> {c['to_matcher']}")
+            elif t == "removed":
+                print(f"      - {c['command']} @ {c['event']} ({c.get('reason')})")
+            elif t == "superseded":
+                print(f"      - {c['command']} @ {c['event']} ({c['matcher']}) superseded by {c['by']}")
+            elif t == "fields_preserved":
+                print(f"      = {c['command']} @ {c['event']} ({c['matcher']}): kept {', '.join(c['fields'])}")
+
+
+def reconcile_one_safe(settings_path: Path, template: dict, dry_run: bool, timestamp: str) -> dict:
+    """reconcile_one, with any per-file failure (OSError mid-read/backup/
+    write, ...) turned into an error report so a batch keeps going."""
+    try:
+        return reconcile_one(settings_path, template, dry_run, timestamp)
+    except Exception as e:  # noqa: BLE001 — isolate one file's failure from the batch
+        return error_report(settings_path, f"{type(e).__name__}: {e}")
+
+
+def cmd_all(dry_run: bool, as_json: bool) -> int:
+    if not TEMPLATE_PATH.is_file():
+        err(f"template not found: {TEMPLATE_PATH}")
+        return 2
+    template = wiring_diff.load_template(TEMPLATE_PATH)
+
+    extra_prune = [BACKUP_ROOT]
+    discovered, pruned = wiring_diff.discover_settings_files(
+        SCAN_ROOT, template_path=TEMPLATE_PATH, extra_prune_roots=extra_prune,
+    )
+    discovered.sort()
+
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    reports = [reconcile_one_safe(p, template, dry_run, timestamp) for p in discovered]
+
+    at_parity = sum(1 for r in reports if r.get("at_parity") and not r.get("error"))
+    would_change = sum(1 for r in reports if r.get("would_change") and not r.get("error"))
+    errors = sum(1 for r in reports if r.get("error"))
+    # Denominator is every discovered file (errors count against parity) —
+    # the same denominator check-wiring-parity uses.
+    pct = round(100.0 * at_parity / len(discovered), 1) if discovered else 100.0
+
+    summary = {
+        "scan_root": str(SCAN_ROOT),
+        "discovered": len(discovered),
+        "pruned": {k: len(v) for k, v in pruned.items()},
+        "at_parity": at_parity,
+        "would_change": would_change,
+        "errors": errors,
+        "pct_at_parity": pct,
+        "dry_run": dry_run,
+        "projects": reports,
+    }
+
+    if as_json:
+        print(json.dumps(summary, indent=2))
+    else:
+        print()
+        print(f"V11 Fleet Update ({'DRY RUN' if dry_run else 'APPLY'})")
+        print("=" * 40)
+        print(f"  Scan root: {SCAN_ROOT}")
+        print(f"  Discovered: {len(discovered)} settings.json files")
+        if pruned:
+            pruned_str = ", ".join(f"{k}={len(v)}" for k, v in sorted(pruned.items()))
+            print(f"  Pruned: {pruned_str}")
+        print()
+        for r in reports:
+            mark = "ERROR" if r.get("error") else ("[parity]" if r["at_parity"] else "[drift]")
+            action = ""
+            if not r.get("error"):
+                if dry_run:
+                    action = "would write" if r["would_change"] else "no-op"
+                else:
+                    action = "written" if r["wrote"] else "no-op"
+            print(f"  {mark:10} {r['path']}  {action}")
+            if r.get("error"):
+                print(f"             {r['error']}")
+        print()
+        print(f"{at_parity}/{len(discovered)} at parity ({pct}%), {would_change} would change, {errors} errors")
+        print()
+
+    return 1 if errors else 0
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# --restore STAMP (review #18 E1): one-command rollback of an apply
+# ─────────────────────────────────────────────────────────────────────────
+
+# A stamp is one plain directory name directly under BACKUP_ROOT (an apply's
+# "%Y%m%dT%H%M%SZ", or a restore's "<that>-pre-restore[.N]"): no separator
+# and no leading dot, so it can't name anything outside the root.
+STAMP_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+
+def _sha256(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _stamp_dir(stamp: str) -> tuple[Path | None, str | None]:
+    """(BACKUP_ROOT/stamp, None), or (None, why it's refused)."""
+    if not STAMP_RE.match(stamp):
+        return None, "invalid stamp name (must be a plain directory name under the backup root)"
+    d = BACKUP_ROOT / stamp
+    if d.is_symlink():
+        return None, "stamp is a symlink (refused: path escape)"
+    if not d.is_dir():
+        return None, f"no such stamp under {BACKUP_ROOT}"
+    return d, None
+
+
+def _new_record(stamp: str, stamp_dir: Path, backup: Path) -> dict:
+    return {
+        "stamp": stamp, "backup": str(backup), "target": str(Path("/") / backup.relative_to(stamp_dir)),
+        "write_path": None, "backup_sha256": None, "target_sha256": None,
+        "differs": None, "mode_differs": None, "status": None, "error": None,
+        "pre_restore_backup": None, "shadowed_by": None,
+    }
+
+
+def _backup_entries(stamp: str, stamp_dir: Path) -> list[dict]:
+    """One record per entry of the stamp's mirrored tree, sorted by backup
+    path. An apply's backups are shutil.copy2'd regular files, so a symlink
+    (file or directory) or other non-regular entry is refused: a link could
+    point the restore at content outside the backup root. So is a target
+    that resolves back inside the backup root. A directory that can't be
+    listed is an error record too (status already "error"), so the run
+    exits 1 rather than succeeding with the targets under it unrestored."""
+    stamp_real = os.path.realpath(stamp_dir)
+    root_real = os.path.realpath(BACKUP_ROOT)
+    out = []
+
+    def unlisted(e: OSError) -> None:
+        rec = _new_record(stamp, stamp_dir, Path(e.filename) if e.filename else stamp_dir)
+        rec["status"] = "error"
+        rec["error"] = f"unreadable backup directory, entries under it not listed ({type(e).__name__}: {e.strerror or e})"
+        out.append(rec)
+
+    for dirpath, dirnames, filenames in os.walk(stamp_dir, onerror=unlisted):  # never follows links
+        linked = [d for d in dirnames if os.path.islink(os.path.join(dirpath, d))]
+        dirnames[:] = [d for d in dirnames if d not in linked]
+        for name in linked + filenames:
+            backup = Path(dirpath) / name
+            rec = _new_record(stamp, stamp_dir, backup)
+            target = rec["target"]
+            try:
+                st_mode = os.lstat(backup).st_mode
+                target_real = os.path.realpath(target)
+                if stat.S_ISLNK(st_mode):
+                    rec["error"] = "symlink in the backup tree (refused: path escape)"
+                elif not stat.S_ISREG(st_mode):
+                    rec["error"] = "not a regular file (refused)"
+                elif not os.path.realpath(backup).startswith(stamp_real + os.sep):
+                    rec["error"] = "resolves outside the backup root (refused: path escape)"
+                elif target_real == root_real or target_real.startswith(root_real + os.sep):
+                    rec["error"] = "target is inside the backup root (refused)"
+            except OSError as e:
+                rec["error"] = f"{type(e).__name__}: {e}"
+            out.append(rec)
+    out.sort(key=lambda r: r["backup"])
+    return out
+
+
+def _inspect_entry(rec: dict, claimed: dict[str, str]) -> None:
+    """Fill rec's write_path/sha256/differs and a dry-run status:
+    would_restore | identical | shadowed | error. `claimed` maps a resolved
+    target to the (older) stamp that owns it — even when that entry errored,
+    so a newer copy never silently stands in for the pre-everything state."""
+    if rec["status"] == "error":  # an unlisted directory: not a target, never shadowed
+        return
+    key = os.path.realpath(rec["target"])
+    if key in claimed:
+        rec["status"], rec["shadowed_by"] = "shadowed", claimed[key]
+        return
+    claimed[key] = rec["stamp"]
+    if rec["error"]:
+        rec["status"] = "error"
+        return
+    try:
+        backup = Path(rec["backup"])
+        write_path = Path(key)  # a symlinked target is written through
+        rec["write_path"] = str(write_path)
+        rec["backup_sha256"] = _sha256(backup.read_bytes())
+        if not write_path.exists():
+            raise FileNotFoundError("target does not exist (not recreated; copy the backup by hand if intended)")
+        if not write_path.is_file():
+            raise IsADirectoryError("target is not a regular file")
+        rec["target_sha256"] = _sha256(write_path.read_bytes())
+        rec["differs"] = rec["target_sha256"] != rec["backup_sha256"]
+        rec["mode_differs"] = stat.S_IMODE(write_path.stat().st_mode) != stat.S_IMODE(backup.stat().st_mode)
+        rec["status"] = "would_restore" if rec["differs"] or rec["mode_differs"] else "identical"
+    except Exception as e:  # noqa: BLE001 — isolate one file's failure from the batch
+        rec["status"], rec["error"] = "error", f"{type(e).__name__}: {e}"
+
+
+def _restore_entry(rec: dict, pre_stamp: str) -> None:
+    """Save the current target under pre_stamp, then atomically write the
+    backup's bytes and mode through to rec's resolved target. The write goes
+    to write_path, the file inspected and just saved, never to a re-resolved
+    target: a link repointed since inspect is refused rather than followed
+    onto a file with no pre-restore backup."""
+    try:
+        backup = Path(rec["backup"])
+        data = backup.read_bytes()
+        if _sha256(data) != rec["backup_sha256"]:
+            raise OSError("backup changed since it was inspected")
+        rec["pre_restore_backup"] = str(wiring_diff.backup_file(rec["write_path"], BACKUP_ROOT, pre_stamp))
+        now = os.path.realpath(rec["target"])
+        if now != rec["write_path"]:
+            raise OSError(f"target now resolves to {now}, not the inspected {rec['write_path']} (refused: repointed since inspect; nothing written)")
+        wiring_diff.atomic_write(rec["write_path"], data, mode=stat.S_IMODE(backup.stat().st_mode))
+        if _sha256(Path(rec["write_path"]).read_bytes()) != rec["backup_sha256"]:
+            raise OSError("post-write check failed: target sha256 != backup sha256")
+        rec["status"] = "restored"
+    except Exception as e:  # noqa: BLE001 — isolate one file's failure from the batch
+        rec["status"], rec["error"] = "error", f"{type(e).__name__}: {e}"
+
+
+def _new_pre_restore_stamp() -> str:
+    """Create BACKUP_ROOT/<now>-pre-restore; a same-second collision gets a
+    .2, .3, ... suffix rather than mixing two restores' saves."""
+    base = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-pre-restore"
+    BACKUP_ROOT.mkdir(parents=True, exist_ok=True)
+    n = 1
+    while True:
+        name = base if n == 1 else f"{base}.{n}"
+        try:
+            (BACKUP_ROOT / name).mkdir()
+            return name
+        except FileExistsError:
+            n += 1
+
+
+def cmd_restore(stamps: list[str], apply: bool, as_json: bool) -> int:
+    # Oldest first (stamp names sort chronologically): a target backed up in
+    # several stamps is restored from the oldest, the pre-everything state.
+    stamps = sorted(set(stamps))
+    dirs, bad = {}, {}
+    for s in stamps:
+        d, reason = _stamp_dir(s)
+        if d is None:
+            bad[s] = reason
+        else:
+            dirs[s] = d
+    if bad:
+        # Refuse the whole call: a typo in a multi-stamp rollback must not
+        # produce a partial restore.
+        if as_json:
+            print(json.dumps({"error": "bad_stamp", "backup_root": str(BACKUP_ROOT), "bad_stamps": bad}, indent=2))
+        else:
+            for s, reason in bad.items():
+                err(f"--restore {s}: {reason}")
+            err("nothing restored")
+        return 2
+
+    records = [rec for s in stamps for rec in _backup_entries(s, dirs[s])]
+    claimed: dict[str, str] = {}
+    for rec in records:
+        _inspect_entry(rec, claimed)
+
+    pre_stamp = None
+    if apply:
+        todo = [r for r in records if r["status"] == "would_restore"]
+        if todo:
+            pre_stamp = _new_pre_restore_stamp()
+            for rec in todo:
+                _restore_entry(rec, pre_stamp)
+
+    def count(status: str) -> int:
+        return sum(1 for r in records if r["status"] == status)
+
+    summary = {
+        "backup_root": str(BACKUP_ROOT),
+        "stamps": stamps,
+        "apply": apply,
+        "listed": len(records),
+        "differ": sum(1 for r in records if r["differs"]),
+        "would_restore": count("would_restore"),
+        "restored": count("restored"),
+        "identical": count("identical"),
+        "shadowed": count("shadowed"),
+        "errors": count("error"),
+        "pre_restore_stamp": pre_stamp,
+        "files": records,
+    }
+
+    if as_json:
+        print(json.dumps(summary, indent=2))
+    else:
+        print()
+        print(f"V11 Restore ({'APPLY' if apply else 'DRY RUN'})")
+        print("=" * 40)
+        print(f"  Backup root: {BACKUP_ROOT}")
+        print(f"  Stamps (oldest first): {', '.join(stamps)}")
+        print()
+        for r in records:
+            if r["differs"] is None:
+                diff_s = ""
+            else:
+                diff_s = "differs" if r["differs"] else ("mode-only" if r["mode_differs"] else "same")
+            print(f"  {r['status']:13} {diff_s:9} {r['backup']} -> {r['target']}")
+            if r["write_path"] and r["write_path"] != r["target"]:
+                print(f"{'':26}symlink: writes through to {r['write_path']}")
+            if r["shadowed_by"]:
+                print(f"{'':26}skipped: restored from the older stamp {r['shadowed_by']}")
+            if r["error"]:
+                print(f"{'':26}{r['error']}")
+        print()
+        print(
+            f"{summary['listed']} listed, {summary['differ']} differ, {summary['identical']} identical, "
+            f"{summary['shadowed']} shadowed, {summary['errors']} errors"
+            + (f", {summary['restored']} restored" if apply else "")
+        )
+        if pre_stamp:
+            print(f"Pre-restore backup: {BACKUP_ROOT / pre_stamp}")
+            print(f"  undo with: v11-update --restore {pre_stamp} --apply")
+        elif not apply:
+            print("DRY RUN — nothing written. Re-run with --apply to restore.")
+        print()
+
+    return 1 if summary["errors"] else 0
+
+
+def cmd_test() -> int:
+    print(VERSION_STRING)
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="v11-update",
+        description="Reconcile V11 project settings.json hook wiring against the canonical template.",
+        epilog=(
+            "PROJECT_OR_PATH, --all or --restore is required; with none, usage is printed and the exit code is 1. "
+            "--all reports pct_at_parity = at_parity / discovered (files that error count against parity; "
+            "check-wiring-parity uses the same denominator). Exit 1 if any file errored. "
+            "--restore STAMP [STAMP ...] rolls back an apply from ${V11_UPDATE_BACKUP_ROOT:-~/.v11-backups/v11-update}/STAMP: "
+            "without --apply it only lists backup -> target and whether the target's sha256 differs; with --apply "
+            "it writes each file back byte-exact with the backup's mode (through a symlinked target, atomically), "
+            "after saving the current file under <root>/<now>-pre-restore/ (undo: --restore <that stamp> --apply). "
+            "Several stamps restore oldest first; a target in more than one is restored from the oldest. "
+            "An unknown or invalid STAMP refuses the whole call (exit 2); a refused or failed file "
+            "(symlink/path escape in the backup tree, missing target) is reported, the rest continue, exit 1. "
+            "Use this, not `git checkout`, to roll back: a repo whose settings.json was dirty before the apply "
+            "would lose those uncommitted edits."
+        ),
+    )
+    p.add_argument("project_or_path", nargs="?", help="project name or path to settings.json / project dir")
+    p.add_argument("--all", action="store_true", help="reconcile every discovered fleet settings.json")
+    p.add_argument("--dry-run", action="store_true", help="compute the diff and report; write ZERO bytes anywhere")
+    p.add_argument("--restore", nargs="+", metavar="STAMP",
+                   help="roll back an apply from the backup stamp(s): a dry-run listing unless --apply")
+    p.add_argument("--apply", action="store_true", help="with --restore: actually restore (default: list only)")
+    p.add_argument("--json", action="store_true", help="machine-readable report")
+    p.add_argument("--test", action="store_true", help="self-test: print version string, exit 0")
+    p.add_argument("--scan", action="store_true", help="deprecated — see scripts/check-wiring-parity")
+    return p
+
+
+def main(argv: list[str]) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    if args.test:
+        return cmd_test()
+
+    if args.scan:
+        print("`--scan` is retired — the old version-ladder survey is gone.")
+        print("Use: scripts/check-wiring-parity [--json] for a live fleet parity report.")
+        return 0
+
+    if args.restore:
+        if args.all or args.project_or_path:
+            parser.error("--restore takes neither PROJECT_OR_PATH nor --all")
+        if args.apply and args.dry_run:
+            parser.error("--restore: --apply and --dry-run are mutually exclusive")
+        return cmd_restore(args.restore, apply=args.apply, as_json=args.json)
+    if args.apply:
+        parser.error("--apply only goes with --restore (an update applies unless --dry-run is given)")
+
+    if args.all:
+        return cmd_all(dry_run=args.dry_run, as_json=args.json)
+
+    if not args.project_or_path:
+        parser.print_usage(sys.stderr)
+        return 1
+
+    return cmd_single(args.project_or_path, dry_run=args.dry_run, as_json=args.json)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

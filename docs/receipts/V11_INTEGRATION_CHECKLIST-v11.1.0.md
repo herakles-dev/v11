@@ -521,7 +521,7 @@ Runner: `scripts/run-tests [--fast|--regression|--coverage]`
 
 ### MCP Servers
 
-- [ ] Hercules Platform MCP server configured in `~/.config/.mcp.json`
+- [ ] Platform MCP server configured in `~/.config/.mcp.json`
 - [ ] Memory search MCP server at `v11/mcp-tools/memory-search/server.py`
 - [ ] Gmail, HuggingFace, Socket MCP servers independent of V11
 

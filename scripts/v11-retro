@@ -165,7 +165,7 @@ self_test() {
     printf '5\n' > "$tmpdir/test-project/.retro-counter"
     local out
     out=$(SESSIONS_ROOT="$tmpdir" V11_RETRO_THRESHOLD=3 "$0" test-project)
-    echo "$out" | grep -q "DUE" || { echo "FAIL: threshold not detected"; rm -rf "$tmpdir"; exit 1; }
+    grep -q "DUE" <<<"$out" || { echo "FAIL: threshold not detected"; rm -rf "$tmpdir"; exit 1; }
     SESSIONS_ROOT="$tmpdir" "$0" test-project --reset >/dev/null
     local count
     count=$(cat "$tmpdir/test-project/.retro-counter" | tr -dc '0-9')

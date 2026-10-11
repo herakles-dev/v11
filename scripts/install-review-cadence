@@ -176,7 +176,7 @@ fi
 # ── Uninstall ────────────────────────────────────────────────────────────
 if [ "$MODE" = "uninstall" ]; then
     _existing="$(crontab -l 2>/dev/null || true)"
-    if ! printf '%s\n' "$_existing" | grep -qF "$MARKER"; then
+    if ! grep -qF "$MARKER" <<<"$_existing"; then
         echo "install-review-cadence: no v11-review-cadence entry found — nothing to remove."
         exit 0
     fi
@@ -258,7 +258,7 @@ chmod +x "$RUN_SCRIPT"
 CRON_LINE="${MINUTE} ${HOUR} * * * ${RUN_SCRIPT} ${MARKER}"
 
 _existing="$(crontab -l 2>/dev/null || true)"
-if printf '%s\n' "$_existing" | grep -qF "$MARKER"; then
+if grep -qF "$MARKER" <<<"$_existing"; then
     _new="$(printf '%s\n' "$_existing" | grep -vF "$MARKER")"
     printf '%s\n%s\n' "$_new" "$CRON_LINE" | crontab -
     echo "install-review-cadence: replaced existing v11-review-cadence entry."

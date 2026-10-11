@@ -19,6 +19,7 @@
 #   agent-scorecard AGENT --caller-kind subagent   # orchestrator | subagent | unknown | daemon | all
 #   agent-scorecard --routing                      # V11.32: per-agent override rate report (no AGENT needed)
 #   agent-scorecard --routing --project P --since D --json
+#   agent-scorecard --routing --live-window 2      # liveness window in hours (default 2)
 #   agent-scorecard --test                         # self-test
 #   agent-scorecard --help
 #
@@ -41,11 +42,11 @@ if [ "${1:-}" == "--test" ]; then
 fi
 
 if [ "${1:-}" == "--help" ] || [ "${1:-}" == "-h" ]; then
-    sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'
     exit 0
 fi
 
-AGENT="" JSON=false SINCE="" PROJECT="" LAYER="all" CALLER_KIND="all" ROUTING=false
+AGENT="" JSON=false SINCE="" PROJECT="" LAYER="all" CALLER_KIND="all" ROUTING=false LIVE_WINDOW=2
 while [ $# -gt 0 ]; do
     case "$1" in
         --json) JSON=true ;;
@@ -54,7 +55,8 @@ while [ $# -gt 0 ]; do
         --layer) LAYER="${2:-all}"; shift ;;
         --caller-kind) CALLER_KIND="${2:-all}"; shift ;;
         --routing) ROUTING=true ;;
-        --help|-h) sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        --live-window) LIVE_WINDOW="${2:-}"; shift ;;
+        --help|-h) sed -n '2,27p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         --*) echo "agent-scorecard: unknown flag '$1'" >&2; exit 2 ;;
         *)
             if [ -z "$AGENT" ]; then AGENT="$1"
@@ -75,6 +77,10 @@ case "$LAYER" in
     *) echo "agent-scorecard: --layer must be all|runtime|lite|wave|swarm|brief (got: $LAYER)" >&2; exit 2 ;;
 esac
 
+if ! printf '%s' "$LIVE_WINDOW" | grep -qE '^[0-9]+([.][0-9]+)?$'; then
+    echo "agent-scorecard: --live-window must be a number of hours (got: $LIVE_WINDOW)" >&2; exit 2
+fi
+
 case "$CALLER_KIND" in
     all|orchestrator|subagent|unknown|daemon) ;;
     *) echo "agent-scorecard: --caller-kind must be all|orchestrator|subagent|unknown|daemon (got: $CALLER_KIND)" >&2; exit 2 ;;
@@ -82,7 +88,8 @@ esac
 
 V11_AS_AGENT="$AGENT" V11_AS_JSON="$JSON" V11_AS_SINCE="$SINCE" \
 V11_AS_PROJECT="$PROJECT" V11_AS_LAYER="$LAYER" V11_AS_CALLER_KIND="$CALLER_KIND" \
-V11_AS_ROUTING="$ROUTING" \
+V11_AS_ROUTING="$ROUTING" V11_AS_LIVE_WINDOW_H="$LIVE_WINDOW" \
+V11_AS_TRANSCRIPTS_DIR="${V11_AS_TRANSCRIPTS_DIR:-$HERCULES_ROOT/.claude/projects}" \
 V11_AS_AUDIT="$METRICS_DIR/autonomy-audit.jsonl" \
 V11_AS_ERRORS="$METRICS_DIR/agent-errors.jsonl" \
 V11_AS_TASK_STATE_DIR="$METRICS_DIR/task-state" \
@@ -90,7 +97,7 @@ V11_AS_TRACE="$METRICS_DIR/dispatch-trace.jsonl" \
 V11_AS_LEDGER_DIR="$METRICS_DIR/ledger" \
 V11_AS_LIBDIR="$SCRIPT_DIR/lib" \
 python3 - <<'PYEOF'
-import os, sys, json, datetime, re
+import os, sys, json, datetime, re, bisect
 from collections import Counter
 
 # v11.44: shared read-side actor canonicalization. Single source of truth is
@@ -103,6 +110,8 @@ try:
 except Exception:
     def _canon(x):
         return x
+# S1-P3: the shared waived/void correction predicate (scripts/lib/review_corrections.py).
+from review_corrections import superseded_review_keys, is_counted_review
 
 def env(k, d=""):
     return os.environ.get(k, d)
@@ -161,6 +170,148 @@ def read_jsonl(path):
     return out
 
 # ---------------------------------------------------------------------------
+# S1-T11 (#53, #99) — durable-ledger identity index, shared by --routing and
+# the per-agent ledger blocks below. A task is identified by
+# (subject_norm, create_seq), never by a bare task_id: ids are reused across
+# sessions (#97). Each identity keeps its created.metadata.agent (the
+# TaskCreate-time recommendation), its source, its last in_progress owner, its
+# start (first in_progress, reset on a reopen) and end (completed/cancelled) ts,
+# its status timeline (pending/active/closed, for "what was it at ts"),
+# and whether it is a review task: metadata.review_of, a pair_ id, or a task
+# recommended to one of V11's reviewer roles (hand-made "…-review" siblings).
+# Each ledger file is parsed once.
+#
+# S1-T11d (#66): rotated copies are read too — ledger/<project>.jsonl.bak* and
+# ledger/archive/*.jsonl (bucketed by each row's own `project`, since archive
+# names do not always start with the project). A rotated row joins only when
+# no live row has its event identity (ev, UTC ts, session, task_id,
+# subject_norm, create_seq); a rewritten copy of one event never counts twice.
+# Rotated-only rows are older, so they go first, in ts order.
+# V11_AS_ROTATED=off reads the live file alone.
+# Per session the index also keeps `sess_act`: the ts of its non-bookkeeping
+# events (not cancelled/reconcile/sprint_archived, not migration or
+# correction-* rows), which is what --routing liveness reads.
+# ---------------------------------------------------------------------------
+ledger_dir = env("V11_AS_LEDGER_DIR")
+
+def _is_reconstructed(src):
+    """migration / backfill-* rows were written after the fact and carry
+    end-state metadata (#99 item 2), so they are not a live record."""
+    src = str(src or "")
+    return src == "migration" or src.startswith("backfill-")
+
+def _rec_agents(raw):
+    """Canonical agents named by a metadata.agent label, first one first. Labels
+    may name several agents or carry a model tag: 'a+b', 'a (opus)',
+    'a(sonnet)', 'a/haiku', 'a x3'."""
+    out = []
+    for part in str(raw or "").split("+"):
+        name = re.sub(r"\(.*?\)|/\S*", " ", part).split()
+        if name and _canon(name[0]) not in out:
+            out.append(_canon(name[0]))
+    return out
+
+_REVIEWER_AGENTS = {"adversarial-lite-reviewer", "adversarial-reviewer"}
+
+_ledger_cache = {}
+_ledger_archive = None  # project -> rows from ledger/archive/*.jsonl
+
+def _event_key(e):
+    return (e.get("ev"), parse_ts(e.get("ts")), e.get("session_uuid"), str(e.get("task_id")),
+            e.get("subject_norm"), e.get("create_seq"))
+
+def _rotated_rows(project, path):
+    global _ledger_archive
+    if env("V11_AS_ROTATED") == "off":
+        return []
+    if _ledger_archive is None:
+        _ledger_archive = {}
+        adir = os.path.join(os.path.dirname(path), "archive")
+        if os.path.isdir(adir):
+            for name in sorted(os.listdir(adir)):
+                if name.endswith(".jsonl"):
+                    for r in read_jsonl(os.path.join(adir, name)):
+                        _ledger_archive.setdefault(r.get("project"), []).append(r)
+    out = list(_ledger_archive.get(project, []))
+    d, bak = os.path.dirname(path), os.path.basename(path) + ".bak"
+    for name in sorted(os.listdir(d)):
+        if name == bak or name.startswith(bak + "."):
+            out += [r for r in read_jsonl(os.path.join(d, name)) if r.get("project") in (project, None)]
+    return out
+
+def _is_bookkeeping(e):
+    # backfill-* rows keep their real event times (only their metadata is
+    # end-state), so they still show a session was active; migration rows are
+    # stamped at import time and corrections by the session applying them.
+    src = str(e.get("source") or "")
+    return (e.get("ev") in ("cancelled", "reconcile", "sprint_archived")
+            or src == "migration" or src.startswith("correction-"))
+
+def _ledger_index(project, path=None):
+    """Identity index for one project's ledger, or None when it has none."""
+    if project in _ledger_cache:
+        return _ledger_cache[project]
+    if path is None and ledger_dir and project and re.match(r'^[A-Za-z0-9._-]+$', project):
+        path = os.path.join(ledger_dir, f"{project}.jsonl")
+    if not path or not os.path.isfile(path):
+        _ledger_cache[project] = None
+        return None
+    live = read_jsonl(path)
+    seen = {_event_key(e) for e in live}
+    rotated = []
+    for e in _rotated_rows(project, path):
+        k = _event_key(e)
+        if k not in seen:
+            seen.add(k)
+            rotated.append(e)
+    _floor = datetime.datetime.min.replace(tzinfo=datetime.timezone.utc)
+    rotated.sort(key=lambda e: parse_ts(e.get("ts")) or _floor)
+    rows = rotated + live
+    ids, by_tid, by_sess, sess_ts, sess_act = {}, {}, {}, {}, {}
+    for e in rows:
+        ts = parse_ts(e.get("ts"))
+        sid = e.get("session_uuid") or ""
+        if ts is not None:
+            sess_ts.setdefault(sid, []).append(ts)
+            if not _is_bookkeeping(e):
+                sess_act.setdefault(sid, []).append(ts)
+        key = (e.get("subject_norm"), e.get("create_seq"))
+        ev = e.get("ev")
+        if ev == "created":
+            md = e.get("metadata") if isinstance(e.get("metadata"), dict) else {}
+            tid = str(e.get("task_id") or "")
+            ident = {"key": key, "created": ts, "session": sid, "task_id": tid,
+                     "rec": md.get("agent") or e.get("recommended_agent") or None,
+                     "source": e.get("source") or "", "owner": None,
+                     "started": None, "end": None, "timeline": [(ts, "pending")],
+                     "is_review": (bool(md.get("review_of")) or tid.startswith("pair_")
+                                   or bool(_REVIEWER_AGENTS.intersection(_rec_agents(
+                                       md.get("agent") or e.get("recommended_agent")))))}
+            ids[key] = ident
+            if tid and ts is not None:
+                by_tid.setdefault(tid, []).append(ident)
+                by_sess.setdefault(sid, []).append(ident)
+        elif key in ids:
+            if ev == "in_progress":
+                if ids[key]["started"] is None or ids[key]["end"] is not None:
+                    ids[key]["started"] = ts  # first start, or a reopen
+                ids[key]["end"] = None
+                ids[key]["timeline"].append((ts, "active"))
+                if e.get("owner") and isinstance(e.get("owner"), str):
+                    ids[key]["owner"] = e.get("owner")
+            elif ev in ("completed", "cancelled") and ts is not None:
+                ids[key]["end"] = ts
+                ids[key]["timeline"].append((ts, "closed"))
+    for v in list(sess_ts.values()) + list(sess_act.values()):
+        v.sort()
+    for i in ids.values():  # status history, so --routing can ask "what was it at ts"
+        i["timeline"] = sorted((x for x in i["timeline"] if x[0] is not None), key=lambda x: x[0])
+    idx = {"rows": rows, "ids": ids, "by_tid": by_tid, "by_sess": by_sess, "sess_ts": sess_ts,
+           "sess_act": sess_act, "rotated_rows": len(rotated)}
+    _ledger_cache[project] = idx
+    return idx
+
+# ---------------------------------------------------------------------------
 # V11.32 (H2) — --routing: dispatch-trace routing-field consumer.
 #
 # dispatch-trace.jsonl has carried recommended_agent/spawned_agent/
@@ -173,10 +324,14 @@ def read_jsonl(path):
 # Null-safe field access (`rec.get(...)` — the jq `// empty` idiom's python
 # equivalent) even though every row currently carries both fields, so a
 # future dispatch-trace-append change that omits one doesn't crash this.
+#
+# S1-T11: this raw recommended != spawned count reported 81.5% where the
+# real rate is far lower (#53). It is kept only behind the rollback lever
+# V11_AS_ROUTING_RAW=true; the default report is the classified one below.
 # ---------------------------------------------------------------------------
 routing_mode = env("V11_AS_ROUTING") == "true"
 
-if routing_mode:
+if routing_mode and env("V11_AS_ROUTING_RAW") == "true":
     per_agent = {}  # recommended_agent -> {"total", "diverged", "reasons": Counter}
     total_all = 0
     diverged_all = 0
@@ -248,6 +403,575 @@ if routing_mode:
         print(f"  {r['recommended_agent']:<28}  {r['total_spawns']:>7}  {r['diverged']:>8}  {r['rate_pct']:>6.1f}%  {top_s}")
     print("  " + "-" * 92)
     print(f"  {'OVERALL':<28}  {total_all:>7}  {diverged_all:>8}  {overall_rate:>6.1f}%   ({diverged_all}/{total_all} diverged)")
+    print()
+    if total_all == 0:
+        print("  No dispatch-trace data found under the current filters.")
+        print(f"  Ledger: {trace_path}  ({'present' if os.path.exists(trace_path) else 'absent'})")
+    sys.exit(0)
+
+# ---------------------------------------------------------------------------
+# S1-T11 (#53, #99) — --routing judged against an INDEPENDENT recommendation.
+#
+# A dispatch-trace row's own routing fields are not evidence of a routing
+# choice: hooks/track-agents fills recommended_agent with the spawned agent
+# when the task has none (forced agreement), reads it from
+# active_task_ids[0] (possibly another in-flight task), and synthesises
+# override_reason as "recommended=X, spawned=Y"; hooks/sync-tasks writes
+# spawned_agent="orchestrator" + "unattributed-self-exec" as an attribution
+# record. So each spawn is re-judged against the durable ledger.
+#
+#   spawns (S1-T11d, #66) one per Agent call. Since 2026-07-10 hooks/track-agents
+#                   writes each call as a single event:"completion" row; rows
+#                   without `event` (or with a hand-set one) come from the
+#                   orchestrator's dispatch-trace-append and name the task
+#                   spawned for (plus sync-tasks self-exec records). A
+#                   completion row whose call started 30 min before .. 5 min
+#                   after an orchestrator row for the same project and agent is
+#                   that row's spawn and is dropped (1:1, nearest first).
+#   task            the ledger identity for (project, task_id) live at the
+#                   spawn. Per session the latest `created` at/before ts
+#                   supersedes earlier ones (a session can reuse an id once the
+#                   first task closed); it is live if not ended before ts and
+#                   its session's last non-bookkeeping ledger event (see
+#                   _ledger_index) is at most --live-window hours (default 2)
+#                   before the spawn (an event up to 5 min after it counts,
+#                   as for owners). Trace rows carry no session, so two live
+#                   candidates from different sessions are ambiguous (#97).
+#   served task     when the row's own task is not live or is ambiguous, the task
+#                   the spawn served, labelled as such: the Agent call in a
+#                   surviving session transcript whose prompt names "task #N"
+#                   (or whose teammate name owns a task) — judged against each
+#                   named task, counted only when every one gives the same
+#                   bucket (a teammate name owning exactly one picks it;
+#                   otherwise unknown: ambiguous_served_task) — else a task in progress
+#                   at ts in a live session whose plan names the spawned agent —
+#                   only if that session is the only live one or every task in
+#                   progress across the live sessions plans that agent
+#                   (otherwise unknown: ambiguous_served_task).
+#   recommendation  the task's created.metadata.agent — written at TaskCreate,
+#                   before and apart from the spawn.
+#
+#   self_executed   spawned_agent is the orchestrator family (no spawn), no
+#                   non-orchestrator owner claimed the task, and no spawn of its
+#                   planned agent is on record from 10 min before the task was
+#                   created to the record.
+#   agreed          spawned == the recommendation, or == the recommendation of
+#                   a sibling in the same session that is in progress at ts (a
+#                   start up to 5 min after the spawn counts: owners are often
+#                   set right after the Agent call) or is a pending review
+#                   sibling (the reviewer spawn is what activates it).
+#                   Sibling matches are reported separately. A row with a
+#                   hand-written override_reason names its task on purpose and
+#                   is never sibling-matched (that is a diverged row).
+#   companion       a different agent spawned while the recommended agent also
+#                   ran for the task (review sibling, research helper), or the
+#                   recommendation was the orchestrator itself. Not a reroute.
+#   diverged        the task had a recommendation; a different agent was
+#                   spawned and the recommended one never ran for it.
+#   unknown         no independent recommendation (reason recorded).
+#
+# Rows whose project has no ledger at all (the #94 test-fixture leak, unwired
+# projects) are excluded from every denominator and counted separately.
+# Headline: rate_pct == decided_rate_pct = diverged / (agreed + companion +
+# diverged), with coverage_pct = decided / ledgered rows and the bounds
+# floor_pct (no unknown row diverged) .. ceiling_pct (every one did).
+# Rollback: V11_AS_ROUTING_RAW=true restores the raw count above;
+# V11_AS_TRANSCRIPTS=off skips the transcript lookup; V11_AS_ROTATED=off reads
+# the live ledger files only.
+# ---------------------------------------------------------------------------
+if routing_mode:
+    _SLACK = datetime.timedelta(seconds=120)
+    _GRACE = datetime.timedelta(minutes=5)
+    _LIVE_WINDOW_H = float(env("V11_AS_LIVE_WINDOW_H") or 2)
+    _LIVE_WINDOW = datetime.timedelta(hours=_LIVE_WINDOW_H)
+    _SELF_EXEC_LEAD = datetime.timedelta(minutes=10)
+    _ECHO_RE = re.compile(r"^recommended=.*, spawned=.*$")
+    BUCKETS = ["agreed", "diverged", "self_executed", "companion", "unknown"]
+
+    trace_rows = read_jsonl(trace_path)
+
+    def _dur(r):
+        d = r.get("duration_ms")
+        return datetime.timedelta(milliseconds=d) if isinstance(d, (int, float)) and not isinstance(d, bool) else datetime.timedelta(0)
+
+    # --- the spawn population (#66 fix 1) -----------------------------------
+    orch_rows = [r for r in trace_rows if r.get("event") != "completion"]
+    comp_rows = [r for r in trace_rows if r.get("event") == "completion"]
+    _comp_by_key = {}
+    for i, r in enumerate(comp_rows):
+        ts = parse_ts(r.get("ts"))
+        if ts is not None and r.get("spawned_agent"):
+            _comp_by_key.setdefault((r.get("project"), _canon(r["spawned_agent"])), []).append((ts - _dur(r), i))
+    _paired = set()
+    for r in sorted(orch_rows, key=lambda r: parse_ts(r.get("ts")) or datetime.datetime.min.replace(tzinfo=datetime.timezone.utc)):
+        ts, sa = parse_ts(r.get("ts")), r.get("spawned_agent")
+        if ts is None or not sa or _canon(sa) == "orchestrator":
+            continue
+        best = None
+        for start, i in _comp_by_key.get((r.get("project"), _canon(sa)), []):
+            if i not in _paired and ts - datetime.timedelta(minutes=30) <= start <= ts + datetime.timedelta(minutes=5):
+                if best is None or abs(start - ts) < best[0]:
+                    best = (abs(start - ts), i)
+        if best:
+            _paired.add(best[1])
+    spawn_rows = ([(r, "orchestrator_row") for r in orch_rows]
+                  + [(r, "completion_only") for i, r in enumerate(comp_rows) if i not in _paired])
+
+    # Every real spawn per (project, canonical agent), unfiltered by --since:
+    # the companion and self-exec tests ask whether an agent ran at all. A
+    # completion row is stamped at the call's end, so it counts from its start.
+    _spawn_ts = {}
+    for t in trace_rows:
+        ts = parse_ts(t.get("ts"))
+        if ts is not None and t.get("spawned_agent") and _canon(t["spawned_agent"]) != "orchestrator":
+            start = ts - _dur(t) if t.get("event") == "completion" else ts
+            _spawn_ts.setdefault((t.get("project"), _canon(t["spawned_agent"])), []).append(start)
+    for v in _spawn_ts.values():
+        v.sort()
+
+    def _spawned_between(project, agent_c, lo, hi):
+        lst = _spawn_ts.get((project, agent_c)) or []
+        j = bisect.bisect_left(lst, lo)
+        return j < len(lst) and lst[j] <= hi
+
+    # --- liveness (#66 fix 2) ---------------------------------------------------
+    def _session_live(idx, sid, ts):
+        # An event up to _GRACE after the spawn counts, as for owner/in_progress
+        # writes: a session resuming after >2 h often logs its first event
+        # (the in_progress) minutes after the Agent call.
+        st = idx["sess_act"].get(sid, [])
+        j = bisect.bisect_right(st, ts + _GRACE)
+        return j > 0 and ts - st[j - 1] <= _LIVE_WINDOW
+
+    def _state_at(i, t):
+        st = None
+        for ets, s in i["timeline"]:
+            if ets > t:
+                break
+            st = s
+        return st
+
+    def _closed_at(i, ts):
+        """Closed at ts and already closed _SLACK before it (a reopen counts)."""
+        return _state_at(i, ts - _SLACK) == "closed" and _state_at(i, ts) == "closed"
+
+    def _is_live(idx, ident, ts):
+        if _closed_at(ident, ts):
+            return False
+        return _session_live(idx, ident["session"], ts)
+
+    # S2-T0b-3 (#113): a trace row's task id binds through the shared resolver
+    # (scripts/lib/task_epoch.py). A row stamped with its session (S2-T0b-2)
+    # binds in that session and TaskList epoch (R1, else R2 at the row ts); an
+    # orchestrator row so bound skips the liveness window. A legacy row binds
+    # by R3 at the row ts; the window breaks a tie between several
+    # identities, and a lone identity that is not live stays task_not_live, as
+    # does any hooks/track-agents row (`event` set): their ids are the
+    # untrusted active_task_ids[0] of #103, and the S1-T11 blind checks label
+    # a closed or idle identity's row unknown, not its task's.
+    # Deviation from design §4 row 5 ("the window only breaks R3 ties"),
+    # orchestrator decision 2026-09-27: the literal rule binds zombie
+    # identities (s1-t11b-blind-handcheck.md:110) and fails 13 validated
+    # tests, and M3 is re-measured on new, stamped rows only (G1), which bind
+    # exactly without the window anyway.
+    # The index is built from the rows read here (rotated included), with no
+    # replay (no rehydrate aliases, as ids above).
+    # Rollback: V11_TASK_RESOLVER=legacy (the window alone, every row).
+    _RESOLVER_SHARED = env("V11_TASK_RESOLVER", "shared") != "legacy"
+    _UUID_RE = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+    _tix_cache = {}
+
+    def _task_index(project, idx):
+        if project not in _tix_cache:
+            try:
+                import task_epoch
+                _tix_cache[project] = task_epoch.TaskIndex.from_ledger(
+                    project, events=idx["rows"], identities=[],
+                    metrics_dir=os.path.dirname(ledger_dir) if ledger_dir else None)
+            except Exception:
+                _tix_cache[project] = None
+        return _tix_cache[project]
+
+    def _live_identity(idx, task_id, ts, row=None):
+        tix = _task_index(row.get("project"), idx) if _RESOLVER_SHARED and row is not None else None
+        if tix is None:
+            return _live_identity_window(idx, task_id, ts)
+        import task_epoch
+        tid = str(task_id or "")
+        res = tix.resolve(row.get("session_uuid") or None, tid, epoch=task_epoch.tl_epoch_of(row),
+                          at=(ts, None))
+        # Exact only when bound inside the row's own session (R1/R2): a
+        # session that is no UUID, or one with no claim on the id, falls back
+        # to R3 ("only"), fleet-wide, which the liveness window still vets
+        # (review #23).
+        exact = ("event" not in row and res.basis != "only"
+                 and bool(_UUID_RE.fullmatch(str(row.get("session_uuid") or ""))))
+        if res.status == task_epoch.BOUND:
+            i = idx["ids"].get(res.identity)
+            if i is None:
+                return None, "task_not_in_ledger"
+            if not exact and not _is_live(idx, i, ts):
+                return None, "task_not_live"
+            return i, None
+        if res.status == task_epoch.UNRESOLVED:
+            return None, "task_not_in_ledger"
+        live = [idx["ids"][c] for c in res.candidates
+                if c in idx["ids"] and _is_live(idx, idx["ids"][c], ts)]
+        if not live:
+            return None, "task_not_live"
+        if len(live) > 1:
+            return None, "ambiguous_identity"
+        return live[0], None
+
+    def _live_identity_window(idx, task_id, ts):
+        latest = {}  # session -> its latest creation of this task_id at/before ts
+        for i in idx["by_tid"].get(str(task_id or ""), []):
+            if i["created"] <= ts + _SLACK:
+                cur = latest.get(i["session"])
+                if cur is None or i["created"] >= cur["created"]:
+                    latest[i["session"]] = i
+        if not latest:
+            return None, "task_not_in_ledger"
+        live = [i for i in latest.values() if _is_live(idx, i, ts)]
+        if not live:
+            return None, "task_not_live"
+        if len(live) > 1:
+            return None, "ambiguous_identity"
+        return live[0], None
+
+    def _sibling_live(i, ts):
+        if i["created"] > ts + _SLACK or _closed_at(i, ts):
+            return False
+        return (i["is_review"] or _state_at(i, ts) == "active"
+                or any(s == "active" and ts < ets <= ts + _GRACE for ets, s in i["timeline"]))
+
+    def _ran_during(project, agent_c, ident, idx):
+        st = idx["sess_act"].get(ident["session"]) or [ident["created"]]
+        return _spawned_between(project, agent_c, ident["created"] - _SLACK,
+                                (ident["end"] or st[-1]) + _SLACK)
+
+    def _written_reason(row):
+        """A rationale the orchestrator wrote itself — not the track-agents echo
+        and not the sync-tasks self-exec sentinel (#53 item 3)."""
+        reason = (row.get("override_reason") or "").strip()
+        if not reason or reason == "unattributed-self-exec" or _ECHO_RE.match(reason):
+            return ""
+        return reason
+
+    # --- served task: transcripts (#66 fix 4) -----------------------------------
+    _tdir = env("V11_AS_TRANSCRIPTS_DIR")
+    _transcripts_on = env("V11_AS_TRANSCRIPTS") != "off" and bool(_tdir) and os.path.isdir(_tdir)
+    _transcript_paths = None
+    _transcript_calls = {}
+    _TASK_RE = re.compile(r"(?i)\btasks?\s*((?:#\s*[\w.-]+[\s,&/+]*(?:and\s+)?)+)")
+
+    def _session_transcript(sid):
+        global _transcript_paths
+        if _transcript_paths is None:
+            _transcript_paths = {}
+            for d in sorted(os.listdir(_tdir)):
+                p = os.path.join(_tdir, d)
+                if os.path.isdir(p):
+                    for f in os.listdir(p):
+                        if f.endswith(".jsonl"):
+                            _transcript_paths.setdefault(f[:-6], os.path.join(p, f))
+        return _transcript_paths.get(sid)
+
+    def _agent_calls(path):
+        """(ts, subagent_type, teammate name, task ids named in the prompt) for
+        every Agent/Task tool call in one session transcript. Fails open."""
+        if path in _transcript_calls:
+            return _transcript_calls[path]
+        calls = []
+        try:
+            with open(path, "r", encoding="utf-8", errors="ignore") as fh:
+                for ln in fh:
+                    if '"tool_use"' not in ln or ('"Agent"' not in ln and '"Task"' not in ln):
+                        continue
+                    try:
+                        d = json.loads(ln)
+                    except Exception:
+                        continue
+                    cts = parse_ts(d.get("timestamp"))
+                    for c in ((d.get("message") or {}).get("content") or []):
+                        if (isinstance(c, dict) and c.get("type") == "tool_use"
+                                and c.get("name") in ("Agent", "Task") and isinstance(c.get("input"), dict)):
+                            inp = c["input"]
+                            text = f"{inp.get('description') or ''}\n{inp.get('prompt') or ''}"
+                            tids = set()
+                            for m in _TASK_RE.finditer(text):
+                                # 'task #7.' / 'tasks #104-#110': drop trailing punctuation
+                                tids.update(t.rstrip(".-") for t in re.findall(r"#\s*([\w.-]+)", m.group(1)))
+                            calls.append((cts, str(inp.get("subagent_type") or ""), inp.get("name"), tids))
+        except Exception:
+            calls = []
+        _transcript_calls[path] = calls
+        return calls
+
+    def _transcript_served(row, idx, ts, sa):
+        """Identities named by the one Agent call that matches this spawn, or None.
+        A teammate name that owns exactly one of them picks that one."""
+        if not _transcripts_on:
+            return None
+        lo, hi = ts - _dur(row) - datetime.timedelta(seconds=60), ts + datetime.timedelta(seconds=5)
+        hits = []
+        for sid in idx["sess_ts"]:
+            st = idx["sess_ts"][sid]
+            j = bisect.bisect_left(st, ts - _LIVE_WINDOW)
+            if not (j < len(st) and st[j] <= ts + _LIVE_WINDOW):
+                continue  # session wrote nothing near the spawn
+            path = _session_transcript(sid)
+            if not path:
+                continue
+            for cts, typ, name, tids in _agent_calls(path):
+                if cts is not None and lo <= cts <= hi and _canon(typ) == sa:
+                    hits.append((sid, name, tids))
+        if len(hits) != 1:
+            return None  # no call, or more than one candidate call
+        sid, name, tids = hits[0]
+        latest = {}
+        for i in idx["by_sess"].get(sid, []):
+            if i["created"] <= ts + _SLACK and (i["task_id"] in tids or (name and i["owner"] == name)):
+                cur = latest.get(i["task_id"])
+                if cur is None or i["created"] >= cur["created"]:
+                    latest[i["task_id"]] = i
+        owned = [i for i in latest.values() if name and i["owner"] == name]
+        return (owned if len(owned) == 1 else list(latest.values())) or None
+
+    def _in_progress(i, ts):
+        return (not _closed_at(i, ts) and i["created"] <= ts + _SLACK
+                and (_state_at(i, ts) == "active"
+                     or any(s == "active" and ts < ets <= ts + _GRACE for ets, s in i["timeline"])))
+
+    def _ledger_served(idx, ts, sa):
+        """-> (task, None) for a task in progress at ts in a live session whose plan
+        names the spawned agent; (None, "ambiguous_served_task") when a plan-name
+        match exists but another live session could have made the spawn and not
+        every task in progress across the live sessions plans that agent (S1-T11f:
+        blind sample 2 row 41 matched a sibling session's task while the spawn
+        served one with no plan); (None, None) when nothing matches."""
+        live = [sid for sid in idx["by_sess"] if _session_live(idx, sid, ts)]
+        match = next((i for sid in live for i in idx["by_sess"][sid]
+                      if i["rec"] and not _is_reconstructed(i["source"]) and _sibling_live(i, ts)
+                      and sa in _rec_agents(i["rec"])), None)
+        if match is None:
+            return None, None
+        if len(live) == 1 or all(sa in _rec_agents(i["rec"]) for sid in live
+                                 for i in idx["by_sess"][sid] if _in_progress(i, ts)):
+            return match, None
+        return None, "ambiguous_served_task"
+
+    def _judge(row, sa, recs, ident, idx, ts, allow_siblings=True):
+        """bucket for a real spawn against one task."""
+        if sa in recs:
+            return "agreed", None
+        if recs and _written_reason(row):
+            # A hand-written override names its task on purpose: no sibling
+            # broadening, no companion — it is the declared reroute.
+            return "diverged", None
+        if allow_siblings:
+            for i in idx["by_sess"].get(ident["session"], []):
+                if (i is not ident and i["rec"] and not _is_reconstructed(i["source"])
+                        and _sibling_live(i, ts) and sa in _rec_agents(i["rec"])):
+                    return "agreed", ("review_sibling" if i["is_review"] else "sibling")
+        if not recs:
+            return "unknown", None
+        if "orchestrator" in recs or any(_ran_during(row.get("project"), a, ident, idx) for a in recs):
+            return "companion", None
+        return "diverged", None
+
+    def _classify(row):
+        """-> (bucket, unknown_reason, canonical recommendation or None, sub-tag)"""
+        sa = _canon(row["spawned_agent"])
+        ts = parse_ts(row.get("ts"))
+        idx = _ledger_index(row.get("project"))
+        if idx is None:
+            return "unknown", "no_ledger", None, None
+        if ts is None:
+            return "unknown", "task_not_in_ledger", None, None
+        ident, why = _live_identity(idx, row.get("task_id"), ts, row)
+        if ident is None:
+            if sa == "orchestrator":
+                return "unknown", why, None, None
+            served = _transcript_served(row, idx, ts, sa)
+            if served:
+                served = [i for i in served if not _is_reconstructed(i["source"])]
+                if served:
+                    recs = []
+                    for i in served:
+                        recs += [a for a in _rec_agents(i["rec"]) if a not in recs]
+                    # S1-T11f's rule on this path too (review #6): the verdict
+                    # must not depend on which named task the spawn served.
+                    bs = {_judge(row, sa, _rec_agents(i["rec"]), i, idx, ts, allow_siblings=False)[0]
+                          for i in served}
+                    if len(bs) > 1:
+                        return "unknown", "ambiguous_served_task", None, None
+                    b = bs.pop()
+                    if b != "unknown":
+                        return b, None, recs[0] if recs else None, "served_task_transcript"
+            served, amb = _ledger_served(idx, ts, sa)
+            if served is not None:
+                return "agreed", None, sa, "served_task_ledger"
+            return "unknown", amb or why, None, None
+        if _is_reconstructed(ident["source"]):
+            return "unknown", "reconstructed_row", None, None
+        recs = _rec_agents(ident["rec"])
+        rec_c = recs[0] if recs else None
+        if sa == "orchestrator":
+            if ident["owner"] and _canon(ident["owner"]) != "orchestrator":
+                return "unknown", "self_exec_contradicted", None, None
+            if any(_spawned_between(row.get("project"), a, ident["created"] - _SELF_EXEC_LEAD, ts + _SLACK)
+                   for a in recs if a != "orchestrator"):
+                return "unknown", "self_exec_spawn_in_window", None, None
+            return "self_executed", None, rec_c, None
+        b, sub = _judge(row, sa, recs, ident, idx, ts)
+        if b == "unknown":
+            return "unknown", "no_recommendation", None, None
+        return b, None, rec_c, sub
+
+    SUBS = ["agreed_sibling", "agreed_sibling_review"]
+    per_agent = {}
+    overall = Counter()
+    unknown_reasons = Counter()
+    sources = Counter()
+    served = Counter()
+    total_all = 0
+    excluded_no_ledger = 0
+    for rec, src in spawn_rows:
+        if not rec.get("recommended_agent") or not rec.get("spawned_agent"):
+            continue
+        if only_proj and rec.get("project") != only_proj:
+            continue
+        if not in_window(rec, ts_key="ts"):
+            continue
+        total_all += 1
+        sources[src] += 1
+        bucket, why, rec_c, sub = _classify(rec)
+        if why == "no_ledger":
+            excluded_no_ledger += 1
+            continue
+        key = rec_c or "(no independent rec)"
+        b = per_agent.setdefault(key, {"total": 0, "reasons": Counter(), **{k: 0 for k in BUCKETS + SUBS}})
+        b["total"] += 1
+        b[bucket] += 1
+        overall[bucket] += 1
+        if sub in ("sibling", "review_sibling"):
+            for k in (["agreed_sibling"] + (["agreed_sibling_review"] if sub == "review_sibling" else [])):
+                b[k] += 1
+                overall[k] += 1
+        elif sub:
+            served[(sub, bucket)] += 1
+        if why:
+            unknown_reasons[why] += 1
+        reason = _written_reason(rec)
+        if reason:
+            b["reasons"][reason] += 1
+
+    def _pct(n, d):
+        return round(n / d * 100.0, 1) if d else 0.0
+
+    def _rate(n, d):
+        return round(n / d * 100.0, 1) if d else None  # nothing decided -> no rate
+
+    routing_rows = []
+    for ra, b in per_agent.items():
+        dec = b["agreed"] + b["companion"] + b["diverged"]
+        routing_rows.append({
+            "recommended_agent": ra,
+            "total_spawns": b["total"],
+            **{k: b[k] for k in BUCKETS + SUBS},
+            "decided": dec,
+            "rate_pct": _rate(b["diverged"], dec),
+            "top_override_reasons": [{"reason": r, "count": c} for r, c in b["reasons"].most_common(3)],
+        })
+    routing_rows.sort(key=lambda r: (-r["diverged"], -r["total_spawns"], r["recommended_agent"]))
+    ledgered = total_all - excluded_no_ledger
+    decided = overall["agreed"] + overall["companion"] + overall["diverged"]
+    served_block = {src: {k: served[(f"served_task_{src}", k)] for k in ("agreed", "companion", "diverged")}
+                    for src in ("transcript", "ledger")}
+    overall_block = {
+        "total_spawns": total_all,
+        "spawn_sources": {"orchestrator_rows": sources["orchestrator_row"],
+                          "completion_only": sources["completion_only"],
+                          "completion_deduped": len(_paired)},
+        "excluded_no_ledger": excluded_no_ledger,
+        "ledgered_rows": ledgered,
+        **{k: overall[k] for k in BUCKETS + SUBS},
+        "served_task": served_block,
+        "decided": decided,
+        "rate_pct": _rate(overall["diverged"], decided),
+        "decided_rate_pct": _rate(overall["diverged"], decided),
+        "coverage_pct": _pct(decided, ledgered),
+        "floor_pct": _pct(overall["diverged"], ledgered),
+        "ceiling_pct": _pct(overall["diverged"] + overall["unknown"], ledgered),
+        "self_executed_pct": _pct(overall["self_executed"], ledgered),
+        "unknown_pct": _pct(overall["unknown"], ledgered),
+        "unknown_reasons": dict(unknown_reasons.most_common()),
+        "liveness_window_h": _LIVE_WINDOW_H,
+        "rotated_ledger_rows": sum((i or {}).get("rotated_rows", 0) for i in _ledger_cache.values()),
+        "transcripts": "on" if _transcripts_on else "off",
+    }
+
+    if as_json:
+        print(json.dumps({
+            "generated_at": now.isoformat(),
+            "filters": {"since": since_raw, "project": only_proj},
+            "advisory_only": True,
+            "source": trace_path,
+            "method": "independent recommendation: ledger created.metadata.agent (S1-T11, #53)",
+            "agents": routing_rows,
+            "overall": overall_block,
+        }, indent=2))
+        sys.exit(0)
+
+    def _fmt_rate(v):
+        return "—" if v is None else f"{v:.1f}%"
+
+    print("V11.32 Agent Scorecard — Routing Report   (ADVISORY ONLY — does not drive DAAO)")
+    print("  S1-T11 (#53): judged against the ledger's created.metadata.agent, not the row's own")
+    print("  recommended_agent/override_reason. The drop from the raw rate is a measurement fix,")
+    print("  not a routing improvement. Raw count: V11_AS_ROUTING_RAW=true.")
+    filt = []
+    if since_raw: filt.append(f"since={since_raw}")
+    if only_proj: filt.append(f"project={only_proj}")
+    if filt:
+        print("  filters: " + "  ".join(filt))
+    print("=" * 96)
+    print(f"  {'RECOMMENDED':<24} {'ROWS':>6} {'AGREED':>6} {'DIVRG':>6} {'SELF':>6} "
+          f"{'COMPN':>6} {'UNKN':>6} {'DEC%':>6}  WRITTEN OVERRIDE REASONS")
+    print("  " + "-" * 92)
+    for r in routing_rows:
+        top_s = "; ".join(f"{x['reason'][:40]} ({x['count']})" for x in r["top_override_reasons"]) or "—"
+        print(f"  {r['recommended_agent'][:24]:<24} {r['total_spawns']:>6} {r['agreed']:>6} "
+              f"{r['diverged']:>6} {r['self_executed']:>6} {r['companion']:>6} {r['unknown']:>6} "
+              f"{_fmt_rate(r['rate_pct']):>6}  {top_s}")
+    print("  " + "-" * 92)
+    ob = overall_block
+    ss = ob["spawn_sources"]
+    print(f"  {'OVERALL':<24} {ledgered:>6} {ob['agreed']:>6} {ob['diverged']:>6} "
+          f"{ob['self_executed']:>6} {ob['companion']:>6} {ob['unknown']:>6} {_fmt_rate(ob['rate_pct']):>6}")
+    print(f"  HEADLINE  diverged {ob['diverged']} of {decided} decided rows = {_fmt_rate(ob['rate_pct'])}"
+          f"   coverage {decided}/{ledgered} ledgered rows = {ob['coverage_pct']:.1f}%")
+    print(f"  bounds over ledgered rows: {ob['floor_pct']:.1f}% if no unknown row diverged"
+          f" .. {ob['ceiling_pct']:.1f}% if every one did")
+    print(f"  spawns counted: {total_all} = {ss['orchestrator_rows']} orchestrator/dispatch rows"
+          f" + {ss['completion_only']} completion-only hook rows"
+          f"   ({ss['completion_deduped']} completion rows deduped against an orchestrator row)")
+    print(f"  agreed {ob['agreed']} = own task {ob['agreed'] - ob['agreed_sibling'] - served_block['transcript']['agreed'] - served_block['ledger']['agreed']}"
+          f" + in-progress sibling {ob['agreed_sibling'] - ob['agreed_sibling_review']}"
+          f" + review sibling {ob['agreed_sibling_review']}"
+          f" + served task {served_block['transcript']['agreed'] + served_block['ledger']['agreed']}")
+    print(f"  served-task rows (own task not live): transcript "
+          + ", ".join(f"{k} {v}" for k, v in served_block["transcript"].items())
+          + "; ledger sibling agreed " + str(served_block["ledger"]["agreed"])
+          + f"   [transcripts {ob['transcripts']}]")
+    print(f"  self_executed {ob['self_executed_pct']:.1f}%   unknown {ob['unknown_pct']:.1f}%"
+          + ("  — " + ", ".join(f"{k} {v}" for k, v in unknown_reasons.most_common()) if unknown_reasons else ""))
+    print(f"  liveness: a task is live when its session's last non-bookkeeping ledger event is at most"
+          f" {_LIVE_WINDOW_H:g} h before the spawn (--live-window)   rotated ledger rows read: {ob['rotated_ledger_rows']}")
+    if excluded_no_ledger:
+        print(f"  excluded from every denominator: {excluded_no_ledger} rows whose project has no ledger"
+              f" (#94 test-fixture leak, unwired projects)")
     print()
     if total_all == 0:
         print("  No dispatch-trace data found under the current filters.")
@@ -732,20 +1456,46 @@ _rec_agents_by_project = {}
 for _rap_proj, _rap_state in _read_task_state_aggregates(task_state_dir):
     _rec_agents_by_project[_rap_proj] = _rap_state.get("recommended_agents") or {}
 
-def _resolve_ledger_row_agent(rec, project_hint):
+def _resolve_ledger_row_agent(rec, project_hint, idx=None):
     arts = rec.get("artifacts") or {}
     sr = arts.get("self_review") if isinstance(arts.get("self_review"), dict) else {}
     cand = sr.get("agent_id") or arts.get("agent_id")
     if not cand:
         ex = rec.get("executor")
-        if ex and ex not in _ORCH_SENTINELS:
+        if isinstance(ex, str) and ex not in _ORCH_SENTINELS:
             cand = ex
+    if cand:
+        ident = (idx or {}).get("ids", {}).get((rec.get("subject_norm"), rec.get("create_seq")))
+        cand = _map_executor(cand, ident)
     if not cand:
         rec_agents = _rec_agents_by_project.get(project_hint) or {}
         cand = rec_agents.get(str(rec.get("task_id")))
     return cand or None
 
-ledger_dir = env("V11_AS_LEDGER_DIR")
+# S1-T11 (#99 item 3): executor labels are mixed — teammate names (s0-t1-lock),
+# agent types, orchestrator. A label that is not a known agent type (never
+# spawned as a subagent_type, never a metadata.agent) is a teammate name and is
+# mapped through the task's created.metadata.agent.
+_agent_types = None
+
+def _known_agent_types():
+    global _agent_types
+    if _agent_types is None:
+        _agent_types = {"orchestrator"}
+        for t in read_jsonl(trace_path):
+            if t.get("spawned_agent"):
+                _agent_types.add(_canon(t["spawned_agent"]))
+        for _p, _path in _iter_ledger_files():
+            for i in ((_ledger_index(_p, _path) or {}).get("ids") or {}).values():
+                _agent_types.update(_rec_agents(i["rec"]))
+    return _agent_types
+
+def _map_executor(raw, ident):
+    raw = raw if isinstance(raw, str) and raw else None  # free-form ledger data
+    if raw is None or _canon(raw) in _known_agent_types():
+        return raw
+    recs = _rec_agents(ident["rec"]) if ident else []
+    return recs[0] if recs else raw
 
 def _iter_ledger_files():
     if not ledger_dir or not os.path.isdir(ledger_dir):
@@ -787,7 +1537,8 @@ _artifacts_token_values = []
 _artifacts_captured = 0
 _artifacts_unattributed = 0
 for _lf_proj, _lf_path in _iter_ledger_files():
-    for rec in read_jsonl(_lf_path):
+    _lf_idx = _ledger_index(_lf_proj, _lf_path)
+    for rec in (_lf_idx or {}).get("rows", []):
         if rec.get("ev") != "completed":
             continue
         _arts = rec.get("artifacts") or {}
@@ -799,7 +1550,7 @@ for _lf_proj, _lf_path in _iter_ledger_files():
             continue
         if not in_window(rec, ts_key="ts"):
             continue
-        row_agent = _resolve_ledger_row_agent(rec, row_project)
+        row_agent = _resolve_ledger_row_agent(rec, row_project, _lf_idx)
         if row_agent is None:
             _artifacts_unattributed += 1
             continue
@@ -848,6 +1599,83 @@ tokens_per_task_block = {
     "trace_captured": _trace_captured,
     "artifacts_captured": _artifacts_captured,
 }
+
+# ---------------------------------------------------------------------------
+# S1-T11 (#99 items 2+3, S1-P1) — review verdicts from the durable ledger on
+# the tasks this agent executed. One verdict per reviewed task identity (the
+# later row wins), from two sources:
+#   - ev:"review" rows (review-queue drains), which name the reviewed identity
+#     (subject_norm, create_seq);
+#   - `completed` rows of a review task whose artifacts.review has the V11.21
+#     lite shape {reviewer, task_id, agent_id, errors}; the reviewed task is
+#     artifacts.review.task_id in the review task's own session, latest
+#     creation at/before the completion (#97: never a bare task_id, and a
+#     session can reuse an id once the first task closed).
+# Executor = artifacts.review.agent_id, else the reviewed task's in_progress
+# owner (each through _map_executor), else its created.metadata.agent.
+# WAIVED/VOID (S1-P3, scripts/lib/review_corrections.py): a row a later
+# waived|void row corrects (corrects_seqno + corrects_ts) is dropped, and so
+# are "void" rows (a rebinding row re-files a voided verdict on the right
+# parent); the correction set is built per ledger file (the key has no
+# project) over the whole file, before --since. Waivers are not verdicts
+# either: a waived ev:"review" row, or a review-task completion whose
+# artifacts.review.verdict is WAIVED, drops the identity's earlier verdict (the
+# waiver is the last word) and counts in waived_excluded. migration/backfill-*
+# rows are counted but flagged: the S0 backfill is the only record of the S0
+# reviews.
+# ---------------------------------------------------------------------------
+_SEV_RANK = {"NONE": 0, "LOW": 1, "MEDIUM": 2, "HIGH": 3, "CRITICAL": 4}
+ledger_reviews_block = {"reviews": 0, "by_severity": {s: 0 for s in _SEV_RANK},
+                        "backfill_flagged": 0, "waived_excluded": 0}
+for _lf_proj, _lf_path in _iter_ledger_files():
+    _lf_idx = _ledger_index(_lf_proj, _lf_path)
+    if not _lf_idx:
+        continue
+    _superseded = superseded_review_keys(_lf_idx["rows"])
+    _verdicts = {}
+    for r in _lf_idx["rows"]:
+        if r.get("ev") == "review" and not is_counted_review(r, _superseded):
+            continue  # waived/voided by a later row, or a void row itself
+        _rv = (r.get("artifacts") or {}).get("review") if isinstance(r.get("artifacts"), dict) else None
+        if r.get("ev") == "review":
+            _parent = _lf_idx["ids"].get((r.get("subject_norm"), r.get("create_seq")))
+            _raw = None
+            _sev = (r.get("review_severity") or "LOW").upper()
+        elif (r.get("ev") == "completed" and isinstance(_rv, dict)
+              and _rv.get("task_id") and _rv.get("reviewer")):
+            _rts = parse_ts(r.get("ts"))
+            _cands = [i for i in _lf_idx["by_tid"].get(str(_rv["task_id"]), [])
+                      if i["session"] == (r.get("session_uuid") or "")
+                      and (_rts is None or i["created"] <= _rts + datetime.timedelta(seconds=120))]
+            _parent = max(_cands, key=lambda i: i["created"]) if _cands else None
+            _raw = _rv.get("agent_id")
+            _errs = [e for e in (_rv.get("errors") or []) if isinstance(e, dict)]
+            _sev = max(((e.get("severity") or "LOW").upper() for e in _errs),
+                       key=lambda s: _SEV_RANK.get(s, 1),
+                       default="LOW" if _rv.get("error_count") else "NONE")
+        else:
+            continue
+        _exec = _map_executor(_raw or (_parent or {}).get("owner"), _parent)
+        if not _exec and _parent:
+            _exec = (_rec_agents(_parent["rec"]) or [None])[0]
+        _key = _parent["key"] if _parent else ("unresolved", r.get("seqno"), r.get("ts"))
+        _waiver = (r.get("outcome") == "waived" if r.get("ev") == "review"
+                   else str(_rv.get("verdict") or "").upper() == "WAIVED")
+        if _waiver:
+            _verdicts.pop(_key, None)
+            if _exec and _canon(_exec) == agent and in_window(r, ts_key="ts"):
+                ledger_reviews_block["waived_excluded"] += 1
+            continue
+        _flag = _is_reconstructed(r.get("source")) or bool(_parent and _is_reconstructed(_parent["source"]))
+        _verdicts[_key] = (r, _exec, _sev, _flag)
+    for r, _exec, _sev, _flag in _verdicts.values():
+        if not _exec or _canon(_exec) != agent or not in_window(r, ts_key="ts"):
+            continue
+        ledger_reviews_block["reviews"] += 1
+        if _sev in ledger_reviews_block["by_severity"]:
+            ledger_reviews_block["by_severity"][_sev] += 1
+        if _flag:
+            ledger_reviews_block["backfill_flagged"] += 1
 
 # --- Build output rows ---
 def render_layer_row(layer_name):
@@ -905,6 +1733,7 @@ if _token_count > 0:   # W3-T13: omitted entirely when no token data
     _out["token_samples"] = _token_count
 # S1-D2: always present (nulls when no data) — never omitted, never fabricated
 _out["tokens_per_task"] = tokens_per_task_block
+_out["ledger_reviews"] = ledger_reviews_block
 
 # v11.44: Brief Quality — orchestrator authoring signal from found_by_layer="brief".
 _bq = layers["brief"]
@@ -1008,6 +1837,14 @@ if calibration_block["advisory"]:
             print(f"      • [{ex['project']}] task #{ex['task_id']}: "
                   f"self={ex['self_severity']} vs adv={ex['adversarial_severity']} "
                   f"({(ex.get('completed_at') or '')[:19]})")
+print()
+
+# S1-T11 — review verdicts from the durable ledger (WAIVED excluded, backfill flagged)
+lrb = ledger_reviews_block
+print('  Ledger review verdicts (ev:"review" + review-task completions; WAIVED/VOID excluded):')
+print(f"    reviews: {lrb['reviews']}  ("
+      + ", ".join(f"{k} {v}" for k, v in lrb["by_severity"].items())
+      + f")   backfill-flagged: {lrb['backfill_flagged']}   waived excluded: {lrb['waived_excluded']}")
 print()
 
 # v11.44 — Brief Quality (orchestrator authoring signal). Shown for the orchestrator,

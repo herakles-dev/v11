@@ -165,7 +165,7 @@ def direct_reasons(task: dict[str, Any]) -> list[str]:
 def read_prescope_ledger_reasons(ledger_file: Path, project: str) -> dict[str, list[str]]:
     """task_id -> ordered, deduplicated list of reason codes from ev:"prescope"
     ledger rows for this project. Tolerant of malformed/foreign lines
-    (mirrors wave-check's replay_ledger_by_task_id read loop)."""
+    (the tolerant read loop wave-check used before improvements/96)."""
     rows: dict[str, list[str]] = {}
     if not ledger_file.exists():
         return rows
@@ -187,13 +187,21 @@ def read_prescope_ledger_reasons(ledger_file: Path, project: str) -> dict[str, l
         if ev.get("ev") != "prescope":
             continue
         tid = ev.get("task_id")
-        reason = ev.get("reason")
-        if not tid or not reason:
+        if not tid:
             continue
+        # S2-T5 (#83): sync-tasks now emits one combined row per TaskCreate
+        # with reasons:[...] (was one row per reason, reason:<str>). The
+        # ledger is append-only, so rows written before this change still
+        # carry the old singular shape — accept both indefinitely.
+        reason_list = ev.get("reasons")
+        if not isinstance(reason_list, list):
+            single = ev.get("reason")
+            reason_list = [single] if single else []
         tid = str(tid)
         bucket = rows.setdefault(tid, [])
-        if reason not in bucket:
-            bucket.append(reason)
+        for reason in reason_list:
+            if isinstance(reason, str) and reason and reason not in bucket:
+                bucket.append(reason)
     return rows
 
 

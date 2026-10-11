@@ -1,0 +1,455 @@
+#!/usr/bin/env python3
+"""
+check-wiring-parity — read-only fleet-wide hook wiring parity report
+(S0-T5, ticket #86), plus unwired V11 session dirs (S1-R3b, ticket #98).
+
+Reuses scripts/lib/wiring_diff.py's diff() against every discovered
+project settings.json (same discovery rules as `v11-update --all`) and
+prints how much of the fleet matches the canonical template, plus a
+per-project mismatch list with a matcher-parity column (e.g. a bare
+"Task" matcher where the template wants "Task|Agent").
+
+Never touches any settings.json — this is `v11-update --all --dry-run`'s
+reporting half, kept as a separate entry point so "check drift" and
+"fix drift" are never the same command. The only writes are the opt-in
+--report-dir file and the --install-cron/--uninstall-cron crontab line.
+
+Usage:
+  check-wiring-parity [--json] [--min PCT] [--root DIR]
+                      [--strict-unwired] [--unwired-since DAYS]
+                      [--report-dir DIR [--keep N]]
+  check-wiring-parity --install-cron [--report-dir DIR] [--keep N]
+  check-wiring-parity --uninstall-cron
+
+%-at-parity = at_parity / discovered: a file that fails to parse or has an
+unexpected shape counts against parity (the same denominator
+`v11-update --all` uses).
+
+Unwired V11 session dirs (#98): `v11-update --all` only discovers dirs
+that already reference v11 hooks, so a session dir with no wiring is
+invisible to the parity numbers. This separate section lists every
+immediate child of the sessions root ($SESSIONS_ROOT, default
+$HERCULES_ROOT/sessions — the hooks' resolution) that holds V11 state
+(.task-state.json, handoff.md, handoff-tasks.json or spec.md) but whose
+.claude/settings.json / settings.local.json doesn't reference v11 hooks.
+A dir whose project code dir ($HERCULES_ROOT/<name>, or a
+.agent-metrics/project-paths.json entry) IS wired is a state mirror —
+the session runs in the code dir — and is reported separately, not as
+unwired. Backup/snapshot/archive dir names are skipped. The section
+never changes the parity verdict unless --strict-unwired is given.
+
+--report-dir DIR writes the JSON report to DIR/<YYYY-MM-DD>.json, keeps
+the newest --keep N (default 12) such files, and prints a one-line
+summary instead of the report. --install-cron / --uninstall-cron manage
+exactly one crontab line tagged "# v11-wiring-parity" (weekly, Sun
+04:30) that runs that report mode; every other crontab line is kept
+byte-for-byte and the crontab is backed up to ~/.v11-backups/ first.
+CRONTAB_CMD overrides the crontab binary (tests).
+
+Exit 0 normally; 1 if the fleet's %-at-parity is below --min, or if
+--strict-unwired and any unwired session dir is listed; 2 on a setup
+error (missing template, unreadable crontab, bad arguments).
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+V11_HOME = Path(os.environ.get("V11_HOME", SCRIPT_DIR.parent))
+sys.path.insert(0, str(SCRIPT_DIR / "lib"))
+import wiring_diff  # noqa: E402
+
+HERCULES_ROOT = Path(os.environ.get("HERCULES_ROOT", "/path/to/operator-home"))
+TEMPLATE_PATH = Path(os.environ.get("V11_UPDATE_TEMPLATE", str(V11_HOME / ".claude" / "settings.json")))
+DEFAULT_ROOT = Path(os.environ.get("V11_UPDATE_SCAN_ROOT", str(HERCULES_ROOT)))
+BACKUP_ROOT = Path(os.environ.get("V11_UPDATE_BACKUP_ROOT", str(Path.home() / ".v11-backups" / "v11-update")))
+# Same resolution as hooks/lib/common.sh.
+SESSIONS_ROOT = Path(os.environ.get("SESSIONS_ROOT", str(HERCULES_ROOT / "sessions")))
+PROJECT_PATHS = HERCULES_ROOT / ".agent-metrics" / "project-paths.json"
+
+# .autonomy-state is deliberately not a marker: track-autonomy writes it
+# for any detected project name, so on its own it marks noise dirs
+# (logs, apps, ...), not V11 sessions.
+V11_STATE_MARKERS = (".task-state.json", "handoff.md", "handoff-tasks.json", "spec.md")
+UNWIRED_TEXT_LIMIT = 25
+
+CRON_TAG = "# v11-wiring-parity"
+CRON_SCHEDULE = "30 4 * * 0"  # weekly, Sunday 04:30 — after # v11-rotate-metrics (04:15)
+DEFAULT_KEEP = 12
+REPORT_NAME_RE = re.compile(r"^\d{4}-\d{2}-\d{2}\.json$")
+
+
+def matcher_parity_issues(changes: list[dict]) -> list[str]:
+    """Human-readable "X -> Y" strings for every rematched (mismatched
+    matcher) command — the fleet's flagship drift case (bare "Task" where
+    the template wants "Task|Agent")."""
+    return [
+        f"{c['command'].rsplit('/', 1)[-1]}@{c['event']}: {c['from_matcher']} -> {c['to_matcher']}"
+        for c in changes if c["type"] == "rematched"
+    ]
+
+
+def analyze_one(settings_path: Path, template: dict) -> dict:
+    try:
+        project_settings = json.loads(settings_path.read_text())
+    except (OSError, json.JSONDecodeError) as e:
+        return {"path": str(settings_path), "error": str(e)}
+
+    try:
+        _new_settings, changes = wiring_diff.diff(project_settings, template.get("hooks", {}))
+    except wiring_diff.SettingsShapeError as e:
+        return {"path": str(settings_path), "error": f"unexpected shape: {e}"}
+    return {
+        "path": str(settings_path),
+        "at_parity": wiring_diff.is_at_parity(changes),
+        "added": [c for c in changes if c["type"] == "added"],
+        "removed": [c for c in changes if c["type"] == "removed"],
+        "superseded": [c for c in changes if c["type"] == "superseded"],
+        "matcher_parity_issues": matcher_parity_issues(changes),
+        "custom_commands": wiring_diff.custom_commands(changes),
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Unwired V11 session dirs (#98)
+# ─────────────────────────────────────────────────────────────────────────
+
+def is_v11_wired(d: Path) -> bool:
+    """d/.claude/settings.json or settings.local.json references v11 hooks
+    (Claude Code loads both)."""
+    for name in ("settings.json", "settings.local.json"):
+        try:
+            text = (d / ".claude" / name).read_text(errors="replace")
+        except OSError:
+            continue
+        if wiring_diff.V11_HOOKS_REF in text:
+            return True
+    return False
+
+
+def _code_dirs(name: str, session_dir: Path, registry: dict) -> list[Path]:
+    """Candidate code dirs for project `name`, excluding the session dir."""
+    entries = registry.get(name)
+    if isinstance(entries, str):
+        entries = [entries]
+    candidates = [HERCULES_ROOT / name] + [Path(p) for p in (entries if isinstance(entries, list) else []) if isinstance(p, str)]
+    session_real = session_dir.resolve()
+    out = []
+    for c in candidates:
+        if c.is_dir() and c.resolve() != session_real and c not in out:
+            out.append(c)
+    return out
+
+
+def find_unwired_session_dirs(sessions_root: Path, since_days: float | None = None) -> tuple[list[dict], list[dict]]:
+    """Return (unwired, state_mirrors), each newest-activity first.
+
+    last_activity = newest mtime among the dir's V11 state files."""
+    if not sessions_root.is_dir():
+        return [], []
+    try:
+        registry = json.loads(PROJECT_PATHS.read_text())
+        if not isinstance(registry, dict):
+            registry = {}
+    except (OSError, ValueError):
+        registry = {}
+    cutoff = None
+    if since_days is not None:
+        cutoff = (datetime.now() - timedelta(days=since_days)).timestamp()
+
+    try:
+        children = sorted(sessions_root.iterdir())
+    except OSError:
+        return [], []
+
+    unwired: list[dict] = []
+    mirrors: list[dict] = []
+    for d in children:
+        if d.name.startswith(".") or wiring_diff.is_backup_dirname(d.name):
+            continue
+        try:
+            if not d.is_dir():
+                continue
+            markers = [m for m in V11_STATE_MARKERS if (d / m).exists()]
+        except OSError:  # unreadable dir — can't tell, skip
+            continue
+        if not markers or is_v11_wired(d):
+            continue
+        mtimes = []
+        for m in markers:
+            try:
+                mtimes.append((d / m).stat().st_mtime)
+            except OSError:
+                pass
+        last = max(mtimes) if mtimes else 0.0
+        if cutoff is not None and last < cutoff:
+            continue
+        entry = {
+            "path": str(d),
+            "state_files": markers,
+            "last_activity": datetime.fromtimestamp(last).isoformat(timespec="seconds"),
+        }
+        wired_code_dir = next((c for c in _code_dirs(d.name, d, registry) if is_v11_wired(c)), None)
+        if wired_code_dir is not None:
+            mirrors.append({**entry, "code_dir": str(wired_code_dir)})
+        else:
+            unwired.append(entry)
+    unwired.sort(key=lambda e: e["last_activity"], reverse=True)
+    mirrors.sort(key=lambda e: e["last_activity"], reverse=True)
+    return unwired, mirrors
+
+
+def print_unwired_section(report: dict) -> None:
+    unwired = report["unwired_session_dirs"]
+    mirrors = report["state_mirror_dirs"]
+    print("Unwired V11 session dirs (V11 state, no .claude settings referencing v11 hooks)")
+    print("=" * 40)
+    print(f"  Sessions root: {report['sessions_root']}")
+    if report["unwired_since_days"] is not None:
+        print(f"  Active within: {report['unwired_since_days']:g} days")
+    print()
+    if unwired:
+        print(f"{'LAST ACTIVITY':<20} {'DIR':<60} STATE FILES")
+        for e in unwired[:UNWIRED_TEXT_LIMIT]:
+            print(f"{e['last_activity']:<20} {e['path']:<60} {', '.join(e['state_files'])}")
+        if len(unwired) > UNWIRED_TEXT_LIMIT:
+            print(f"  ... and {len(unwired) - UNWIRED_TEXT_LIMIT} more (--json for the full list)")
+        print()
+    mirror_note = ""
+    if mirrors:
+        mirror_note = f" (e.g. {mirrors[0]['path']} -> {mirrors[0]['code_dir']})"
+    print(f"{len(unwired)} unwired; {len(mirrors)} state mirrors not listed — their project code dir is wired{mirror_note}")
+    print()
+
+
+def write_report(report: dict, report_dir: Path, keep: int) -> tuple[Path, list[Path]]:
+    """Write report_dir/<today>.json; delete all but the newest `keep`
+    <YYYY-MM-DD>.json files (nothing else in report_dir is touched)."""
+    report_dir.mkdir(parents=True, exist_ok=True)
+    path = report_dir / f"{datetime.now().date().isoformat()}.json"
+    wiring_diff.atomic_write(path, json.dumps(report, indent=2) + "\n")
+    dated = sorted(p for p in report_dir.iterdir() if p.is_file() and REPORT_NAME_RE.match(p.name))
+    pruned = dated[:-keep] if len(dated) > keep else []
+    for p in pruned:
+        p.unlink()
+    return path, pruned
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Weekly cron line (# v11-wiring-parity)
+# ─────────────────────────────────────────────────────────────────────────
+
+def _crontab_cmd() -> list[str]:
+    return shlex.split(os.environ.get("CRONTAB_CMD", "crontab"))
+
+
+def _read_crontab() -> bytes:
+    """Current crontab bytes; b"" when the user has none. Raises
+    RuntimeError on any other failure so we never overwrite a crontab we
+    couldn't read."""
+    r = subprocess.run(_crontab_cmd() + ["-l"], capture_output=True)
+    if r.returncode == 0:
+        return r.stdout
+    if b"no crontab" in r.stderr.lower():
+        return b""
+    raise RuntimeError(f"`crontab -l` failed (exit {r.returncode}): {r.stderr.decode(errors='replace').strip()}")
+
+
+def _write_crontab(content: bytes, previous: bytes) -> None:
+    """Back `previous` up to ~/.v11-backups/crontab.<stamp>, then install
+    `content` via `crontab -`."""
+    backup_dir = Path.home() / ".v11-backups"
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+    backup = backup_dir / f"crontab.{stamp}.{os.getpid()}"
+    backup.write_bytes(previous)
+    r = subprocess.run(_crontab_cmd() + ["-"], input=content, capture_output=True)
+    if r.returncode != 0:
+        raise RuntimeError(f"`crontab -` failed (exit {r.returncode}): {r.stderr.decode(errors='replace').strip()}")
+    print(f"Crontab backup: {backup}")
+
+
+def _is_ours(line: bytes) -> bool:
+    return line.rstrip().endswith(CRON_TAG.encode())
+
+
+def _without_ours(existing: bytes) -> tuple[bytes, list[bytes]]:
+    """(existing minus our tagged lines, our lines). Other lines are kept
+    byte-for-byte; a missing final newline is added so an append (or
+    `crontab -`) never glues onto the last line."""
+    lines = existing.split(b"\n")
+    ours = [l for l in lines if _is_ours(l)]
+    body = b"\n".join(l for l in lines if not _is_ours(l))
+    if body and not body.endswith(b"\n"):
+        body += b"\n"
+    return body, ours
+
+
+def cron_line(report_dir: Path, keep: int) -> str:
+    target = V11_HOME / "scripts" / "check-wiring-parity"
+    log = Path.home() / ".agent-metrics" / "wiring-parity.log"
+    return (
+        f"{CRON_SCHEDULE} {shlex.quote(str(target))} --report-dir {shlex.quote(str(report_dir))} "
+        f"--keep {keep} >> {shlex.quote(str(log))} 2>&1 {CRON_TAG}"
+    )
+
+
+def install_cron(report_dir: Path, keep: int) -> int:
+    target = V11_HOME / "scripts" / "check-wiring-parity"
+    if "/.claude/worktrees/" in str(target):
+        print(f"ERROR: refusing to install a cron line pointing into a worktree ({target}); "
+              "run the installer from the main checkout.", file=sys.stderr)
+        return 2
+    if not (target.is_file() and os.access(target, os.X_OK)):
+        print(f"ERROR: cron target not found/executable: {target}", file=sys.stderr)
+        return 2
+    line = cron_line(report_dir, keep)
+    if "%" in line:  # cron turns an unescaped % into a newline
+        print(f"ERROR: '%' in a cron path is not supported: {line}", file=sys.stderr)
+        return 2
+    try:
+        existing = _read_crontab()
+        body, ours = _without_ours(existing)
+        if [l.rstrip(b"\r") for l in ours] == [line.encode()]:
+            print(f"check-wiring-parity: cron line already installed (unchanged):\n  {line}")
+            return 0
+        # The line's `>> log` redirect needs the log's dir to exist.
+        (Path.home() / ".agent-metrics").mkdir(parents=True, exist_ok=True)
+        _write_crontab(body + line.encode() + b"\n", existing)
+    except RuntimeError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 2
+    print(f"check-wiring-parity: {'replaced' if ours else 'installed'} cron line:\n  {line}")
+    print("Rollback: check-wiring-parity --uninstall-cron")
+    return 0
+
+
+def uninstall_cron() -> int:
+    try:
+        existing = _read_crontab()
+        body, ours = _without_ours(existing)
+        if not ours:
+            print("check-wiring-parity: no v11-wiring-parity cron line — nothing to remove.")
+            return 0
+        _write_crontab(body, existing)
+    except RuntimeError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 2
+    print("check-wiring-parity: removed v11-wiring-parity cron line.")
+    return 0
+
+
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog="check-wiring-parity", description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--json", action="store_true", help="machine-readable report")
+    parser.add_argument("--min", type=float, default=None, help="minimum %% at parity (at_parity / discovered); exit 1 if below")
+    parser.add_argument("--root", default=None, help="override the scan root (default: V11_UPDATE_SCAN_ROOT / HERCULES_ROOT)")
+    parser.add_argument("--strict-unwired", action="store_true", help="exit 1 if any unwired V11 session dir is listed")
+    parser.add_argument("--unwired-since", type=float, default=None, metavar="DAYS",
+                        help="only list session dirs whose V11 state changed in the last DAYS days")
+    parser.add_argument("--report-dir", default=None, metavar="DIR",
+                        help="write the JSON report to DIR/<YYYY-MM-DD>.json and print a one-line summary")
+    parser.add_argument("--keep", type=int, default=DEFAULT_KEEP, metavar="N",
+                        help=f"with --report-dir / --install-cron: keep the newest N reports (default {DEFAULT_KEEP})")
+    cron = parser.add_mutually_exclusive_group()
+    cron.add_argument("--install-cron", action="store_true", help=f"install/replace the weekly '{CRON_TAG}' crontab line")
+    cron.add_argument("--uninstall-cron", action="store_true", help=f"remove the '{CRON_TAG}' crontab line")
+    args = parser.parse_args(argv)
+
+    if args.keep < 1:
+        parser.error("--keep must be >= 1")
+    if args.unwired_since is not None and args.unwired_since < 0:
+        parser.error("--unwired-since must be >= 0")
+    if args.uninstall_cron:
+        return uninstall_cron()
+    if args.install_cron:
+        report_dir = Path(args.report_dir) if args.report_dir else Path.home() / ".agent-metrics" / "wiring-parity"
+        return install_cron(report_dir.resolve(), args.keep)
+
+    if not TEMPLATE_PATH.is_file():
+        print(f"ERROR: template not found: {TEMPLATE_PATH}", file=sys.stderr)
+        return 2
+    template = wiring_diff.load_template(TEMPLATE_PATH)
+
+    scan_root = Path(args.root) if args.root else DEFAULT_ROOT
+    discovered, pruned = wiring_diff.discover_settings_files(
+        scan_root, template_path=TEMPLATE_PATH, extra_prune_roots=[BACKUP_ROOT],
+    )
+    discovered.sort()
+
+    results = [analyze_one(p, template) for p in discovered]
+    ok = [r for r in results if not r.get("error")]
+    errors = [r for r in results if r.get("error")]
+    at_parity = [r for r in ok if r["at_parity"]]
+    mismatched = [r for r in ok if not r["at_parity"]]
+    # Denominator is every discovered file, errors included — matches
+    # `v11-update --all`.
+    pct = round(100.0 * len(at_parity) / len(discovered), 1) if discovered else 100.0
+
+    unwired, mirrors = find_unwired_session_dirs(SESSIONS_ROOT, args.unwired_since)
+
+    report = {
+        "scan_root": str(scan_root),
+        "discovered": len(discovered),
+        "pruned": {k: len(v) for k, v in pruned.items()},
+        "at_parity": len(at_parity),
+        "mismatched": len(mismatched),
+        "errors": len(errors),
+        "pct_at_parity": pct,
+        "projects": results,
+        "sessions_root": str(SESSIONS_ROOT),
+        "unwired_since_days": args.unwired_since,
+        "unwired_session_dirs": unwired,
+        "state_mirror_dirs": mirrors,
+    }
+
+    if args.report_dir:
+        path, removed = write_report(report, Path(args.report_dir), args.keep)
+        print(f"{datetime.now().isoformat(timespec='seconds')} wrote {path}: "
+              f"{len(at_parity)}/{len(discovered)} at parity ({pct}%), {len(errors)} errors, "
+              f"{len(unwired)} unwired session dirs; pruned {len(removed)} old reports")
+    elif args.json:
+        print(json.dumps(report, indent=2))
+    else:
+        print()
+        print("V11 Fleet Wiring Parity")
+        print("=" * 40)
+        print(f"  Scan root: {scan_root}")
+        print(f"  Discovered: {len(discovered)} settings.json files")
+        if pruned:
+            print(f"  Pruned: {', '.join(f'{k}={len(v)}' for k, v in sorted(pruned.items()))}")
+        print()
+        if mismatched:
+            print(f"{'PROJECT':<70} {'ADDED':>6} {'REMOVED':>8} {'SUPERSEDED':>11}  MATCHER PARITY")
+            for r in mismatched:
+                matcher_col = "; ".join(r["matcher_parity_issues"]) or "-"
+                print(f"{r['path']:<70} {len(r['added']):>6} {len(r['removed']):>8} {len(r['superseded']):>11}  {matcher_col}")
+            print()
+        if errors:
+            print("Errors:")
+            for r in errors:
+                print(f"  {r['path']}: {r['error']}")
+            print()
+        print(f"{len(at_parity)}/{len(discovered)} at parity ({pct}%), {len(errors)} errors")
+        print()
+        print_unwired_section(report)
+
+    rc = 0
+    if args.min is not None and pct < args.min:
+        rc = 1
+    if args.strict_unwired and unwired:
+        rc = 1
+    return rc
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

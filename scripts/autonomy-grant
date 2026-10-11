@@ -72,7 +72,7 @@ run_self_test() {
     mkdir -p "$TEST_DIR"
 
     # Test 1: grant on missing .autonomy-state (init skeleton)
-    "$0" "$TEST_PROJECT" 3 --reason "self-test init" 2>&1 | grep -q "persisted" || {
+    "$0" "$TEST_PROJECT" 3 --reason "self-test init" 2>&1 | grep "persisted" >/dev/null || {
         echo "FAIL: grant on missing state file did not emit persisted message"
         exit 3
     }
@@ -90,7 +90,7 @@ run_self_test() {
     [ "$GRANT_SOURCE" = "manual" ] || { echo "FAIL: expected source=manual, got $GRANT_SOURCE"; exit 3; }
 
     # Test 2: escalate to A5
-    "$0" "$TEST_PROJECT" 5 --reason "self-test escalate" 2>&1 | grep -q "persisted" || {
+    "$0" "$TEST_PROJECT" 5 --reason "self-test escalate" 2>&1 | grep "persisted" >/dev/null || {
         echo "FAIL: escalate to A5 did not emit persisted message"
         exit 3
     }
@@ -107,7 +107,7 @@ run_self_test() {
     [ "$SUCCESSFUL" = "0" ] || { echo "FAIL: expected successful=0 (initial skeleton), got $SUCCESSFUL"; exit 3; }
 
     # Test 5: grant without --reason
-    "$0" "$TEST_PROJECT" 2 2>&1 | grep -q "persisted" || {
+    "$0" "$TEST_PROJECT" 2 2>&1 | grep "persisted" >/dev/null || {
         echo "FAIL: grant without --reason failed"
         exit 3
     }

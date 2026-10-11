@@ -1,6 +1,6 @@
 {
   "metadata": {
-    "version": "11.44",
+    "version": "11.46",
     "protocol": "V11",
     "description": "V11 Spec Agents - Per-Task Agent Assignment, Artifact Handoffs, Adversarial Verification, Semantic Memory, Tracker System",
     "created": "2026-02-11",
@@ -31,7 +31,7 @@
   },
   "agents": [
     {
-      "version": "11.44",
+      "version": "11.46",
       "category": "spec-v11",
       "description": "Session planning and initialization for V11 spec-driven development",
       "model": "opus",
@@ -76,7 +76,7 @@
       "v11_native": true
     },
     {
-      "version": "11.44",
+      "version": "11.46",
       "category": "spec-v11",
       "description": "Architecture design for complex, novel problems",
       "model": "opus",
@@ -125,7 +125,7 @@
       "v11_native": true
     },
     {
-      "version": "11.44",
+      "version": "11.46",
       "category": "spec-v11",
       "description": "Code implementation and business logic",
       "model": "sonnet",
@@ -193,7 +193,7 @@
       "most_frequent": true
     },
     {
-      "version": "11.44",
+      "version": "11.46",
       "category": "spec-v11",
       "description": "Multi-service coordination and API contracts",
       "model": "sonnet",
@@ -254,7 +254,7 @@
       "v11_native": true
     },
     {
-      "version": "11.44",
+      "version": "11.46",
       "category": "spec-v11",
       "description": "L1-L4 testing and validation",
       "model": "sonnet",
@@ -316,7 +316,7 @@
       "v11_native": true
     },
     {
-      "version": "11.44",
+      "version": "11.46",
       "category": "spec-v11",
       "description": "Security architecture and validation (merged)",
       "model": "opus",
@@ -379,7 +379,7 @@
       ]
     },
     {
-      "version": "11.44",
+      "version": "11.46",
       "category": "spec-v11",
       "description": "Performance optimization",
       "model": "opus",
@@ -424,7 +424,7 @@
       "v11_native": true
     },
     {
-      "version": "11.44",
+      "version": "11.46",
       "category": "spec-v11",
       "description": "Rollback and failure recovery",
       "model": "sonnet",
@@ -476,7 +476,7 @@
       "success_rate_required": "100%"
     },
     {
-      "version": "11.44",
+      "version": "11.46",
       "category": "spec-v11",
       "description": "Code review, PR review, and design critique",
       "model": "opus",
@@ -527,7 +527,7 @@
       "read_only": true
     },
     {
-      "version": "11.44",
+      "version": "11.46",
       "category": "spec-v11",
       "description": "Adversarial wave review — 5-lens audit (quality, completeness, integration, security, rationale — Dark Code Layer 4 'why' lens)",
       "model": "sonnet",
@@ -570,7 +570,7 @@
       "read_only": true
     },
     {
-      "version": "11.44",
+      "version": "11.46",
       "category": "spec-v11",
       "description": "Routing strategist: reviews a plan and recommends V11 formations, specialist agents per role, and skills per task. READ-ONLY advisory.",
       "model": "opus",
@@ -625,7 +625,7 @@
       "v11_native": true
     },
     {
-      "version": "11.44",
+      "version": "11.46",
       "category": "spec-v11",
       "description": "Adversarial-lite post-task review — fast 3-lens pass (correctness, completeness, integration) scoped strictly to a task's files_changed; emits difficulty 1-5 + per-error JSON verdict for agent-effectiveness attribution",
       "model": "sonnet",
@@ -666,7 +666,7 @@
       "read_only": true
     },
     {
-      "version": "11.44",
+      "version": "11.46",
       "category": "spec-v11",
       "description": "Minimal-scope auto-fixer for adversarial-lite-reviewer errors (LOW/MEDIUM/HIGH only — CRITICAL refused/escalated). Smallest change per error + scoped re-verify. Dedicated agent: never the implementer under measurement",
       "model": "sonnet",
@@ -1652,7 +1652,7 @@
   },
   "integration": {
     "tasks_system": "required",
-    "hercules_network": "required",
+    "app_network": "required",
     "port_registry": "~/config/port-registry.json",
     "observability": "~/scripts/observability-cli/"
   },
