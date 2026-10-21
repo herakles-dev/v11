@@ -1,14 +1,14 @@
 # V11 Protocol — Open-Source Distribution Manifest
 
-**What this is**: A complete partition of every asset in `~/v11` (source version **v11.34.0**,
-2026-07-20 per `VERSION.md`) into CORE / OPTIONAL / EXCLUDE, produced for the Claude Partner
+**What this is**: A complete partition of every asset in `~/v11` (source version **v11.46**,
+2026-09-26 per `VERSION.md`) into CORE / OPTIONAL / EXCLUDE, produced for the Claude Partner
 Network application's public V11 release. This supersedes `~/opensource-staging/v11-starter-pack/`,
 which was a hand-picked, partial teaching extract (6/24 hooks, 2/19 schemas, 0/98 scripts, no
 installer, organized into 7 "modules": task-system, hooks, formations, autonomy, sessions, agents,
 scaling). This manifest classifies **everything** on disk instead of a curated subset, so gaps are
 visible rather than silently absent.
 
-**Date**: 2026-07-26.
+**Date**: 2026-10-11.
 
 **Bucket definitions** (from the brief):
 - **CORE** — required for the V11 loop to function on someone else's machine: task system, write
